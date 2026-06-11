@@ -1,0 +1,23 @@
+{
+  "max_per_day": 15,
+  "automerge": true,
+  "draft": false,
+  "model": "claude-sonnet-4-6",
+  "max_turns": 60,
+  "diff_cap_lines": 1500,
+  "max_fix_attempts": 2,
+  "max_nights_before_parking": 2,
+  "diff_cap_exempt_paths": [
+    "^tests/fixtures/"
+  ],
+  "forbidden_paths": [
+    "^\\.github/workflows/",
+    "^tools/nightshift/",
+    "^CLAUDE\\.md$",
+    "^AGENTS\\.md$"
+  ],
+  "evergreen_tasks": [
+    "00.daily_questions",
+    "01.daily_todos"
+  ]
+}
