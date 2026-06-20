@@ -216,3 +216,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ── Nightshift runtime state (machine-local, not for commit) ──────────
+# Worker-owned local config (backend creds, routing overrides).
+config.json.local
+# Per-queue run records + run logs.
+.tasks/runs/
+.tasks/logs/
+.tasks/*/runs/
+# Manager/worker landing worktrees and locks.
+.worktrees/
+# Worker local run history / status.
+.nightshift-worker/
+# UI player settings + other manager-local runtime state.
+.nightshift/
+# Saved playlists (machine-local, like player settings).
+workflows.json

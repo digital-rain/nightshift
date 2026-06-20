@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nightshift Worker</title>
+    <!-- Shared branding from the operator UI, mounted at /shared. -->
+    <link rel="stylesheet" href="/shared/style.css" />
+    <link rel="stylesheet" href="worker.css" />
+  </head>
+  <body data-view="now">
+    <header class="topbar">
+      <div class="brand">
+        <img class="logo" src="/shared/logo.png" alt="Nightshift" />
+        <div class="brand-text">
+          <span class="brand-name">Nightshift</span>
+          <span id="brand-tag" class="brand-tag">Nightshift Worker</span>
+        </div>
+      </div>
+      <div class="worker-id">
+        <span id="worker-id">—</span>
+        <span id="worker-backend" class="pill">—</span>
+      </div>
+    </header>
+
+    <nav class="worker-nav">
+      <button type="button" class="nav-opt active" data-view="now">Now</button>
+      <button type="button" class="nav-opt" data-view="history">History</button>
+    </nav>
+
+    <main>
+      <section id="view-now" class="worker-view">
+        <div class="caps-strip">
+          <span class="caps-item"><span class="caps-label">models</span> <span id="cap-models" class="muted">—</span></span>
+          <span class="caps-item"><span class="caps-label">mcp</span> <span id="cap-mcps" class="muted">—</span></span>
+        </div>
+        <div id="now-idle" class="empty">Idle — waiting for the manager to hand out work.</div>
+        <div id="now-card" class="now-card" hidden>
+          <div class="now-head">
+            <span id="now-task" class="now-task">—</span>
+            <span id="now-queue" class="pill">—</span>
+            <span id="now-phase" class="pill phase">—</span>
+          </div>
+          <div class="now-meta">
+            <span id="now-model" class="muted">—</span>
+            <span id="now-started" class="muted">—</span>
+          </div>
+          <pre id="now-log" class="log"></pre>
+        </div>
+      </section>
+
+      <section id="view-history" class="worker-view" hidden>
+        <div class="stats-row">
+          <div class="stat"><span class="stat-num" id="st-total">0</span><span class="stat-label">runs</span></div>
+          <div class="stat"><span class="stat-num" id="st-done">0</span><span class="stat-label">completed</span></div>
+          <div class="stat"><span class="stat-num" id="st-err">0</span><span class="stat-label">errored</span></div>
+          <div class="stat"><span class="stat-num" id="st-loc">0</span><span class="stat-label">LOC</span></div>
+        </div>
+        <table class="history">
+          <thead>
+            <tr><th>Task</th><th>Queue</th><th>Model</th><th>Status</th><th>Result</th></tr>
+          </thead>
+          <tbody id="history-body"></tbody>
+        </table>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

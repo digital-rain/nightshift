@@ -1,0 +1,89 @@
+/* Workers page — manager-era operator surface. Layered on top of style.css so
+   the existing screens are untouched; only the new #screen-workers and its
+   widgets are styled here. */
+
+body[data-view="workers"] #screen-workers { display: flex; flex: 1; }
+
+.screen-workers { flex-direction: column; overflow-y: auto; }
+
+.workers-list { list-style: none; margin: 0 0 1rem; padding: 0; display: flex; flex-direction: column; gap: 0.5rem; }
+
+.worker-card {
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.1));
+  border-radius: 10px;
+  padding: 0.6rem 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.worker-card-head { display: flex; align-items: center; gap: 0.5rem; }
+.worker-id { font-weight: 600; }
+.worker-backend { opacity: 0.75; font-size: 0.85em; }
+.worker-routing { opacity: 0.7; font-size: 0.8em; }
+.worker-now { font-size: 0.85em; opacity: 0.85; }
+
+.worker-status {
+  margin-left: auto;
+  font-size: 0.72em;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+}
+.worker-status.idle { color: var(--ok, #6cc070); }
+.worker-status.busy { color: var(--accent, #6aa0ff); }
+.worker-status.offline { color: var(--muted, #888); }
+
+.pill {
+  font-size: 0.72em;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  color: var(--ok, #6cc070);
+}
+.pill.stale { color: var(--muted, #888); }
+
+.workers-subhead { margin: 1rem 0 0.35rem; font-size: 0.9em; opacity: 0.8; }
+
+.cmp-table { width: 100%; border-collapse: collapse; font-size: 0.85em; margin-bottom: 0.75rem; }
+.cmp-table th, .cmp-table td { text-align: right; padding: 0.3rem 0.5rem; border-bottom: 1px solid var(--hairline, rgba(255, 255, 255, 0.08)); }
+.cmp-table th:first-child, .cmp-table td:first-child { text-align: left; }
+.cmp-table th { opacity: 0.7; font-weight: 600; }
+
+.workers-blocked { margin-bottom: 1rem; }
+.workers-blocked h3 { margin: 0.5rem 0 0.35rem; font-size: 0.9em; color: var(--warn, #d8a657); }
+.blocked-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.3rem; }
+.blocked-list li { font-size: 0.85em; opacity: 0.9; }
+.blocked-list .reason { opacity: 0.7; }
+
+/* Advertised capabilities on a worker card. */
+.worker-caps { font-size: 0.8em; display: flex; gap: 0.4rem; }
+.worker-caps .caps-label { opacity: 0.55; min-width: 4.5rem; }
+.worker-caps .caps-val { opacity: 0.85; }
+
+/* Queue dedication editor. */
+.dedication-hint { font-size: 0.8em; opacity: 0.7; margin: 0 0 0.5rem; }
+.dedication-list { list-style: none; margin: 0 0 1rem; padding: 0; display: flex; flex-direction: column; gap: 0.4rem; }
+.dedication-row { display: flex; align-items: center; gap: 0.5rem; }
+.dedication-queue { min-width: 7rem; font-weight: 600; font-size: 0.85em; }
+.dedication-input {
+  flex: 1;
+  background: var(--field, rgba(255, 255, 255, 0.06));
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.12));
+  border-radius: 6px;
+  padding: 0.25rem 0.5rem;
+  color: inherit;
+  font-size: 0.85em;
+}
+.dedication-save {
+  font-size: 0.8em;
+  padding: 0.25rem 0.7rem;
+  border-radius: 6px;
+  border: 1px solid var(--hairline, rgba(255, 255, 255, 0.18));
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.dedication-save:hover { background: var(--hover, rgba(255, 255, 255, 0.08)); }
+.dedication-save:disabled { opacity: 0.5; cursor: default; }

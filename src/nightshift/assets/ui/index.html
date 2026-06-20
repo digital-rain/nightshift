@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nightshift</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body data-view="now">
+    <!-- Top bar: brand + global actions only (transport lives at the bottom). -->
+    <header class="topbar">
+      <div class="brand">
+        <img class="logo" src="logo.png" alt="Nightshift" />
+        <div class="brand-text">
+          <span class="brand-name">Nightshift</span>
+          <span id="brand-tag" class="brand-tag">agent task runner</span>
+        </div>
+      </div>
+
+      <div class="actions">
+        <div id="mode" class="mode-group" role="group" aria-label="Transport mode">
+          <button type="button" class="mode-opt" data-mode="oneshot" aria-pressed="false"
+                  title="1-shot — run a single task once">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="9" />
+              <path d="M10.5 9.5 12.5 8V16" />
+              <path d="M10.5 16h4" />
+            </svg>
+          </button>
+          <button type="button" class="mode-opt active" data-mode="auto" aria-pressed="true"
+                  title="Play once — run the whole queue one time">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M17 2l4 4-4 4" />
+              <path d="M3 11V9a4 4 0 0 1 4-4h14" />
+              <path d="M7 22l-4-4 4-4" />
+              <path d="M21 13v2a4 4 0 0 1-4 4H3" />
+              <path d="M11 14V10l-1.5 1" />
+            </svg>
+          </button>
+          <button type="button" class="mode-opt" data-mode="repeat" aria-pressed="false"
+                  title="Repeat — loop the queue continuously">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M17 2l4 4-4 4" />
+              <path d="M3 11V9a4 4 0 0 1 4-4h14" />
+              <path d="M7 22l-4-4 4-4" />
+              <path d="M21 13v2a4 4 0 0 1-4 4H3" />
+            </svg>
+          </button>
+        </div>
+        <div id="play-filter" class="play-filter" role="group"
+             aria-label="Play priority filter">
+          <button type="button" class="pf-opt on" data-priority="all"
+                  aria-pressed="true" title="Play all priorities">ALL</button>
+          <button type="button" class="pf-opt" data-priority="0"
+                  aria-pressed="false" title="P0 — highest">P0</button>
+          <button type="button" class="pf-opt" data-priority="1"
+                  aria-pressed="false" title="P1">P1</button>
+          <button type="button" class="pf-opt" data-priority="2"
+                  aria-pressed="false" title="P2">P2</button>
+          <button type="button" class="pf-opt" data-priority="3"
+                  aria-pressed="false" title="P3">P3</button>
+          <button type="button" class="pf-opt" data-priority="4"
+                  aria-pressed="false" title="P4">P4</button>
+          <button type="button" class="pf-opt" data-priority="5"
+                  aria-pressed="false" title="P5 — lowest">P5</button>
+        </div>
+        <button id="btn-add" class="abtn" title="Add a task">&#43;</button>
+        <button id="btn-settings" class="abtn abtn-gear" title="Settings">&#9881;</button>
+      </div>
+    </header>
+
+    <main class="screens">
+      <section id="screen-now" class="screen screen-now" aria-label="Now">
+        <div class="now-layout">
+          <div id="now-body" class="now-body"></div>
+          <div id="now-detail" class="now-detail"></div>
+        </div>
+      </section>
+
+      <!-- Full-area editable task-detail pane: takes over the content region
+           (between the top bar and the bottom strips) when you open a task —
+           and the same surface, with no file behind it yet, when you add a new
+           one. A `<` chevron navigates back; navigating back without saving
+           discards the edits / the new-task draft (back is cancel). -->
+      <section id="screen-detail" class="screen screen-detail" aria-label="Task detail">
+        <div class="detail-takeover-head">
+          <button id="detail-back" class="detail-back" title="Back" aria-label="Back">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M15 5l-7 7 7 7" />
+            </svg>
+          </button>
+          <h2 id="detail-screen-title">Task</h2>
+        </div>
+        <div id="detail-screen-body" class="detail-body"></div>
+      </section>
+
+      <section id="screen-queue" class="screen screen-queue" aria-label="Queue">
+        <!-- Chrome: the active queue's name + the Add menu, hairline-separated
+             from the UP NEXT list below. -->
+        <div class="queue-chrome">
+          <h2 id="queue-playlist" class="queue-playlist">Main queue</h2>
+          <div class="add-menu-wrap">
+            <button id="btn-add-menu" class="ghost-btn" title="Add"
+                    aria-haspopup="true" aria-expanded="false">+ Add</button>
+            <div id="add-menu" class="add-menu" hidden role="menu">
+              <button class="add-menu-item" data-act="new" role="menuitem">New task…</button>
+              <button class="add-menu-item" data-act="from" role="menuitem">Add from playlist…</button>
+            </div>
+          </div>
+        </div>
+        <h2 class="queue-upnext">UP NEXT <span id="queue-count" class="count"></span>
+          <button id="queue-sort" type="button" class="queue-sort"
+                  title="Sort by priority" aria-pressed="false">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 6h11M4 12h7M4 18h3" />
+              <path d="M18 8l3-3 3 3M21 5v13" />
+            </svg>
+          </button>
+        </h2>
+        <ul id="queue" class="queue"></ul>
+        <p id="queue-empty" class="empty" hidden>No pending tasks.</p>
+      </section>
+
+      <section id="screen-playlists" class="screen screen-playlists" aria-label="Playlists">
+        <div class="pane-head">
+          <h2>Playlists <span id="playlists-count" class="count"></span></h2>
+          <button id="btn-add-playlist" class="ghost-btn" title="Create a playlist">+ New</button>
+        </div>
+        <ul id="playlists" class="playlists"></ul>
+        <p id="playlists-empty" class="empty" hidden>No playlists yet. Create one — a self-contained queue under .tasks/&lt;name&gt;.</p>
+      </section>
+
+      <section id="screen-history" class="screen screen-history" aria-label="History">
+        <div class="pane-head">
+          <h2>History</h2>
+          <div class="pane-head-actions">
+            <button id="btn-stats" class="ghost-btn" title="Run statistics for this queue">Stats</button>
+            <button id="btn-clear" class="ghost-btn" title="Clear all run records">Clear</button>
+          </div>
+        </div>
+        <div id="history" class="history"></div>
+        <p id="history-empty" class="empty" hidden>No runs yet.</p>
+      </section>
+
+      <!-- Statistics for the active queue's run history, opened from History.
+           Read-only graphical summary: task count, average time, success rate,
+           and a breakdown by failure mode. A `<` chevron returns to History. -->
+      <section id="screen-stats" class="screen screen-stats" aria-label="Statistics">
+        <div class="detail-takeover-head">
+          <button id="stats-back" class="detail-back" title="Back to History" aria-label="Back to History">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M15 5l-7 7 7 7" />
+            </svg>
+          </button>
+          <h2 id="stats-title">Statistics</h2>
+        </div>
+        <div id="stats-body" class="stats-body"></div>
+        <p id="stats-empty" class="empty" hidden>No runs yet.</p>
+      </section>
+
+      <!-- Workers: registered worker fleet (backend, routing, status, current
+           task) plus per-worker and per-backend comparison stats. Driven by the
+           manager API + live SSE convergence (manager-events.js). -->
+      <section id="screen-workers" class="screen screen-workers" aria-label="Workers">
+        <div class="pane-head">
+          <h2>Workers <span id="workers-count" class="count"></span></h2>
+          <span id="workers-conn" class="pill" title="Live link to manager">live</span>
+        </div>
+        <ul id="workers-list" class="workers-list"></ul>
+        <p id="workers-empty" class="empty" hidden>No workers checked in.</p>
+        <div id="workers-blocked" class="workers-blocked" hidden>
+          <h3>Blocked tasks</h3>
+          <ul id="blocked-list" class="blocked-list"></ul>
+        </div>
+        <h3 class="workers-subhead">Queue dedication</h3>
+        <p class="dedication-hint">
+          Bind a queue to specific worker(s): its tasks are then offered only to
+          those workers. Leave blank for any matching worker. Combined with a
+          worker configured without MCP connectors, this fences a sensitive queue
+          by configuration alone.
+        </p>
+        <ul id="dedication-list" class="dedication-list"></ul>
+        <h3 class="workers-subhead">By backend</h3>
+        <table class="cmp-table"><thead><tr>
+          <th>Backend</th><th>Runs</th><th>Done</th><th>Err</th><th>LOC</th><th>Avg s</th>
+          <th>Turns</th><th>Tokens</th><th>Cost</th>
+        </tr></thead><tbody id="by-backend-body"></tbody></table>
+        <h3 class="workers-subhead">By worker</h3>
+        <table class="cmp-table"><thead><tr>
+          <th>Worker</th><th>Runs</th><th>Done</th><th>Err</th><th>LOC</th><th>Avg s</th>
+          <th>Turns</th><th>Tokens</th><th>Cost</th>
+        </tr></thead><tbody id="by-worker-body"></tbody></table>
+        <h3 class="workers-subhead">By model</h3>
+        <table class="cmp-table"><thead><tr>
+          <th>Model</th><th>Runs</th><th>Done</th><th>Err</th><th>LOC</th><th>Avg s</th>
+          <th>Turns</th><th>Tokens</th><th>Cost</th>
+        </tr></thead><tbody id="by-model-body"></tbody></table>
+        <h3 class="workers-subhead">By queue</h3>
+        <table class="cmp-table"><thead><tr>
+          <th>Queue</th><th>Runs</th><th>Done</th><th>Err</th><th>LOC</th><th>Avg s</th>
+          <th>Turns</th><th>Tokens</th><th>Cost</th>
+        </tr></thead><tbody id="by-queue-body"></tbody></table>
+      </section>
+    </main>
+
+    <!-- Bottom region: two strips, iPhone-Music style. Upper = mini-player
+         (now playing + transport); lower = tab icons. -->
+    <div class="bottombar">
+      <div class="miniplayer">
+        <div class="controls">
+          <button id="btn-play" class="tbtn" title="Play">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 4v16l13-8z" /></svg>
+          </button>
+          <button id="btn-skip" class="tbtn" title="Skip current track">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 4v16l11-8z" /><rect x="17" y="4" width="3" height="16" rx="1" /></svg>
+          </button>
+          <button id="btn-stop" class="tbtn" title="Stop">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="1.5" /></svg>
+          </button>
+        </div>
+      </div>
+
+      <nav id="bottomnav" class="bottomnav" role="tablist" aria-label="Screens">
+        <button class="navbtn" data-view="home" role="tab" title="Main queue (home)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3 11l9-8 9 8" /><path d="M5 10v10h14V10" />
+          </svg>
+          <span>Home</span>
+        </button>
+        <button class="navbtn" data-view="now" role="tab">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9" /><path d="M10 9l5 3-5 3z" fill="currentColor" />
+          </svg>
+          <span>Now</span>
+        </button>
+        <button class="navbtn" data-view="queue" role="tab">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />
+          </svg>
+          <span>Queue</span>
+        </button>
+        <button class="navbtn" data-view="playlists" role="tab">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M4 7h11M4 12h11M4 17h7" /><circle cx="18" cy="16" r="3" /><path d="M21 16V8l-3 1" />
+          </svg>
+          <span>Playlists</span>
+        </button>
+        <button class="navbtn" data-view="history" role="tab">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" />
+          </svg>
+          <span>History</span>
+        </button>
+        <button class="navbtn" data-view="workers" role="tab" title="Worker fleet + comparison stats">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="4" width="18" height="6" rx="1" /><rect x="3" y="14" width="18" height="6" rx="1" />
+            <path d="M7 7h.01M7 17h.01" />
+          </svg>
+          <span>Workers</span>
+        </button>
+      </nav>
+    </div>
+
+    <!-- Settings modal -->
+    <div id="settings-modal" class="modal" hidden>
+      <div class="modal-card">
+        <h3>Settings</h3>
+        <div id="settings-fields" class="settings-fields"></div>
+        <details class="raw-json">
+          <summary>Raw JSON</summary>
+          <textarea id="settings-raw" rows="8" spellcheck="false"></textarea>
+        </details>
+        <p id="settings-error" class="error" hidden></p>
+        <div class="modal-actions">
+          <button id="settings-cancel" class="btn">Cancel</button>
+          <button id="settings-save" class="btn primary">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Add-from-playlist picker -->
+    <div id="addfrom-modal" class="modal" hidden>
+      <div class="modal-card">
+        <div class="detail-head">
+          <h3>Add from playlist</h3>
+          <button id="addfrom-close" class="abtn" title="Close">&#10005;</button>
+        </div>
+        <p class="field-desc">Open <strong>Playlists</strong> with &#8250;, then add a whole queue with +, or open one to pick individual tasks. “library” is the main queue. Tasks are copied into the current queue.</p>
+        <p id="addfrom-status" class="field-desc addfrom-status" hidden></p>
+        <ul id="addfrom-list" class="addfrom-list"></ul>
+        <p id="addfrom-empty" class="empty" hidden>No other playlists to add from.</p>
+      </div>
+    </div>
+
+    <!-- Create playlist modal -->
+    <div id="playlist-modal" class="modal" hidden>
+      <div class="modal-card">
+        <h3>New playlist</h3>
+        <label>Name
+          <input id="playlist-name" type="text" placeholder="e.g. nightshift" />
+        </label>
+        <p class="field-desc">A playlist is a self-contained queue under .tasks/&lt;name&gt; that inherits its settings from the main queue.</p>
+        <p id="playlist-error" class="error" hidden></p>
+        <div class="modal-actions">
+          <button id="playlist-cancel" class="btn">Cancel</button>
+          <button id="playlist-save" class="btn primary">Create</button>
+        </div>
+      </div>
+    </div>
+
+    <link rel="stylesheet" href="workers-panel.css" />
+    <script src="app.js"></script>
+    <!-- Manager-era additions: Workers fleet page + snapshot/delta SSE so all
+         browsers converge live (reorder / status / leases / workers). Loaded
+         after app.js so they can reuse its globals where present. -->
+    <script src="workers.js"></script>
+    <script src="manager-events.js"></script>
+  </body>
+</html>

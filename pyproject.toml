@@ -1,0 +1,76 @@
+[project]
+name = "nightshift"
+version = "0.1.0"
+description = "Pull-based overnight agent task runner (manager + workers)."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    # HTTP API + operator/worker UIs.
+    "fastapi>=0.100.0",
+    "uvicorn>=0.20.0",
+    # Worker -> manager client and backend HTTP calls.
+    "httpx>=0.27.0",
+    # Request/response models.
+    "pydantic>=2.7,<3.0",
+    # Durable manager state (the in-memory store needs nothing extra).
+    "asyncpg>=0.29",
+    # .env loading for the legacy local runner.
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+# Inbound Slack capture daemon (`python -m nightshift.slack.slackd`). Outbound
+# Slack notifications use httpx and need no extra install.
+slack = [
+    "slack-bolt>=1.18",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.14",
+]
+
+[project.scripts]
+nightshift-manager = "nightshift.manager.__main__:main"
+nightshift-worker = "nightshift.worker.__main__:main"
+nightshift-server = "nightshift.server.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nightshift"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+asyncio_mode = "auto"
+addopts = "-q"
+
+[tool.ruff]
+src = ["src", "tests"]
+exclude = ["src/nightshift/assets/**"]
+
+[tool.ruff.lint]
+extend-select = ["I", "UP", "B", "C4"]
+# Inherited posture: these mirror the original project's ignore set so the
+# extracted code stays byte-for-byte (imports aside). Tighten incrementally.
+ignore = [
+    "E501",  # line length
+    "E402",  # deferred imports are intentional in a few modules
+    "E731",  # lambda assignment
+    "E741",  # ambiguous single-letter names (intentional locals)
+    "F841",  # unused local (clean up incrementally)
+    "B007",  # unused loop control variable
+    "B008",  # function call in default arg (typer/fastapi idiom)
+    "B023",  # loop-variable binding in a closure (pre-existing pattern)
+    "B904",  # raise ... from within except
+    "B905",  # zip without explicit strict
+    "C408",  # dict() call instead of literal
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["nightshift"]
+lines-after-imports = 2

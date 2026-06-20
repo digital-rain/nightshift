@@ -1,0 +1,48 @@
+{
+  "max_per_day": 200,
+  "automerge": false,
+  "draft": false,
+  "default_model": "auto",
+  "model": "claude-opus-4-8",
+  "cursor_model": "claude-opus-4-8-high",
+  "scheduled_models": [
+    "claude-sonnet-4-6",
+    "claude-opus-4-6",
+    "claude-opus-4-8",
+    "claude-sonnet-4-5",
+    "claude-opus-4-5"
+  ],
+  "diff_cap_lines": 1500,
+  "max_fix_attempts": 6,
+  "max_nights_before_parking": 2,
+  "auto_resolve": true,
+  "worker_backend": "claude-code",
+  "autostash_operator_work": true,
+  "max_concurrent_queues": 2,
+  "max_resolve_attempts": 2,
+  "resolve_model": null,
+  "resolve_backend": null,
+  "diff_cap_exempt_paths": [
+    "^tests/fixtures/",
+    "^\\.tasks/",
+    "^docs/",
+    "^prompts/",
+    "\\.md$",
+    "\\.(txt|rst|adoc)$"
+  ],
+  "forbidden_paths": [
+    "^\\.github/workflows/",
+    "^tools/nightshift/config\\.json$",
+    "^tools/nightshift/spawn_daily\\.py$",
+    "^tools/nightshift/render_task\\.py$",
+    "^tools/nightshift/nightshift\\.md$",
+    "^tools/nightshift/nightshift-resolve\\.md$",
+    "^tools/nightshift/NIGHTSHIFT\\.md$",
+    "^tools/nightshift/README\\.md$",
+    "^CLAUDE\\.md$",
+    "^AGENTS\\.md$"
+  ],
+  "forbidden_template_paths": [
+    "^tools/nightshift/templates/"
+  ]
+}

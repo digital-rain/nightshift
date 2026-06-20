@@ -1,0 +1,341 @@
+"""Cross-queue next-task arbitration for the manager.
+
+The scheduler answers one question per worker poll: *given everything currently
+runnable across every queue, and the capabilities this worker advertised in its
+poll request, which single task should it run next?*
+
+Routing is **pull-based and capability-matched**. The poll request *is* the
+filter: it carries the worker's queues, accepted priorities, advertised models,
+and installed MCP connectors. A candidate is eligible iff it matches all of
+them. Nothing is keyed off the worker's backend any more -- a pinned model
+routes to whoever advertises that model id, regardless of which harness runs it.
+
+Design:
+
+* Per queue, reuse the engine's ``live_ordered_queue`` (which already applies
+  the queue's sort mode, disabled filter, and play-priority filter) to get the
+  ordered runnable stems, then drop anything currently **leased**, **blocked**
+  (an unsatisfiable pin / connector), or **after-blocked** (a frontmatter
+  ``after:`` dependency whose target task is still in the queue). The first
+  survivor is that queue's *head*.
+* Apply the worker's capability filter (queues, priorities, model membership,
+  MCP superset) plus manager-side queue dedication as a pre-arbitration cut.
+* Arbitrate across the surviving per-queue heads by ascending ``priority`` with a
+  round-robin tiebreak (fewest-served queue wins) so no queue starves.
+
+Everything here is pure given its inputs except :func:`build_candidates`, which
+reads the canonical ``.tasks/`` files. That split keeps the arbitration unit
+testable without a repo.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from nightshift import playlists
+from nightshift.engine import live_ordered_queue
+from nightshift.spawn_daily import split_frontmatter, task_priority
+
+
+# Worker-interpreted keywords that pin no specific model: any worker may take a
+# task carrying one of these, so they never gate routing or mark a task blocked.
+AGNOSTIC_MODELS = frozenset({"auto", "max", "", "default"})
+
+
+def is_agnostic_model(model: str | None) -> bool:
+    """True when ``model`` pins nothing concrete (auto / max / unset)."""
+    return (model or "").strip().lower() in AGNOSTIC_MODELS
+
+
+def queue_label(queue: str | None) -> str:
+    """Human/route label for a queue: ``main`` for the default ``.tasks`` queue,
+    else the playlist name. Used for worker ``queues`` matching."""
+    return queue or "main"
+
+
+def _norm_set(values: list[str] | None) -> set[str]:
+    """Lower-cased, whitespace-stripped set (advertised models / mcps)."""
+    return {str(v).strip().lower() for v in (values or []) if str(v).strip()}
+
+
+@dataclass(frozen=True)
+class TaskCandidate:
+    """One runnable task with the metadata the scheduler arbitrates on."""
+
+    queue: str | None              # None = main .tasks queue
+    task: str
+    priority: int
+    model: str                     # auto | max | explicit model id
+    required_mcps: tuple[str, ...] = ()   # MCP connectors the brief declares
+    after: str | None = None       # frontmatter dependency stem (without .md)
+
+    @property
+    def label(self) -> str:
+        return queue_label(self.queue)
+
+
+@dataclass(frozen=True)
+class WorkerFilter:
+    """A polling worker's capabilities, echoed in every poll request. ``queues``
+    / ``priorities`` of ``None`` mean "any"; ``models`` / ``mcps`` of ``None`` or
+    empty mean the worker advertises none (so it can only take agnostic / no-MCP
+    tasks)."""
+
+    worker_id: str
+    queues: list[str] | None = None
+    priorities: list[int] | None = None
+    models: list[str] | None = None
+    mcps: list[str] | None = None
+
+    def _model_ok(self, cand: TaskCandidate) -> bool:
+        if is_agnostic_model(cand.model):
+            return True
+        return cand.model.strip().lower() in _norm_set(self.models)
+
+    def _mcps_ok(self, cand: TaskCandidate) -> bool:
+        if not cand.required_mcps:
+            return True
+        return _norm_set(cand.required_mcps).issubset(_norm_set(self.mcps))
+
+    def accepts(
+        self,
+        cand: TaskCandidate,
+        *,
+        dedication: dict[str, list[str]] | None = None,
+    ) -> bool:
+        if self.queues is not None and cand.label not in self.queues:
+            return False
+        # Manager-side queue dedication: a dedicated queue's tasks are only
+        # offered to its bound worker(s); other workers are cut here even if they
+        # otherwise match. A bound worker still serves its other queues normally.
+        if dedication:
+            owners = dedication.get(cand.label)
+            if owners and self.worker_id not in owners:
+                return False
+        if self.priorities is not None and cand.priority not in self.priorities:
+            return False
+        if not self._model_ok(cand):
+            return False
+        if not self._mcps_ok(cand):
+            return False
+        return True
+
+
+@dataclass
+class SchedulerState:
+    """Mutable arbitration memory carried across polls (round-robin fairness)."""
+
+    served: dict[str, int] = field(default_factory=dict)
+
+    def record(self, queue: str | None) -> None:
+        label = queue_label(queue)
+        self.served[label] = self.served.get(label, 0) + 1
+
+
+def _after_dep(meta: dict) -> str | None:
+    """The ``after:`` dependency stem from frontmatter, normalized (no ``.md``)."""
+    raw = meta.get("after")
+    if not raw:
+        return None
+    return str(raw).strip().removesuffix(".md")
+
+
+def _normalize_model(meta: dict, default_model: str) -> str:
+    model = meta.get("model")
+    if model is None or str(model).strip() == "":
+        return default_model
+    return str(model).strip()
+
+
+def parse_required_mcps(meta: dict) -> tuple[str, ...]:
+    """Parse the frontmatter ``mcp:`` declaration into a normalized tuple.
+
+    The line-based frontmatter parser stores the value as a plain string, so we
+    accept a comma-separated list with optional surrounding brackets/quotes:
+    ``mcp: slack, github`` or ``mcp: [slack, github]``.
+    """
+    raw = meta.get("mcp")
+    if raw is None:
+        return ()
+    text = str(raw).strip().strip("[]")
+    out: list[str] = []
+    for part in text.split(","):
+        item = part.strip().strip("'\"").strip()
+        if item:
+            out.append(item)
+    return tuple(out)
+
+
+def build_candidates(
+    root: Path,
+    queue: str | None,
+    *,
+    default_model: str = "auto",
+) -> list[TaskCandidate]:
+    """Read a queue's runnable tasks (in execution order) into candidates.
+
+    Reuses :func:`live_ordered_queue` for ordering + the disabled/play-priority
+    filters, then parses each task's frontmatter for priority / model / mcp /
+    after.
+    """
+    tasks_rel = playlists.tasks_rel(queue)
+    out: list[TaskCandidate] = []
+    for stem in live_ordered_queue(root, tasks_rel):
+        path = root / tasks_rel / f"{stem}.md"
+        try:
+            meta = split_frontmatter(path.read_text(errors="replace"))[0]
+        except OSError:
+            meta = {}
+        out.append(
+            TaskCandidate(
+                queue=queue,
+                task=stem,
+                priority=task_priority(meta),
+                model=_normalize_model(meta, default_model),
+                required_mcps=parse_required_mcps(meta),
+                after=_after_dep(meta),
+            )
+        )
+    return out
+
+
+def queue_head(
+    candidates: list[TaskCandidate],
+    *,
+    worker: WorkerFilter,
+    leased: set[tuple[str | None, str]],
+    blocked: set[tuple[str | None, str]],
+    present_tasks: set[str],
+    dedication: dict[str, list[str]] | None = None,
+) -> TaskCandidate | None:
+    """First eligible candidate in a single queue's order, or None.
+
+    A candidate is skipped when it is leased, blocked, after-blocked (its
+    ``after:`` target file is still present in the queue), or rejected by the
+    worker's capability filter / queue dedication.
+    """
+    for cand in candidates:
+        key = (cand.queue, cand.task)
+        if key in leased or key in blocked:
+            continue
+        if cand.after and cand.after in present_tasks:
+            continue
+        if not worker.accepts(cand, dedication=dedication):
+            continue
+        return cand
+    return None
+
+
+def arbitrate(
+    heads: list[TaskCandidate],
+    state: SchedulerState,
+) -> TaskCandidate | None:
+    """Pick one task across per-queue heads: ascending priority, then the
+    least-served queue (round-robin), then queue label for determinism."""
+    if not heads:
+        return None
+    return min(
+        heads,
+        key=lambda c: (c.priority, state.served.get(c.label, 0), c.label),
+    )
+
+
+def pick_next(
+    candidates_by_queue: dict[str | None, list[TaskCandidate]],
+    *,
+    worker: WorkerFilter,
+    leased: set[tuple[str | None, str]],
+    blocked: set[tuple[str | None, str]],
+    state: SchedulerState,
+    dedication: dict[str, list[str]] | None = None,
+) -> TaskCandidate | None:
+    """End-to-end arbitration over already-built per-queue candidate lists.
+
+    ``present_tasks`` (for ``after:`` resolution) is the set of every task stem
+    currently in *any* queue -- a dependency is satisfied once its file is gone.
+    """
+    present_tasks = {c.task for cands in candidates_by_queue.values() for c in cands}
+    heads: list[TaskCandidate] = []
+    for cands in candidates_by_queue.values():
+        head = queue_head(
+            cands,
+            worker=worker,
+            leased=leased,
+            blocked=blocked,
+            present_tasks=present_tasks,
+            dedication=dedication,
+        )
+        if head is not None:
+            heads.append(head)
+    chosen = arbitrate(heads, state)
+    if chosen is not None:
+        state.record(chosen.queue)
+    return chosen
+
+
+def unroutable(
+    candidates_by_queue: dict[str | None, list[TaskCandidate]],
+    *,
+    available_models: set[str],
+    available_mcps: set[str],
+    dedication: dict[str, list[str]] | None = None,
+    online_workers: set[str] | None = None,
+) -> list[tuple[TaskCandidate, str]]:
+    """Candidates that no live worker can ever currently serve, with a reason.
+
+    The manager marks these **blocked** (with the reason) instead of leaving them
+    pending forever. A candidate is unroutable when:
+
+    * its pinned model is advertised by no live worker, or
+    * a connector it requires is advertised by no live worker, or
+    * its queue is dedicated to worker(s) that are all offline.
+
+    ``auto``/``max`` candidates are never unroutable on the model axis.
+    """
+    avail_models = {m.strip().lower() for m in available_models}
+    avail_mcps = {m.strip().lower() for m in available_mcps}
+    online = online_workers or set()
+    out: list[tuple[TaskCandidate, str]] = []
+    for cands in candidates_by_queue.values():
+        for cand in cands:
+            reason: str | None = None
+            if (
+                not is_agnostic_model(cand.model)
+                and cand.model.strip().lower() not in avail_models
+            ):
+                reason = f"no live worker provides model '{cand.model}'"
+            else:
+                missing = [
+                    m for m in cand.required_mcps if m.strip().lower() not in avail_mcps
+                ]
+                if missing:
+                    reason = (
+                        f"no live worker provides connector '{missing[0]}'"
+                    )
+                elif dedication:
+                    owners = dedication.get(cand.label)
+                    if owners and not any(o in online for o in owners):
+                        reason = (
+                            f"queue '{cand.label}' is dedicated to offline "
+                            f"worker(s) {', '.join(owners)}"
+                        )
+            if reason is not None:
+                out.append((cand, reason))
+    return out
+
+
+__all__ = [
+    "AGNOSTIC_MODELS",
+    "SchedulerState",
+    "TaskCandidate",
+    "WorkerFilter",
+    "arbitrate",
+    "build_candidates",
+    "is_agnostic_model",
+    "parse_required_mcps",
+    "pick_next",
+    "queue_head",
+    "queue_label",
+    "unroutable",
+]

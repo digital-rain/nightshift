@@ -1,0 +1,89 @@
+/* Worker UI specifics layered on the shared operator stylesheet. */
+
+.caps-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  padding: 0.5rem 0;
+  margin-bottom: 0.5rem;
+  font-size: 0.82em;
+  border-bottom: 1px solid var(--border, #2a2a2a);
+}
+.caps-strip .caps-label { opacity: 0.55; margin-right: 0.25rem; }
+
+.worker-nav {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border, #2a2a2a);
+}
+
+.worker-nav .nav-opt {
+  background: transparent;
+  border: 1px solid var(--border, #2a2a2a);
+  color: var(--fg, #ddd);
+  border-radius: 6px;
+  padding: 0.35rem 0.9rem;
+  cursor: pointer;
+}
+
+.worker-nav .nav-opt.active {
+  background: var(--accent, #3b82f6);
+  color: #fff;
+  border-color: var(--accent, #3b82f6);
+}
+
+.worker-view { padding: 1rem; }
+
+.worker-id { display: flex; align-items: center; gap: 0.5rem; }
+
+.pill {
+  display: inline-block;
+  padding: 0.1rem 0.55rem;
+  border-radius: 999px;
+  background: var(--panel, #1c1c1c);
+  border: 1px solid var(--border, #2a2a2a);
+  font-size: 0.8rem;
+}
+.pill.phase { text-transform: capitalize; }
+
+.now-card {
+  border: 1px solid var(--border, #2a2a2a);
+  border-radius: 8px;
+  padding: 1rem;
+  background: var(--panel, #1c1c1c);
+}
+.now-head { display: flex; align-items: center; gap: 0.6rem; }
+.now-task { font-weight: 600; font-size: 1.1rem; }
+.now-meta { margin: 0.4rem 0; display: flex; gap: 1rem; }
+.muted { color: var(--muted, #888); font-size: 0.85rem; }
+
+.log {
+  margin-top: 0.75rem;
+  max-height: 50vh;
+  overflow: auto;
+  background: #0d0d0d;
+  border: 1px solid var(--border, #2a2a2a);
+  border-radius: 6px;
+  padding: 0.6rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+}
+
+.empty { padding: 2rem; text-align: center; color: var(--muted, #888); }
+
+.stats-row { display: flex; gap: 1.5rem; margin-bottom: 1rem; }
+.stat { display: flex; flex-direction: column; align-items: center; }
+.stat-num { font-size: 1.6rem; font-weight: 700; }
+.stat-label { color: var(--muted, #888); font-size: 0.75rem; text-transform: uppercase; }
+
+table.history { width: 100%; border-collapse: collapse; }
+table.history th, table.history td {
+  text-align: left;
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid var(--border, #2a2a2a);
+  font-size: 0.85rem;
+}
+.status-completed { color: #4ade80; }
+.status-error { color: #f87171; }
