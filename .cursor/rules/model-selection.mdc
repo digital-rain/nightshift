@@ -1,0 +1,18 @@
+---
+description: Default Claude model selection for this workspace
+alwaysApply: true
+---
+
+# Model selection
+
+Use Opus 4.6 for implementation work in Cursor.
+
+Use Opus 4.8 for planning and task breakdown.
+
+## Nightshift task briefs
+
+Leave `model` unset in nightshift task briefs by default; an unset model resolves to `auto`, which lets the worker pick the most cost-effective capable model for its backend.
+
+Pin a model only when a task genuinely needs a specific capability — e.g. `model: max` for the most capable configuration the worker can offer (biggest model / max thinking / max context), or an explicit vendor model id (e.g. `claude-opus-4-8`) for planning-grade reasoning.
+
+An explicit, vendor-specific id also routes the task: the manager only offers it to a worker whose backend can serve that vendor, and a pinned id must appear in `scheduled_models` in `tools/nightshift/config.json`, which is now a pin-only allow-set consulted only when a brief pins an explicit model.

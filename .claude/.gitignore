@@ -1,0 +1,7 @@
+commands/pipeline-orchestrate.md
+commands/pipeline-task.md
+commands/pipeline-clean.md
+agents/pipeline-planner.md
+agents/pipeline-executor.md
+agents/pipeline-validator.md
+agents/pipeline-finalizer.md

@@ -1,0 +1,23 @@
+---
+description: Sentence-per-line formatting for Markdown
+globs:
+  - "**/*.md"
+  - "**/*.mdc"
+---
+
+# Sentence-per-line Markdown
+
+Write each sentence on its own line; no soft line-wrapping within a
+sentence.
+
+When editing an existing paragraph, convert only the touched
+paragraph to this style; do not reformat surrounding paragraphs that
+have not been changed.
+
+Apply to Markdown files, READMEs, docstrings, and inline comments.
+
+## Why
+
+Diffs are cleaner and code review is easier when prose is line-
+oriented. This is the same rule minip uses; the convention is
+shared across the workspace.
