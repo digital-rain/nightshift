@@ -8,10 +8,10 @@ provenance trailer (spec §9.4).
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
+from _workspace import build_workspace
 from nightshift.slack import slackd
 from nightshift.slack.config import SlackConfig
 from nightshift.slack.intake import ParsedTask
@@ -72,15 +72,18 @@ def _config(**over: Any) -> SlackConfig:
     return SlackConfig(**base)
 
 
-def _repo(tmp_path: Path) -> Path:
-    (tmp_path / ".tasks").mkdir()
-    (tmp_path / ".tasks" / "config.json").write_text(json.dumps({"order": []}) + "\n")
-    return tmp_path
+def _tasks_root(tmp_path: Path) -> Path:
+    """Content store (``<ws>/nightshift-tasks``) with an empty ``main`` queue —
+    what ``CaptureHandler`` now writes captures into."""
+    workspace = build_workspace(
+        tmp_path, main_repo=None, repos=(), commit_tasks=False
+    )
+    return workspace / "nightshift-tasks"
 
 
 def _handler(tmp_path: Path, poster: _FakePoster, **cfg: Any) -> CaptureHandler:
     return CaptureHandler(
-        _repo(tmp_path), _config(**cfg), backend=_FakeBackend(), poster=poster
+        _tasks_root(tmp_path), _config(**cfg), backend=_FakeBackend(), poster=poster
     )
 
 
@@ -212,16 +215,19 @@ def test_commit_message_carries_provenance() -> None:
         author="U-OK",
         permalink="https://slack/p",
     )
-    result = EnqueueResult(slug="s", path=Path("x"), tasks_rel=".tasks", queue=None)
+    result = EnqueueResult(slug="s", path=Path("x"), tasks_rel="main", queue=None)
     msg = commit_message(result, parsed)
     assert "Slack-Author: U-OK" in msg
     assert "Slack-Permalink: https://slack/p" in msg
 
 
 def test_run_exits_cleanly_when_unconfigured(tmp_path: Path, monkeypatch: Any) -> None:
-    root = _repo(tmp_path)
+    workspace = build_workspace(
+        tmp_path, main_repo=None, repos=(), commit_tasks=False
+    )
     monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
     monkeypatch.delenv("SLACK_APP_TOKEN", raising=False)
+    monkeypatch.delenv("NIGHTSHIFT_TASKS_REPO", raising=False)
     # No tokens, slack disabled ⇒ intake inactive ⇒ exit 2, not a crash.
-    rc = slackd.run(root)
+    rc = slackd.run(workspace)
     assert rc == 2

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from _workspace import build_workspace
 from nightshift.slack.intake import (
     ParsedTask,
     build_task,
@@ -206,60 +207,66 @@ def test_render_task_markdown_round_trips() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _repo(tmp_path: Path) -> Path:
-    (tmp_path / ".tasks").mkdir()
-    (tmp_path / ".tasks" / "config.json").write_text(
-        json.dumps({"order": ["existing"]}) + "\n"
+def _tasks_root(tmp_path: Path, *, order: list[str] | None = None) -> Path:
+    """Build a content store (``<ws>/nightshift-tasks``) with a seeded ``main``
+    queue ``order`` and return its root — the value ``enqueue`` now addresses."""
+    workspace = build_workspace(
+        tmp_path, main_repo=None, repos=(), commit_tasks=False
     )
-    return tmp_path
+    tasks_root = workspace / "nightshift-tasks"
+    seeded = list(order if order is not None else ["existing"])
+    (tasks_root / "main" / "config.json").write_text(
+        json.dumps({"order": seeded}) + "\n"
+    )
+    return tasks_root
 
 
 def test_enqueue_main_queue_appends_order(tmp_path: Path) -> None:
-    root = _repo(tmp_path)
+    tasks_root = _tasks_root(tmp_path)
     parsed = build_task("x", backend=_FakeBackend(title="New task"))
-    result = enqueue(root, parsed)
-    assert result.path == root / ".tasks" / "new-task.md"
+    result = enqueue(tasks_root, parsed)
+    assert result.path == tasks_root / "main" / "new-task.md"
     assert result.path.exists()
-    order = json.loads((root / ".tasks" / "config.json").read_text())["order"]
+    order = json.loads((tasks_root / "main" / "config.json").read_text())["order"]
     assert order == ["existing", "new-task"]
 
 
 def test_enqueue_now_prepends_order(tmp_path: Path) -> None:
-    root = _repo(tmp_path)
+    tasks_root = _tasks_root(tmp_path)
     parsed = build_task("x #now", backend=_FakeBackend(title="Urgent"))
-    result = enqueue(root, parsed)
+    result = enqueue(tasks_root, parsed)
     assert result.slug == "urgent"
-    order = json.loads((root / ".tasks" / "config.json").read_text())["order"]
+    order = json.loads((tasks_root / "main" / "config.json").read_text())["order"]
     assert order == ["urgent", "existing"]
 
 
 def test_enqueue_creates_playlist_when_needed(tmp_path: Path) -> None:
-    root = _repo(tmp_path)
+    tasks_root = _tasks_root(tmp_path)
     parsed = build_task("x queue: experiments", backend=_FakeBackend(title="Exp task"))
-    result = enqueue(root, parsed)
+    result = enqueue(tasks_root, parsed)
     assert result.queue == "experiments"
-    assert result.tasks_rel == ".tasks/experiments"
-    assert (root / ".tasks" / "experiments" / "exp-task.md").exists()
-    cfg = json.loads((root / ".tasks" / "experiments" / "config.json").read_text())
+    assert result.tasks_rel == "experiments"
+    assert (tasks_root / "experiments" / "exp-task.md").exists()
+    cfg = json.loads((tasks_root / "experiments" / "config.json").read_text())
     assert cfg["order"] == ["exp-task"]
 
 
 def test_enqueue_unique_slug_on_collision(tmp_path: Path) -> None:
-    root = _repo(tmp_path)
-    first = enqueue(root, build_task("x", backend=_FakeBackend(title="Dup")))
-    second = enqueue(root, build_task("x", backend=_FakeBackend(title="Dup")))
+    tasks_root = _tasks_root(tmp_path)
+    first = enqueue(tasks_root, build_task("x", backend=_FakeBackend(title="Dup")))
+    second = enqueue(tasks_root, build_task("x", backend=_FakeBackend(title="Dup")))
     assert first.slug == "dup"
     assert second.slug == "dup-2"
     assert second.path.exists()
 
 
 def test_enqueue_writes_directive_frontmatter(tmp_path: Path) -> None:
-    root = _repo(tmp_path)
+    tasks_root = _tasks_root(tmp_path)
     parsed = build_task(
         "x #automerge loc: 50 after: foo",
         backend=_FakeBackend(title="Rich"),
     )
-    result = enqueue(root, parsed)
+    result = enqueue(tasks_root, parsed)
     text = result.path.read_text()
     assert "automerge: true" in text
     assert "loc: 50" in text

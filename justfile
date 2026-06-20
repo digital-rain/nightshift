@@ -6,6 +6,7 @@ ENDCOLOR := `printf "\033[0m"`
 venv    := ".venv"
 py      := venv + "/bin/python"
 root    := justfile_directory()
+workspace := env_var_or_default("NIGHTSHIFT_WORKSPACE", justfile_directory())
 mig_dir := justfile_directory() / "src/nightshift/assets/migrations"
 
 # List available recipes.
@@ -29,7 +30,7 @@ venv:
 manager port="":
     #!/usr/bin/env bash
     set -euo pipefail
-    args=(--root "{{root}}")
+    args=(--workspace "{{workspace}}")
     if [ -n "{{port}}" ]; then args+=(--port "{{port}}"); fi
     {{py}} -m nightshift.manager "${args[@]}"
 
@@ -37,25 +38,25 @@ manager port="":
 worker port="":
     #!/usr/bin/env bash
     set -euo pipefail
-    args=(--root "{{root}}")
+    args=(--workspace "{{workspace}}")
     if [ -n "{{port}}" ]; then args+=(--ui-port "{{port}}"); fi
     {{py}} -m nightshift.worker "${args[@]}"
 
 # Launch a worker with no UI (poll loop only).
 worker-headless:
-    {{py}} -m nightshift.worker --root "{{root}}" --no-ui
+    {{py}} -m nightshift.worker --workspace "{{workspace}}" --no-ui
 
 # Launch the legacy single-box UI server (viewer + player; default :8799).
 server port="":
     #!/usr/bin/env bash
     set -euo pipefail
-    args=(--root "{{root}}")
+    args=(--workspace "{{workspace}}")
     if [ -n "{{port}}" ]; then args+=(--port "{{port}}"); fi
     {{py}} -m nightshift.server "${args[@]}"
 
 # Launch the Slack Socket Mode capture daemon (needs the `slack` extra + tokens).
 slackd:
-    {{py}} -m nightshift.slack.slackd --root "{{root}}"
+    {{py}} -m nightshift.slack.slackd --workspace "{{workspace}}"
 
 # Stop whatever server is listening on `port` (default 8800).
 stop port="8800":

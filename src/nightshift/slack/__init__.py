@@ -8,7 +8,7 @@ restarts and planes.
 
 Phase 2 adds the **inbound** half: the capture inbox
 (:mod:`nightshift.slack.intake`) turns a free-form intake-channel message into a
-queued ``.tasks/<slug>.md``, driven by the Socket Mode daemon
+queued brief in the content store (``<tasks_root>/<queue>/<slug>.md``), driven by the Socket Mode daemon
 (:mod:`nightshift.slack.slackd`). The daemon imports ``slack-bolt`` lazily, so
 disabled/CLI runs and the outbound notifier never require it.
 

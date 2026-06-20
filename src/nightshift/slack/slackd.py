@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import subprocess
 import sys
 import uuid
@@ -26,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from nightshift.repos import DEFAULT_TASKS_REPO
 from nightshift.slack.config import SlackConfig, resolve_slack_config
 from nightshift.slack.intake import (
     ClaudeNormaliseBackend,
@@ -36,6 +38,7 @@ from nightshift.slack.intake import (
     enqueue,
     render_confirmation,
 )
+from nightshift.spawn_daily import load_config, resolve_config
 
 
 _log = logging.getLogger("nightshift.slack.slackd")
@@ -112,14 +115,14 @@ class CaptureHandler:
 
     def __init__(
         self,
-        root: Path,
+        tasks_root: Path,
         config: SlackConfig,
         *,
         backend: NormaliseBackend,
         poster: SlackPoster,
         config_defaults: dict[str, Any] | None = None,
     ) -> None:
-        self._root = root
+        self._tasks_root = tasks_root
         self._config = config
         self._backend = backend
         self._poster = poster
@@ -203,7 +206,7 @@ class CaptureHandler:
 
     def _enqueue_and_ack(self, parsed: ParsedTask, channel: str, ts: str) -> None:
         try:
-            result = enqueue(self._root, parsed)
+            result = enqueue(self._tasks_root, parsed)
             self._land(result, parsed)
         except Exception as exc:
             _log.warning("slack_intake_enqueue_failed error=%s", exc)
@@ -222,8 +225,9 @@ class CaptureHandler:
         """Land the new task file per ``default_enqueue`` (spec §5.4).
 
         ``commit`` stages the file (and any ``config.json`` order update) and
-        commits to local ``main`` with the provenance trailer; ``pr`` is left to
-        a remote-first deployment (logged; the file still lands on disk so the
+        commits to the content store's local ``main`` with the provenance
+        trailer (``tasks_root`` is its own git repo); ``pr`` is left to a
+        remote-first deployment (logged; the file still lands on disk so the
         local plane sees it).
         """
         if self._config.default_enqueue != "commit":
@@ -235,8 +239,8 @@ class CaptureHandler:
         config_path = result.path.parent / "config.json"
         if config_path.exists():
             paths.append(str(config_path))
-        _git(self._root, ["add", *paths])
-        _git(self._root, ["commit", "-m", commit_message(result, parsed)])
+        _git(self._tasks_root, ["add", *paths])
+        _git(self._tasks_root, ["commit", "-m", commit_message(result, parsed)])
 
     # ----- gating helpers ------------------------------------------------- #
 
@@ -341,7 +345,7 @@ class SlackPoster:
 # --------------------------------------------------------------------------- #
 
 
-def run(root: Path, *, argv: list[str] | None = None) -> int:
+def run(workspace: Path, *, argv: list[str] | None = None) -> int:
     """Start the Socket Mode daemon. Returns a process exit code.
 
     Exits cleanly (non-zero) with a clear message when Slack is unconfigured —
@@ -350,10 +354,10 @@ def run(root: Path, *, argv: list[str] | None = None) -> int:
     inside the daemon path, never at module import.
     """
     from nightshift.run_local import load_dotenv
-    from nightshift.spawn_daily import resolve_config
 
-    load_dotenv(root)
-    runner_config = resolve_config(root)
+    load_dotenv(workspace)
+    tasks_root = workspace / _resolve_tasks_repo(workspace)
+    runner_config = resolve_config(workspace, tasks_root)
     config = resolve_slack_config(runner_config)
 
     if not config.intake_active:
@@ -373,7 +377,7 @@ def run(root: Path, *, argv: list[str] | None = None) -> int:
     poster = SlackPoster(app.client)
     backend = ClaudeNormaliseBackend(config=runner_config)
     handler = CaptureHandler(
-        root,
+        tasks_root,
         config,
         backend=backend,
         poster=poster,
@@ -432,6 +436,24 @@ def _enqueue_defaults(runner_config: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _resolve_tasks_repo(workspace: Path) -> str:
+    """Name of the content-store repo (``tasks_root = workspace / tasks_repo``).
+
+    Env ``NIGHTSHIFT_TASKS_REPO`` wins, then ``<workspace>/config.json``'s
+    ``tasks_repo`` key, then :data:`nightshift.repos.DEFAULT_TASKS_REPO` —
+    matching every other entry point so the daemon names the same store.
+    """
+    env = os.environ.get("NIGHTSHIFT_TASKS_REPO")
+    if env:
+        return env
+    try:
+        cfg = load_config(workspace)
+    except (FileNotFoundError, ValueError, OSError):
+        cfg = {}
+    name = cfg.get("tasks_repo") if isinstance(cfg, dict) else None
+    return str(name or DEFAULT_TASKS_REPO)
+
+
 def _unconfigured_reason(config: SlackConfig) -> str:
     missing: list[str] = []
     if not config.enabled:
@@ -454,10 +476,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Nightshift Slack Socket Mode daemon (inbound capture)."
     )
-    parser.add_argument("--root", type=Path, default=Path.cwd())
+    parser.add_argument("--workspace", type=Path, default=Path.cwd())
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    return run(args.root.resolve())
+    return run(args.workspace.resolve())
 
 
 if __name__ == "__main__":

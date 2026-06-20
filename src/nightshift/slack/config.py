@@ -1,10 +1,11 @@
 """Resolved Slack configuration for the outbound notifier and inbound inbox.
 
-The ``slack`` block lives in the layered runner config (shipped
-``tools/nightshift/config.json`` defaults, overridable by ``.tasks/config.json``
-and a playlist's ``config.json`` via :func:`spawn_daily.resolve_config`). When
-no ``slack`` block is present — the default ship state — the notifier is
-disabled and every hook is a cheap no-op (spec §11 invariant 1).
+The ``slack`` block lives in the layered runner config (operator
+``<workspace>/config.json`` defaults, overridable by the content store's
+``<tasks_root>/config.json`` and a queue's ``config.json`` via
+:func:`spawn_daily.resolve_config`). When no ``slack`` block is present — the
+default ship state — the notifier is disabled and every hook is a cheap no-op
+(spec §11 invariant 1).
 
 The tokens are *secrets*, never config: the bot token is read from
 ``SLACK_BOT_TOKEN`` and the Socket Mode app token from ``SLACK_APP_TOKEN``

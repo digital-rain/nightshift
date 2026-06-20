@@ -1,8 +1,13 @@
 """Shared nightshift orchestration core.
 
-This module owns the logic for turning the `.tasks/` queue into work: building
-the task list, running a worker in an isolated git worktree, validating, and
-squash-committing to local ``main``. It is consumed by two front-ends:
+This module owns the logic for turning a queue into work across a *workspace* of
+many git repos. It threads **two roots**: ``tasks_root`` (the ``nightshift-tasks``
+content store, ``<workspace>/<tasks_repo>``) holds briefs + queue config, while
+each task's git ops run in ``repo_root`` (``<workspace>/<repo>``, resolved per
+task). It builds the task list, runs a worker in an isolated git worktree (placed
+outside the target repo under ``<workspace>/.worktrees/<repo>/``), validates, and
+squash-commits to the target repo's local ``main``. It is consumed by two
+front-ends:
 
 - the CLI (:mod:`nightshift.run_local`), which prints events to stdout, and
 - the server (:mod:`nightshift.server.app`), which drives runs with transport
@@ -33,7 +38,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from nightshift import playlists
+from nightshift import playlists, repos
 from nightshift._paths import asset
 from nightshift.events import (
     RUN_FINISHED,
@@ -53,6 +58,7 @@ from nightshift.spawn_daily import (
     find_autosplit_sources,
     is_disabled,
     load_config,
+    load_queue_config,
     resolve_config,
     resolve_frontmatter,
     slugify,
@@ -206,16 +212,22 @@ class RunSummary:
 MIN_FREE_PCT = 2.0
 
 
-def enough_free_disk(root: Path, min_free_pct: float = MIN_FREE_PCT) -> bool:
-    """Return True when the filesystem holding `root` has >= min_free_pct free."""
-    usage = shutil.disk_usage(root)
+def enough_free_disk(workspace: Path, min_free_pct: float = MIN_FREE_PCT) -> bool:
+    """Return True when the filesystem holding ``workspace`` has >= min_free_pct free."""
+    usage = shutil.disk_usage(workspace)
     return (usage.free / usage.total) * 100.0 >= min_free_pct
 
 
-def check_preconditions(root: Path) -> None:
-    """Fail fast if prerequisites are missing."""
-    if not enough_free_disk(root):
-        usage = shutil.disk_usage(root)
+def check_preconditions(workspace: Path, repo: str) -> None:
+    """Fail fast if prerequisites are missing.
+
+    Disk headroom is checked on the ``workspace`` (which parents every worktree);
+    tracked-code WIP and the pre-flight ``just validate`` are checked in the
+    target ``repo_root = workspace / repo``.
+    """
+    repo_root = workspace / repo
+    if not enough_free_disk(workspace):
+        usage = shutil.disk_usage(workspace)
         free_pct = (usage.free / usage.total) * 100.0
         sys.exit(
             f"error: only {free_pct:.1f}% disk free (need >= {MIN_FREE_PCT}%).\n"
@@ -231,13 +243,18 @@ def check_preconditions(root: Path) -> None:
             "error: ANTHROPIC_API_KEY is not set.\n"
             "Add it to .env or export it in your shell."
         )
-    # Queue state (.tasks/) and untracked files never block a run — they are
-    # snapshotted / ignored at land time. Only genuine tracked *code* WIP matters,
-    # and only when autostash is off (otherwise the land step sets it aside).
-    blockers = _landing_blockers(root)
+    # Untracked files never block a run. Only genuine tracked *code* WIP in the
+    # target repo matters, and only when autostash is off (otherwise the land
+    # step sets it aside). Briefs/queue config live in the separate content
+    # store, never in the target repo, so they can't be a blocker here.
+    blockers = _landing_blockers(repo_root)
     if blockers:
         shown = "\n".join(f"  {line}" for line in blockers[:10])
-        autostash = bool(resolve_config(root).get("autostash_operator_work", True))
+        try:
+            host_config = load_config(workspace)
+        except (FileNotFoundError, ValueError):
+            host_config = {}
+        autostash = bool(host_config.get("autostash_operator_work", True))
         if autostash:
             print(
                 "note: main has uncommitted code — it will be set aside "
@@ -252,7 +269,7 @@ def check_preconditions(root: Path) -> None:
     print("Running just validate (pre-flight)...")
     result = subprocess.run(
         ["just", "validate"],
-        cwd=root,
+        cwd=repo_root,
         capture_output=True,
         text=True,
     )
@@ -265,9 +282,13 @@ def check_preconditions(root: Path) -> None:
         )
 
 
-def acquire_lock(root: Path) -> int:
-    """Acquire an exclusive lockfile; exit if another instance is running."""
-    lock_path = root / ".worktrees" / ".nightshift-local.lock"
+def acquire_lock(workspace: Path) -> int:
+    """Acquire an exclusive lockfile; exit if another instance is running.
+
+    The lock is workspace-level (``<workspace>/.worktrees/.nightshift-local.lock``)
+    so a single local runner owns the whole workspace at a time.
+    """
+    lock_path = workspace / ".worktrees" / ".nightshift-local.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_CREAT | os.O_WRONLY)
     try:
@@ -294,11 +315,12 @@ def resolve_title(task: str, meta: dict) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Execution order — `.tasks/config.json`
+# Execution order — `<tasks_root>/<queue>/config.json`
 # --------------------------------------------------------------------------- #
 #
 # Task files no longer need a numeric `NN.` prefix to be ordered. Execution
-# order is driven by an explicit list in `.tasks/config.json`:
+# order is driven by an explicit list in a queue's `config.json` (e.g.
+# `<tasks_root>/main/config.json`):
 #
 #     {"order": ["side-by-side", "detail-view", ...]}
 #
@@ -315,17 +337,17 @@ SORT_PRIORITY = "priority"
 SORT_MODES = (SORT_MANUAL, SORT_PRIORITY)
 
 
-def _order_config_path(root: Path, tasks_rel: str = ".tasks") -> Path:
-    return root / tasks_rel / ORDER_CONFIG
+def _order_config_path(tasks_root: Path, tasks_rel: str = "main") -> Path:
+    return tasks_root / tasks_rel / ORDER_CONFIG
 
 
-def load_order(root: Path, tasks_rel: str = ".tasks") -> list[str]:
+def load_order(tasks_root: Path, tasks_rel: str = "main") -> list[str]:
     """Return the configured task order from a queue's `config.json`.
 
     Returns an empty list when the file is absent or malformed — callers treat
     that as "no explicit order" and fall back to filename order.
     """
-    path = _order_config_path(root, tasks_rel)
+    path = _order_config_path(tasks_root, tasks_rel)
     if not path.exists():
         return []
     try:
@@ -338,13 +360,13 @@ def load_order(root: Path, tasks_rel: str = ".tasks") -> list[str]:
     return [str(name) for name in order]
 
 
-def save_order(root: Path, order: list[str], tasks_rel: str = ".tasks") -> list[str]:
+def save_order(tasks_root: Path, order: list[str], tasks_rel: str = "main") -> list[str]:
     """Persist the task order to a queue's `config.json`, preserving other keys.
 
     Returns the written order. The on-disk JSON keeps any sibling keys so the
     file can hold other queue settings (e.g. ``validate``) alongside ``order``.
     """
-    path = _order_config_path(root, tasks_rel)
+    path = _order_config_path(tasks_root, tasks_rel)
     path.parent.mkdir(parents=True, exist_ok=True)
     data: dict = {}
     if path.exists():
@@ -361,7 +383,7 @@ def save_order(root: Path, order: list[str], tasks_rel: str = ".tasks") -> list[
 
 
 def save_queue_config_value(
-    root: Path, key: str, value: object, tasks_rel: str = ".tasks"
+    tasks_root: Path, key: str, value: object, tasks_rel: str = "main"
 ) -> object:
     """Set a single key in a queue's ``config.json``, preserving sibling keys.
 
@@ -369,7 +391,7 @@ def save_queue_config_value(
     ``validate``). A ``None`` value removes the key so the queue falls back to
     the inherited default. Returns the value written (or ``None`` when removed).
     """
-    path = _order_config_path(root, tasks_rel)
+    path = _order_config_path(tasks_root, tasks_rel)
     path.parent.mkdir(parents=True, exist_ok=True)
     data: dict = {}
     if path.exists():
@@ -387,13 +409,13 @@ def save_queue_config_value(
     return value
 
 
-def load_sort_mode(root: Path, tasks_rel: str = ".tasks") -> str:
+def load_sort_mode(tasks_root: Path, tasks_rel: str = "main") -> str:
     """Return a queue's sort mode from its `config.json` (``manual`` default).
 
     Any value other than the known modes (incl. a missing/malformed file)
     degrades to ``manual`` so the queue keeps its drag-defined order.
     """
-    path = _order_config_path(root, tasks_rel)
+    path = _order_config_path(tasks_root, tasks_rel)
     if not path.exists():
         return SORT_MANUAL
     try:
@@ -404,11 +426,11 @@ def load_sort_mode(root: Path, tasks_rel: str = ".tasks") -> str:
     return mode if mode in SORT_MODES else SORT_MANUAL
 
 
-def save_sort_mode(root: Path, mode: str, tasks_rel: str = ".tasks") -> str:
+def save_sort_mode(tasks_root: Path, mode: str, tasks_rel: str = "main") -> str:
     """Persist a queue's sort mode, preserving sibling keys. Unknown modes are
     coerced to ``manual``. Returns the mode written."""
     clean = mode if mode in SORT_MODES else SORT_MANUAL
-    save_queue_config_value(root, "sort", clean, tasks_rel)
+    save_queue_config_value(tasks_root, "sort", clean, tasks_rel)
     return clean
 
 
@@ -428,14 +450,14 @@ def _clean_priority_list(values: object) -> list[int]:
     return sorted(out)
 
 
-def load_play_priorities(root: Path, tasks_rel: str = ".tasks") -> list[int]:
+def load_play_priorities(tasks_root: Path, tasks_rel: str = "main") -> list[int]:
     """Return a queue's play-priority filter from its `config.json`.
 
     The filter restricts which tasks *play*: only tasks whose priority is in the
     returned set run. An empty list means "all priorities" (no filter) — the
     default when the key is absent or malformed.
     """
-    path = _order_config_path(root, tasks_rel)
+    path = _order_config_path(tasks_root, tasks_rel)
     if not path.exists():
         return []
     try:
@@ -447,20 +469,20 @@ def load_play_priorities(root: Path, tasks_rel: str = ".tasks") -> list[int]:
 
 
 def save_play_priorities(
-    root: Path, priorities: list[int], tasks_rel: str = ".tasks"
+    tasks_root: Path, priorities: list[int], tasks_rel: str = "main"
 ) -> list[int]:
     """Persist a queue's play-priority filter (sorted/de-duped/validated),
     preserving sibling keys. An empty list clears the filter (play all). Returns
     the cleaned list written."""
     clean = _clean_priority_list(priorities)
-    save_queue_config_value(root, "play_priorities", clean, tasks_rel)
+    save_queue_config_value(tasks_root, "play_priorities", clean, tasks_rel)
     return clean
 
 
 def _apply_play_filter(
-    root: Path,
+    tasks_root: Path,
     stems: list[str],
-    tasks_rel: str = ".tasks",
+    tasks_rel: str = "main",
     *,
     priorities: dict[str, int] | None = None,
 ) -> list[str]:
@@ -468,23 +490,23 @@ def _apply_play_filter(
 
     A no-op when the filter is empty ("all priorities"). ``priorities`` lets a
     caller pass an already-parsed priority map to avoid a second read."""
-    selected = load_play_priorities(root, tasks_rel)
+    selected = load_play_priorities(tasks_root, tasks_rel)
     if not selected:
         return stems
     chosen = set(selected)
     if priorities is None:
-        priorities = _read_priorities(root, stems, tasks_rel)
+        priorities = _read_priorities(tasks_root, stems, tasks_rel)
     return [s for s in stems if priorities.get(s, DEFAULT_PRIORITY) in chosen]
 
 
 def _read_priorities(
-    root: Path, stems: list[str], tasks_rel: str = ".tasks"
+    tasks_root: Path, stems: list[str], tasks_rel: str = "main"
 ) -> dict[str, int]:
     """Read the 0-5 priority of each stem from its task file's frontmatter.
 
     Missing files / frontmatter fall back to the default (lowest) priority via
     :func:`task_priority`."""
-    tasks_dir = root / tasks_rel
+    tasks_dir = tasks_root / tasks_rel
     out: dict[str, int] = {}
     for stem in stems:
         path = tasks_dir / f"{stem}.md"
@@ -498,9 +520,9 @@ def _read_priorities(
 
 
 def order_stems(
-    root: Path,
+    tasks_root: Path,
     stems: list[str],
-    tasks_rel: str = ".tasks",
+    tasks_rel: str = "main",
     *,
     priorities: dict[str, int] | None = None,
     sort: str | None = None,
@@ -516,19 +538,19 @@ def order_stems(
     ``priorities`` lets a caller that already parsed frontmatter pass the map in
     to avoid a second read; when omitted it's read on demand in priority mode.
     """
-    order = load_order(root, tasks_rel)
+    order = load_order(tasks_root, tasks_rel)
     rank = {name: i for i, name in enumerate(order)}
     listed = sorted((s for s in stems if s in rank), key=lambda s: rank[s])
     unlisted = sorted(s for s in stems if s not in rank)
     manual = listed + unlisted
 
     if sort is None:
-        sort = load_sort_mode(root, tasks_rel)
+        sort = load_sort_mode(tasks_root, tasks_rel)
     if sort != SORT_PRIORITY:
         return manual
 
     if priorities is None:
-        priorities = _read_priorities(root, manual, tasks_rel)
+        priorities = _read_priorities(tasks_root, manual, tasks_rel)
     manual_index = {stem: i for i, stem in enumerate(manual)}
     return sorted(
         manual,
@@ -536,7 +558,7 @@ def order_stems(
     )
 
 
-def reorder_queue(root: Path, order: list[str], tasks_rel: str = ".tasks") -> list[str]:
+def reorder_queue(tasks_root: Path, order: list[str], tasks_rel: str = "main") -> list[str]:
     """Set the queue execution order from a UI drag.
 
     Accepts the desired ordering of task stems; only stems backed by an actual
@@ -544,7 +566,7 @@ def reorder_queue(root: Path, order: list[str], tasks_rel: str = ".tasks") -> li
     and any existing queue task omitted from ``order`` is appended in filename
     order so a partial payload never drops tasks. Returns the persisted order.
     """
-    tasks_dir = root / tasks_rel
+    tasks_dir = tasks_root / tasks_rel
     existing = {p.stem for p in tasks_dir.glob("*.md")} if tasks_dir.exists() else set()
     seen: set[str] = set()
     cleaned: list[str] = []
@@ -554,54 +576,53 @@ def reorder_queue(root: Path, order: list[str], tasks_rel: str = ".tasks") -> li
             seen.add(name)
     for name in sorted(existing - seen):
         cleaned.append(name)
-    return save_order(root, cleaned, tasks_rel)
+    return save_order(tasks_root, cleaned, tasks_rel)
 
 
-def build_task_list(root: Path, task_arg: str, tasks_rel: str = ".tasks") -> list[str]:
+def build_task_list(tasks_root: Path, task_arg: str, tasks_rel: str = "main") -> list[str]:
     """Build the ordered list of tasks to run for a queue.
 
-    Autosplit dispatch (spawning subtasks, committing the daily queue) applies
-    only to the main `.tasks` queue; a playlist is a plain ordered set of its
-    own `*.md` files.
+    Autosplit dispatch (spawning subtasks, committing the daily queue to the
+    content store) applies only to the default ``main`` queue; an alternate
+    queue is a plain ordered set of its own `*.md` files.
     """
-    tasks_dir = root / tasks_rel
-    is_main = tasks_rel == ".tasks"
+    is_main = tasks_rel == playlists.DEFAULT_QUEUE
 
     if task_arg != "all":
         if is_main:
-            autosplit_sources = set(find_autosplit_sources(root))
+            autosplit_sources = set(find_autosplit_sources(tasks_root, tasks_rel))
             if task_arg in autosplit_sources:
-                result = spawn_source(root, task_arg, write=True)
+                result = spawn_source(tasks_root, task_arg, write=True, tasks_rel=tasks_rel)
                 if result and result.spawned:
-                    _commit_dispatch(root)
+                    _commit_dispatch(tasks_root, tasks_rel)
                     return [t.name for t in result.spawned]
                 return []
         return [task_arg]
 
     results = []
     if is_main:
-        results = spawn_all(root, write=True)
+        results = spawn_all(tasks_root, write=True, tasks_rel=tasks_rel)
         if results:
-            _commit_dispatch(root)
+            _commit_dispatch(tasks_root, tasks_rel)
 
-    queue_names = live_ordered_queue(root, tasks_rel)
+    queue_names = live_ordered_queue(tasks_root, tasks_rel)
     spawned_names = [t.name for r in results for t in r.spawned]
-    ordered = order_stems(root, list(set(queue_names) | set(spawned_names)), tasks_rel)
+    ordered = order_stems(tasks_root, list(set(queue_names) | set(spawned_names)), tasks_rel)
     # Re-apply the play-priority filter so freshly-spawned autosplit subtasks
     # (folded in via the union above) also respect the active filter.
-    return _apply_play_filter(root, ordered, tasks_rel)
+    return _apply_play_filter(tasks_root, ordered, tasks_rel)
 
 
-def live_ordered_queue(root: Path, tasks_rel: str = ".tasks") -> list[str]:
+def live_ordered_queue(tasks_root: Path, tasks_rel: str = "main") -> list[str]:
     """Read-only ordered scan of a queue's runnable task stems.
 
-    Globs ``<tasks_rel>/*.md``, skips autosplit-source and disabled files, and
-    returns the stems in the queue's configured order. This is the side-effect-
-    free core of :func:`build_task_list` ("all") — no spawning, no commits — and
-    is reused by the live re-scan in :func:`run_queue` (which calls it every
-    iteration, so it must stay quiet and cheap).
+    Globs ``<tasks_root>/<tasks_rel>/*.md``, skips autosplit-source and disabled
+    files, and returns the stems in the queue's configured order. This is the
+    side-effect-free core of :func:`build_task_list` ("all") — no spawning, no
+    commits — and is reused by the live re-scan in :func:`run_queue` (which calls
+    it every iteration, so it must stay quiet and cheap).
     """
-    tasks_dir = root / tasks_rel
+    tasks_dir = tasks_root / tasks_rel
     if not tasks_dir.exists():
         return []
     autosplit = _find_autosplit_tasks(tasks_dir)
@@ -616,8 +637,8 @@ def live_ordered_queue(root: Path, tasks_rel: str = ".tasks") -> list[str]:
             continue
         queue_names.append(p.stem)
         priorities[p.stem] = task_priority(meta)
-    ordered = order_stems(root, queue_names, tasks_rel, priorities=priorities)
-    return _apply_play_filter(root, ordered, tasks_rel, priorities=priorities)
+    ordered = order_stems(tasks_root, queue_names, tasks_rel, priorities=priorities)
+    return _apply_play_filter(tasks_root, ordered, tasks_rel, priorities=priorities)
 
 
 def _find_autosplit_tasks(tasks_dir: Path) -> set[str]:
@@ -633,99 +654,26 @@ def _find_autosplit_tasks(tasks_dir: Path) -> set[str]:
     return result
 
 
-def _commit_dispatch(root: Path) -> None:
-    """Commit daily-queue dispatch (spawned files + evergreen reset) to main."""
-    subprocess.run(
-        ["git", "add", ".tasks/"],
-        cwd=root,
-        check=True,
-        capture_output=True,
-    )
-    result = subprocess.run(
-        ["git", "status", "--porcelain", ".tasks/"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-    )
-    if result.stdout.strip():
-        subprocess.run(
-            ["git", "commit", "-m", "nightshift-local: dispatch daily queues"],
-            cwd=root,
-            check=True,
-            capture_output=True,
-        )
+def commit_tasks(
+    tasks_root: Path, message: str, *, pathspecs: tuple[str, ...] = (".",)
+) -> str | None:
+    """Stage ``pathspecs`` in the content store (``tasks_root``) and commit them.
 
+    The generic content-store commit helper for the ``nightshift-tasks`` git
+    lifecycle (briefs created/removed, queue config edited). Local commit only —
+    no remote required, no push. Returns the new commit's short sha, or ``None``
+    when ``tasks_root`` is not a git repo *or* nothing was staged (a no-op).
 
-# What a pre-run snapshot commits: the whole ``.tasks/`` tree (task briefs,
-# queue ``config.json``, and any queue-adjacent files a worker might read) so the
-# worktree mirrors the operator's working state — *minus* the runtime run/log
-# records. Those records are live state written *during* a run; the main queue's
-# ``runs/``/``logs/`` are gitignored, but a playlist's are tracked (the gitignore
-# only covers ``.tasks/runs``), so they must be excluded explicitly or a snapshot
-# would sweep in-flight run output. The leading ``.tasks`` always matches the
-# (existing) dir, so unlike a ``*.md``-only pathspec this never aborts ``git add``
-# when an optional file is absent. ``:(exclude,glob)`` magic spans every playlist.
-QUEUE_SNAPSHOT_PATHSPECS = (
-    ".tasks",
-    ":(exclude,glob).tasks/**/runs/**",
-    ":(exclude,glob).tasks/**/logs/**",
-)
-
-
-def _queue_snapshot_pathspecs(tasks_rel: str) -> tuple[str, ...]:
-    """Pathspecs that scope a snapshot to a single queue's *definition* subtree.
-
-    The main queue snapshots only its top-level ``.tasks/*.md`` + ``config.json``
-    (excluding every playlist sub-dir), and a playlist snapshots only its own
-    ``.tasks/<name>/**`` minus runtime ``runs/``/``logs/``. Scoping per queue
-    means two concurrent runners' snapshots never sweep each other's files."""
-    if tasks_rel == ".tasks":
-        return (".tasks", ":(exclude,glob).tasks/*/**")
-    return (
-        tasks_rel,
-        f":(exclude,glob){tasks_rel}/runs/**",
-        f":(exclude,glob){tasks_rel}/logs/**",
-    )
-
-
-def commit_queue_state(root: Path, tasks_rel: str = ".tasks") -> str | None:
-    """Commit any uncommitted queue changes so a run's worktree sees them.
-
-    Worktrees are branched from committed ``HEAD`` (see :func:`setup_worktree`),
-    so a task file added/edited/reordered through the UI but not yet committed is
-    *absent* from the worker's checkout — the worker is handed a task path that
-    doesn't exist, and the run fails. Snapshotting the queue just before a run
-    closes that race.
-
-    Only the landing queue's own definition subtree is committed (see
-    :func:`_queue_snapshot_pathspecs`; runtime ``runs/``/``logs/`` and other
-    queues' files are excluded), so a user's unrelated working-tree edits — and a
-    concurrent queue's snapshot — are left untouched. Returns the new commit's
-    short sha, or ``None`` when the queue was already clean (the common case once
-    everything is committed). Callers that mutate the root index/HEAD must hold
-    :func:`landing_lock`; this function does not take it itself (so it can run
-    inside a squash's lock without deadlocking).
+    ``git add`` exits 1 when a pathspec matches only ``.gitignore``-ignored files
+    (a queue's runtime ``runs/``/``logs/`` are gitignored in the store); that case
+    is tolerated — the wanted files are still staged — while any other failure is
+    treated as "nothing to commit" so a lifecycle event can never crash a run.
     """
-    if not (root / ".tasks").exists():
+    if not (tasks_root / ".git").exists():
         return None
-    pathspecs = _queue_snapshot_pathspecs(tasks_rel)
-    inside = subprocess.run(
-        ["git", "rev-parse", "--is-inside-work-tree"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-    )
-    if inside.returncode != 0 or inside.stdout.strip() != "true":
-        return None
-    # ``git add`` walks the positive pathspec's tree and exits 1 when it meets a
-    # fully-ignored runtime dir (``runs/``/``logs/`` from .gitignore): the wanted
-    # definition files are still staged and the ignored ones skipped — exactly the
-    # intent — but the non-zero exit would otherwise abort the run. Neither the
-    # negative pathspecs above nor ``--ignore-errors`` suppress it, so tolerate the
-    # ignored-files case here while still surfacing any real failure (lock, etc.).
     add = subprocess.run(
         ["git", "-c", "advice.addIgnoredFile=false", "add", "--", *pathspecs],
-        cwd=root,
+        cwd=tasks_root,
         capture_output=True,
         text=True,
     )
@@ -733,21 +681,18 @@ def commit_queue_state(root: Path, tasks_rel: str = ".tasks") -> str | None:
         add.returncode != 1
         or "ignored by one of your .gitignore" not in add.stderr
     ):
-        raise subprocess.CalledProcessError(
-            add.returncode, add.args, output=add.stdout, stderr=add.stderr
-        )
+        return None
     staged = subprocess.run(
         ["git", "diff", "--cached", "--name-only", "--", *pathspecs],
-        cwd=root,
+        cwd=tasks_root,
         capture_output=True,
         text=True,
     )
     if not staged.stdout.strip():
         return None
     commit = subprocess.run(
-        ["git", "commit", "-m", "nightshift: snapshot queue state before run",
-         "--", *pathspecs],
-        cwd=root,
+        ["git", "commit", "-m", message, "--", *pathspecs],
+        cwd=tasks_root,
         capture_output=True,
         text=True,
     )
@@ -755,16 +700,43 @@ def commit_queue_state(root: Path, tasks_rel: str = ".tasks") -> str | None:
         return None
     return subprocess.run(
         ["git", "rev-parse", "--short", "HEAD"],
-        cwd=root,
+        cwd=tasks_root,
         capture_output=True,
         text=True,
     ).stdout.strip() or None
 
 
+def _commit_dispatch(tasks_root: Path, tasks_rel: str = "main") -> None:
+    """Commit autosplit dispatch (spawned files + evergreen reset) in the content
+    store, scoped to the dispatched queue dir."""
+    commit_tasks(
+        tasks_root,
+        "nightshift-local: dispatch daily queues",
+        pathspecs=(tasks_rel,),
+    )
+
+
+def commit_queue_state(tasks_root: Path, tasks_rel: str = "main") -> str | None:
+    """Commit a queue's brief/config churn in the content store (``tasks_root``).
+
+    The pre-run *target-repo* snapshot is gone: briefs are read live from
+    ``tasks_root`` and delivered to the worker via a run-scratch file, so a run
+    never needs to snapshot anything into the repo it lands in. This helper is
+    retained for the create/edit lifecycle — it commits the queue dir
+    (``<tasks_root>/<tasks_rel>``) churn locally, returning the new short sha or
+    ``None`` when the store was already clean / not a git repo.
+    """
+    return commit_tasks(
+        tasks_root,
+        "nightshift: commit queue state",
+        pathspecs=(tasks_rel,),
+    )
+
+
 TASK_TEMPLATE = asset("templates", "task.md")
 
 
-def create_task(root: Path, title: str, text: str, tasks_rel: str = ".tasks") -> dict:
+def create_task(tasks_root: Path, title: str, text: str, tasks_rel: str = "main") -> dict:
     """Create a new task file `<tasks_rel>/<slug(title)>.md` from the template.
 
     Tasks are no longer numbered: the filename is the slugified title and the
@@ -778,7 +750,7 @@ def create_task(root: Path, title: str, text: str, tasks_rel: str = ".tasks") ->
     if not title_clean:
         raise ValueError("title is required")
 
-    tasks_dir = root / tasks_rel
+    tasks_dir = tasks_root / tasks_rel
     tasks_dir.mkdir(parents=True, exist_ok=True)
     name = slugify(title_clean)
     dest = tasks_dir / f"{name}.md"
@@ -791,24 +763,24 @@ def create_task(root: Path, title: str, text: str, tasks_rel: str = ".tasks") ->
     )
     content = content.replace("Task description goes here.", text.strip() or title_clean, 1)
     dest.write_text(content)
-    save_order(root, [*load_order(root, tasks_rel), name], tasks_rel)
+    save_order(tasks_root, [*load_order(tasks_root, tasks_rel), name], tasks_rel)
     return {"task": name, "title": title_clean}
 
 
-def delete_task(root: Path, task: str, tasks_rel: str = ".tasks") -> dict:
+def delete_task(tasks_root: Path, task: str, tasks_rel: str = "main") -> dict:
     """Delete a queue task file ``<tasks_rel>/<task>.md``.
 
     Guards against path traversal: ``task`` must resolve to a direct child of
     the queue's tasks dir. Raises ``FileNotFoundError`` if there's no such task.
     """
-    tasks_dir = (root / tasks_rel).resolve()
+    tasks_dir = (tasks_root / tasks_rel).resolve()
     dest = (tasks_dir / f"{task}.md").resolve()
     if dest.parent != tasks_dir or not dest.is_file():
         raise FileNotFoundError(task)
     dest.unlink()
-    order = load_order(root, tasks_rel)
+    order = load_order(tasks_root, tasks_rel)
     if task in order:
-        save_order(root, [name for name in order if name != task], tasks_rel)
+        save_order(tasks_root, [name for name in order if name != task], tasks_rel)
     return {"task": task, "deleted": True}
 
 
@@ -822,57 +794,33 @@ def task_is_evergreen(meta: dict, task: str, config: dict) -> bool:
 
 
 def drop_completed_task(
-    root: Path, task: str, tasks_rel: str = ".tasks", *, queue: str | None = None
+    tasks_root: Path, task: str, tasks_rel: str = "main", *, queue: str | None = None
 ) -> bool:
-    """Ensure a landed regular task's file is gone from the queue on ``main``.
+    """Ensure a landed regular task's brief is gone from the content store.
 
-    Queue removal of a completed task is the worker's job (it ``git rm``\\ s its
-    own task file in the branch that lands). But a worker can finish successfully
-    without removing it — a "no changes" completion never touches the file, and a
-    worker may simply forget — leaving the task in ``<tasks_rel>/`` so the UI
-    keeps listing a task that has already completed. This is the engine's
-    backstop: after a successful land it deletes any lingering task file (and its
-    execution-order entry) and commits that removal, so :func:`list_queue` and
-    the dashboard drop the completed item.
+    Completed regular tasks must leave the queue. After a successful land the
+    engine deletes the brief from ``tasks_root`` (and its execution-order entry)
+    and commits that removal in the content store via :func:`commit_tasks`, so
+    :func:`list_queue` and the dashboard drop the completed item. The brief never
+    lived in the target repo, so this is purely a content-store operation.
 
-    No-ops (returns ``False``) when the file is already gone — the common case
-    when the worker did remove it. Returns ``True`` when it removed the file.
-    Held under :func:`landing_lock` so the commit can't race a concurrent
-    queue's snapshot/land on the shared index/HEAD.
+    No-ops (returns ``False``) when the brief is already gone. Returns ``True``
+    when it removed the brief. ``queue`` is accepted for caller symmetry but the
+    brief path is derived from ``tasks_rel``.
     """
-    task_file = (root / tasks_rel).resolve() / f"{task}.md"
+    task_file = (tasks_root / tasks_rel).resolve() / f"{task}.md"
     if not task_file.is_file():
         return False
-    with landing_lock(root):
-        # Re-check inside the lock: a concurrent land may have removed it.
-        if not task_file.is_file():
-            return False
-        delete_task(root, task, tasks_rel)
-        pathspecs = _queue_snapshot_pathspecs(tasks_rel)
-        subprocess.run(
-            ["git", "add", "--", *pathspecs],
-            cwd=root,
-            capture_output=True,
-            text=True,
-        )
-        staged = subprocess.run(
-            ["git", "diff", "--cached", "--name-only", "--", *pathspecs],
-            cwd=root,
-            capture_output=True,
-            text=True,
-        )
-        if staged.stdout.strip():
-            subprocess.run(
-                ["git", "commit", "-m", f"nightshift: drop completed task {task}",
-                 "--", *pathspecs],
-                cwd=root,
-                capture_output=True,
-                text=True,
-            )
+    delete_task(tasks_root, task, tasks_rel)
+    commit_tasks(
+        tasks_root,
+        f"nightshift: drop completed task {task}",
+        pathspecs=(tasks_rel,),
+    )
     return True
 
 
-def import_task(root: Path, src_rel: str, task: str, dest_rel: str) -> dict:
+def import_task(tasks_root: Path, src_rel: str, task: str, dest_rel: str) -> dict:
     """Copy a task file from one queue into another, appending it to the
     destination's execution order.
 
@@ -881,12 +829,12 @@ def import_task(root: Path, src_rel: str, task: str, dest_rel: str) -> dict:
     added so nothing is clobbered. Both paths are guarded against traversal the
     same way :func:`delete_task` is. Returns ``{task, title}`` for the new copy.
     """
-    src_dir = (root / src_rel).resolve()
+    src_dir = (tasks_root / src_rel).resolve()
     src = (src_dir / f"{task}.md").resolve()
     if src.parent != src_dir or not src.is_file():
         raise FileNotFoundError(task)
 
-    dest_dir = (root / dest_rel).resolve()
+    dest_dir = (tasks_root / dest_rel).resolve()
     dest_dir.mkdir(parents=True, exist_ok=True)
     name = task
     dest = dest_dir / f"{name}.md"
@@ -898,14 +846,15 @@ def import_task(root: Path, src_rel: str, task: str, dest_rel: str) -> dict:
 
     text = src.read_text(errors="replace")
     dest.write_text(text)
-    save_order(root, [*load_order(root, dest_rel), name], dest_rel)
+    save_order(tasks_root, [*load_order(tasks_root, dest_rel), name], dest_rel)
 
     meta = split_frontmatter(text)[0] if text.startswith("---") else {}
     return {"task": name, "title": resolve_title(name, meta)}
 
 
-def read_task(root: Path, task: str, tasks_rel: str = ".tasks") -> dict:
-    """Read a single queue task file ``.tasks/<task>.md`` for the detail view.
+def read_task(tasks_root: Path, task: str, tasks_rel: str = "main") -> dict:
+    """Read a single queue brief ``<tasks_root>/<tasks_rel>/<task>.md`` for the
+    detail view.
 
     Returns ``{task, title, body, frontmatter, evergreen, disabled}`` where
     ``frontmatter`` is the parsed YAML block merged with resolved defaults
@@ -914,17 +863,19 @@ def read_task(root: Path, task: str, tasks_rel: str = ".tasks") -> dict:
     it neither spawns subtasks nor mutates the queue.
 
     Guards against path traversal the same way :func:`delete_task` does: ``task``
-    must resolve to a direct child of ``.tasks``. Raises ``FileNotFoundError``
+    must resolve to a direct child of the queue dir. Raises ``FileNotFoundError``
     if there's no such task.
     """
-    tasks_dir = (root / tasks_rel).resolve()
+    tasks_dir = (tasks_root / tasks_rel).resolve()
     dest = (tasks_dir / f"{task}.md").resolve()
     if dest.parent != tasks_dir or not dest.is_file():
         raise FileNotFoundError(task)
 
     text = dest.read_text(errors="replace")
     meta, body = split_frontmatter(text) if text.startswith("---") else ({}, text)
-    config = resolve_config(root, tasks_rel)
+    # ``tasks_root`` is ``<workspace>/<tasks_repo>`` by construction, so its
+    # parent is the workspace — resolve the layered queue config from both roots.
+    config = resolve_config(tasks_root.parent, tasks_root, tasks_rel)
     resolved = resolve_frontmatter(meta, config)
     evergreen = bool(meta.get("evergreen", False)) or task in set(
         config.get("evergreen_tasks", [])
@@ -959,8 +910,12 @@ def read_task(root: Path, task: str, tasks_rel: str = ".tasks") -> dict:
 # Frontmatter keys the detail-view editor is allowed to set. ``model: None``
 # clears the key so the task inherits the config default. ``title`` is a
 # frontmatter key too, but is written via the dedicated ``title`` change so it
-# always lands ahead of the other keys (it's the file's headline).
-_EDITABLE_META_KEYS = {"disabled", "evergreen", "automerge", "draft", "model", "priority"}
+# always lands ahead of the other keys (it's the file's headline). ``repo`` is
+# the per-task target-repo override (a bare workspace-child name); clearing it
+# (``repo: None``) falls the task back to the queue's default ``repo``.
+_EDITABLE_META_KEYS = {
+    "disabled", "evergreen", "automerge", "draft", "model", "priority", "repo",
+}
 
 # The detail-view editor may also rewrite the spec prose (``body``) and the
 # headline (``title``); these aren't plain frontmatter scalars so they're
@@ -982,10 +937,10 @@ def _strip_leading_blanks(lines: list[str]) -> list[str]:
 
 
 def set_task_meta(
-    root: Path,
+    tasks_root: Path,
     task: str,
     changes: dict[str, object | None],
-    tasks_rel: str = ".tasks",
+    tasks_rel: str = "main",
 ) -> dict:
     """Update a queue task file in place from the detail-view editor.
 
@@ -1009,7 +964,7 @@ def set_task_meta(
     if bad:
         raise ValueError(f"non-editable keys: {', '.join(sorted(bad))}")
 
-    tasks_dir = (root / tasks_rel).resolve()
+    tasks_dir = (tasks_root / tasks_rel).resolve()
     dest = (tasks_dir / f"{task}.md").resolve()
     if dest.parent != tasks_dir or not dest.is_file():
         raise FileNotFoundError(task)
@@ -1070,10 +1025,10 @@ def set_task_meta(
         out = body
     dest.write_text("\n".join(out).rstrip("\n") + "\n")
 
-    return read_task(root, task, tasks_rel)
+    return read_task(tasks_root, task, tasks_rel)
 
 
-def list_queue(root: Path, tasks_rel: str = ".tasks") -> list[dict]:
+def list_queue(tasks_root: Path, tasks_rel: str = "main") -> list[dict]:
     """List top-level `<tasks_rel>/*.md` (skips subdirs) for the UI queue.
 
     Returns ``{task, title, evergreen, disabled}`` in the configured execution
@@ -1081,10 +1036,10 @@ def list_queue(root: Path, tasks_rel: str = ".tasks") -> list[dict]:
     for unlisted tasks. Unlike :func:`build_task_list` this is read-only: it
     neither spawns autosplit subtasks nor commits.
     """
-    tasks_dir = root / tasks_rel
+    tasks_dir = tasks_root / tasks_rel
     if not tasks_dir.exists():
         return []
-    config = resolve_config(root, tasks_rel)
+    config = resolve_config(tasks_root.parent, tasks_root, tasks_rel)
     evergreen_tasks = set(config.get("evergreen_tasks", []))
 
     by_stem: dict[str, dict] = {}
@@ -1101,7 +1056,7 @@ def list_queue(root: Path, tasks_rel: str = ".tasks") -> list[dict]:
             "disabled": is_disabled(meta),
             "priority": priorities[p.stem],
         }
-    ordered = order_stems(root, list(by_stem), tasks_rel, priorities=priorities)
+    ordered = order_stems(tasks_root, list(by_stem), tasks_rel, priorities=priorities)
     return [by_stem[s] for s in ordered]
 
 
@@ -1110,24 +1065,19 @@ def list_queue(root: Path, tasks_rel: str = ".tasks") -> list[dict]:
 # --------------------------------------------------------------------------- #
 
 
-def build_prompt(root: Path, task: str, tasks_rel: str = ".tasks") -> str:
+def build_prompt(task: str, *, task_file: str, validate_cmd: str) -> str:
     """Build the worker prompt matching CI injection format.
 
-    The validate command is resolved through the queue's layered config
-    (:func:`resolve_config`) and injected as ``$VALIDATE`` so the worker runs
-    the queue's own gate (e.g. a playlist's ``just validate-nightshift``) rather
-    than the hardcoded default — matching the command the engine later enforces.
-
-    ``$TASK_FILE`` carries the task file's *actual* queue-relative path
-    (``{tasks_rel}/{task}.md``), which is ``.tasks/<task>.md`` for the main queue
-    but ``.tasks/<playlist>/<task>.md`` for a playlist. The worker removes (and
-    reads) this path rather than a hardcoded ``.tasks/<task>.md`` so a completed
-    playlist task actually leaves its queue instead of lingering after it lands.
+    ``task_file`` is the path to the **already-materialised** run-scratch brief
+    (see :func:`materialize_brief`) — a read-only file *outside* the target
+    worktree, so the brief never enters the repo the agent lands in.
+    ``validate_cmd`` is the queue's resolved validate command, injected as
+    ``$VALIDATE`` so the worker runs the queue's own gate — matching the command
+    the engine later enforces. The caller (engine or worker) resolves both from
+    the queue config before calling, so this helper needs neither root.
     """
     prompt_file = asset("prompts", "nightshift-local.md")
     prompt_body = prompt_file.read_text()
-    validate_cmd = str(resolve_config(root, tasks_rel).get("validate") or DEFAULT_VALIDATE_CMD)
-    task_file = f"{tasks_rel}/{task}.md"
     return (
         f"Your task file is: {task_file}\n"
         f"The TASK variable is: {task}\n"
@@ -1217,8 +1167,8 @@ SYMLINK_TARGETS = [
 
 
 def _queue_slug(queue: str | None) -> str:
-    """Path/branch-safe token for a queue: ``main`` for the main ``.tasks`` queue,
-    otherwise the playlist name (already a slug)."""
+    """Path/branch-safe token for a queue: ``main`` for the default queue,
+    otherwise the queue name (already a slug)."""
     return queue or "main"
 
 
@@ -1228,27 +1178,53 @@ def worktree_branch(task: str, queue: str | None = None) -> str:
     return f"task-local/{_queue_slug(queue)}/{task}"
 
 
-def worktree_dir(root: Path, task: str, queue: str | None = None) -> Path:
-    """Worktree directory for a task, namespaced by queue (see
-    :func:`worktree_branch`)."""
-    return root / ".worktrees" / f"task-local-{_queue_slug(queue)}-{task}"
+def worktree_dir(workspace: Path, repo: str, task: str, queue: str | None = None) -> Path:
+    """Worktree directory for a task, placed **outside** the target repo under a
+    workspace-level ``<workspace>/.worktrees/<repo>/`` so the target repo stays
+    pristine; namespaced by queue (see :func:`worktree_branch`)."""
+    return (
+        workspace / ".worktrees" / repo / f"task-local-{_queue_slug(queue)}-{task}"
+    )
 
 
-# Serialize every mutation of the root index/HEAD/stash so concurrent queue
-# runners (and a stray CLI process) can never interleave on the shared working
-# tree. Two layers: a process-local lock across registry runner threads, and a
-# cross-process file lock so a server land and a CLI land can't collide.
+def materialize_brief(
+    workspace: Path, repo: str, task: str, body: str, *, queue: str | None = None
+) -> Path:
+    """Write a task's brief ``body`` to a run-scratch file **outside** the
+    target worktree and return its path.
+
+    The scratch file is a sibling of the worktree dir
+    (``<workspace>/.worktrees/<repo>/task-local-<queue>-<task>.taskfile.md``), so
+    the brief is delivered to the worker (as ``$TASK_FILE``) without ever entering
+    the target repo's tracked tree — the agent cannot accidentally commit it, and
+    only the implementation squash lands. The body is the frontmatter-stripped
+    brief markdown (as carried in the work order).
+    """
+    scratch = (
+        workspace / ".worktrees" / repo
+        / f"task-local-{_queue_slug(queue)}-{task}.taskfile.md"
+    )
+    scratch.parent.mkdir(parents=True, exist_ok=True)
+    scratch.write_text(body if body.endswith("\n") else f"{body}\n")
+    return scratch
+
+
+# Serialize every mutation of a target repo's index/HEAD/stash so concurrent
+# queue runners (and a stray CLI process) can never interleave on the shared
+# working tree. Two layers: a process-local lock across registry runner threads,
+# and a cross-process file lock (per workspace+repo) so a server land and a CLI
+# land can't collide.
 _LANDING_LOCK = threading.Lock()
-_LANDING_LOCK_FILE = ".worktrees/.nightshift-landing.lock"
 
 
 @contextlib.contextmanager
-def landing_lock(root: Path):
+def landing_lock(workspace: Path, repo: str):
     """Hold the in-process + cross-process landing lock for a short critical
-    section (a queue snapshot, or a squash-merge + commit). Not reentrant — never
-    nest ``landing_lock`` calls on one thread."""
+    section (a squash-merge + commit) on a target repo. The cross-process lock
+    file lives at ``<workspace>/.worktrees/<repo>/.nightshift-landing.lock``. Not
+    reentrant — never nest ``landing_lock`` calls on one thread."""
     with _LANDING_LOCK:
-        path = root / _LANDING_LOCK_FILE
+        path = workspace / ".worktrees" / repo / ".nightshift-landing.lock"
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(path), os.O_CREAT | os.O_WRONLY, 0o644)
         try:
@@ -1259,32 +1235,38 @@ def landing_lock(root: Path):
             os.close(fd)
 
 
-def setup_worktree(root: Path, task: str, *, queue: str | None = None) -> Path:
-    """Create a git worktree and symlink build artifacts."""
-    wt_dir = worktree_dir(root, task, queue)
+def setup_worktree(
+    workspace: Path, repo: str, task: str, *, queue: str | None = None
+) -> Path:
+    """Create a git worktree (checked out from the target ``repo_root`` but
+    placed outside it under ``<workspace>/.worktrees/<repo>/``) and symlink build
+    artifacts from the target repo into it."""
+    repo_root = workspace / repo
+    wt_dir = worktree_dir(workspace, repo, task, queue)
     branch = worktree_branch(task, queue)
 
     if wt_dir.exists():
         subprocess.run(
             ["git", "worktree", "remove", "--force", str(wt_dir)],
-            cwd=root,
+            cwd=repo_root,
             capture_output=True,
         )
     subprocess.run(
         ["git", "branch", "-D", branch],
-        cwd=root,
+        cwd=repo_root,
         capture_output=True,
     )
 
+    wt_dir.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         ["git", "worktree", "add", str(wt_dir), "-b", branch, "HEAD"],
-        cwd=root,
+        cwd=repo_root,
         check=True,
         capture_output=True,
     )
 
     for target in SYMLINK_TARGETS:
-        src = root / target
+        src = repo_root / target
         dst = wt_dir / target
         if src.exists() and not dst.exists():
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -1293,49 +1275,58 @@ def setup_worktree(root: Path, task: str, *, queue: str | None = None) -> Path:
     return wt_dir
 
 
-def teardown_worktree(root: Path, task: str, *, queue: str | None = None) -> None:
+def teardown_worktree(
+    workspace: Path, repo: str, task: str, *, queue: str | None = None
+) -> None:
     """Remove the worktree and its branch unconditionally."""
-    wt_dir = worktree_dir(root, task, queue)
+    repo_root = workspace / repo
+    wt_dir = worktree_dir(workspace, repo, task, queue)
     branch = worktree_branch(task, queue)
 
     subprocess.run(
         ["git", "worktree", "remove", "--force", str(wt_dir)],
-        cwd=root,
+        cwd=repo_root,
         capture_output=True,
     )
     subprocess.run(
         ["git", "branch", "-D", branch],
-        cwd=root,
+        cwd=repo_root,
         capture_output=True,
     )
 
 
-def cleanup_task_worktree(root: Path, task: str, *, queue: str | None = None) -> bool:
+def cleanup_task_worktree(
+    workspace: Path, repo: str, task: str, *, queue: str | None = None
+) -> bool:
     """Remove a task's *preserved* worktree + branch when present (the artifacts a
     failed-to-land task leaves behind for a later Resolve). Returns True when
     something existed and was removed; a no-op (False) when neither exists — so a
     cleanly-landed task, whose worktree the engine already tore down, is safe to
     pass here. Callers are responsible for the orphan check (no active/other run
     still needs the branch)."""
-    if not worktree_dir(root, task, queue).exists() and not _branch_exists(
-        root, worktree_branch(task, queue)
+    repo_root = workspace / repo
+    if not worktree_dir(workspace, repo, task, queue).exists() and not _branch_exists(
+        repo_root, worktree_branch(task, queue)
     ):
         return False
-    teardown_worktree(root, task, queue=queue)
+    teardown_worktree(workspace, repo, task, queue=queue)
     return True
 
 
-def _worktree_has_commits(root: Path, task: str, *, queue: str | None = None) -> bool:
+def _worktree_has_commits(
+    workspace: Path, repo: str, task: str, *, queue: str | None = None
+) -> bool:
     """True if the task's worktree branch has commits beyond ``HEAD``.
 
     A worker that made no commit (a non-agentic API backend, or an agentic one
     that decided nothing was needed) leaves nothing to validate or squash. When
     we can't tell, err on the side of "yes" so the normal path still runs.
     """
+    repo_root = workspace / repo
     branch = worktree_branch(task, queue)
     result = subprocess.run(
         ["git", "rev-list", "--count", f"HEAD..{branch}"],
-        cwd=root,
+        cwd=repo_root,
         capture_output=True,
         text=True,
     )
@@ -1345,13 +1336,13 @@ def _worktree_has_commits(root: Path, task: str, *, queue: str | None = None) ->
         return True
 
 
-def _tracked_changes(root: Path) -> list[str]:
-    """Porcelain status lines for *tracked* changes in ``root`` (ignores
+def _tracked_changes(repo_root: Path) -> list[str]:
+    """Porcelain status lines for *tracked* changes in ``repo_root`` (ignores
     untracked ``??`` files, which only block a merge if they collide — and that
     case surfaces via git's own stderr instead)."""
     result = subprocess.run(
         ["git", "status", "--porcelain"],
-        cwd=root,
+        cwd=repo_root,
         capture_output=True,
         text=True,
     )
@@ -1366,52 +1357,40 @@ def _porcelain_path(line: str) -> str:
 
     Lines are ``XY <path>``; a rename is ``R  <old> -> <new>`` — we want the
     destination. Surrounding quotes (git quotes paths with special chars) are
-    stripped so prefix matching against ``.tasks/`` is reliable."""
+    stripped so callers see a clean repo-relative path."""
     path = line[3:] if len(line) > 3 else line.strip()
     if " -> " in path:
         path = path.split(" -> ", 1)[1]
     return path.strip().strip('"')
 
 
-def _is_queue_path(path: str) -> bool:
-    """True for paths under the ``.tasks/`` tree (queue definitions, run records,
-    logs) — the operator's queue state, not code a worker squash can conflict
-    with."""
-    return path == ".tasks" or path.startswith(".tasks/")
+def _landing_blockers(repo_root: Path) -> list[str]:
+    """Tracked changes in the target repo that should block a squash-merge.
 
-
-def _landing_blockers(root: Path) -> list[str]:
-    """Tracked changes that should block a squash-merge: everything from
-    :func:`_tracked_changes` EXCEPT paths under ``.tasks/``.
-
-    Queue definition edits, live run records, and logs are the operator's queue
-    state, not code that can conflict with a worker's squash — the worker never
-    edits the parent queue's ``.tasks/``, so leaving them dirty is safe for
-    ``git merge --squash``."""
-    return [
-        line for line in _tracked_changes(root)
-        if not _is_queue_path(_porcelain_path(line))
-    ]
+    The content store is a *separate* repo, so briefs/queue config never live in
+    ``repo_root`` and can't be a blocker. Every tracked change here is therefore
+    genuine operator *code* WIP — return all of it (the land still stash/restores
+    it when ``autostash`` is on)."""
+    return _tracked_changes(repo_root)
 
 
 AUTOSTASH_MESSAGE = "nightshift-autostash"
 
 
-def _stash_operator_work(root: Path, paths: list[str]) -> str | None:
-    """Set aside the operator's tracked code WIP (the given non-``.tasks`` paths)
-    for the land critical section. Returns the captured stash *commit sha*, or
-    ``None`` when there was nothing to set aside.
+def _stash_operator_work(repo_root: Path, paths: list[str]) -> str | None:
+    """Set aside the operator's tracked code WIP (the given ``paths``) in the
+    target repo for the land critical section. Returns the captured stash
+    *commit sha*, or ``None`` when there was nothing to set aside.
 
     Stack-free by design: ``git stash create`` records the WIP as a commit object
     without touching the LIFO stash stack, so a human running ``git stash``
     mid-land can never perturb it. ``stash create`` does not revert the tree, so
-    we then explicitly clean just the blocker ``paths`` (leaving live ``.tasks/``
-    run records and any other queue state dirty in the working tree)."""
+    we then explicitly clean just the blocker ``paths``."""
     if not paths:
         return None
     created = subprocess.run(
         ["git", "stash", "create", AUTOSTASH_MESSAGE],
-        cwd=root,
+        cwd=repo_root,
         capture_output=True,
         text=True,
     )
@@ -1419,16 +1398,16 @@ def _stash_operator_work(root: Path, paths: list[str]) -> str | None:
     if created.returncode != 0 or not sha:
         return None
     # `stash create` captured the WIP but left the tree dirty; clean exactly the
-    # blocker paths so the merge sees them at HEAD (queue runtime state untouched).
+    # blocker paths so the merge sees them at HEAD.
     subprocess.run(
         ["git", "checkout", "HEAD", "--", *paths],
-        cwd=root,
+        cwd=repo_root,
         capture_output=True,
     )
     return sha
 
 
-def _restore_operator_work(root: Path, sha: str, paths: list[str]) -> str | None:
+def _restore_operator_work(repo_root: Path, sha: str, paths: list[str]) -> str | None:
     """Re-apply the set-aside WIP commit ``sha`` on top of the landed tree.
     Returns ``None`` on success, or a human-readable conflict detail when the
     apply conflicts with what the task just landed.
@@ -1439,23 +1418,23 @@ def _restore_operator_work(root: Path, sha: str, paths: list[str]) -> str | None
     ``git stash store`` so the operator can recover it by hand — never lost."""
     result = subprocess.run(
         ["git", "stash", "apply", sha],
-        cwd=root,
+        cwd=repo_root,
         capture_output=True,
         text=True,
     )
     if result.returncode == 0:
         return None
-    # Conflict: clear the half-applied blocker paths (keep .tasks runtime state)
-    # and stash-store the sha so the WIP is findable for a manual restore.
+    # Conflict: clear the half-applied blocker paths and stash-store the sha so
+    # the WIP is findable for a manual restore.
     if paths:
         subprocess.run(
             ["git", "checkout", "HEAD", "--", *paths],
-            cwd=root,
+            cwd=repo_root,
             capture_output=True,
         )
     subprocess.run(
         ["git", "stash", "store", "-m", AUTOSTASH_MESSAGE, sha],
-        cwd=root,
+        cwd=repo_root,
         capture_output=True,
     )
     detail = (result.stderr.strip() or result.stdout.strip()
@@ -1463,19 +1442,19 @@ def _restore_operator_work(root: Path, sha: str, paths: list[str]) -> str | None
     return detail
 
 
-def _reset_to_head(root: Path) -> None:
-    """Undo a half-applied squash so a failed merge never leaves ``root`` in a
-    conflicted/partly-staged state. Safe only because :func:`squash_to_main`
+def _reset_to_head(repo_root: Path) -> None:
+    """Undo a half-applied squash so a failed merge never leaves ``repo_root`` in
+    a conflicted/partly-staged state. Safe only because :func:`squash_to_main`
     refuses to start when the tree already has tracked changes."""
-    subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=root, capture_output=True)
+    subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=repo_root, capture_output=True)
 
 
-def _conflicted_paths(root: Path) -> list[str]:
+def _conflicted_paths(repo_root: Path) -> list[str]:
     """Files left with unmerged (conflicted) entries in the index after a failed
     ``git merge --squash``. Must be read *before* :func:`_reset_to_head`."""
     result = subprocess.run(
         ["git", "diff", "--name-only", "--diff-filter=U"],
-        cwd=root,
+        cwd=repo_root,
         capture_output=True,
         text=True,
     )
@@ -1505,13 +1484,13 @@ _NON_CODE_BASENAMES = frozenset({
 })
 _NON_CODE_BAZEL_SUFFIXES = frozenset({".bazel", ".bzl"})
 
-# Directory prefixes whose contents are never code for LOC accounting: the task
-# queue itself, build/dist output, vendored deps, and the git dir. Matched
-# case-insensitively against the full (forward-slashed) path. Mirrors the
-# pathspec excludes the spec references
-# (``:(exclude).tasks/``, ``:(exclude)dist/*``, ``:(exclude)build/*``, …).
+# Directory prefixes whose contents are never code for LOC accounting:
+# build/dist output, vendored deps, and the git dir. Matched case-insensitively
+# against the full (forward-slashed) path. ``.worktrees/`` is excluded
+# defensively (worktrees live under the workspace, not a landed commit, but a
+# repo that nests one should never have it counted).
 _NON_CODE_DIR_PREFIXES: tuple[str, ...] = (
-    ".tasks/",
+    ".worktrees/",
     ".git/",
     "dist/",
     "build/",
@@ -1552,7 +1531,7 @@ def _is_code_path(path: str) -> bool:
     build file, lockfile, or data/asset file (the categories the spec excludes)."""
     lowered = path.lower()
     # A path under any excluded directory (anywhere in the tree) is not code:
-    # ``.tasks/10.foo.md``, ``services/ui/dist/bundle.js``, ``a/build/x`` …
+    # ``services/ui/dist/bundle.js``, ``a/build/x`` …
     for prefix in _NON_CODE_DIR_PREFIXES:
         if lowered.startswith(prefix) or ("/" + prefix) in lowered:
             return False
@@ -1581,16 +1560,16 @@ def _is_comment_line(content: str, suffix: str) -> bool:
     return any(stripped.startswith(p) for p in prefixes)
 
 
-def compute_code_loc(root: Path, sha: str) -> int:
-    """Lines of code churned by a single commit ``sha`` (added + removed),
-    excluding build files, docs, comments, and blank lines.
+def compute_code_loc(repo_root: Path, sha: str) -> int:
+    """Lines of code churned by a single commit ``sha`` in ``repo_root`` (added +
+    removed), excluding build files, docs, comments, and blank lines.
 
     Reads the commit's own diff (``git show <sha>``) so a squash commit is
     measured against its parent. Returns 0 on any git error or for the initial
     commit (no parent) so a missing figure never breaks a run record."""
     result = subprocess.run(
         ["git", "show", sha, "--format=", "--unified=0", "--no-color", "--no-renames"],
-        cwd=root,
+        cwd=repo_root,
         capture_output=True,
         text=True,
     )
@@ -1626,10 +1605,10 @@ def _count_diff_code_lines(diff: str) -> int:
     return total
 
 
-def _branch_exists(root: Path, branch: str) -> bool:
+def _branch_exists(repo_root: Path, branch: str) -> bool:
     return subprocess.run(
         ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
-        cwd=root,
+        cwd=repo_root,
         capture_output=True,
     ).returncode == 0
 
@@ -1647,22 +1626,27 @@ def _squash_failure_kind(recoverable: bool, detail: str) -> str:
 
 
 def squash_to_main(
-    root: Path, task: str, title: str, *, queue: str | None = None, autostash: bool = True,
+    workspace: Path,
+    repo: str,
+    task: str,
+    title: str,
+    *,
+    queue: str | None = None,
+    autostash: bool = True,
 ) -> tuple[str | None, str, bool]:
-    """Merge the task's worktree branch as a single squash commit on ``main``.
+    """Merge the task's worktree branch as a single squash commit on the target
+    repo's ``main`` (``repo_root = workspace / repo``).
 
     Returns ``(sha, "", False)`` on success, or ``(None, detail, recoverable)``
     on failure where ``detail`` is a human-readable reason and ``recoverable``
     says whether re-attempting the *same* squash could succeed once the user
     clears a blocker.
 
-    Queue state (``.tasks/``) never blocks a land: it is snapshotted up-front via
-    :func:`commit_queue_state`, and the dirty-tree precheck (:func:`_landing_blockers`)
-    ignores it, so adding/editing tasks or live playlist run records mid-run can
-    never refuse a squash.
-
-    Genuine operator *code* WIP in ``main`` is handled by ``autostash`` (default
-    on, set per-playlist via ``autostash_operator_work``):
+    Briefs/queue config live in the separate content store and are delivered via
+    a run-scratch file, so the target repo only ever receives the implementation
+    squash — there is nothing to snapshot up-front, and every tracked change in
+    ``repo_root`` is genuine operator *code* WIP. That WIP is handled by
+    ``autostash`` (default on, set per-queue via ``autostash_operator_work``):
 
     * ``autostash=True`` — the operator's tracked code changes are set aside with
       ``git stash`` for the brief merge+commit, then restored. A success may
@@ -1683,28 +1667,25 @@ def squash_to_main(
     On any merge/commit failure the working tree is reset back to ``HEAD`` (and
     any set-aside work restored) so it is never left half-merged.
 
-    The whole critical section (snapshot → optional set-aside → merge → commit →
-    reset-on-failure → restore) runs under :func:`landing_lock`, so concurrent
-    queue runners (and a CLI process) serialize on the shared index/HEAD/stash
-    instead of seeing a half-merged tree.
+    The whole critical section (optional set-aside → merge → commit →
+    reset-on-failure → restore) runs under :func:`landing_lock` (per
+    workspace+repo), so concurrent queue runners (and a CLI process) serialize on
+    the repo's index/HEAD/stash instead of seeing a half-merged tree.
     """
+    repo_root = workspace / repo
     branch = worktree_branch(task, queue)
 
-    if not _branch_exists(root, branch):
+    if not _branch_exists(repo_root, branch):
         return None, f"no task branch '{branch}' to merge (nothing to recover)", False
 
-    with landing_lock(root):
-        # Snapshot the queue so .tasks/ edits + live run records never block the
-        # land (queue-scoped so a concurrent queue's snapshot can't collide).
-        commit_queue_state(root, playlists.tasks_rel(queue))
-
-        blockers = _landing_blockers(root)
+    with landing_lock(workspace, repo):
+        blockers = _landing_blockers(repo_root)
         wip_sha: str | None = None
         blocker_paths: list[str] = []
         if blockers:
             blocker_paths = [_porcelain_path(line) for line in blockers]
             if autostash:
-                wip_sha = _stash_operator_work(root, blocker_paths)
+                wip_sha = _stash_operator_work(repo_root, blocker_paths)
             if not autostash or wip_sha is None:
                 shown = "\n".join(f"    {line}" for line in blockers[:20])
                 extra = "" if len(blockers) <= 20 else f"\n    … and {len(blockers) - 20} more"
@@ -1717,13 +1698,13 @@ def squash_to_main(
         try:
             merge = subprocess.run(
                 ["git", "merge", "--squash", branch],
-                cwd=root,
+                cwd=repo_root,
                 capture_output=True,
                 text=True,
             )
             if merge.returncode != 0:
-                conflicts = _conflicted_paths(root)
-                _reset_to_head(root)
+                conflicts = _conflicted_paths(repo_root)
+                _reset_to_head(repo_root)
                 if conflicts:
                     shown = "\n".join(f"    {p}" for p in conflicts)
                     return None, (
@@ -1741,7 +1722,7 @@ def squash_to_main(
 
             commit = subprocess.run(
                 ["git", "commit", "-m", f"task: {title}"],
-                cwd=root,
+                cwd=repo_root,
                 capture_output=True,
                 text=True,
             )
@@ -1751,18 +1732,18 @@ def squash_to_main(
                     or commit.stdout.strip()
                     or f"git commit exited {commit.returncode}"
                 )
-                _reset_to_head(root)
+                _reset_to_head(repo_root)
                 return None, f"commit failed:\n{detail}", False
 
             sha = subprocess.run(
                 ["git", "rev-parse", "--short", "HEAD"],
-                cwd=root,
+                cwd=repo_root,
                 capture_output=True,
                 text=True,
             ).stdout.strip()
         finally:
             if wip_sha:
-                restore_detail = _restore_operator_work(root, wip_sha, blocker_paths)
+                restore_detail = _restore_operator_work(repo_root, wip_sha, blocker_paths)
 
     if restore_detail:
         return sha, (
@@ -1774,10 +1755,11 @@ def squash_to_main(
 
 
 def recover_task(
-    root: Path, task: str, title: str, *, queue: str | None = None
+    workspace: Path, repo: str, task: str, title: str, *, queue: str | None = None
 ) -> TaskResult:
     """Re-attempt the squash-merge for a task whose validate passed but whose
-    merge to ``main`` failed (typically a dirty tree at the time).
+    merge to the target repo's ``main`` failed (typically a dirty tree at the
+    time).
 
     The worktree branch is preserved on such failures precisely so this cheap
     recovery is possible without re-running the worker. On success the branch
@@ -1785,7 +1767,8 @@ def recover_task(
     can fix the blocker (e.g. commit their work) and retry again.
     """
     branch = worktree_branch(task, queue)
-    if not _branch_exists(root, branch):
+    repo_root = workspace / repo
+    if not _branch_exists(repo_root, branch):
         return TaskResult(
             task=task, title=title, success=False,
             error=(
@@ -1794,19 +1777,23 @@ def recover_task(
             ),
         )
 
-    autostash = bool(
-        resolve_config(root, playlists.tasks_rel(queue)).get(
-            "autostash_operator_work", True
-        )
+    # Autostash is an operator/global default in ``<workspace>/config.json``;
+    # recovery doesn't carry a tasks_root so it reads the host config directly.
+    try:
+        host_config = load_config(workspace)
+    except (FileNotFoundError, ValueError):
+        host_config = {}
+    autostash = bool(host_config.get("autostash_operator_work", True))
+    sha, detail, _ = squash_to_main(
+        workspace, repo, task, title, queue=queue, autostash=autostash
     )
-    sha, detail, _ = squash_to_main(root, task, title, queue=queue, autostash=autostash)
     if sha is None:
         return TaskResult(
             task=task, title=title, success=False,
             error=detail or "squash-merge to main failed",
         )
 
-    teardown_worktree(root, task, queue=queue)
+    teardown_worktree(workspace, repo, task, queue=queue)
     return TaskResult(
         task=task, title=title, success=True, commit_sha=sha,
         result_line=f"recovered: landed ({sha})",
@@ -1821,23 +1808,26 @@ RESOLVE_PROMPT_FILE = asset("prompts", "nightshift-resolve.md")
 DEFAULT_MAX_RESOLVE_ATTEMPTS = 2
 
 
-def build_resolve_prompt(root: Path, task: str, *, context: str) -> str:
+def build_resolve_prompt(task: str, *, task_file: str, context: str) -> str:
     """Build the prompt for the resolve agent — the resolution charter plus the
-    concrete reason the squash-merge to main failed."""
+    concrete reason the squash-merge to main failed.
+
+    ``task_file`` is the path to the materialised run-scratch brief (outside the
+    worktree), never a path inside the target repo."""
     prompt_body = RESOLVE_PROMPT_FILE.read_text()
     return (
-        f"Your task file is: .tasks/{task}.md\n"
+        f"Your task file is: {task_file}\n"
         f"The TASK variable is: {task}\n\n"
         f"## Why the merge to main failed\n\n{context}\n\n"
         f"{prompt_body}"
     )
 
 
-def _link_worktree_artifacts(root: Path, worktree_dir: Path) -> None:
-    """Symlink build artifacts (`.venv`, node_modules) into ``worktree_dir`` so a
-    re-attached worktree can run ``just validate``."""
+def _link_worktree_artifacts(repo_root: Path, worktree_dir: Path) -> None:
+    """Symlink build artifacts (`.venv`, node_modules) from the target repo into
+    ``worktree_dir`` so a re-attached worktree can run ``just validate``."""
     for target in SYMLINK_TARGETS:
-        src = root / target
+        src = repo_root / target
         dst = worktree_dir / target
         if src.exists() and not dst.exists():
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -1845,24 +1835,26 @@ def _link_worktree_artifacts(root: Path, worktree_dir: Path) -> None:
 
 
 def _ensure_worktree_for_branch(
-    root: Path, task: str, *, queue: str | None = None
+    workspace: Path, repo: str, task: str, *, queue: str | None = None
 ) -> Path | None:
     """Ensure the task's worktree exists on its preserved branch (re-attaching it
     if its checkout was cleaned up). Returns the dir, or ``None`` if the branch is
     gone. Unlike :func:`setup_worktree` this never deletes the branch."""
+    repo_root = workspace / repo
     branch = worktree_branch(task, queue)
-    if not _branch_exists(root, branch):
+    if not _branch_exists(repo_root, branch):
         return None
-    wt_dir = worktree_dir(root, task, queue)
+    wt_dir = worktree_dir(workspace, repo, task, queue)
     if not wt_dir.exists():
+        wt_dir.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(
             ["git", "worktree", "add", str(wt_dir), branch],
-            cwd=root,
+            cwd=repo_root,
             capture_output=True,
         )
     if not wt_dir.exists():
         return None
-    _link_worktree_artifacts(root, wt_dir)
+    _link_worktree_artifacts(repo_root, wt_dir)
     return wt_dir
 
 
@@ -1905,7 +1897,9 @@ def _rebase_onto_main(worktree_dir: Path) -> tuple[str, str]:
 
 
 def resolve_task(
-    root: Path,
+    workspace: Path,
+    repo: str,
+    tasks_root: Path,
     task: str,
     title: str,
     *,
@@ -1915,7 +1909,8 @@ def resolve_task(
     abort_reason: object = None,
     queue: str | None = None,
 ) -> TaskResult:
-    """Resolve a task whose validated work failed to land on ``main``.
+    """Resolve a task whose validated work failed to land on the target repo's
+    ``main`` (``repo_root = workspace / repo``).
 
     Diagnoses first, then acts:
 
@@ -1927,29 +1922,33 @@ def resolve_task(
       resolves the conflicts, re-validates, and squashes — bounded by
       ``max_resolve_attempts``.
 
-    Emits ``TASK_STARTED``/``TASK_STATUS``/``TASK_RESULT`` so the caller can drive
-    it as a tracked job (live log + ``resolve`` phase). The branch is preserved on
-    failure so the operator can still resolve it by hand.
+    The brief is read from ``tasks_root`` (the content store); rebase/squash run
+    in ``repo_root``. Emits ``TASK_STARTED``/``TASK_STATUS``/``TASK_RESULT`` so the
+    caller can drive it as a tracked job (live log + ``resolve`` phase). The
+    branch is preserved on failure so the operator can still resolve it by hand.
     """
-    config = config or load_config(root)
+    tasks_rel = playlists.tasks_rel(queue)
+    config = config or resolve_config(workspace, tasks_root, tasks_rel)
+    repo_root = workspace / repo
     branch = worktree_branch(task, queue)
 
-    task_file = root / playlists.tasks_rel(queue) / f"{task}.md"
+    task_file = tasks_root / tasks_rel / f"{task}.md"
     meta: dict = {}
     body = ""
     if task_file.exists():
         meta, body = split_frontmatter(task_file.read_text())
     emit(Event(TASK_STARTED, {
-        "task": task, "title": title, "frontmatter": {**meta}, "body": body.strip(),
+        "task": task, "title": title, "repo": repo,
+        "frontmatter": {**meta}, "body": body.strip(),
     }))
 
-    if not _branch_exists(root, branch):
+    if not _branch_exists(repo_root, branch):
         error = (
             "nothing to resolve: the task branch no longer exists. "
             "Re-run the task instead."
         )
         emit(Event(TASK_RESULT, {
-            "task": task, "status": "error", "error": error,
+            "task": task, "status": "error", "error": error, "repo": repo,
             "result_line": "branch gone — re-run the task",
             "failure_kind": "merge_rejected",
         }))
@@ -1962,17 +1961,17 @@ def resolve_task(
     emit(Event(TASK_STATUS, {"task": task, "status": "running", "phase": "commit"}))
     autostash = bool(config.get("autostash_operator_work", True))
     sha, detail, recoverable = squash_to_main(
-        root, task, title, queue=queue, autostash=autostash
+        workspace, repo, task, title, queue=queue, autostash=autostash
     )
     if sha is not None:
-        loc = compute_code_loc(root, sha)
-        teardown_worktree(root, task, queue=queue)
+        loc = compute_code_loc(repo_root, sha)
+        teardown_worktree(workspace, repo, task, queue=queue)
         # Backstop queue removal for a landed regular task (see drop_completed_task).
         if not task_is_evergreen(meta, task, config):
-            drop_completed_task(root, task, playlists.tasks_rel(queue), queue=queue)
+            drop_completed_task(tasks_root, task, tasks_rel, queue=queue)
         result_line = f"resolved: landed ({sha})"
         emit(Event(TASK_RESULT, {
-            "task": task, "status": "completed",
+            "task": task, "status": "completed", "repo": repo,
             "result_line": result_line, "commit_sha": sha, "loc": loc,
         }))
         return TaskResult(
@@ -1983,7 +1982,7 @@ def resolve_task(
     if recoverable:
         # Transient blocker (e.g. main has uncommitted edits): not an agent's job.
         emit(Event(TASK_RESULT, {
-            "task": task, "status": "error", "error": detail,
+            "task": task, "status": "error", "error": detail, "repo": repo,
             "result_line": "blocked — clear main, then resolve",
             "recoverable": True, "failure_kind": "merge_rejected",
         }))
@@ -1994,14 +1993,16 @@ def resolve_task(
 
     # 2. Content conflict (or generic merge failure): hand it to the agent.
     return _agent_resolve(
-        root, task, title,
+        workspace, repo, tasks_root, task, title,
         conflict_detail=detail, emit=emit, config=config,
         backend_name=backend_name, abort_reason=abort_reason, queue=queue,
     )
 
 
 def _agent_resolve(
-    root: Path,
+    workspace: Path,
+    repo: str,
+    tasks_root: Path,
     task: str,
     title: str,
     *,
@@ -2012,10 +2013,13 @@ def _agent_resolve(
     abort_reason: object = None,
     queue: str | None = None,
 ) -> TaskResult:
-    """Rebase the task branch onto ``main`` and drive an agent to resolve the
-    conflicts / validation failures, then squash. Bounded by config
-    ``max_resolve_attempts``."""
+    """Rebase the task branch onto the target repo's ``main`` and drive an agent
+    to resolve the conflicts / validation failures, then squash. Bounded by
+    config ``max_resolve_attempts``."""
     from nightshift.backends import LAUNCH_FAILED, WorkerSpec, get_backend
+
+    tasks_rel = playlists.tasks_rel(queue)
+    repo_root = workspace / repo
 
     def _emit_log(line: str) -> None:
         emit(Event(TASK_LOG, {"task": task, "line": line}))
@@ -2026,11 +2030,11 @@ def _agent_resolve(
     def _should_abort() -> str | None:
         return abort_reason() if callable(abort_reason) else None
 
-    worktree_dir = _ensure_worktree_for_branch(root, task, queue=queue)
+    worktree_dir = _ensure_worktree_for_branch(workspace, repo, task, queue=queue)
     if worktree_dir is None:
         error = "could not prepare the task worktree for resolution"
         emit(Event(TASK_RESULT, {
-            "task": task, "status": "error", "error": error,
+            "task": task, "status": "error", "error": error, "repo": repo,
             "result_line": "resolve setup failed", "failure_kind": "merge_conflict",
         }))
         return TaskResult(
@@ -2041,10 +2045,14 @@ def _agent_resolve(
     max_attempts = int(config.get("max_resolve_attempts", DEFAULT_MAX_RESOLVE_ATTEMPTS))
     validate_cmd = resolve_validate_cmd(config)
     env = worker_env()
-    task_file = root / playlists.tasks_rel(queue) / f"{task}.md"
+    task_file = tasks_root / tasks_rel / f"{task}.md"
     meta: dict = {}
+    body = ""
     if task_file.exists():
-        meta, _ = split_frontmatter(task_file.read_text())
+        meta, body = split_frontmatter(task_file.read_text())
+    # Deliver the brief via a run-scratch file outside the worktree (the brief
+    # never enters the target repo).
+    scratch = materialize_brief(workspace, repo, task, body, queue=queue)
     resolved = resolve_frontmatter(meta, config)
     model = config.get("resolve_model") or resolved["model"]
     backend = get_backend(
@@ -2070,7 +2078,7 @@ def _agent_resolve(
             )
             spec = WorkerSpec(
                 task=task,
-                prompt=build_resolve_prompt(root, task, context=context),
+                prompt=build_resolve_prompt(task, task_file=str(scratch), context=context),
                 model=model,
                 max_turns=resolved["max_turns"],
                 cwd=worktree_dir,
@@ -2083,7 +2091,9 @@ def _agent_resolve(
             if worker.aborted is not None:
                 if _rebase_in_progress(worktree_dir):
                     _abort_rebase(worktree_dir)
-                emit(Event(TASK_RESULT, {"task": task, "status": worker.aborted}))
+                emit(Event(TASK_RESULT, {
+                    "task": task, "status": worker.aborted, "repo": repo,
+                }))
                 return TaskResult(
                     task=task, title=title, success=False, status=worker.aborted,
                 )
@@ -2095,7 +2105,7 @@ def _agent_resolve(
                 if _rebase_in_progress(worktree_dir):
                     _abort_rebase(worktree_dir)
                 emit(Event(TASK_RESULT, {
-                    "task": task, "status": "error", "error": error,
+                    "task": task, "status": "error", "error": error, "repo": repo,
                     "result_line": "worker executable not found",
                     "failure_kind": "worker_launch",
                 }))
@@ -2132,18 +2142,18 @@ def _agent_resolve(
 
         emit(Event(TASK_STATUS, {"task": task, "status": "running", "phase": "commit"}))
         sha, squash_detail, _recoverable = squash_to_main(
-            root, task, title, queue=queue,
+            workspace, repo, task, title, queue=queue,
             autostash=bool(config.get("autostash_operator_work", True)),
         )
         if sha is not None:
-            loc = compute_code_loc(root, sha)
-            teardown_worktree(root, task, queue=queue)
+            loc = compute_code_loc(repo_root, sha)
+            teardown_worktree(workspace, repo, task, queue=queue)
             # Backstop queue removal for a landed regular task (see drop_completed_task).
             if not task_is_evergreen(meta, task, config):
-                drop_completed_task(root, task, playlists.tasks_rel(queue), queue=queue)
+                drop_completed_task(tasks_root, task, tasks_rel, queue=queue)
             result_line = f"resolved: landed ({sha})"
             emit(Event(TASK_RESULT, {
-                "task": task, "status": "completed",
+                "task": task, "status": "completed", "repo": repo,
                 "result_line": result_line, "commit_sha": sha, "loc": loc,
             }))
             return TaskResult(
@@ -2153,9 +2163,9 @@ def _agent_resolve(
         last_error = squash_detail or "squash-merge still failed after resolution"
 
     error = f"auto-resolve failed after {max_attempts} attempt(s):\n{last_error}"
-    _write_failure_log(root, worktree_dir, task, error)
+    _write_failure_log(workspace, repo, worktree_dir, task, error)
     emit(Event(TASK_RESULT, {
-        "task": task, "status": "error", "error": error,
+        "task": task, "status": "error", "error": error, "repo": repo,
         "result_line": "auto-resolve failed — manual resolution needed",
         "recoverable": False, "failure_kind": "merge_conflict",
     }))
@@ -2169,11 +2179,9 @@ def _agent_resolve(
 # Failure logging / repair
 # --------------------------------------------------------------------------- #
 
-FAILURE_LOG_DIR = ".worktrees/failures"
-
-
 def _write_failure_log(
-    root: Path,
+    workspace: Path,
+    repo: str,
     worktree_dir: Path,
     task: str,
     error: str,
@@ -2181,8 +2189,11 @@ def _write_failure_log(
     validate_stdout: str = "",
     validate_stderr: str = "",
 ) -> Path:
-    """Write a terse failure log so repeated failures are diagnosable."""
-    log_dir = root / FAILURE_LOG_DIR
+    """Write a terse failure log so repeated failures are diagnosable. Logs live
+    under the workspace-level worktree area for the repo
+    (``<workspace>/.worktrees/<repo>/failures/<task>.log``), never in the target
+    repo."""
+    log_dir = workspace / ".worktrees" / repo / "failures"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{task}.log"
 
@@ -2272,6 +2283,29 @@ def extract_result_line(validate_stdout: str, validate_stderr: str = "") -> str:
     return "validate passed"
 
 
+# Honest-failure sentinel: an agent that cannot complete a task makes **no
+# commits** and emits a final log line ``NIGHTSHIFT_BLOCKED: <reason>`` (no
+# ``.BLOCKED`` file is written anywhere). The worker/engine scan captured output
+# for this marker to surface a ``blocked`` status + reason.
+_BLOCKED_SENTINEL = re.compile(r"^\s*NIGHTSHIFT_BLOCKED:\s*(.*\S)?\s*$")
+
+
+def extract_blocked_reason(text: str) -> str | None:
+    """Return the reason from the **last** ``NIGHTSHIFT_BLOCKED: <reason>`` line in
+    ``text``, or ``None`` when the sentinel is absent.
+
+    A bare ``NIGHTSHIFT_BLOCKED:`` with no reason still counts as a block and
+    yields a generic ``"blocked"`` reason. Scanning the whole captured log (last
+    match wins) tolerates the marker appearing mid-stream before the agent's
+    final summary."""
+    reason: str | None = None
+    for line in text.splitlines():
+        match = _BLOCKED_SENTINEL.match(line)
+        if match:
+            reason = (match.group(1) or "").strip() or "blocked"
+    return reason
+
+
 # --------------------------------------------------------------------------- #
 # Run control
 # --------------------------------------------------------------------------- #
@@ -2331,28 +2365,39 @@ class Controller:
 
 
 def run_task(
-    root: Path,
+    workspace: Path,
+    tasks_root: Path,
     task: str,
     *,
+    repo: str | None = None,
     emit: Listener = _noop,
     abort_reason: object = None,
     backend_name: str | None = None,
-    tasks_rel: str = ".tasks",
+    tasks_rel: str = "main",
 ) -> TaskResult:
-    """Run a single task end-to-end. Always cleans up the worktree when done.
+    """Run a single task end-to-end across the two roots. Always cleans up the
+    worktree when done.
 
-    ``abort_reason`` is an optional zero-arg callable returning ``None`` to
-    continue or a status string (``"skipped"`` / ``"stopped"``) to terminate
-    the worker early. ``backend_name`` selects the worker shim (claude / cursor
-    / anthropic / ollama); when ``None`` it falls back to ``config`` then the
-    default. ``tasks_rel`` selects the queue (``.tasks`` or a playlist sub-dir)
-    the task file is read from and whose config (incl. the ``validate`` command)
-    applies. The final ``task_result`` event carries a ``timings`` dict of
+    The brief is read from ``tasks_root`` (the content store); the target repo is
+    resolved per task (``repo`` override → queue ``config.json`` ``repo``) and all
+    git ops run in ``repo_root = workspace / repo``. ``abort_reason`` is an
+    optional zero-arg callable returning ``None`` to continue or a status string
+    (``"skipped"`` / ``"stopped"``) to terminate the worker early.
+    ``backend_name`` selects the worker shim (claude / cursor / anthropic /
+    ollama); when ``None`` it falls back to ``config`` then the default.
+    ``tasks_rel`` selects the queue dir (``main`` or an alternate queue) and whose
+    config (incl. the ``validate`` command and default ``repo``) applies.
+
+    Two non-error early exits exist: a malformed/absent ``repo`` reference is an
+    **authoring** error (``RepoConfigError`` → ``TASK_RESULT`` ``error``), while a
+    well-formed but currently-absent repo **pauses** the task
+    (``TASK_RESULT`` ``"paused"`` + reason ``repo_unavailable``) without cutting a
+    worktree. The final ``task_result`` event carries a ``timings`` dict of
     per-phase seconds (``worker`` / ``validate`` / ``commit`` / ``total``).
     """
-    tasks_dir = root / tasks_rel
+    tasks_dir = tasks_root / tasks_rel
     task_file = tasks_dir / f"{task}.md"
-    config = resolve_config(root, tasks_rel)
+    config = resolve_config(workspace, tasks_root, tasks_rel)
     queue = playlists.queue_from_tasks_rel(tasks_rel)
 
     if not task_file.exists():
@@ -2384,20 +2429,57 @@ def run_task(
             result_line="skipped: task is disabled",
         )
 
+    # Resolve the target repo (task frontmatter override → queue default). A
+    # malformed/absent reference is an authoring error (never dispatched).
+    if not repo:
+        try:
+            repo = repos.resolve_repo(
+                meta.get("repo"),
+                load_queue_config(tasks_root, tasks_rel).get("repo"),
+            )
+        except repos.RepoConfigError as err:
+            emit(Event(TASK_RESULT, {
+                "task": task, "status": "error", "error": str(err),
+                "result_line": "repo configuration error",
+                "failure_kind": "repo_config",
+            }))
+            return TaskResult(
+                task=task, title=title, success=False, error=str(err),
+                result_line="repo configuration error", failure_kind="repo_config",
+            )
+
+    # A well-formed reference to an absent/`.git`-less repo pauses (not fails) the
+    # task until the repo appears — no worktree is cut, no run is recorded.
+    if not repos.repo_available(workspace, repo):
+        result_line = f"paused: repo '{repo}' is not available"
+        emit(Event(TASK_RESULT, {
+            "task": task, "status": "paused", "repo": repo,
+            "reason": "repo_unavailable", "result_line": result_line,
+        }))
+        return TaskResult(
+            task=task, title=title, success=False, status="paused",
+            result_line=result_line,
+        )
+
     frontmatter = {**meta}
     frontmatter.setdefault("model", resolved["model"])
     # Carry the brief prose into the run record so History can show the original
     # brief after the task file is removed (completed tasks leave the queue).
     emit(Event(TASK_STARTED, {
-        "task": task, "title": title, "frontmatter": frontmatter, "body": body.strip(),
+        "task": task, "title": title, "repo": repo,
+        "frontmatter": frontmatter, "body": body.strip(),
     }))
     emit(Event(TASK_STATUS, {"task": task, "status": "running", "phase": "worker"}))
 
     def _should_abort() -> str | None:
         return abort_reason() if callable(abort_reason) else None
 
+    repo_root = workspace / repo
     t_task_start = time.monotonic()
-    worktree_dir = setup_worktree(root, task, queue=queue)
+    # Deliver the brief via a run-scratch file outside the worktree (the brief
+    # never enters the target repo), then cut the worktree from the target repo.
+    scratch = materialize_brief(workspace, repo, task, body, queue=queue)
+    worktree_dir = setup_worktree(workspace, repo, task, queue=queue)
     preserve_worktree = False
 
     # Imported here, not at module top, to avoid a backends<->engine import
@@ -2405,7 +2487,11 @@ def run_task(
     from nightshift.backends import LAUNCH_FAILED, WorkerSpec, get_backend
 
     try:
-        prompt = build_prompt(root, task, tasks_rel)
+        prompt = build_prompt(
+            task,
+            task_file=str(scratch),
+            validate_cmd=str(config.get("validate") or DEFAULT_VALIDATE_CMD),
+        )
         env = worker_env()
         validate_cmd = resolve_validate_cmd(config)
         backend = get_backend(backend_name or config.get("worker_backend"))
@@ -2442,7 +2528,8 @@ def run_task(
 
         if worker.aborted is not None:
             emit(Event(TASK_RESULT, {
-                "task": task, "status": worker.aborted, "timings": _with_total(),
+                "task": task, "status": worker.aborted, "repo": repo,
+                "timings": _with_total(),
             }))
             return TaskResult(task=task, title=title, success=False, status=worker.aborted)
 
@@ -2451,9 +2538,9 @@ def run_task(
                 f"{worker.error}. Add the worker binary to PATH or set its "
                 "'*_bin' in config.json."
             )
-            _write_failure_log(root, worktree_dir, task, error)
+            _write_failure_log(workspace, repo, worktree_dir, task, error)
             emit(Event(TASK_RESULT, {
-                "task": task, "status": "error", "error": error,
+                "task": task, "status": "error", "error": error, "repo": repo,
                 "result_line": "worker executable not found",
                 "failure_kind": "worker_launch", "timings": _with_total(),
             }))
@@ -2465,10 +2552,10 @@ def run_task(
 
         if worker.returncode != 0:
             error = worker.error or f"worker [{backend.name}] exited with code {worker.returncode}"
-            _write_failure_log(root, worktree_dir, task, error)
+            _write_failure_log(workspace, repo, worktree_dir, task, error)
             line = error.splitlines()[0][:120]
             emit(Event(TASK_RESULT, {
-                "task": task, "status": "error", "error": error,
+                "task": task, "status": "error", "error": error, "repo": repo,
                 "result_line": line, "failure_kind": "worker_error",
                 "timings": _with_total(),
             }))
@@ -2479,15 +2566,15 @@ def run_task(
 
         # No commits → nothing to validate or squash. Finish cleanly instead of
         # tripping the squash step (e.g. non-agentic completion backends).
-        if not _worktree_has_commits(root, task, queue=queue):
+        if not _worktree_has_commits(workspace, repo, task, queue=queue):
             result_line = "no changes produced (worker emitted output only)"
-            # A no-changes completion never removed the task file (no branch to
-            # land), so drop it here for regular tasks — a completed task must
-            # leave the queue. Evergreen tasks keep their file and re-run.
+            # A no-changes completion never removed the brief (no branch to land),
+            # so drop it here for regular tasks — a completed task must leave the
+            # queue. Evergreen tasks keep their file and re-run.
             if not task_is_evergreen(meta, task, config):
-                drop_completed_task(root, task, tasks_rel, queue=queue)
+                drop_completed_task(tasks_root, task, tasks_rel, queue=queue)
             emit(Event(TASK_RESULT, {
-                "task": task, "status": "completed",
+                "task": task, "status": "completed", "repo": repo,
                 "result_line": result_line, "timings": _with_total(),
             }))
             return TaskResult(task=task, title=title, success=True, result_line=result_line)
@@ -2496,7 +2583,9 @@ def run_task(
         # sink time into validate.
         if _should_abort() is not None:
             reason = _should_abort()
-            emit(Event(TASK_RESULT, {"task": task, "status": reason, "timings": _with_total()}))
+            emit(Event(TASK_RESULT, {
+                "task": task, "status": reason, "repo": repo, "timings": _with_total(),
+            }))
             return TaskResult(task=task, title=title, success=False, status=reason)
 
         # A queue may opt out of validation by setting an empty validate command;
@@ -2526,19 +2615,22 @@ def run_task(
             # nothing is committed to main.
             if _should_abort() is not None:
                 reason = _should_abort()
-                emit(Event(TASK_RESULT, {"task": task, "status": reason, "timings": _with_total()}))
+                emit(Event(TASK_RESULT, {
+                    "task": task, "status": reason, "repo": repo,
+                    "timings": _with_total(),
+                }))
                 return TaskResult(task=task, title=title, success=False, status=reason)
 
             if validate_result.returncode != 0:
                 error = f"just validate failed:\n{validate_result.stdout[-2000:]}\n{validate_result.stderr[-2000:]}"
                 _write_failure_log(
-                    root, worktree_dir, task, error,
+                    workspace, repo, worktree_dir, task, error,
                     validate_stdout=validate_result.stdout,
                     validate_stderr=validate_result.stderr,
                 )
                 result_line = extract_result_line(validate_result.stdout, validate_result.stderr)
                 emit(Event(TASK_RESULT, {
-                    "task": task, "status": "error", "error": error,
+                    "task": task, "status": "error", "error": error, "repo": repo,
                     "result_line": result_line, "failure_kind": "validation_error",
                     "timings": _with_total(),
                 }))
@@ -2554,13 +2646,15 @@ def run_task(
         if _should_abort() is not None:
             reason = _should_abort()
             preserve_worktree = True
-            emit(Event(TASK_RESULT, {"task": task, "status": reason, "timings": _with_total()}))
+            emit(Event(TASK_RESULT, {
+                "task": task, "status": reason, "repo": repo, "timings": _with_total(),
+            }))
             return TaskResult(task=task, title=title, success=False, status=reason)
 
         emit(Event(TASK_STATUS, {"task": task, "status": "running", "phase": "commit"}))
         t_commit = time.monotonic()
         sha, squash_error, recoverable = squash_to_main(
-            root, task, title, queue=queue,
+            workspace, repo, task, title, queue=queue,
             autostash=bool(config.get("autostash_operator_work", True)),
         )
         timings["commit"] = round(time.monotonic() - t_commit, 1)
@@ -2570,7 +2664,7 @@ def run_task(
             emit(Event(TASK_LOG, {"task": task, "line": f"  warning: {squash_error}\n"}))
         if sha is None:
             error = squash_error or "squash-merge to main failed"
-            _write_failure_log(root, worktree_dir, task, error)
+            _write_failure_log(workspace, repo, worktree_dir, task, error)
             # Keep the worktree branch either way so the validated work is never
             # lost: a transient blocker can be re-squashed once cleared, and a
             # content conflict can be resolved by hand against the branch.
@@ -2589,7 +2683,7 @@ def run_task(
                     "line": "  auto-resolve enabled — launching resolver agent...\n",
                 }))
                 result = _agent_resolve(
-                    root, task, title,
+                    workspace, repo, tasks_root, task, title,
                     conflict_detail=error, emit=emit, config=config,
                     backend_name=backend_name, abort_reason=abort_reason, queue=queue,
                 )
@@ -2602,7 +2696,7 @@ def run_task(
                 else "squash-merge conflict — manual resolution needed"
             )
             emit(Event(TASK_RESULT, {
-                "task": task, "status": "error", "error": error,
+                "task": task, "status": "error", "error": error, "repo": repo,
                 "result_line": result_line,
                 "recoverable": recoverable, "failure_kind": failure_kind,
                 "timings": _with_total(),
@@ -2612,23 +2706,24 @@ def run_task(
                 failure_kind=failure_kind,
             )
 
-        # Code lines churned by the squash commit this task landed on ``main``
-        # (added + removed), excluding build files, docs, comments, and
-        # queue/output dirs — summed on the Stats page. The landed commit is the
-        # one metric the Stats backfill can also reconstruct from a record's
+        # Code lines churned by the squash commit this task landed on the target
+        # repo's ``main`` (added + removed), excluding build files, docs, comments,
+        # and build/output dirs — summed on the Stats page. The landed commit is
+        # the one metric the Stats backfill can also reconstruct from a record's
         # ``commit_sha`` after the task branch is torn down, so live capture and
         # backfill report the *same* figure for every task (a branch-history sum
         # would diverge from any later backfill and make the total inconsistent).
-        loc = compute_code_loc(root, sha)
+        loc = compute_code_loc(repo_root, sha)
         # Backstop the worker's queue removal: a regular task that lands must
-        # leave the queue. If the worker's branch didn't ``git rm`` its task
-        # file, the squash kept it on ``main`` and the UI would keep listing a
-        # completed task — drop it here. Evergreen tasks keep their file.
+        # leave the queue. If the worker's branch didn't ``git rm`` its brief, the
+        # squash kept it on ``main`` and the UI would keep listing a completed
+        # task — drop it from the content store here. Evergreen tasks keep theirs.
         if not task_is_evergreen(meta, task, config):
-            drop_completed_task(root, task, tasks_rel, queue=queue)
+            drop_completed_task(tasks_root, task, tasks_rel, queue=queue)
         emit(Event(TASK_RESULT, {
             "task": task,
             "status": "completed",
+            "repo": repo,
             "result_line": result_line,
             "commit_sha": sha,
             "loc": loc,
@@ -2641,28 +2736,31 @@ def run_task(
 
     finally:
         if not preserve_worktree:
-            teardown_worktree(root, task, queue=queue)
+            teardown_worktree(workspace, repo, task, queue=queue)
 
 
 def run_queue(
-    root: Path,
+    workspace: Path,
+    tasks_root: Path,
     tasks: list[str],
     *,
     listeners: list[Listener] | None = None,
     controller: Controller | None = None,
     run_id: str | None = None,
     backend_name: str | None = None,
-    tasks_rel: str = ".tasks",
+    tasks_rel: str = "main",
     follow_queue: bool = False,
     task_slot: Callable[[], AbstractContextManager[object]] | None = None,
     admit_task: Callable[[], str | None] | None = None,
 ) -> RunSummary:
     """Run tasks from a queue, emitting events to ``listeners``.
 
-    If a :class:`Controller` is supplied the loop honours pause/stop/skip; with
-    no controller it runs straight through (the CLI path). ``backend_name``
-    selects the worker shim for every task in the run. ``tasks_rel`` selects the
-    queue (main ``.tasks`` or a playlist sub-dir) the tasks belong to.
+    Briefs are read from ``tasks_root`` (the content store) and each task resolves
+    its own target repo inside :func:`run_task` (the run is paused, not failed, if
+    that repo is currently absent). If a :class:`Controller` is supplied the loop
+    honours pause/stop/skip; with no controller it runs straight through (the CLI
+    path). ``backend_name`` selects the worker shim for every task in the run.
+    ``tasks_rel`` selects the queue dir (``main`` or an alternate queue).
 
     ``task_slot`` (server concurrency governor) is an optional context-manager
     factory held for the duration of *each* ``run_task`` (worker→validate→land),
@@ -2680,9 +2778,9 @@ def run_queue(
     drop out of the scan). With ``follow_queue`` off the loop drains exactly the
     passed ``tasks`` (oneshot semantics, unchanged).
 
-    The queue is snapshotted (:func:`commit_queue_state`) before each task cuts
-    its worktree, so a task added/edited mid-run is committed to ``HEAD`` and is
-    present in the worker's checkout instead of failing as a missing file.
+    There is no pre-run target-repo snapshot: briefs live in ``tasks_root`` and
+    are delivered to the worker via a run-scratch file, so the target repo only
+    ever receives the implementation squash.
     """
     emit: Listener = _noop
     if listeners:
@@ -2711,7 +2809,7 @@ def run_queue(
                 # the current on-disk state, never a list captured at play time.
                 # The running task is already in ``attempted`` (added below
                 # before its run_task call), so it's never reshuffled.
-                live = live_ordered_queue(root, tasks_rel)
+                live = live_ordered_queue(tasks_root, tasks_rel)
                 for stem in live:
                     if stem not in order and stem not in attempted:
                         order.append(stem)
@@ -2748,16 +2846,10 @@ def run_queue(
                     }))
                     break
 
-            # Per-task snapshot: commit any newly-added/edited queue files to HEAD
-            # before run_task cuts the worktree from it. Under the landing lock
-            # (queue-scoped) so a concurrent queue's snapshot/land can't race on
-            # the shared index/HEAD.
-            with landing_lock(root):
-                commit_queue_state(root, tasks_rel)
-
             def _run() -> TaskResult:
                 return run_task(
-                    root,
+                    workspace,
+                    tasks_root,
                     task,
                     emit=emit,
                     abort_reason=(

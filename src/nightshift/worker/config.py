@@ -51,7 +51,7 @@ DEFAULT_MAX_MODELS = {
 
 @dataclass
 class WorkerConfig:
-    root: Path
+    workspace: Path
     worker_id: str
     backend: str
     manager_url: str
@@ -102,9 +102,9 @@ class WorkerConfig:
         )
 
 
-def _load_dotenv(root: Path) -> None:
+def _load_dotenv(workspace: Path) -> None:
     """Load ``.env`` into ``os.environ`` (without overriding existing vars)."""
-    path = root / ".env"
+    path = workspace / ".env"
     if not path.exists():
         return
     for line in path.read_text(errors="replace").splitlines():
@@ -117,8 +117,8 @@ def _load_dotenv(root: Path) -> None:
         os.environ.setdefault(key, value)
 
 
-def _load_local(root: Path) -> dict:
-    path = root / LOCAL_CONFIG_REL
+def _load_local(workspace: Path) -> dict:
+    path = workspace / LOCAL_CONFIG_REL
     if not path.exists():
         return {}
     try:
@@ -148,10 +148,10 @@ def _int_csv(value: str | None) -> list[int] | None:
     return out or None
 
 
-def load_worker_config(root: Path) -> WorkerConfig:
-    root = root.resolve()
-    _load_dotenv(root)
-    local = _load_local(root)
+def load_worker_config(workspace: Path) -> WorkerConfig:
+    workspace = workspace.resolve()
+    _load_dotenv(workspace)
+    local = _load_local(workspace)
 
     backend = (
         os.environ.get("NIGHTSHIFT_WORKER_BACKEND")
@@ -189,7 +189,7 @@ def load_worker_config(root: Path) -> WorkerConfig:
     )
 
     return WorkerConfig(
-        root=root,
+        workspace=workspace,
         worker_id=worker_id,
         backend=backend,
         manager_url=manager_url,

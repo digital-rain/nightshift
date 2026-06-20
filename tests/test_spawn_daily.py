@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
+from _workspace import build_workspace, git, git_commit_all
 from nightshift._paths import TEMPLATES_DIR
 from nightshift.spawn_daily import (
     extract_items,
@@ -22,15 +22,28 @@ from nightshift.spawn_daily import (
 TEMPLATES = TEMPLATES_DIR
 
 
-def _seed_nightshift_tree(tmp_path: Path, *, names: tuple[str, ...] = ()) -> Path:
-    # The operator config the spawn logic reads lives at the repo root. Templates
-    # are resolved from the installed package, so the temp tree only needs the
-    # config and an empty ``.tasks`` queue.
-    (tmp_path / "config.json").write_text(
-        json.dumps({"model": "claude-sonnet-4-6", "max_turns": 60, "automerge": True, "draft": False})
+def _tasks_root(tmp_path: Path, *, commit: bool = False) -> Path:
+    """Build a two-root workspace and return its content-store root.
+
+    The spawn logic operates on the ``nightshift-tasks`` content store and its
+    default ``main`` queue (``<tasks_root>/main/``). The operator config it
+    layers in lives at ``<workspace>/config.json`` (``tasks_root.parent``);
+    seed it with the model defaults the original suite relied on so resolved
+    models stay stable. No target repos are needed — spawning never dispatches.
+    """
+    workspace = build_workspace(
+        tmp_path,
+        main_repo=None,
+        repos=(),
+        config={
+            "model": "claude-sonnet-4-6",
+            "max_turns": 60,
+            "automerge": True,
+            "draft": False,
+        },
+        commit_tasks=commit,
     )
-    (tmp_path / ".tasks").mkdir(parents=True, exist_ok=True)
-    return tmp_path
+    return workspace / "nightshift-tasks"
 
 
 def test_split_frontmatter_parses_model() -> None:
@@ -84,55 +97,57 @@ def test_extract_items_empty_body() -> None:
 
 
 def test_find_autosplit_sources(tmp_path: Path) -> None:
-    root = _seed_nightshift_tree(tmp_path, names=("task.md",))
-    (root / ".tasks/00._questions.md").write_text("---\nautosplit: true\n---\n")
-    (root / ".tasks/00._todo.md").write_text("---\nautosplit: true\n---\n")
-    (root / ".tasks/02.service-triage.md").write_text("---\nevergreen: true\n---\n")
-    (root / ".tasks/10.normal-task.md").write_text("Do something.\n")
+    tasks_root = _tasks_root(tmp_path)
+    main = tasks_root / "main"
+    (main / "00._questions.md").write_text("---\nautosplit: true\n---\n")
+    (main / "00._todo.md").write_text("---\nautosplit: true\n---\n")
+    (main / "02.service-triage.md").write_text("---\nevergreen: true\n---\n")
+    (main / "10.normal-task.md").write_text("Do something.\n")
 
-    sources = find_autosplit_sources(root)
+    sources = find_autosplit_sources(tasks_root)
     assert sources == ["00._questions", "00._todo"]
 
 
 def test_inspect_daily_todos_items(tmp_path: Path) -> None:
-    root = _seed_nightshift_tree(tmp_path, names=("task.md", "00._todo.md"))
-    (root / ".tasks/00._todo.md").write_text(
+    tasks_root = _tasks_root(tmp_path)
+    (tasks_root / "main/00._todo.md").write_text(
         (TEMPLATES / "00._todo.md").read_text()
         + "1. Fix the Ops screen\n* Add disable toggle\n"
     )
 
-    result = inspect_source(root, "00._todo")
+    result = inspect_source(tasks_root, "00._todo")
     assert result.item_count == 2
     assert result.items[0] == "Fix the Ops screen"
 
 
 def test_spawn_writes_tasks_and_resets_template(tmp_path: Path) -> None:
-    root = _seed_nightshift_tree(tmp_path, names=("task.md", "00._todo.md"))
-    (root / ".tasks/00._todo.md").write_text(
+    tasks_root = _tasks_root(tmp_path)
+    main = tasks_root / "main"
+    (main / "00._todo.md").write_text(
         "---\nautosplit: true\nmodel: claude-opus-4-6\n---\n\n"
         "Fix the following:\n\n"
         "1. First item\n2. Second item\n"
     )
 
-    results = spawn_all(root, write=True)
+    results = spawn_all(tasks_root, write=True)
     assert len(results) == 1
     assert len(results[0].spawned) == 2
     assert results[0].spawned[0].model == "claude-opus-4-6"
     assert "Fix the following:" in results[0].spawned[0].body
     assert "First item" in results[0].spawned[0].body
-    assert list((root / ".tasks").glob("00.*.md"))
-    assert (root / ".tasks/00._todo.md").read_text() == (
+    assert list(main.glob("00.*.md"))
+    assert (main / "00._todo.md").read_text() == (
         TEMPLATES / "00._todo.md"
     ).read_text()
 
 
 def test_spawn_questions_include_preamble(tmp_path: Path) -> None:
-    root = _seed_nightshift_tree(tmp_path, names=("task.md", "00._questions.md"))
-    (root / ".tasks/00._questions.md").write_text(
+    tasks_root = _tasks_root(tmp_path)
+    (tasks_root / "main/00._questions.md").write_text(
         (TEMPLATES / "00._questions.md").read_text() + "* What is the macro regime?\n"
     )
 
-    result = spawn_source(root, "00._questions", write=True)
+    result = spawn_source(tasks_root, "00._questions", write=True)
     assert result is not None
     assert "docs/daily/" in result.spawned[0].body
     assert "What is the macro regime?" in result.spawned[0].body
@@ -152,52 +167,42 @@ def test_is_disabled_false_explicit() -> None:
 
 
 def test_find_autosplit_sources_skips_disabled(tmp_path: Path) -> None:
-    root = _seed_nightshift_tree(tmp_path, names=("task.md",))
-    (root / ".tasks/00._todo.md").write_text("---\nautosplit: true\n---\n")
-    (root / ".tasks/00._questions.md").write_text(
+    tasks_root = _tasks_root(tmp_path)
+    main = tasks_root / "main"
+    (main / "00._todo.md").write_text("---\nautosplit: true\n---\n")
+    (main / "00._questions.md").write_text(
         "---\nautosplit: true\ndisabled: true\n---\n"
     )
-    sources = find_autosplit_sources(root)
+    sources = find_autosplit_sources(tasks_root)
     assert sources == ["00._todo"]
 
 
 def test_matrix_from_task_names_skips_disabled(tmp_path: Path) -> None:
-    root = _seed_nightshift_tree(tmp_path, names=("task.md",))
-    (root / ".tasks/10.active.md").write_text("---\nmodel: claude-sonnet-4-6\n---\nDo it.")
-    (root / ".tasks/20.paused.md").write_text(
+    tasks_root = _tasks_root(tmp_path)
+    main = tasks_root / "main"
+    (main / "10.active.md").write_text("---\nmodel: claude-sonnet-4-6\n---\nDo it.")
+    (main / "20.paused.md").write_text(
         "---\nmodel: claude-sonnet-4-6\ndisabled: true\n---\nDo later."
     )
-    entries = matrix_from_task_names(root, ["10.active", "20.paused"])
+    entries = matrix_from_task_names(tasks_root, ["10.active", "20.paused"])
     assert len(entries) == 1
     assert entries[0]["task"] == "10.active"
 
 
 def test_recover_matrix_from_git_diff(tmp_path: Path) -> None:
-    import subprocess
-
-    root = _seed_nightshift_tree(tmp_path, names=("task.md", "00._todo.md"))
-    (root / ".tasks/00._todo.md").write_text(
+    tasks_root = _tasks_root(tmp_path, commit=True)
+    main = tasks_root / "main"
+    (main / "00._todo.md").write_text(
         "---\nautosplit: true\n---\n\nFix the following:\n\n1. Ship dispatch PR flow\n"
     )
-    git_env = {
-        "GIT_AUTHOR_NAME": "test",
-        "GIT_AUTHOR_EMAIL": "test@test",
-        "GIT_COMMITTER_NAME": "test",
-        "GIT_COMMITTER_EMAIL": "test@test",
-    }
-    subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
-    subprocess.run(["git", "add", "."], cwd=root, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "base"],
-        cwd=root, check=True, capture_output=True, env=git_env,
-    )
-    spawn_source(root, "00._todo", write=True)
-    subprocess.run(["git", "add", ".tasks/"], cwd=root, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "spawn"],
-        cwd=root, check=True, capture_output=True, env=git_env,
-    )
-    matrix = recover_matrix(root, base_ref="HEAD^")
+    # Commit the autosplit source so the spawned subtasks are the only additions
+    # the recovery diff picks up (it runs against the content-store repo itself).
+    git_commit_all(tasks_root, "base autosplit source")
+    spawn_source(tasks_root, "00._todo", write=True)
+    git(tasks_root, "add", "main")
+    git_commit_all(tasks_root, "spawn")
+
+    matrix = recover_matrix(tasks_root, base_ref="HEAD^")
     assert len(matrix) == 1
     assert matrix[0]["task"].startswith("00.")
     assert matrix[0]["model"] == "claude-sonnet-4-6"

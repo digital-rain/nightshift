@@ -382,7 +382,7 @@ def test_thread_store_tolerates_missing_and_malformed(tmp_path: Path) -> None:
 
 
 def test_thread_store_for_queue_path(tmp_path: Path) -> None:
-    main = ThreadStore.for_queue(tmp_path, ".tasks")
-    assert main.path == tmp_path / ".tasks" / "slack-threads.json"
-    pl = ThreadStore.for_queue(tmp_path, ".tasks/experiments")
-    assert pl.path == tmp_path / ".tasks/experiments" / "slack-threads.json"
+    main = ThreadStore.for_queue(tmp_path)  # default queue dir is ``main``
+    assert main.path == tmp_path / "main" / "slack-threads.json"
+    pl = ThreadStore.for_queue(tmp_path, "experiments")
+    assert pl.path == tmp_path / "experiments" / "slack-threads.json"

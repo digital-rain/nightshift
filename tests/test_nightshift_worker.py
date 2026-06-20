@@ -4,7 +4,6 @@ handshake that actually lands a commit on main via the manager (co-located).
 
 from __future__ import annotations
 
-import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -12,6 +11,7 @@ from typing import Any
 from starlette.testclient import TestClient
 
 import nightshift.backends as backends_mod
+from _workspace import build_workspace
 from nightshift.backends import WorkerResult
 from nightshift.manager.app import create_app
 from nightshift.manager.store import MemoryStore
@@ -20,23 +20,14 @@ from nightshift.worker.local_store import LocalStore
 from nightshift.worker.loop import WorkerLoop
 
 
-def _git(root: Path, *args: str) -> None:
-    subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
-
-
 def _seed(tmp_path: Path, tasks: dict[str, str]) -> Path:
-    (tmp_path / "config.json").write_text(
-        json.dumps({"model": "auto", "validate": "true", "default_model": "auto"})
-    )
-    (tmp_path / ".tasks").mkdir(parents=True, exist_ok=True)
-    for name, content in tasks.items():
-        (tmp_path / ".tasks" / f"{name}.md").write_text(content)
-    _git(tmp_path, "init")
-    _git(tmp_path, "config", "user.email", "test@test")
-    _git(tmp_path, "config", "user.name", "test")
-    _git(tmp_path, "add", "-A")
-    _git(tmp_path, "commit", "-m", "init")
-    return tmp_path
+    """Build a two-root workspace seeded with ``tasks`` in the default queue.
+
+    Returns the workspace path. The content store is
+    ``<workspace>/nightshift-tasks`` and the default target repo (``longitude``)
+    is bound to the ``main`` queue, so a dispatched task lands there.
+    """
+    return build_workspace(tmp_path, tasks=tasks)
 
 
 # --------------------------------------------------------------------------- #
@@ -61,7 +52,7 @@ def test_worker_config_from_env(tmp_path: Path, monkeypatch) -> None:
 
 def _cfg(backend: str) -> WorkerConfig:
     return WorkerConfig(
-        root=Path("/tmp"), worker_id="w", backend=backend, manager_url="http://x"
+        workspace=Path("/tmp"), worker_id="w", backend=backend, manager_url="http://x"
     )
 
 
@@ -85,7 +76,7 @@ def test_model_resolution_no_vendor_mismatch() -> None:
 
 def test_model_aliases_remap_explicit_ids() -> None:
     cfg = WorkerConfig(
-        root=Path("/tmp"), worker_id="w", backend="gemini", manager_url="http://x",
+        workspace=Path("/tmp"), worker_id="w", backend="gemini", manager_url="http://x",
         model_aliases={"gemini-3-pro": "gemini-3-pro-002"},
     )
     # A mapped id resolves to its target; an unmapped id passes through; auto/max
@@ -169,27 +160,30 @@ class _LoopClient:
 
 
 def test_worker_lands_a_task_via_manager(tmp_path: Path, monkeypatch) -> None:
-    root = _seed(tmp_path, {"10.do": "---\nmodel: auto\n---\nDo the thing."})
+    workspace = _seed(tmp_path, {"10.do": "---\nmodel: auto\n---\nDo the thing."})
+    tasks_root = workspace / "nightshift-tasks"
+    repo_root = workspace / "longitude"  # the target repo bound to the main queue
     monkeypatch.setattr(backends_mod, "get_backend", lambda name: _CommittingBackend())
 
-    with TestClient(create_app(root, store=MemoryStore())) as tc:
+    with TestClient(create_app(workspace, store=MemoryStore())) as tc:
         cfg = WorkerConfig(
-            root=root, worker_id="w1", backend="claude-code",
+            workspace=workspace, worker_id="w1", backend="claude-code",
             manager_url="http://test",
         )
-        local = LocalStore(root)
+        local = LocalStore(workspace)
         loop = WorkerLoop(cfg, _LoopClient(tc), local)
         loop.checkin()
 
         did = loop.run_once()
         assert did is True
 
-        # The task landed on main (the generated file is now committed).
+        # The task landed on the TARGET repo's main (the generated file is now
+        # committed there, not in the workspace or the content store).
         log = subprocess.run(
-            ["git", "log", "--oneline"], cwd=root, capture_output=True, text=True
+            ["git", "log", "--oneline"], cwd=repo_root, capture_output=True, text=True
         ).stdout
         assert "task: " in log
-        assert (root / "GENERATED.txt").exists()
+        assert (repo_root / "GENERATED.txt").exists()
 
         # The run is recorded completed with a commit + backend/model captured.
         runs = tc.get("/api/runs").json()
@@ -197,12 +191,14 @@ def test_worker_lands_a_task_via_manager(tmp_path: Path, monkeypatch) -> None:
         assert runs[0]["status"] == "completed"
         assert runs[0]["commit_sha"]
         assert runs[0]["backend"] == "claude-code"
+        # The run carries the target repo it landed against.
+        assert runs[0]["repo"] == "longitude"
 
         # Local worker history reflects the landed run.
         assert local.history()[0]["status"] == "completed"
 
-        # The task file left the queue (completed tasks leave .tasks/).
-        assert not (root / ".tasks/10.do.md").exists()
+        # The task file left the content store's queue (completed tasks leave it).
+        assert not (tasks_root / "main/10.do.md").exists()
 
         # A second poll finds nothing left to do.
         assert loop.run_once() is False

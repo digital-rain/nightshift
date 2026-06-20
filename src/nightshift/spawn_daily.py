@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from nightshift._paths import asset
+from nightshift.repos import DEFAULT_TASKS_REPO
 
 
 ITEM_RE = re.compile(
@@ -53,19 +54,24 @@ class ExecuteResult:
     reset_written: bool
 
 
-def load_config(root: Path) -> dict:
-    return json.loads((root / "config.json").read_text())
+def load_config(workspace: Path) -> dict:
+    """Read the operator/host config at ``<workspace>/config.json`` (manager
+    block, ``tasks_repo`` name, and global runner defaults). Returns ``{}`` when
+    absent/malformed is *not* tolerated here — callers wrap the FileNotFoundError
+    as today (``resolve_config`` falls back to ``{}``)."""
+    return json.loads((workspace / "config.json").read_text())
 
 
-def save_config_value(root: Path, key: str, value: object) -> object:
-    """Set a single key in the root ``tools/nightshift/config.json``, preserving
-    sibling keys and their order. Returns the value written.
+def save_config_value(workspace: Path, key: str, value: object) -> object:
+    """Set a single key in ``<workspace>/config.json``, preserving sibling keys
+    and their order. Returns the value written.
 
     Used by the Settings UI for *global* knobs (e.g. ``max_concurrent_queues``)
-    that live in the root config rather than per-queue config or player settings.
-    ``config.json`` is worker-forbidden but operator-editable, so writing it from
-    the UI is an operator action consistent with the ``forbidden_paths`` model."""
-    path = root / "config.json"
+    that live in the operator config rather than per-queue config or player
+    settings. ``config.json`` is worker-forbidden but operator-editable, so
+    writing it from the UI is an operator action consistent with the
+    ``forbidden_paths`` model."""
+    path = workspace / "config.json"
     data: dict = {}
     if path.exists():
         try:
@@ -90,10 +96,11 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return out
 
 
-def load_queue_config(root: Path, tasks_rel: str = ".tasks") -> dict:
-    """Read a queue's ``config.json`` (the main ``.tasks`` dir or a playlist
-    sub-dir). Returns ``{}`` when the file is absent or malformed."""
-    path = root / tasks_rel / "config.json"
+def load_queue_config(tasks_root: Path, tasks_rel: str = "main") -> dict:
+    """Read a queue's ``config.json`` (``<tasks_root>/<tasks_rel>/config.json``;
+    ``tasks_rel`` is the queue dir, default ``main``). Returns ``{}`` when the
+    file is absent or malformed. The queue's ``repo`` key is read from here."""
+    path = tasks_root / tasks_rel / "config.json"
     if not path.exists():
         return {}
     try:
@@ -103,21 +110,34 @@ def load_queue_config(root: Path, tasks_rel: str = ".tasks") -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def resolve_config(root: Path, tasks_rel: str = ".tasks") -> dict:
-    """Layered runner config for a queue.
+def load_store_config(tasks_root: Path) -> dict:
+    """Read the optional workspace-level/system-wide content-store config at
+    ``<tasks_root>/config.json``. Returns ``{}`` when absent or malformed."""
+    path = tasks_root / "config.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (ValueError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
-    Resolution order (later wins): shipped ``tools/nightshift/config.json``
-    defaults, then the system-wide ``.tasks/config.json``, then — for a playlist
-    (``tasks_rel`` like ``.tasks/<name>``) — that playlist's own ``config.json``.
-    A playlist therefore inherits every setting it does not itself override.
+
+def resolve_config(workspace: Path, tasks_root: Path, tasks_rel: str = "main") -> dict:
+    """Layered runner config for a queue, rebased onto the two roots.
+
+    Resolution order (later wins): the operator/global ``<workspace>/config.json``,
+    then the optional workspace-level content-store ``<tasks_root>/config.json``
+    (the system-wide layer, formerly ``.tasks/config.json``), then the per-queue
+    ``<tasks_root>/<tasks_rel>/config.json``. A queue therefore inherits every
+    setting it does not itself override.
     """
     try:
-        merged = load_config(root)
+        merged = load_config(workspace)
     except (FileNotFoundError, ValueError):
         merged = {}
-    merged = _deep_merge(merged, load_queue_config(root, ".tasks"))
-    if tasks_rel and tasks_rel != ".tasks":
-        merged = _deep_merge(merged, load_queue_config(root, tasks_rel))
+    merged = _deep_merge(merged, load_store_config(tasks_root))
+    merged = _deep_merge(merged, load_queue_config(tasks_root, tasks_rel))
     return merged
 
 
@@ -212,9 +232,13 @@ def task_priority(meta: dict, default: int = DEFAULT_PRIORITY) -> int:
     return max(MIN_PRIORITY, min(MAX_PRIORITY, value))
 
 
-def find_autosplit_sources(root: Path) -> list[str]:
-    """Return sorted stems of task files with autosplit: true in frontmatter."""
-    tasks_dir = root / ".tasks"
+def find_autosplit_sources(tasks_root: Path, tasks_rel: str = "main") -> list[str]:
+    """Return sorted stems of task files with autosplit: true in frontmatter.
+
+    Scans the queue dir ``<tasks_root>/<tasks_rel>`` of the content store (the
+    default queue is ``main``).
+    """
+    tasks_dir = tasks_root / tasks_rel
     sources: list[str] = []
     for p in sorted(tasks_dir.glob("*.md")):
         text = p.read_text(errors="replace")
@@ -288,8 +312,10 @@ def render_spawned_task(
     return text
 
 
-def inspect_source(root: Path, source: str) -> InspectResult:
-    path = root / ".tasks" / f"{source}.md"
+def inspect_source(
+    tasks_root: Path, source: str, tasks_rel: str = "main"
+) -> InspectResult:
+    path = tasks_root / tasks_rel / f"{source}.md"
     if not path.exists():
         return InspectResult(source=source, item_count=0, items=[])
     _meta, body = split_frontmatter(path.read_text())
@@ -297,16 +323,20 @@ def inspect_source(root: Path, source: str) -> InspectResult:
     return InspectResult(source=source, item_count=len(items), items=items)
 
 
-def spawn_source(root: Path, source: str, *, write: bool = False) -> ExecuteResult | None:
-    inspect = inspect_source(root, source)
+def spawn_source(
+    tasks_root: Path, source: str, *, write: bool = False, tasks_rel: str = "main"
+) -> ExecuteResult | None:
+    inspect = inspect_source(tasks_root, source, tasks_rel)
     if inspect.item_count == 0:
         return None
 
-    path = root / ".tasks" / f"{source}.md"
+    path = tasks_root / tasks_rel / f"{source}.md"
     meta, body = split_frontmatter(path.read_text())
-    config = load_config(root)
+    # ``tasks_root`` is ``<workspace>/<tasks_repo>`` by construction, so the
+    # workspace is its parent — use the layered queue config for model defaults.
+    config = resolve_config(tasks_root.parent, tasks_root, tasks_rel)
     resolved = resolve_frontmatter(meta, config)
-    tasks_dir = root / ".tasks"
+    tasks_dir = tasks_root / tasks_rel
     template = asset("templates", "task.md")
     evergreen_template = asset("templates", f"{source}.md")
     parent_num = source.split(".", 1)[0]
@@ -341,15 +371,17 @@ def spawn_source(root: Path, source: str, *, write: bool = False) -> ExecuteResu
             (tasks_dir / f"{name}.md").write_text(content)
 
     if write:
-        (root / ".tasks" / f"{source}.md").write_text(evergreen_template.read_text())
+        (tasks_dir / f"{source}.md").write_text(evergreen_template.read_text())
 
     return ExecuteResult(source=source, spawned=spawned, reset_written=write)
 
 
-def spawn_all(root: Path, *, write: bool = False) -> list[ExecuteResult]:
+def spawn_all(
+    tasks_root: Path, *, write: bool = False, tasks_rel: str = "main"
+) -> list[ExecuteResult]:
     results: list[ExecuteResult] = []
-    for source in find_autosplit_sources(root):
-        result = spawn_source(root, source, write=write)
+    for source in find_autosplit_sources(tasks_root, tasks_rel):
+        result = spawn_source(tasks_root, source, write=write, tasks_rel=tasks_rel)
         if result is not None:
             results.append(result)
     return results
@@ -370,16 +402,19 @@ def matrix_entries(results: list[ExecuteResult]) -> list[dict]:
 
 
 def matrix_from_task_names(
-    root: Path,
+    tasks_root: Path,
     names: list[str],
     *,
     scheduled_only: bool = False,
+    tasks_rel: str = "main",
 ) -> list[dict]:
-    config = load_config(root)
+    # ``tasks_root`` is ``<workspace>/<tasks_repo>``; resolve the layered queue
+    # config (its parent is the workspace by construction).
+    config = resolve_config(tasks_root.parent, tasks_root, tasks_rel)
     scheduled_models = config.get("scheduled_models")
     entries: list[dict] = []
     for name in names:
-        path = root / ".tasks" / f"{name}.md"
+        path = tasks_root / tasks_rel / f"{name}.md"
         meta = split_frontmatter(path.read_text())[0] if path.exists() else {}
         if is_disabled(meta):
             print(f"skip {name}: disabled", file=sys.stderr)
@@ -402,7 +437,9 @@ def matrix_from_task_names(
     return entries
 
 
-def recover_matrix(root: Path, *, base_ref: str) -> list[dict]:
+def recover_matrix(
+    tasks_root: Path, *, base_ref: str, tasks_rel: str = "main"
+) -> list[dict]:
     out = subprocess.check_output(
         [
             "git",
@@ -411,10 +448,10 @@ def recover_matrix(root: Path, *, base_ref: str) -> list[dict]:
             "--diff-filter=A",
             f"{base_ref}...HEAD",
             "--",
-            ".tasks/",
+            f"{tasks_rel}/",
         ],
         text=True,
-        cwd=root,
+        cwd=tasks_root,
     )
     names: list[str] = []
     for line in out.splitlines():
@@ -426,12 +463,12 @@ def recover_matrix(root: Path, *, base_ref: str) -> list[dict]:
     names.sort()
     if not names:
         return []
-    return matrix_from_task_names(root, names)
+    return matrix_from_task_names(tasks_root, names, tasks_rel=tasks_rel)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=Path.cwd())
+    parser.add_argument("--workspace", type=Path, default=Path.cwd())
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("list-autosplit", help="List autosplit source names (JSON array)")
@@ -471,26 +508,35 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
-    root = args.root.resolve()
+    workspace = args.workspace.resolve()
+    # The content store ``tasks_root = <workspace>/<tasks_repo>`` holds briefs and
+    # queue config; the CLI subcommands operate on its default ``main`` queue.
+    try:
+        host_config = load_config(workspace)
+    except (FileNotFoundError, ValueError):
+        host_config = {}
+    tasks_repo = str(host_config.get("tasks_repo") or DEFAULT_TASKS_REPO)
+    tasks_root = workspace / tasks_repo
+    tasks_rel = "main"
 
     if args.cmd == "list-autosplit":
-        print(json.dumps(find_autosplit_sources(root)))
+        print(json.dumps(find_autosplit_sources(tasks_root, tasks_rel)))
         return 0
 
     if args.cmd == "inspect":
-        print(json.dumps(asdict(inspect_source(root, args.source))))
+        print(json.dumps(asdict(inspect_source(tasks_root, args.source, tasks_rel))))
         return 0
 
     if args.cmd == "inspect-all":
         payload = [
-            asdict(inspect_source(root, source))
-            for source in find_autosplit_sources(root)
+            asdict(inspect_source(tasks_root, source, tasks_rel))
+            for source in find_autosplit_sources(tasks_root, tasks_rel)
         ]
         print(json.dumps(payload))
         return 0
 
     if args.cmd == "execute-all":
-        sources = find_autosplit_sources(root)
+        sources = find_autosplit_sources(tasks_root, tasks_rel)
         if args.sources:
             parsed = json.loads(args.sources)
             if not isinstance(parsed, list):
@@ -498,7 +544,7 @@ def main(argv: list[str] | None = None) -> int:
             sources = parsed
         results: list[ExecuteResult] = []
         for source in sources:
-            result = spawn_source(root, source, write=args.write)
+            result = spawn_source(tasks_root, source, write=args.write, tasks_rel=tasks_rel)
             if result is not None:
                 results.append(result)
         print(
@@ -522,12 +568,14 @@ def main(argv: list[str] | None = None) -> int:
         names = json.loads(args.tasks)
         if not isinstance(names, list):
             raise SystemExit("--tasks must be a JSON array")
-        entries = matrix_from_task_names(root, names, scheduled_only=args.scheduled_only)
+        entries = matrix_from_task_names(
+            tasks_root, names, scheduled_only=args.scheduled_only, tasks_rel=tasks_rel
+        )
         print(json.dumps(entries))
         return 0
 
     if args.cmd == "recover-matrix":
-        print(json.dumps(recover_matrix(root, base_ref=args.base_ref)))
+        print(json.dumps(recover_matrix(tasks_root, base_ref=args.base_ref, tasks_rel=tasks_rel)))
         return 0
 
     return 1

@@ -93,14 +93,17 @@ def parse_duration(value: str) -> int:
     return total
 
 
-def settings_path(root: Path) -> Path:
-    return root / SETTINGS_REL_PATH
+def settings_path(workspace: Path) -> Path:
+    return workspace / SETTINGS_REL_PATH
 
 
-def load_settings(root: Path) -> dict[str, Any]:
-    """Return defaults merged with any persisted values."""
+def load_settings(workspace: Path) -> dict[str, Any]:
+    """Return defaults merged with any persisted values.
+
+    Player settings are operator/host-level, so they live at the workspace root
+    (``<workspace>/.nightshift/settings.json``)."""
     values = dict(DEFAULTS)
-    path = settings_path(root)
+    path = settings_path(workspace)
     if path.exists():
         try:
             stored = json.loads(path.read_text())
@@ -139,12 +142,12 @@ def validate_settings(values: dict[str, Any]) -> list[str]:
     return errors
 
 
-def save_settings(root: Path, incoming: dict[str, Any]) -> dict[str, Any]:
+def save_settings(workspace: Path, incoming: dict[str, Any]) -> dict[str, Any]:
     """Validate and persist settings, returning the merged result.
 
     Raises ``ValueError`` (joined messages) when validation fails.
     """
-    merged = load_settings(root)
+    merged = load_settings(workspace)
     for key in DEFAULTS:
         if key in incoming:
             merged[key] = incoming[key]
@@ -155,7 +158,7 @@ def save_settings(root: Path, incoming: dict[str, Any]) -> dict[str, Any]:
     if errors:
         raise ValueError("; ".join(errors))
 
-    path = settings_path(root)
+    path = settings_path(workspace)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(merged, indent=2) + "\n")
     return merged

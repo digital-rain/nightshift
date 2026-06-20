@@ -27,10 +27,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from nightshift import playlists as playlists_mod
+from nightshift import repos
 from nightshift._paths import UI_DIR
 from nightshift.engine import (
+    commit_tasks,
+    compute_code_loc,
     create_task,
     delete_task,
+    drop_completed_task,
     list_queue,
     load_play_priorities,
     load_sort_mode,
@@ -38,11 +42,15 @@ from nightshift.engine import (
     reorder_queue,
     resolve_title,
     save_play_priorities,
+    save_queue_config_value,
     save_sort_mode,
+    set_task_meta,
+    task_is_evergreen,
 )
 from nightshift.events import new_run_id
 from nightshift.manager.config import ManagerConfig, load_manager_config
 from nightshift.manager.hub import Hub
+from nightshift.manager.landing import canonical_head, land
 from nightshift.manager.registry import Registry
 from nightshift.manager.scheduler import (
     SchedulerState,
@@ -55,7 +63,7 @@ from nightshift.manager.scheduler import (
 )
 from nightshift.manager.store import NightshiftStore, open_store
 from nightshift.server import settings as settings_mod
-from nightshift.spawn_daily import resolve_config, split_frontmatter
+from nightshift.spawn_daily import load_queue_config, resolve_config, split_frontmatter
 
 
 # UI assets ship inside the package (see nightshift._paths.UI_DIR).
@@ -140,9 +148,47 @@ class QueueDedication(BaseModel):
     worker_ids: list[str]
 
 
+class QueueConfig(BaseModel):
+    # Per-queue default target repo (workspace-relative child name). ``None``
+    # clears the binding (a queue with no repo is an authoring error on dispatch).
+    repo: str | None = None
+
+
 class TaskCreate(BaseModel):
     title: str
     text: str
+    # Optional per-task repo override (defaults to the queue's repo). Written as
+    # an editable frontmatter meta key on the new brief.
+    repo: str | None = None
+
+
+class TaskUpdate(BaseModel):
+    # Partial edit; unset fields are left untouched. ``repo`` is an editable
+    # frontmatter meta key (the per-task target-repo override).
+    repo: str | None = None
+
+
+def _normalize_repo(value: object) -> str | None:
+    """Validate an optional per-task repo override from a request payload.
+
+    ``None`` / ``""`` / ``"default"`` clear the override (the task then inherits
+    the queue default); any other value must be a bare workspace-child slug or
+    it is rejected as a 400 (the path-traversal guard) — surfaced at edit time
+    rather than silently written and only caught later at dispatch. Mirrors the
+    legacy server's guard so the shared UI behaves identically on both backends.
+    """
+    if value in (None, "", "default"):
+        return None
+    repo = str(value).strip()
+    if not repo:
+        return None
+    if not repos.is_valid_repo_ref(repo):
+        raise ValueError(
+            f"invalid repo reference {repo!r}: a repo must be a bare workspace "
+            "child name matching [a-z0-9][a-z0-9-]* (no paths, '..', '/', or "
+            "absolute paths)"
+        )
+    return repo
 
 
 # --------------------------------------------------------------------------- #
@@ -150,9 +196,14 @@ class TaskCreate(BaseModel):
 # --------------------------------------------------------------------------- #
 
 
-def create_app(root: Path, *, store: NightshiftStore | None = None) -> FastAPI:
-    root = root.resolve()
-    cfg: ManagerConfig = load_manager_config(root)
+def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> FastAPI:
+    workspace = Path(workspace).resolve()
+    cfg: ManagerConfig = load_manager_config(workspace)
+    # The two roots: briefs/queue config live in the content store
+    # (``tasks_root``); git ops resolve a target repo per task under the
+    # workspace. ``tasks_repo`` is the content-store repo's bare child name.
+    tasks_repo = cfg.tasks_repo
+    tasks_root = workspace / tasks_repo
 
     @contextlib.asynccontextmanager
     async def _lifespan(app: FastAPI):
@@ -167,10 +218,15 @@ def create_app(root: Path, *, store: NightshiftStore | None = None) -> FastAPI:
 
     app = FastAPI(title="Nightshift Manager", lifespan=_lifespan)
 
-    app.state.root = root
+    app.state.workspace = workspace
+    app.state.tasks_root = tasks_root
+    app.state.tasks_repo = tasks_repo
     app.state.cfg = cfg
     app.state.hub = Hub()
     app.state.sched_state = SchedulerState()
+    # One repo_unavailable warning per queue (deduped by queue key); cleared on
+    # rescan so a re-cloned repo re-warns if it disappears again.
+    app.state.repo_warnings = set()
     app.state.store = store  # may be None until lifespan opens one
 
     def _store() -> NightshiftStore:
@@ -218,10 +274,16 @@ def create_app(root: Path, *, store: NightshiftStore | None = None) -> FastAPI:
         return label
 
     def _queue_exists(queue: str | None) -> bool:
-        return queue is None or playlists_mod.exists(root, queue)
+        return queue is None or playlists_mod.exists(tasks_root, queue)
 
     def _all_queues() -> list[str | None]:
-        return [None, *[p["name"] for p in playlists_mod.list_playlists(root)]]
+        return [None, *[p["name"] for p in playlists_mod.list_playlists(tasks_root)]]
+
+    def _queue_repo(queue: str | None) -> str | None:
+        """The queue's configured default target repo (or ``None`` when unset)."""
+        return load_queue_config(
+            tasks_root, playlists_mod.tasks_rel(queue)
+        ).get("repo")
 
     # ===================================================================== #
     # Worker API
@@ -258,9 +320,10 @@ def create_app(root: Path, *, store: NightshiftStore | None = None) -> FastAPI:
         await store.reclaim_expired_leases()
         await _registry().reap_stale()
 
-        # Build candidates across every queue from the canonical briefs.
+        # Build candidates across every queue from the canonical briefs in the
+        # content store (each candidate already carries its resolved target repo).
         candidates_by_queue = {
-            q: build_candidates(root, q, default_model=cfg.default_model)
+            q: build_candidates(tasks_root, q, default_model=cfg.default_model)
             for q in _all_queues()
         }
 
@@ -293,10 +356,50 @@ def create_app(root: Path, *, store: NightshiftStore | None = None) -> FastAPI:
                     payload={"reason": reason},
                 )
 
+        # Repo resolution & availability: a malformed/unset repo reference is an
+        # authoring error (-> blocked); a well-formed name whose repo is absent
+        # pauses the task (-> repo_unavailable) and warns once per queue. Both
+        # are excluded from dispatch; neither records a failed run.
+        repo_excluded: set[tuple[str | None, str]] = set()
+        for cands in candidates_by_queue.values():
+            for cand in cands:
+                key = (cand.queue, cand.task)
+                if cand.repo_error is not None:
+                    existing = await store.get_task_state(cand.queue, cand.task)
+                    if not existing or existing.get("state") != "blocked":
+                        await store.set_task_state(
+                            cand.queue, cand.task, "blocked",
+                            blocked_reason=cand.repo_error,
+                        )
+                        await _emit(
+                            "task_blocked",
+                            queue=cand.queue,
+                            task=cand.task,
+                            payload={"reason": cand.repo_error},
+                        )
+                    repo_excluded.add(key)
+                elif cand.repo and not repos.repo_available(workspace, cand.repo):
+                    existing = await store.get_task_state(cand.queue, cand.task)
+                    if not existing or existing.get("state") != "repo_unavailable":
+                        await store.set_task_state(
+                            cand.queue, cand.task, "repo_unavailable", repo=cand.repo
+                        )
+                    repo_excluded.add(key)
+                    if cand.queue not in app.state.repo_warnings:
+                        app.state.repo_warnings.add(cand.queue)
+                        await _emit(
+                            "repo_unavailable",
+                            queue=cand.queue,
+                            task=cand.task,
+                            payload={"repo": cand.repo},
+                        )
+
         active = await store.active_leases()
         leased = {(_queue_from_label(le["queue"]), le["task"]) for le in active}
         blocked_rows = await store.list_blocked()
         blocked = {(_queue_from_label(b["queue"]), b["task"]) for b in blocked_rows}
+        # Never dispatch a paused (repo_unavailable) or repo-blocked task.
+        blocked |= repo_excluded
 
         worker = WorkerFilter(
             worker_id=body.worker_id,
@@ -316,9 +419,14 @@ def create_app(root: Path, *, store: NightshiftStore | None = None) -> FastAPI:
         if chosen is None:
             return JSONResponse({"work": None}, status_code=200)
 
-        from nightshift.manager.landing import canonical_head
-
-        base_ref = canonical_head(root)
+        # The chosen candidate is repo-available by construction; clear any prior
+        # paused/blocked overlay it may carry (e.g. a now-resolved repo) so the
+        # dispatch is clean, and pin the target repo's HEAD as base_ref.
+        repo = chosen.repo
+        prior = await store.get_task_state(chosen.queue, chosen.task)
+        if prior and prior.get("state") in ("repo_unavailable", "blocked"):
+            await store.clear_task_state(chosen.queue, chosen.task)
+        base_ref = canonical_head(workspace / repo)
         lease = await store.acquire_lease(
             task=chosen.task,
             queue=chosen.queue,
@@ -333,7 +441,8 @@ def create_app(root: Path, *, store: NightshiftStore | None = None) -> FastAPI:
 
         run_id = new_run_id()
         order = _build_work_order(
-            root, chosen.task, chosen.queue, lease["id"], run_id, base_ref, cfg
+            workspace, tasks_root, chosen.task, chosen.queue, repo,
+            lease["id"], run_id, base_ref, cfg,
         )
         await store.create_run(
             run_id,
@@ -345,6 +454,7 @@ def create_app(root: Path, *, store: NightshiftStore | None = None) -> FastAPI:
             title=order["title"],
             body=order["body"],
             required_mcps=list(chosen.required_mcps),
+            repo=repo,
         )
         await store.set_lease_status(lease["id"], "leased", run_id=run_id)
         await _registry().set_busy(
@@ -401,6 +511,9 @@ def create_app(root: Path, *, store: NightshiftStore | None = None) -> FastAPI:
         queue = _queue_from_label(body.queue)
         lease = await store.get_lease(body.lease_id)
         base_ref = lease.get("base_ref") if lease else None
+        # The target repo the worker ran against is recorded on the run (and is
+        # workspace-relative); landing materialises ``workspace / repo``.
+        repo = run.get("repo")
 
         # Agent telemetry recorded on every outcome (a failed/no-change run still
         # burned turns + tokens), so the per-task rollups stay accurate.
@@ -410,6 +523,32 @@ def create_app(root: Path, *, store: NightshiftStore | None = None) -> FastAPI:
             "output_tokens": body.output_tokens,
             "cost_usd": body.cost_usd,
         }
+
+        # An honest block from the worker (no commits): record the outcome, hold
+        # the task in the DB ``blocked`` state with its reason, do NOT land and do
+        # NOT drop the brief, so a Resolve can pick it up later.
+        if body.status == "blocked":
+            reason = body.failure_reason or body.result_line or "blocked"
+            await store.update_run(
+                run_id,
+                status="blocked",
+                result_line=body.result_line,
+                failure_kind=body.failure_kind or "blocked",
+                failure_reason=body.failure_reason,
+                model=body.model,
+                **telemetry,
+            )
+            await store.set_lease_status(body.lease_id, "released")
+            await store.set_task_state(queue, body.task, "blocked", blocked_reason=reason)
+            await _registry().set_idle(body.worker_id)
+            await _emit(
+                "task_blocked", queue=queue, task=body.task, payload={"reason": reason},
+            )
+            await _emit(
+                "task_result", run_id=run_id, queue=queue, task=body.task,
+                payload={"status": "blocked", "result_line": body.result_line},
+            )
+            return JSONResponse({"landed": False, "status": "blocked"})
 
         # A non-completed submit (worker failed/aborted before producing a branch)
         # records the outcome and releases the lease without touching main.
@@ -451,11 +590,11 @@ def create_app(root: Path, *, store: NightshiftStore | None = None) -> FastAPI:
             await _emit("queue_changed", queue=queue)
             return JSONResponse({"landed": False, "status": "completed", "no_changes": True})
 
-        from nightshift.manager.landing import land
-
-        meta = _task_meta(root, body.task, queue)
+        tasks_rel = playlists_mod.tasks_rel(queue)
+        meta = _task_meta(tasks_root, body.task, queue)
         result = land(
-            root,
+            workspace,
+            repo,
             body.task,
             body.title,
             queue=queue,
@@ -463,9 +602,11 @@ def create_app(root: Path, *, store: NightshiftStore | None = None) -> FastAPI:
             landing_mode=cfg.landing_mode,
             automerge=bool(meta.get("automerge", True)),
             draft=bool(meta.get("draft", False)),
-            autostash=bool(resolve_config(root, playlists_mod.tasks_rel(queue)).get(
-                "autostash_operator_work", True
-            )),
+            autostash=bool(
+                resolve_config(workspace, tasks_root, tasks_rel).get(
+                    "autostash_operator_work", True
+                )
+            ),
         )
 
         if not result.landed:
@@ -503,24 +644,17 @@ def create_app(root: Path, *, store: NightshiftStore | None = None) -> FastAPI:
             )
 
         # Backstop the worker's queue removal: a completed regular task must
-        # leave the queue. Evergreen tasks keep their file and re-run.
-        from nightshift.engine import (
-            compute_code_loc,
-            drop_completed_task,
-            task_is_evergreen,
-        )
-
-        tasks_rel = playlists_mod.tasks_rel(queue)
+        # leave the content store. Evergreen tasks keep their file and re-run.
         if not task_is_evergreen(
-            meta, body.task, resolve_config(root, tasks_rel)
+            meta, body.task, resolve_config(workspace, tasks_root, tasks_rel)
         ):
             with contextlib.suppress(Exception):
-                drop_completed_task(root, body.task, tasks_rel, queue=queue)
+                drop_completed_task(tasks_root, body.task, tasks_rel, queue=queue)
 
         loc = None
         if result.sha:
             with contextlib.suppress(Exception):
-                loc = compute_code_loc(root, result.sha)
+                loc = compute_code_loc(workspace / repo, result.sha)
         await store.update_run(
             run_id,
             status="completed",
@@ -564,27 +698,75 @@ def create_app(root: Path, *, store: NightshiftStore | None = None) -> FastAPI:
         target = _queue_from_label(queue)
         if not _queue_exists(target):
             return JSONResponse({"error": "queue not found"}, status_code=404)
-        return JSONResponse(list_queue(root, playlists_mod.tasks_rel(target)))
+        return JSONResponse(list_queue(tasks_root, playlists_mod.tasks_rel(target)))
 
     @app.get("/api/tasks/{task}")
     def get_task(task: str, queue: str | None = None) -> JSONResponse:
         target = _queue_from_label(queue)
         try:
-            return JSONResponse(read_task(root, task, playlists_mod.tasks_rel(target)))
+            return JSONResponse(read_task(tasks_root, task, playlists_mod.tasks_rel(target)))
         except FileNotFoundError:
             return JSONResponse({"error": "task not found"}, status_code=404)
 
     @app.post("/api/tasks")
     async def post_task(body: TaskCreate, queue: str | None = None) -> JSONResponse:
         target = _queue_from_label(queue)
-        created = create_task(root, body.title, body.text, playlists_mod.tasks_rel(target))
+        target_rel = playlists_mod.tasks_rel(target)
+        # Validate the optional repo override *before* writing the brief so a
+        # malformed ref is a clean 400 that never orphans a file in the content
+        # store (matches the legacy server and the contract's edit-time guard).
+        try:
+            repo_override = _normalize_repo(body.repo)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        try:
+            created = create_task(tasks_root, body.title, body.text, target_rel)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except FileExistsError as exc:
+            return JSONResponse({"error": f"task already exists: {exc}"}, status_code=409)
+        # Optional per-task repo override is written as an editable meta key.
+        if repo_override is not None:
+            with contextlib.suppress(FileNotFoundError, ValueError):
+                set_task_meta(
+                    tasks_root, created["task"], {"repo": repo_override}, target_rel
+                )
+        commit_tasks(tasks_root, f"nightshift: create task {created['task']}")
         await _emit("queue_changed", queue=target, task=created.get("task"))
         return JSONResponse(created)
+
+    @app.patch("/api/tasks/{task}")
+    async def patch_task(
+        task: str, body: TaskUpdate, queue: str | None = None
+    ) -> JSONResponse:
+        target = _queue_from_label(queue)
+        target_rel = playlists_mod.tasks_rel(target)
+        # ``repo`` is the per-task target-repo override (an editable meta key).
+        changes = body.model_dump(exclude_unset=True)
+        if not changes:
+            return JSONResponse({"error": "no fields to update"}, status_code=400)
+        # A malformed override is a 400 here (edit-time guard); a sent ``null``
+        # clears it so the task falls back to the queue default.
+        if "repo" in changes:
+            try:
+                changes["repo"] = _normalize_repo(changes["repo"])
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+        try:
+            updated = set_task_meta(tasks_root, task, changes, target_rel)
+        except FileNotFoundError:
+            return JSONResponse({"error": "task not found"}, status_code=404)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        commit_tasks(tasks_root, f"nightshift: edit task {task}")
+        await _emit("queue_changed", queue=target, task=task)
+        return JSONResponse(updated)
 
     @app.delete("/api/tasks/{task}")
     async def remove_task(task: str, queue: str | None = None) -> JSONResponse:
         target = _queue_from_label(queue)
-        result = delete_task(root, task, playlists_mod.tasks_rel(target))
+        result = delete_task(tasks_root, task, playlists_mod.tasks_rel(target))
+        commit_tasks(tasks_root, f"nightshift: delete task {task}")
         await _emit("queue_changed", queue=target, task=task)
         return JSONResponse(result)
 
@@ -593,19 +775,23 @@ def create_app(root: Path, *, store: NightshiftStore | None = None) -> FastAPI:
         target = _queue_from_label(queue)
         if not _queue_exists(target):
             return JSONResponse({"error": "queue not found"}, status_code=404)
-        order = reorder_queue(root, req.order, playlists_mod.tasks_rel(target))
+        target_rel = playlists_mod.tasks_rel(target)
+        order = reorder_queue(tasks_root, req.order, target_rel)
+        commit_tasks(tasks_root, f"nightshift: reorder queue {queue_label(target)}")
         await _emit("queue_changed", queue=target, payload={"order": order})
         return JSONResponse({"order": order})
 
     @app.get("/api/queue/sort")
     def get_queue_sort(queue: str | None = None) -> JSONResponse:
         target = _queue_from_label(queue)
-        return JSONResponse({"sort": load_sort_mode(root, playlists_mod.tasks_rel(target))})
+        return JSONResponse({"sort": load_sort_mode(tasks_root, playlists_mod.tasks_rel(target))})
 
     @app.put("/api/queue/sort")
     async def put_queue_sort(req: QueueSort, queue: str | None = None) -> JSONResponse:
         target = _queue_from_label(queue)
-        sort = save_sort_mode(root, req.sort, playlists_mod.tasks_rel(target))
+        target_rel = playlists_mod.tasks_rel(target)
+        sort = save_sort_mode(tasks_root, req.sort, target_rel)
+        commit_tasks(tasks_root, f"nightshift: set sort {queue_label(target)}")
         await _emit("queue_changed", queue=target, payload={"sort": sort})
         return JSONResponse({"sort": sort})
 
@@ -613,7 +799,7 @@ def create_app(root: Path, *, store: NightshiftStore | None = None) -> FastAPI:
     def get_play_priorities(queue: str | None = None) -> JSONResponse:
         target = _queue_from_label(queue)
         return JSONResponse(
-            {"priorities": load_play_priorities(root, playlists_mod.tasks_rel(target))}
+            {"priorities": load_play_priorities(tasks_root, playlists_mod.tasks_rel(target))}
         )
 
     @app.put("/api/queue/play-priorities")
@@ -621,11 +807,59 @@ def create_app(root: Path, *, store: NightshiftStore | None = None) -> FastAPI:
         req: QueuePlayPriorities, queue: str | None = None
     ) -> JSONResponse:
         target = _queue_from_label(queue)
-        priorities = save_play_priorities(
-            root, req.priorities, playlists_mod.tasks_rel(target)
-        )
+        target_rel = playlists_mod.tasks_rel(target)
+        priorities = save_play_priorities(tasks_root, req.priorities, target_rel)
+        commit_tasks(tasks_root, f"nightshift: set play-priorities {queue_label(target)}")
         await _emit("queue_changed", queue=target, payload={"priorities": priorities})
         return JSONResponse({"priorities": priorities})
+
+    @app.get("/api/queue/config")
+    def get_queue_config(queue: str | None = None) -> JSONResponse:
+        target = _queue_from_label(queue)
+        if not _queue_exists(target):
+            return JSONResponse({"error": "queue not found"}, status_code=404)
+        return JSONResponse({"repo": _queue_repo(target)})
+
+    async def _set_queue_repo(target: str | None, req: QueueConfig) -> JSONResponse:
+        """Persist a queue's default target repo into its ``config.json`` and
+        commit the content store. A null/empty value clears the binding; a
+        malformed name is rejected (the path-traversal guard — a per-task ``repo``
+        override still wins at dispatch, but a bad queue default is an authoring
+        error we surface here rather than at poll time)."""
+        if not _queue_exists(target):
+            return JSONResponse({"error": "queue not found"}, status_code=404)
+        repo_value = req.repo.strip() if isinstance(req.repo, str) else None
+        repo_value = repo_value or None
+        if repo_value is not None and not repos.is_valid_repo_ref(repo_value):
+            return JSONResponse(
+                {"error": (
+                    f"invalid repo reference {repo_value!r}: a repo must be a bare "
+                    "workspace child name (no paths, '..', '/', or absolute paths)"
+                )},
+                status_code=400,
+            )
+        target_rel = playlists_mod.tasks_rel(target)
+        save_queue_config_value(tasks_root, "repo", repo_value, target_rel)
+        commit_tasks(tasks_root, f"nightshift: set repo {queue_label(target)}")
+        await _emit("queue_changed", queue=target, payload={"repo": repo_value})
+        return JSONResponse({"repo": repo_value})
+
+    @app.put("/api/queue/config")
+    async def put_queue_config(req: QueueConfig, queue: str | None = None) -> JSONResponse:
+        return await _set_queue_repo(_queue_from_label(queue), req)
+
+    @app.get("/api/queue/repo")
+    def get_queue_repo(queue: str | None = None) -> JSONResponse:
+        """The target queue's default repo (mirrors the server's dedicated
+        ``/api/queue/repo`` so the shared UI has one binding endpoint)."""
+        target = _queue_from_label(queue)
+        if not _queue_exists(target):
+            return JSONResponse({"error": "queue not found"}, status_code=404)
+        return JSONResponse({"repo": _queue_repo(target)})
+
+    @app.put("/api/queue/repo")
+    async def put_queue_repo(req: QueueConfig, queue: str | None = None) -> JSONResponse:
+        return await _set_queue_repo(_queue_from_label(queue), req)
 
     @app.get("/api/queue/dedication")
     async def get_queue_dedication(queue: str | None = None) -> JSONResponse:
@@ -651,7 +885,57 @@ def create_app(root: Path, *, store: NightshiftStore | None = None) -> FastAPI:
 
     @app.get("/api/playlists")
     def get_playlists() -> JSONResponse:
-        return JSONResponse(playlists_mod.list_playlists(root))
+        return JSONResponse(playlists_mod.list_playlists(tasks_root))
+
+    # ----- repos (multi-repo workspace) ----------------------------------- #
+
+    def _repos_payload() -> dict[str, Any]:
+        """The known-repos set, per-queue repo bindings, and warnings.
+
+        The known set is the workspace's direct children with ``.git``; per-queue
+        repo comes from each queue's ``config.json``. A queue whose configured
+        repo is set but absent surfaces a single warning (matching the
+        one-warning-per-queue pause rule)."""
+        known = repos.known_repos(workspace)
+        queues_payload: list[dict[str, Any]] = []
+        warnings: list[dict[str, Any]] = []
+        for q in _all_queues():
+            label = queue_label(q)
+            repo = _queue_repo(q)
+            available = bool(repo) and repos.repo_available(workspace, repo)
+            queues_payload.append({"queue": label, "repo": repo, "available": available})
+            if repo and not available:
+                warnings.append({"queue": label, "repo": repo})
+        return {
+            "workspace": str(workspace),
+            "tasks_repo": tasks_repo,
+            "repos": [{"name": name, "available": True} for name in known],
+            "queues": queues_payload,
+            "warnings": warnings,
+        }
+
+    @app.get("/api/repos")
+    def get_repos() -> JSONResponse:
+        return JSONResponse(_repos_payload())
+
+    @app.post("/api/repos/rescan")
+    async def rescan_repos() -> JSONResponse:
+        """Recompute the known-repos set and auto-resume any paused
+        (``repo_unavailable``) task whose repo is now present, then re-warn from
+        scratch on the next poll."""
+        store = _store()
+        resumed: list[dict[str, Any]] = []
+        for row in await store.tasks_in_state("repo_unavailable"):
+            repo = row.get("repo")
+            if repo and repos.repo_available(workspace, repo):
+                queue = _queue_from_label(row.get("queue"))
+                await store.clear_task_state(queue, row["task"])
+                resumed.append({"queue": queue_label(queue), "task": row["task"]})
+                await _emit("queue_changed", queue=queue, task=row["task"])
+        # Reset the per-queue warning dedupe so a still-missing repo re-warns.
+        app.state.repo_warnings = set()
+        await _emit("repos_changed", payload={"resumed": resumed})
+        return JSONResponse(_repos_payload())
 
     @app.get("/api/runs")
     async def get_runs(queue: str | None = None, limit: int = 200) -> JSONResponse:
@@ -692,7 +976,7 @@ def create_app(root: Path, *, store: NightshiftStore | None = None) -> FastAPI:
     def get_settings() -> JSONResponse:
         return JSONResponse(
             {
-                "settings": settings_mod.load_settings(root),
+                "settings": settings_mod.load_settings(workspace),
                 "schema": settings_mod.SCHEMA,
                 "cadences": {
                     "poll_seconds": cfg.cadences.poll_seconds,
@@ -707,7 +991,7 @@ def create_app(root: Path, *, store: NightshiftStore | None = None) -> FastAPI:
     @app.put("/api/settings")
     async def put_settings(body: dict[str, Any]) -> JSONResponse:
         try:
-            merged = settings_mod.save_settings(root, body)
+            merged = settings_mod.save_settings(workspace, body)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         await _emit("settings_changed", payload={"settings": merged})
@@ -770,8 +1054,8 @@ def _jsonable(row: dict[str, Any] | None) -> dict[str, Any]:
     return out
 
 
-def _task_meta(root: Path, task: str, queue: str | None) -> dict[str, Any]:
-    path = root / playlists_mod.tasks_rel(queue) / f"{task}.md"
+def _task_meta(tasks_root: Path, task: str, queue: str | None) -> dict[str, Any]:
+    path = tasks_root / playlists_mod.tasks_rel(queue) / f"{task}.md"
     try:
         return split_frontmatter(path.read_text(errors="replace"))[0]
     except OSError:
@@ -779,9 +1063,11 @@ def _task_meta(root: Path, task: str, queue: str | None) -> dict[str, Any]:
 
 
 def _build_work_order(
-    root: Path,
+    workspace: Path,
+    tasks_root: Path,
     task: str,
     queue: str | None,
+    repo: str,
     lease_id: str,
     run_id: str,
     base_ref: str | None,
@@ -789,14 +1075,20 @@ def _build_work_order(
 ) -> dict[str, Any]:
     """Assemble the JSON work order handed to a worker.
 
-    Landing policy (landing/automerge/draft) and backend choice are intentionally
-    *not* included — landing is manager-side, backend is worker-owned.
+    The brief is read from the content store (``tasks_root``) and its body is
+    embedded (frontmatter stripped) so the brief never enters the target repo.
+    Every path is **workspace-relative**: ``repo`` is a bare child name and
+    ``task_path`` is ``<tasks_repo>/<queue>/<task>.md``. ``base_ref`` is the
+    target repo's canonical HEAD. Landing policy (landing/automerge/draft) and
+    backend choice are intentionally *not* included — landing is manager-side,
+    backend is worker-owned.
     """
     tasks_rel = playlists_mod.tasks_rel(queue)
-    path = root / tasks_rel / f"{task}.md"
+    tasks_repo = tasks_root.name
+    path = tasks_root / tasks_rel / f"{task}.md"
     text = path.read_text(errors="replace") if path.exists() else ""
     meta, body = split_frontmatter(text)
-    merged = resolve_config(root, tasks_rel)
+    merged = resolve_config(workspace, tasks_root, tasks_rel)
 
     model = meta.get("model") or cfg.default_model
     raw_turns = meta.get("turns", merged.get("max_turns"))
@@ -818,7 +1110,8 @@ def _build_work_order(
         "priority": int(meta.get("priority", 5)) if str(meta.get("priority", "")).strip() != "" else 5,
         "title": resolve_title(task, meta),
         "body": body.strip(),
-        "task_path": f"{tasks_rel}/{task}.md",
+        "repo": repo,
+        "task_path": f"{tasks_repo}/{tasks_rel}/{task}.md",
         "base_ref": base_ref,
         "config": config_blob,
     }

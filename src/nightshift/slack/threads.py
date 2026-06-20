@@ -2,8 +2,8 @@
 
 A task maps to a single Slack parent message (``thread_ts``) reused across
 intake → local → remote and across restarts (spec §11 invariant 2). The map is
-a small JSON file under the queue dir (``.tasks/slack-threads.json`` for the
-main queue, ``.tasks/<playlist>/slack-threads.json`` for a playlist) so the
+a small JSON file under the queue dir (``main/slack-threads.json`` for the
+default queue, ``<playlist>/slack-threads.json`` for a playlist) so the
 same slug shares one thread even when a later run is a different process.
 
 Writes are serialised under a lock and persisted atomically; reads tolerate a
@@ -47,9 +47,9 @@ class ThreadStore:
         self._loaded = False
 
     @classmethod
-    def for_queue(cls, root: Path, tasks_rel: str = ".tasks") -> ThreadStore:
-        """Store at ``<root>/<tasks_rel>/slack-threads.json``."""
-        return cls(root / tasks_rel / THREADS_FILENAME)
+    def for_queue(cls, tasks_root: Path, tasks_rel: str = "main") -> ThreadStore:
+        """Store at ``<tasks_root>/<tasks_rel>/slack-threads.json``."""
+        return cls(tasks_root / tasks_rel / THREADS_FILENAME)
 
     @property
     def path(self) -> Path:

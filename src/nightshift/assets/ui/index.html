@@ -135,6 +135,28 @@
         <p id="playlists-empty" class="empty" hidden>No playlists yet. Create one — a self-contained queue under .tasks/&lt;name&gt;.</p>
       </section>
 
+      <!-- Repos: the multi-repo workspace surface. Read-only workspace path,
+           the known-repos set (workspace children with a .git), and each
+           queue's default-repo binding + availability. Rescan re-scans the
+           workspace and auto-resumes any task paused on a now-present repo. -->
+      <section id="screen-repos" class="screen screen-repos" aria-label="Repos">
+        <div class="pane-head">
+          <h2>Repos</h2>
+          <button id="btn-rescan" class="ghost-btn"
+                  title="Re-scan the workspace for repos (resumes paused tasks)">Rescan</button>
+        </div>
+        <div id="repos-warnings" class="repos-warnings" hidden></div>
+        <div class="repos-workspace-row">
+          <span class="repos-ws-label">Workspace</span>
+          <code id="repos-workspace" class="repos-workspace">—</code>
+        </div>
+        <h3 class="repos-subhead">Known repos <span id="repos-count" class="count"></span></h3>
+        <ul id="repos-list" class="repos-list"></ul>
+        <p id="repos-empty" class="empty" hidden>No git repos found in the workspace.</p>
+        <h3 class="repos-subhead">Queue bindings</h3>
+        <ul id="repos-queues" class="repos-queues"></ul>
+      </section>
+
       <section id="screen-history" class="screen screen-history" aria-label="History">
         <div class="pane-head">
           <h2>History</h2>
@@ -269,6 +291,15 @@
             <path d="M7 7h.01M7 17h.01" />
           </svg>
           <span>Workers</span>
+        </button>
+        <button class="navbtn" data-view="repos" role="tab" title="Workspace repos + queue bindings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <ellipse cx="12" cy="5" rx="8" ry="3" />
+            <path d="M4 5v6c0 1.66 3.58 3 8 3s8-1.34 8-3V5" />
+            <path d="M4 11v6c0 1.66 3.58 3 8 3s8-1.34 8-3v-6" />
+          </svg>
+          <span>Repos</span>
         </button>
       </nav>
     </div>

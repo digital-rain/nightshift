@@ -24,8 +24,8 @@ Design:
   round-robin tiebreak (fewest-served queue wins) so no queue starves.
 
 Everything here is pure given its inputs except :func:`build_candidates`, which
-reads the canonical ``.tasks/`` files. That split keeps the arbitration unit
-testable without a repo.
+reads the canonical briefs from the content store (``tasks_root``). That split
+keeps the arbitration unit testable without a repo.
 """
 
 from __future__ import annotations
@@ -33,9 +33,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from nightshift import playlists
+from nightshift import playlists, repos
 from nightshift.engine import live_ordered_queue
-from nightshift.spawn_daily import split_frontmatter, task_priority
+from nightshift.spawn_daily import load_queue_config, split_frontmatter, task_priority
 
 
 # Worker-interpreted keywords that pin no specific model: any worker may take a
@@ -49,8 +49,8 @@ def is_agnostic_model(model: str | None) -> bool:
 
 
 def queue_label(queue: str | None) -> str:
-    """Human/route label for a queue: ``main`` for the default ``.tasks`` queue,
-    else the playlist name. Used for worker ``queues`` matching."""
+    """Human/route label for a queue: ``main`` for the default queue, else the
+    playlist name. Used for worker ``queues`` matching."""
     return queue or "main"
 
 
@@ -63,12 +63,19 @@ def _norm_set(values: list[str] | None) -> set[str]:
 class TaskCandidate:
     """One runnable task with the metadata the scheduler arbitrates on."""
 
-    queue: str | None              # None = main .tasks queue
+    queue: str | None              # None = main queue
     task: str
     priority: int
     model: str                     # auto | max | explicit model id
     required_mcps: tuple[str, ...] = ()   # MCP connectors the brief declares
     after: str | None = None       # frontmatter dependency stem (without .md)
+    # Resolved target repo (task frontmatter ``repo:`` → queue default). ``None``
+    # when resolution raised :class:`nightshift.repos.RepoConfigError`, in which
+    # case ``repo_error`` carries the message so the manager can mark the task
+    # ``blocked`` (an authoring error). Availability (repo present + ``.git``) is
+    # a *separate* check the manager performs in ``worker_poll``.
+    repo: str | None = None
+    repo_error: str | None = None
 
     @property
     def label(self) -> str:
@@ -168,7 +175,7 @@ def parse_required_mcps(meta: dict) -> tuple[str, ...]:
 
 
 def build_candidates(
-    root: Path,
+    tasks_root: Path,
     queue: str | None,
     *,
     default_model: str = "auto",
@@ -177,16 +184,28 @@ def build_candidates(
 
     Reuses :func:`live_ordered_queue` for ordering + the disabled/play-priority
     filters, then parses each task's frontmatter for priority / model / mcp /
-    after.
+    after, and resolves the target ``repo`` (task frontmatter override → the
+    queue's default ``repo`` from its ``config.json``). A malformed/unset repo
+    reference is *not* fatal here: the candidate carries ``repo=None`` plus
+    ``repo_error`` and the manager marks it ``blocked``. Repo *availability* is
+    checked by the manager (``worker_poll``), so it stays testable without a
+    workspace on disk.
     """
     tasks_rel = playlists.tasks_rel(queue)
+    queue_repo = load_queue_config(tasks_root, tasks_rel).get("repo")
     out: list[TaskCandidate] = []
-    for stem in live_ordered_queue(root, tasks_rel):
-        path = root / tasks_rel / f"{stem}.md"
+    for stem in live_ordered_queue(tasks_root, tasks_rel):
+        path = tasks_root / tasks_rel / f"{stem}.md"
         try:
             meta = split_frontmatter(path.read_text(errors="replace"))[0]
         except OSError:
             meta = {}
+        repo: str | None = None
+        repo_error: str | None = None
+        try:
+            repo = repos.resolve_repo(meta.get("repo"), queue_repo)
+        except repos.RepoConfigError as err:
+            repo_error = str(err)
         out.append(
             TaskCandidate(
                 queue=queue,
@@ -195,6 +214,8 @@ def build_candidates(
                 model=_normalize_model(meta, default_model),
                 required_mcps=parse_required_mcps(meta),
                 after=_after_dep(meta),
+                repo=repo,
+                repo_error=repo_error,
             )
         )
     return out

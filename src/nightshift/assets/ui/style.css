@@ -979,6 +979,7 @@ body[data-view="queue"] #screen-queue,
 body[data-view="playlists"] #screen-playlists,
 body[data-view="history"] #screen-history,
 body[data-view="stats"] #screen-stats,
+body[data-view="repos"] #screen-repos,
 body[data-view="detail"] #screen-detail { display: flex; flex: 1; }
 
 /* ---- full-area task detail takeover ---- */
@@ -1063,6 +1064,112 @@ body[data-view="detail"] #screen-detail { display: flex; flex: 1; }
 }
 .pl-item:hover .pl-del { opacity: 1; }
 .pl-del:hover { color: var(--err); background: var(--bg-sunken); }
+
+/* ---- Repos screen (multi-repo workspace) ---- */
+.repos-subhead {
+  margin: 18px 0 10px;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+}
+/* Warnings — one per queue whose bound repo is absent. Reads like the warn
+   (`--warn`) treatment that the paused tasks themselves carry. */
+.repos-warnings { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+.repos-warning {
+  padding: 10px 12px;
+  border: 1px solid rgba(230, 192, 104, 0.4);
+  border-left-width: 3px;
+  border-radius: 8px;
+  background: rgba(230, 192, 104, 0.12);
+  color: var(--warn);
+  font-size: 13px;
+}
+/* Read-only workspace path (operator config — never edited from the UI). */
+.repos-workspace-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elev);
+}
+.repos-ws-label {
+  flex: none;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+}
+.repos-workspace {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--text);
+  word-break: break-all;
+}
+.repos-list, .repos-queues {
+  list-style: none; margin: 0; padding: 0;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.repo-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elev);
+}
+.repo-main { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.repo-name {
+  font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  word-break: break-all;
+}
+.repo-tag {
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+}
+/* Per-queue binding rows: the queue label + availability on top, the
+   default-repo selector (and any inline error) below. */
+.repo-queue-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elev);
+}
+.repo-queue-head { display: flex; align-items: center; gap: 10px; }
+.repo-queue-name { font-weight: 600; }
+.repo-queue-ctl { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.repo-queue-ctl-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+}
+.repo-select { min-width: 180px; }
+.repo-queue-error { margin: 0; font-size: 12px; }
+
+/* The target-repo tag in a history row: neutral (monospace, dim) so it's
+   distinct from the accent-coloured playlist tag beside it. */
+.hrow-repo {
+  background: var(--bg-sunken);
+  color: var(--text-dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 600;
+}
 
 /* History playlist tag */
 .hrow-tag {

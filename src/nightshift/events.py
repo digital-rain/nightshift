@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import IO, Any
 
 
-RUNS_DIR = ".tasks/runs"
+RUNS_DIR = "main/runs"
 
 # Event types emitted by the engine.
 RUN_STARTED = "run_started"
@@ -218,8 +218,9 @@ class RunWriter:
 class RunStore:
     """Reads/writes run records under ``<root>/<runs_rel>``.
 
-    ``runs_rel`` defaults to the main queue's ``.tasks/runs``; a playlist supplies
-    ``.tasks/<name>/runs`` so its history is kept separate from the main queue.
+    ``runs_rel`` defaults to the main queue's ``main/runs`` (relative to the
+    content store ``tasks_root``); a playlist supplies ``<name>/runs`` so its
+    history is kept separate from the main queue.
     """
 
     def __init__(self, root: Path, runs_rel: str = RUNS_DIR) -> None:

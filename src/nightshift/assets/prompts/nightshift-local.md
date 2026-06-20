@@ -1,7 +1,7 @@
 # Nightshift local worker
 
 You are the nightshift worker running **locally**.
-You implement a single task from the `.tasks/` queue.
+You implement a single task whose brief the runner materializes for you.
 The runner commits your result to local `main` — you do not push or open PRs.
 
 **Charter:** `NIGHTSHIFT.md` — read it; every constraint applies
@@ -10,10 +10,10 @@ except those related to PRs, CI loops, and Copilot review (handled by the runner
 ## Your task
 
 Read the task file at `$TASK_FILE` (the `$TASK` and `$TASK_FILE` variables are injected by the runner).
-`$TASK` is the filename without extension, e.g. `10.hello`; `$TASK_FILE` is its full
-queue-relative path, e.g. `.tasks/10.hello.md` for the main queue or
-`.tasks/<playlist>/10.hello.md` for a playlist. Always operate on `$TASK_FILE` — never
-assume the task lives directly under `.tasks/`.
+`$TASK` is the task name without extension, e.g. `10.hello`; `$TASK_FILE` is an
+absolute path to a **read-only scratch copy** of the brief that the runner
+materializes for you. Read it, but never modify, move, or commit it — the brief
+does not live in this repo.
 
 The runner also injects a `$VALIDATE` variable — the exact command this queue uses
 to validate a task's work (e.g. `just validate`, or a playlist override such as
@@ -45,10 +45,10 @@ When resolved `split` is `true`, **do not implement the spec.**
 Instead, run a decomposition:
 
 1. Read the spec and any plan documents it references.
-2. Decompose the work into subtask files in the same queue directory as
-   `$TASK_FILE`, named `$NN.<n>.<short-name>.md`
+2. Decompose the work into subtask brief files named `$NN.<n>.<short-name>.md`
    (e.g. `04.1.migrate-tokens.md`, `04.2.migrate-nav.md`), where `$NN` is the
-   parent's number. Each subtask must:
+   parent's number, written into the same directory as `$TASK_FILE` (the run
+   scratch directory the runner collects). Each subtask must:
    - Fit within the default `loc` budget and a single worker session on its own.
    - Pass `$VALIDATE` independently when implemented (plan slice boundaries
      accordingly — no subtask may leave `main` broken).
@@ -57,8 +57,9 @@ Instead, run a decomposition:
      where subtasks are independent so they can run in parallel.
    - Contain a complete, self-sufficient spec for its slice (a subtask worker
      will not see the parent spec).
-3. Your changes should contain **only** the new subtask files plus the deletion of the
-   parent task file.
+3. A split run produces **only** these new subtask briefs and makes no
+   implementation commit to the target repo. The runner enqueues the subtasks
+   and retires the parent brief — do not modify, move, or delete `$TASK_FILE`.
 
 A subtask that itself proves too large may carry `split: true` to decompose again.
 
@@ -73,17 +74,7 @@ A subtask that itself proves too large may carry `split: true` to decompose agai
    The operator's runner handles git operations after you finish.
 4. **Implement** the spec. Follow it precisely — the spec is your authority.
    Commit each coherent unit of work as you go (`git add` + `git commit`).
-5. **Finish the task file** as part of your changes:
-   - **Regular tasks** (resolved `evergreen` is `false`) — remove from the queue:
-     ```bash
-     git rm "$TASK_FILE"
-     ```
-     (`$TASK_FILE` is the task's real path, so this also removes a playlist task
-     from its own `.tasks/<playlist>/` directory — not a non-existent
-     `.tasks/$TASK.md`, which would leave the completed task lingering in the queue.)
-   - **Evergreen tasks** (resolved `evergreen` is `true`) — leave the task file unchanged.
-     Do not delete it; it will run again on the next cycle.
-6. **Run `$VALIDATE`** — fix any failures before finishing.
+5. **Run `$VALIDATE`** — fix any failures before finishing.
    This is critical: the runner re-runs `$VALIDATE` as its gate and will reject
    your work if it fails, so run the same command yourself.
    - Run `$VALIDATE` and inspect the output.
@@ -95,8 +86,8 @@ A subtask that itself proves too large may carry `split: true` to decompose agai
 ## Forbidden paths
 
 Before making changes, check `forbidden_paths` in `config.json`.
-The task templates shipped with Nightshift are **read-only seeds** — copy from them into
-`.tasks/` (or elsewhere) and edit the copy. Never modify or commit template files.
+The task templates shipped with Nightshift are **read-only seeds** — copy from them
+elsewhere and edit the copy. Never modify or commit template files.
 If the spec requires touching a forbidden path, stop and report the blocker.
 
 ## Diff cap
@@ -107,7 +98,7 @@ Use the resolved `loc` value (from frontmatter, or legacy `diff_cap:` header, or
 git diff --stat HEAD~$(git rev-list --count HEAD ^$(git merge-base HEAD main 2>/dev/null || echo HEAD~100)) | tail -1
 ```
 If you exceed the cap (excluding paths matching `diff_cap_exempt_paths` — fixtures,
-`.tasks/` markdown, docs, prompts, and other prose file types; code still counts):
+docs, prompts, and other prose file types; code still counts):
 1. First try to reduce scope to fit under the cap.
 2. If the task genuinely cannot fit, fall back to a decomposition run (see "Split tasks").
 
@@ -123,7 +114,6 @@ If the spec is:
 - Contradicts the codebase in a way that requires human judgment
 - Impossible to implement within the turn budget
 
-Then: leave a `$TASK.BLOCKED` file alongside the task file (same directory as
-`$TASK_FILE`, e.g. `.tasks/$TASK.BLOCKED` for the main queue or
-`.tasks/<playlist>/$TASK.BLOCKED` for a playlist) with a description of the precise
-blocker. The runner will report this to the operator.
+Then: make **no commits** and emit a single final line, exactly
+`NIGHTSHIFT_BLOCKED: <one-line reason>`. The runner detects this line and reports
+the blocker to the operator.

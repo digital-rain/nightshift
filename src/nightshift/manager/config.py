@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from nightshift.repos import DEFAULT_TASKS_REPO
 from nightshift.spawn_daily import load_config
 
 
@@ -42,6 +43,9 @@ class ManagerConfig:
     default_model: str = "auto"
     shared_secret: str | None = None
     dsn: str | None = None
+    # Name of the content-store repo (a workspace child) holding briefs + queue
+    # config; ``tasks_root = workspace / tasks_repo``.
+    tasks_repo: str = DEFAULT_TASKS_REPO
     cadences: Cadences = field(default_factory=Cadences)
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -60,22 +64,26 @@ def _as_int(value: Any, default: int) -> int:
         return default
 
 
-def load_manager_config(root: Path) -> ManagerConfig:
-    """Resolve manager config from ``config.json`` ``manager`` block + env.
+def load_manager_config(workspace: Path) -> ManagerConfig:
+    """Resolve manager config from ``<workspace>/config.json`` ``manager`` block + env.
 
     Environment overrides (operator/deploy-time): ``NIGHTSHIFT_MANAGER_HOST``,
     ``NIGHTSHIFT_MANAGER_PORT``, ``NIGHTSHIFT_LANDING_MODE``,
     ``NIGHTSHIFT_SHARED_SECRET``, ``NIGHTSHIFT_DEFAULT_MODEL``,
-    ``NIGHTSHIFT_PG_DSN``.
+    ``NIGHTSHIFT_PG_DSN``, ``NIGHTSHIFT_TASKS_REPO``.
 
     The store DSN is Nightshift's own (``NIGHTSHIFT_PG_DSN`` env > ``manager.dsn``
     block); it deliberately does **not** fall back to longitude's ``LONG_PG_DSN``,
     so Nightshift never silently rides on the longitude database. Point it at the
     same DSN explicitly if you want them to share one. When unset, the manager
     uses the in-memory store.
+
+    ``tasks_repo`` (the content-store repo name) is a top-level operator key in
+    ``<workspace>/config.json`` (env ``NIGHTSHIFT_TASKS_REPO`` wins), defaulting
+    to :data:`nightshift.repos.DEFAULT_TASKS_REPO`.
     """
     try:
-        cfg = load_config(root)
+        cfg = load_config(workspace)
     except (FileNotFoundError, ValueError):
         cfg = {}
     block = cfg.get("manager", {}) if isinstance(cfg, dict) else {}
@@ -101,6 +109,12 @@ def load_manager_config(root: Path) -> ManagerConfig:
 
     dsn = os.environ.get("NIGHTSHIFT_PG_DSN") or block.get("dsn") or None
 
+    tasks_repo = (
+        os.environ.get("NIGHTSHIFT_TASKS_REPO")
+        or (cfg.get("tasks_repo") if isinstance(cfg, dict) else None)
+        or DEFAULT_TASKS_REPO
+    )
+
     return ManagerConfig(
         host=os.environ.get("NIGHTSHIFT_MANAGER_HOST") or block.get("host") or "0.0.0.0",
         port=_as_int(os.environ.get("NIGHTSHIFT_MANAGER_PORT") or block.get("port"), 8800),
@@ -108,6 +122,7 @@ def load_manager_config(root: Path) -> ManagerConfig:
         default_model=default_model,
         shared_secret=os.environ.get("NIGHTSHIFT_SHARED_SECRET") or block.get("shared_secret"),
         dsn=dsn,
+        tasks_repo=str(tasks_repo),
         cadences=cadences,
         raw=cfg if isinstance(cfg, dict) else {},
     )

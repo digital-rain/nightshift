@@ -266,7 +266,7 @@ def slugify_title(title: str) -> str:
 
 
 def render_task_markdown(parsed: ParsedTask) -> str:
-    """The full ``.tasks/<slug>.md`` text — frontmatter block + body."""
+    """The full ``<queue>/<slug>.md`` text — frontmatter block + body."""
     lines = ["---"]
     for key in _FRONTMATTER_ORDER:
         if key in parsed.frontmatter:
@@ -318,20 +318,21 @@ class EnqueueResult:
     queue: str | None
 
 
-def enqueue(root: Path, parsed: ParsedTask) -> EnqueueResult:
+def enqueue(tasks_root: Path, parsed: ParsedTask) -> EnqueueResult:
     """Materialise ``parsed`` into the right queue and update its ``order``.
 
-    Writes ``.tasks/<slug>.md`` (or ``.tasks/<playlist>/<slug>.md`` for a
-    ``queue:`` directive), creating the playlist if needed (spec §6). The slug
-    is the task's ``config.json`` ``order`` key: ``#now`` prepends it, otherwise
-    it is appended. Reuses the engine's frontmatter format so both planes read
-    the same file (spec §11 invariant 5). Returns where it landed.
+    Writes ``<queue>/<slug>.md`` under the content store — ``main/<slug>.md`` for
+    the default queue, ``<playlist>/<slug>.md`` for a ``queue:`` directive —
+    creating the playlist if needed (spec §6). The slug is the task's
+    ``config.json`` ``order`` key: ``#now`` prepends it, otherwise it is
+    appended. Reuses the engine's frontmatter format so both planes read the
+    same file (spec §11 invariant 5). Returns where it landed.
     """
     queue = parsed.queue
-    if queue and not playlists.exists(root, queue):
-        playlists.create_playlist(root, queue)
+    if queue and not playlists.exists(tasks_root, queue):
+        playlists.create_playlist(tasks_root, queue)
     tasks_rel = playlists.tasks_rel(queue)
-    queue_dir = root / tasks_rel
+    queue_dir = tasks_root / tasks_rel
     queue_dir.mkdir(parents=True, exist_ok=True)
 
     slug = _unique_slug(queue_dir, parsed.slug)
@@ -354,7 +355,7 @@ def _unique_slug(queue_dir: Path, slug: str) -> str:
 def _update_order(queue_dir: Path, slug: str, *, prepend: bool) -> None:
     """Insert ``slug`` into the queue's ``config.json`` ``order`` list.
 
-    The main queue may have no ``config.json`` (it lives at ``.tasks/config.json``
+    The default queue may have no ``config.json`` (it lives at ``main/config.json``
     with other settings); a playlist always has one. Either way we read what is
     there, splice the slug in, and write it back, leaving other keys untouched.
     """

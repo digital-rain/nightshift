@@ -40,19 +40,20 @@ class LandingResult:
     pr_url: str | None = None
 
 
-def _rev_parse(root: Path, ref: str) -> str | None:
+def _rev_parse(repo_root: Path, ref: str) -> str | None:
     res = subprocess.run(
-        ["git", "rev-parse", ref], cwd=root, capture_output=True, text=True
+        ["git", "rev-parse", ref], cwd=repo_root, capture_output=True, text=True
     )
     return res.stdout.strip() if res.returncode == 0 else None
 
 
-def canonical_head(root: Path) -> str | None:
-    """Current canonical ``main`` SHA — the ``base_ref`` handed to a worker."""
-    return _rev_parse(root, "HEAD")
+def canonical_head(repo_root: Path) -> str | None:
+    """Current canonical ``main`` SHA of a target repo — the ``base_ref`` handed
+    to a worker."""
+    return _rev_parse(repo_root, "HEAD")
 
 
-def merge_tree_conflicts(root: Path, branch: str, *, base: str = "HEAD") -> list[str]:
+def merge_tree_conflicts(repo_root: Path, branch: str, *, base: str = "HEAD") -> list[str]:
     """Preview a squash of ``branch`` onto ``base`` without touching the tree.
 
     Uses ``git merge-tree --write-tree`` (git ≥ 2.38). Returns the conflicting
@@ -61,7 +62,7 @@ def merge_tree_conflicts(root: Path, branch: str, *, base: str = "HEAD") -> list
     """
     res = subprocess.run(
         ["git", "merge-tree", "--write-tree", "--name-only", base, branch],
-        cwd=root,
+        cwd=repo_root,
         capture_output=True,
         text=True,
     )
@@ -72,16 +73,17 @@ def merge_tree_conflicts(root: Path, branch: str, *, base: str = "HEAD") -> list
     return lines[1:] if len(lines) > 1 else lines
 
 
-def base_ref_drifted(root: Path, base_ref: str | None) -> bool:
+def base_ref_drifted(repo_root: Path, base_ref: str | None) -> bool:
     """True when canonical ``main`` has advanced past the worker's pinned base."""
     if not base_ref:
         return False
-    head = canonical_head(root)
-    return head is not None and head != base_ref and _rev_parse(root, base_ref) is not None
+    head = canonical_head(repo_root)
+    return head is not None and head != base_ref and _rev_parse(repo_root, base_ref) is not None
 
 
 def land(
-    root: Path,
+    workspace: Path,
+    repo: str,
     task: str,
     title: str,
     *,
@@ -92,18 +94,22 @@ def land(
     draft: bool = False,
     autostash: bool = True,
 ) -> LandingResult:
-    """Land a submitted task branch onto canonical ``main``, then sync remotely.
+    """Land a submitted task branch onto canonical ``main`` of the target
+    ``repo``, then sync remotely.
 
-    Returns a :class:`LandingResult`. On a content conflict (whether or not the
-    base drifted) the branch is left intact and ``conflict=True`` is returned so
-    the caller can issue a resolve work-order.
+    ``repo`` is the workspace-relative child name; the target repo path
+    (``repo_root = workspace / repo``) is materialised here only for the git
+    calls. Returns a :class:`LandingResult`. On a content conflict (whether or
+    not the base drifted) the branch is left intact and ``conflict=True`` is
+    returned so the caller can issue a resolve work-order.
     """
+    repo_root = workspace / repo
     branch = worktree_branch(task, queue)
 
     # Pre-check: if main drifted past base_ref and the merge would conflict,
     # refuse cleanly so the caller resolves rather than the squash failing deep.
-    if base_ref_drifted(root, base_ref):
-        conflicts = merge_tree_conflicts(root, branch)
+    if base_ref_drifted(repo_root, base_ref):
+        conflicts = merge_tree_conflicts(repo_root, branch)
         if conflicts:
             shown = "\n".join(f"    {p}" for p in conflicts[:20])
             return LandingResult(
@@ -117,7 +123,7 @@ def land(
             )
 
     sha, squash_error, recoverable = squash_to_main(
-        root, task, title, queue=queue, autostash=autostash
+        workspace, repo, task, title, queue=queue, autostash=autostash
     )
     if sha is None:
         # squash_to_main reports a conflict as recoverable=False.
@@ -132,25 +138,29 @@ def land(
 
     # The branch has landed on canonical main; reclaim its worktree + branch
     # (mirrors the engine's post-squash teardown in the single-process path).
-    teardown_worktree(root, task, queue=queue)
+    teardown_worktree(workspace, repo, task, queue=queue)
 
     if landing_mode == "push":
         result.remote = "push"
-        _push_main(root, result)
+        _push_main(workspace, repo, result)
     elif landing_mode == "pr":
         result.remote = "pr"
-        _open_pr(root, task, title, queue=queue, automerge=automerge, draft=draft, result=result)
+        _open_pr(
+            workspace, repo, task, title,
+            queue=queue, automerge=automerge, draft=draft, result=result,
+        )
     return result
 
 
-def _push_main(root: Path, result: LandingResult) -> None:
+def _push_main(workspace: Path, repo: str, result: LandingResult) -> None:
     """Fast-forward GitHub ``main`` directly (no PR). Requires the manager token
     on main's protected-branch bypass list. Best-effort: a push failure is
     recorded in ``detail`` but never unwinds the already-landed local commit."""
-    with landing_lock(root):
+    repo_root = workspace / repo
+    with landing_lock(workspace, repo):
         res = subprocess.run(
             ["git", "push", "origin", "HEAD:main"],
-            cwd=root,
+            cwd=repo_root,
             capture_output=True,
             text=True,
         )
@@ -162,7 +172,8 @@ def _push_main(root: Path, result: LandingResult) -> None:
 
 
 def _open_pr(
-    root: Path,
+    workspace: Path,
+    repo: str,
     task: str,
     title: str,
     *,
@@ -176,11 +187,12 @@ def _open_pr(
     Defaults ``automerge=true`` / ``draft=false`` (overridable per task). The
     branch points at the squash commit on main so the PR is exactly the landed
     change. GitHub auth lives only on the manager (``gh``)."""
+    repo_root = workspace / repo
     pr_branch = f"task/{_queue_slug(queue)}-{task}"
-    with landing_lock(root):
+    with landing_lock(workspace, repo):
         push = subprocess.run(
             ["git", "push", "-f", "origin", f"HEAD:refs/heads/{pr_branch}"],
-            cwd=root,
+            cwd=repo_root,
             capture_output=True,
             text=True,
         )
@@ -199,7 +211,7 @@ def _open_pr(
     ]
     if draft:
         argv.append("--draft")
-    create = subprocess.run(argv, cwd=root, capture_output=True, text=True)
+    create = subprocess.run(argv, cwd=repo_root, capture_output=True, text=True)
     if create.returncode != 0:
         result.detail = (
             f"{result.detail}\nlocal land ok ({result.sha}); gh pr create failed: "
@@ -210,7 +222,7 @@ def _open_pr(
     if automerge and not draft and result.pr_url:
         subprocess.run(
             ["gh", "pr", "merge", "--auto", "--squash", result.pr_url],
-            cwd=root,
+            cwd=repo_root,
             capture_output=True,
             text=True,
         )

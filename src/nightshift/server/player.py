@@ -24,17 +24,19 @@ server tails for SSE; runners only track the lightweight player-state summary
 from __future__ import annotations
 
 import contextlib
+import os
 import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
-from nightshift import playlists
+from nightshift import playlists, repos
 from nightshift.engine import (
     Controller,
     build_task_list,
     enough_free_disk,
+    read_task,
     resolve_config,
     resolve_task,
     run_queue,
@@ -50,6 +52,31 @@ from nightshift.events import (
 )
 from nightshift.server.settings import load_settings, parse_duration
 from nightshift.slack import listener_for_queue
+from nightshift.spawn_daily import load_config, load_queue_config
+
+
+def resolve_tasks_repo(workspace: Path) -> str:
+    """Name of the content-store repo (``tasks_root = workspace / tasks_repo``).
+
+    Read from ``<workspace>/config.json`` (key ``tasks_repo``), with the
+    ``NIGHTSHIFT_TASKS_REPO`` env var winning and
+    :data:`nightshift.repos.DEFAULT_TASKS_REPO` as the fallback — matching the
+    manager/worker resolution order so every entry point names the same store.
+    """
+    env = os.environ.get("NIGHTSHIFT_TASKS_REPO")
+    if env:
+        return env
+    try:
+        cfg = load_config(workspace)
+    except (FileNotFoundError, ValueError, OSError):
+        cfg = {}
+    name = cfg.get("tasks_repo") if isinstance(cfg, dict) else None
+    return str(name or repos.DEFAULT_TASKS_REPO)
+
+
+def resolve_tasks_root(workspace: Path) -> Path:
+    """The content store ``<workspace>/<tasks_repo>`` — briefs + queue config."""
+    return workspace / resolve_tasks_repo(workspace)
 
 
 class ConcurrencyGate:
@@ -83,18 +110,28 @@ class ConcurrencyGate:
 class QueueRunner:
     """Drives a single queue's play-throughs with transport control.
 
-    Constructed with an explicit ``queue`` (``None`` = the main ``.tasks``
-    queue) and pinned to it for its lifetime: its run store, tasks dir, and every
-    ``run_task``/``squash``/``resolve`` call use that queue. Multiple runners run
+    Constructed with an explicit ``queue`` (``None`` = the main queue) and
+    pinned to it for its lifetime: its run store, tasks dir, and every
+    ``run_task``/``squash``/``resolve`` call use that queue. The runner threads
+    the two roots — ``workspace`` (where git ops + worktrees live, per task) and
+    ``tasks_root`` (the content store holding briefs + queue config + the
+    gitignored ``runs/``) — into every engine call. Multiple runners run
     independently; a shared :class:`ConcurrencyGate` bounds total workers."""
 
     def __init__(
-        self, root: Path, queue: str | None, gate: ConcurrencyGate
+        self,
+        workspace: Path,
+        tasks_root: Path,
+        queue: str | None,
+        gate: ConcurrencyGate,
     ) -> None:
-        self.root = root
-        self.queue = queue  # None = main `.tasks`, else a playlist name.
+        self.workspace = workspace
+        self.tasks_root = tasks_root
+        self.queue = queue  # None = main queue, else a playlist name.
         self._gate = gate
-        self.store = RunStore(root, playlists.runs_rel(queue))
+        # Run records live under the queue's gitignored ``runs/`` in the content
+        # store (never committed), so the store is rooted at ``tasks_root``.
+        self.store = RunStore(tasks_root, playlists.runs_rel(queue))
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._controller: Controller | None = None
@@ -211,18 +248,50 @@ class QueueRunner:
             rec = self.store.find_task(run_id, task)
             if rec is None:
                 return {"ok": False, "error": "task not found in this run"}
+            # The resolve runs git ops in the task's target repo, so resolve it
+            # (task override → queue default) up front. A missing repo binding is
+            # an authoring error reported synchronously rather than crashing the
+            # job thread.
+            repo = self._resolve_repo(task)
+            if repo is None:
+                return {
+                    "ok": False,
+                    "error": "no target repo configured for this queue",
+                }
             title = rec.get("title") or task
             self._state = "playing"
             self._now_playing = task
             self._thread = threading.Thread(
                 target=self._resolve_loop,
-                args=(run_id, task, title),
+                args=(run_id, task, title, repo),
                 daemon=True,
             )
             self._thread.start()
         return {"ok": True, "started": True, "task": task}
 
-    def _resolve_loop(self, origin_run_id: str, task: str, title: str) -> None:
+    def _resolve_repo(self, task: str) -> str | None:
+        """Resolve the target repo for ``task`` (frontmatter override → queue
+        default). Returns ``None`` when no repo is configured (an authoring
+        error the caller surfaces) instead of raising."""
+        tasks_rel = self._tasks_rel
+        task_repo: str | None = None
+        if (self.tasks_root / tasks_rel / f"{task}.md").is_file():
+            try:
+                task_repo = read_task(self.tasks_root, task, tasks_rel)[
+                    "frontmatter_raw"
+                ].get("repo")
+            except (FileNotFoundError, ValueError, KeyError):
+                task_repo = None
+        try:
+            return repos.resolve_repo(
+                task_repo, load_queue_config(self.tasks_root, tasks_rel).get("repo")
+            )
+        except repos.RepoConfigError:
+            return None
+
+    def _resolve_loop(
+        self, origin_run_id: str, task: str, title: str, repo: str
+    ) -> None:
         try:
             controller = Controller()
             with self._lock:
@@ -231,19 +300,23 @@ class QueueRunner:
             writer = run_store.start(launched_by="resolve", playlist=self.queue)
             with self._lock:
                 self._current_run_id = writer.run_id
-            backend_name = load_settings(self.root).get("worker_backend")
+            backend_name = load_settings(self.workspace).get("worker_backend")
             slack_listener = listener_for_queue(
-                self.root, tasks_rel=self._tasks_rel, queue=self.queue
+                self.workspace, self.tasks_root, tasks_rel=self._tasks_rel, queue=self.queue
             )
             emit = fan_out([writer.emit, self._make_tracker(), slack_listener])
             emit(Event(RUN_STARTED, {"run_id": writer.run_id, "tasks": [task]}))
             try:
                 result = resolve_task(
-                    self.root,
+                    self.workspace,
+                    repo,
+                    self.tasks_root,
                     task,
                     title,
                     emit=emit,
-                    config=resolve_config(self.root, self._tasks_rel),
+                    config=resolve_config(
+                        self.workspace, self.tasks_root, self._tasks_rel
+                    ),
                     backend_name=backend_name,
                     abort_reason=controller.abort_reason,
                     queue=self.queue,
@@ -279,8 +352,8 @@ class QueueRunner:
             target = start_task or self._cursor
             if not target:
                 return []
-            return build_task_list(self.root, target, tasks_rel)
-        full = build_task_list(self.root, "all", tasks_rel)
+            return build_task_list(self.tasks_root, target, tasks_rel)
+        full = build_task_list(self.tasks_root, "all", tasks_rel)
         if start_task and start_task in full:
             return full[full.index(start_task):]
         return full
@@ -301,7 +374,7 @@ class QueueRunner:
 
         Keeps the server from thrashing a too-full tree with new worktrees; the
         run pauses with a clear ``disk`` failure instead."""
-        if enough_free_disk(self.root):
+        if enough_free_disk(self.workspace):
             return None
         return (
             "insufficient free disk to start another task — free space and "
@@ -322,13 +395,14 @@ class QueueRunner:
                 writer = run_store.start(launched_by="ui", playlist=self.queue)
                 with self._lock:
                     self._current_run_id = writer.run_id
-                backend_name = load_settings(self.root).get("worker_backend")
+                backend_name = load_settings(self.workspace).get("worker_backend")
                 slack_listener = listener_for_queue(
-                    self.root, tasks_rel=tasks_rel, queue=self.queue
+                    self.workspace, self.tasks_root, tasks_rel=tasks_rel, queue=self.queue
                 )
                 try:
                     run_queue(
-                        self.root,
+                        self.workspace,
+                        self.tasks_root,
                         tasks,
                         listeners=[
                             writer.emit,
@@ -363,7 +437,9 @@ class QueueRunner:
 
     def _repeat_seconds(self) -> int:
         try:
-            return parse_duration(load_settings(self.root).get("repeat_interval", "30m"))
+            return parse_duration(
+                load_settings(self.workspace).get("repeat_interval", "30m")
+            )
         except ValueError:
             return 1800
 
@@ -393,13 +469,20 @@ class PlayerRegistry:
     exists so the existing API and UI keep working; Phase 3 adds the per-queue
     surfaces (``states`` etc.)."""
 
-    def __init__(self, root: Path) -> None:
-        self.root = root
+    def __init__(self, workspace: Path) -> None:
+        self.workspace = workspace
+        # The content store ``<workspace>/<tasks_repo>`` — briefs, queue config,
+        # and the gitignored per-queue ``runs/`` all live here.
+        self.tasks_root = resolve_tasks_root(workspace)
         self._lock = threading.RLock()
         self._runners: dict[str | None, QueueRunner] = {}
         self._focused: str | None = None
         self._gate = ConcurrencyGate(
-            lambda: int(resolve_config(self.root).get("max_concurrent_queues", 2))
+            lambda: int(
+                resolve_config(self.workspace, self.tasks_root).get(
+                    "max_concurrent_queues", 2
+                )
+            )
         )
 
     # ----- runners ----------------------------------------------------- #
@@ -408,7 +491,9 @@ class PlayerRegistry:
         with self._lock:
             r = self._runners.get(queue)
             if r is None:
-                r = QueueRunner(self.root, queue, self._gate)
+                r = QueueRunner(
+                    self.workspace, self.tasks_root, queue, self._gate
+                )
                 self._runners[queue] = r
             return r
 

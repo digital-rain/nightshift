@@ -2,8 +2,8 @@
 
 The manager owns durable cross-worker history (Postgres); this is just the
 *local* view a single worker shows on its Now / History screens. Records append
-to a small JSONL file under the worker root; live "now playing" state is held in
-memory and read by the worker UI's status API.
+to a small JSONL file under the worker's ``--workspace``; live "now playing"
+state is held in memory and read by the worker UI's status API.
 """
 
 from __future__ import annotations
@@ -45,8 +45,8 @@ class NowPlaying:
 
 
 class LocalStore:
-    def __init__(self, root: Path) -> None:
-        self._dir = root / LOCAL_DIR
+    def __init__(self, workspace: Path) -> None:
+        self._dir = workspace / LOCAL_DIR
         self._dir.mkdir(parents=True, exist_ok=True)
         self._path = self._dir / RUNS_FILE
         self._lock = threading.Lock()

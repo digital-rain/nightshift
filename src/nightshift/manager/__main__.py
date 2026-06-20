@@ -19,14 +19,14 @@ from nightshift.manager.config import load_manager_config
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=Path.cwd())
+    parser.add_argument("--workspace", type=Path, default=Path.cwd())
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
     args = parser.parse_args(argv)
 
-    root = args.root.resolve()
-    cfg = load_manager_config(root)
-    app = create_app(root)
+    workspace = args.workspace.resolve()
+    cfg = load_manager_config(workspace)
+    app = create_app(workspace)
     uvicorn.run(
         app,
         host=args.host or cfg.host,

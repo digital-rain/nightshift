@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from _workspace import build_workspace, make_target_repo
 from nightshift import engine
 from nightshift.engine import (
     Controller,
@@ -35,6 +36,7 @@ from nightshift.events import (
     Event,
     RunStore,
 )
+from nightshift.repos import DEFAULT_TASKS_REPO
 from nightshift.server.player import ConcurrencyGate, Player, PlayerRegistry
 from nightshift.server.settings import (
     load_settings,
@@ -45,16 +47,24 @@ from nightshift.server.settings import (
 from nightshift.spawn_daily import load_config, save_config_value
 
 
-def _seed(root: Path, tasks: dict[str, str] | None = None) -> Path:
-    # The operator config lives at the repo root; task templates ship inside the
-    # installed package (the engine resolves them from there).
-    (root / "config.json").write_text(
+def _seed(workspace: Path, tasks: dict[str, str] | None = None, **kw: object) -> Path:
+    """Scaffold a two-root workspace via the shared builder and return its content
+    store (``tasks_root = <workspace>/nightshift-tasks``).
+
+    The builder seeds the default ``main`` queue (briefs at ``main/``, runs at
+    ``main/runs``) bound to a real ``longitude`` target repo. We then pin the
+    operator ``config.json`` to the legacy shape — a ``claude-sonnet-4-6`` model
+    default and the ``00._todo`` evergreen list, and crucially *no* ``validate``
+    key — so the migrated assertions about resolved defaults (model inheritance,
+    the engine's ``just validate`` default surfacing when nothing overrides it)
+    hold exactly as they did on the single-root layout. Extra builder knobs
+    (``repos``, ``main_repo``, ``queues`` …) pass straight through ``**kw``.
+    """
+    build_workspace(workspace, tasks=tasks, **kw)
+    (workspace / "config.json").write_text(
         json.dumps({"model": "claude-sonnet-4-6", "evergreen_tasks": ["00._todo"]})
     )
-    (root / ".tasks").mkdir(parents=True, exist_ok=True)
-    for name, content in (tasks or {}).items():
-        (root / ".tasks" / f"{name}.md").write_text(content)
-    return root
+    return workspace / DEFAULT_TASKS_REPO
 
 
 # --------------------------------------------------------------------------- #
@@ -227,18 +237,18 @@ def test_clear_runs(tmp_path: Path) -> None:
 
 
 def test_delete_task(tmp_path: Path) -> None:
-    _seed(tmp_path, tasks={"alpha": "Do alpha."})
-    assert (tmp_path / ".tasks/alpha.md").exists()
+    tasks_root = _seed(tmp_path, tasks={"alpha": "Do alpha."})
+    assert (tasks_root / "main/alpha.md").exists()
 
-    result = delete_task(tmp_path, "alpha")
+    result = delete_task(tasks_root, "alpha")
     assert result["deleted"] is True
-    assert not (tmp_path / ".tasks/alpha.md").exists()
+    assert not (tasks_root / "main/alpha.md").exists()
 
     with pytest.raises(FileNotFoundError):
-        delete_task(tmp_path, "alpha")
+        delete_task(tasks_root, "alpha")
     # Path traversal is rejected.
     with pytest.raises(FileNotFoundError):
-        delete_task(tmp_path, "../../etc/passwd")
+        delete_task(tasks_root, "../../etc/passwd")
 
 
 def test_resolve_claude_bin(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -260,15 +270,15 @@ def test_resolve_claude_bin(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_run_task_missing_claude_errors_gracefully(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _seed(tmp_path, tasks={"10.x": "do x"})
-    monkeypatch.setattr(engine, "setup_worktree", lambda root, task, *, queue=None: tmp_path)
-    monkeypatch.setattr(engine, "teardown_worktree", lambda root, task, *, queue=None: None)
-    monkeypatch.setattr(engine, "build_prompt", lambda root, task, tasks_rel=".tasks": "p")
+    tasks_root = _seed(tmp_path, tasks={"10.x": "do x"})
+    monkeypatch.setattr(engine, "setup_worktree", lambda ws, repo, task, *, queue=None: tmp_path)
+    monkeypatch.setattr(engine, "teardown_worktree", lambda ws, repo, task, *, queue=None: None)
+    monkeypatch.setattr(engine, "build_prompt", lambda task, *, task_file=None, validate_cmd=None: "p")
     monkeypatch.setattr(engine, "_write_failure_log", lambda *a, **k: None)
     monkeypatch.setattr(engine, "resolve_claude_bin", lambda config=None: "no-such-bin-xyz")
 
     events: list[Event] = []
-    result = engine.run_task(tmp_path, "10.x", emit=events.append)
+    result = engine.run_task(tmp_path, tasks_root, "10.x", emit=events.append)
 
     assert result.success is False
     assert "not found" in (result.result_line or "")
@@ -314,17 +324,17 @@ def test_extract_result_line_fallback() -> None:
 
 
 def test_list_queue_skips_subdirs_and_flags_evergreen(tmp_path: Path) -> None:
-    _seed(tmp_path, tasks={
+    tasks_root = _seed(tmp_path, tasks={
         "alpha": "Do alpha.",
         "beta": "---\ntitle: Beta thing\nmodel: claude-opus-4-8\n---\nDo beta.",
         "00._todo": "---\nautosplit: true\n---\nstuff",
         "green": "---\nevergreen: true\n---\nrecurring",
     })
-    notes = tmp_path / ".tasks/notes"
+    notes = tasks_root / "main/notes"
     notes.mkdir()
     (notes / "ignore.md").write_text("not a task")
 
-    queue = list_queue(tmp_path)
+    queue = list_queue(tasks_root)
     names = [q["task"] for q in queue]
     assert "alpha" in names
     assert "ignore" not in names  # subdir skipped
@@ -339,13 +349,13 @@ def test_read_task_returns_brief_with_resolved_frontmatter(tmp_path: Path) -> No
     # with resolved defaults (model/draft/automerge) even when the file omits them.
     from nightshift.engine import read_task
 
-    _seed(tmp_path, tasks={
+    tasks_root = _seed(tmp_path, tasks={
         "beta": "---\ntitle: Beta thing\nmodel: claude-opus-4-8\n---\nDo beta well.\n",
         "plain": "Just a body, no frontmatter.",
         "green": "---\nevergreen: true\n---\nrecurring",
     })
 
-    beta = read_task(tmp_path, "beta")
+    beta = read_task(tasks_root, "beta")
     assert beta["task"] == "beta"
     assert beta["title"] == "Beta thing"
     assert beta["body"] == "Do beta well."
@@ -355,20 +365,20 @@ def test_read_task_returns_brief_with_resolved_frontmatter(tmp_path: Path) -> No
     assert "automerge" in beta["frontmatter"]
     assert beta["evergreen"] is False
 
-    plain = read_task(tmp_path, "plain")
+    plain = read_task(tasks_root, "plain")
     assert plain["title"] == "plain"
     assert plain["body"] == "Just a body, no frontmatter."
     # config model default applies when the file has no model.
     assert plain["frontmatter"]["model"] == "claude-sonnet-4-6"
 
-    green = read_task(tmp_path, "green")
+    green = read_task(tasks_root, "green")
     assert green["evergreen"] is True
 
     # missing / traversal-shaped names raise FileNotFoundError.
     with pytest.raises(FileNotFoundError):
-        read_task(tmp_path, "nope")
+        read_task(tasks_root, "nope")
     with pytest.raises(FileNotFoundError):
-        read_task(tmp_path, "../../etc/passwd")
+        read_task(tasks_root, "../../etc/passwd")
 
 
 def test_set_task_meta_edits_toggles_and_model(tmp_path: Path) -> None:
@@ -376,21 +386,21 @@ def test_set_task_meta_edits_toggles_and_model(tmp_path: Path) -> None:
     # existing keys where they sit and clearing the model to inherit the default.
     from nightshift.engine import read_task, set_task_meta
 
-    _seed(tmp_path, tasks={
+    tasks_root = _seed(tmp_path, tasks={
         "alpha": "---\ntitle: Alpha\nmodel: claude-opus-4-8\ndraft: false\n---\nThe brief.\n",
     })
 
-    brief = set_task_meta(tmp_path, "alpha", {"draft": True, "evergreen": True})
+    brief = set_task_meta(tasks_root, "alpha", {"draft": True, "evergreen": True})
     assert brief["frontmatter"]["draft"] is True
     assert brief["evergreen"] is True
     # Untouched keys survive.
     assert brief["frontmatter"]["model"] == "claude-opus-4-8"
 
     # model None clears the pin so the task inherits the config default.
-    cleared = set_task_meta(tmp_path, "alpha", {"model": None})
+    cleared = set_task_meta(tasks_root, "alpha", {"model": None})
     assert "model" not in cleared["frontmatter_raw"]
     assert cleared["frontmatter"]["model"] == "claude-sonnet-4-6"
-    assert "non-editable" not in read_task(tmp_path, "alpha")["body"]
+    assert "non-editable" not in read_task(tasks_root, "alpha")["body"]
 
 
 def test_set_task_meta_edits_title_and_body(tmp_path: Path) -> None:
@@ -398,24 +408,24 @@ def test_set_task_meta_edits_title_and_body(tmp_path: Path) -> None:
     # headline) and brief prose alongside the toggles.
     from nightshift.engine import set_task_meta
 
-    _seed(tmp_path, tasks={
+    tasks_root = _seed(tmp_path, tasks={
         "alpha": "---\ntitle: Old title\nmodel: claude-opus-4-8\n---\nOld brief.\n",
     })
 
     brief = set_task_meta(
-        tmp_path, "alpha", {"title": "New title", "body": "New brief prose."}
+        tasks_root, "alpha", {"title": "New title", "body": "New brief prose."}
     )
     assert brief["title"] == "New title"
     assert brief["body"] == "New brief prose."
     # The title rewrites the existing key in place, not a duplicate.
-    text = (tmp_path / ".tasks/alpha.md").read_text()
+    text = (tasks_root / "main/alpha.md").read_text()
     assert text.count("title:") == 1
     # The model pin is preserved through a content-only edit.
     assert brief["frontmatter"]["model"] == "claude-opus-4-8"
 
     # A combined save updates everything in one call.
     combined = set_task_meta(
-        tmp_path, "alpha", {"title": "T2", "body": "B2", "disabled": True, "draft": True}
+        tasks_root, "alpha", {"title": "T2", "body": "B2", "disabled": True, "draft": True}
     )
     assert combined["title"] == "T2"
     assert combined["body"] == "B2"
@@ -426,83 +436,86 @@ def test_set_task_meta_edits_title_and_body(tmp_path: Path) -> None:
 def test_set_task_meta_rejects_empty_title_and_bad_keys(tmp_path: Path) -> None:
     from nightshift.engine import set_task_meta
 
-    _seed(tmp_path, tasks={"alpha": "---\ntitle: Alpha\n---\nbody"})
+    tasks_root = _seed(tmp_path, tasks={"alpha": "---\ntitle: Alpha\n---\nbody"})
     with pytest.raises(ValueError):
-        set_task_meta(tmp_path, "alpha", {"title": "   "})
+        set_task_meta(tasks_root, "alpha", {"title": "   "})
     with pytest.raises(ValueError):
-        set_task_meta(tmp_path, "alpha", {"bogus": "x"})
+        set_task_meta(tasks_root, "alpha", {"bogus": "x"})
     with pytest.raises(FileNotFoundError):
-        set_task_meta(tmp_path, "../../etc/passwd", {"draft": True})
+        set_task_meta(tasks_root, "../../etc/passwd", {"draft": True})
 
 
 def test_list_queue_respects_config_order(tmp_path: Path) -> None:
-    _seed(tmp_path, tasks={
+    tasks_root = _seed(tmp_path, tasks={
         "alpha": "Do alpha.",
         "beta": "Do beta.",
         "gamma": "Do gamma.",
     })
-    reorder_queue(tmp_path, ["gamma", "alpha", "beta"])
-    queue = list_queue(tmp_path)
+    reorder_queue(tasks_root, ["gamma", "alpha", "beta"])
+    queue = list_queue(tasks_root)
     assert [q["task"] for q in queue] == ["gamma", "alpha", "beta"]
 
 
 # --------------------------------------------------------------------------- #
-# execution order — .tasks/config.json
+# execution order — <queue>/config.json
 # --------------------------------------------------------------------------- #
 
 
 def test_order_config_drives_queue_order(tmp_path: Path) -> None:
-    # Numbering removed: order is driven by .tasks/config.json, not the filename.
-    _seed(tmp_path, tasks={
+    # Numbering removed: order is driven by the queue's config.json, not the filename.
+    tasks_root = _seed(tmp_path, tasks={
         "alpha": "Do alpha.",
         "beta": "Do beta.",
         "gamma": "Do gamma.",
     })
-    engine.save_order(tmp_path, ["gamma", "alpha", "beta"])
-    names = [q["task"] for q in list_queue(tmp_path)]
+    engine.save_order(tasks_root, ["gamma", "alpha", "beta"])
+    names = [q["task"] for q in list_queue(tasks_root)]
     assert names == ["gamma", "alpha", "beta"]
 
 
 def test_order_unlisted_tasks_fall_back_to_filename(tmp_path: Path) -> None:
     # Listed tasks lead in configured order; unlisted ones follow lexically.
-    _seed(tmp_path, tasks={"alpha": "a", "beta": "b", "gamma": "c", "delta": "d"})
-    engine.save_order(tmp_path, ["gamma"])
-    names = [q["task"] for q in list_queue(tmp_path)]
+    tasks_root = _seed(tmp_path, tasks={"alpha": "a", "beta": "b", "gamma": "c", "delta": "d"})
+    engine.save_order(tasks_root, ["gamma"])
+    names = [q["task"] for q in list_queue(tasks_root)]
     assert names == ["gamma", "alpha", "beta", "delta"]
 
 
 def test_order_stems_ignores_stale_and_missing_config(tmp_path: Path) -> None:
-    _seed(tmp_path)
-    # No config file → pure filename order.
-    assert engine.order_stems(tmp_path, ["b", "a"]) == ["a", "b"]
+    # A queue with no config.json order falls back to pure filename order. The
+    # builder writes a (repo-bound) config with an empty ``order``, so drop it
+    # to exercise the "no order configured" path the original test covered.
+    tasks_root = _seed(tmp_path)
+    (tasks_root / "main/config.json").unlink()
+    assert engine.order_stems(tasks_root, ["b", "a"]) == ["a", "b"]
     # Stale entries (no such stem in the input) are ignored, not surfaced.
-    engine.save_order(tmp_path, ["ghost", "b"])
-    assert engine.order_stems(tmp_path, ["a", "b"]) == ["b", "a"]
+    engine.save_order(tasks_root, ["ghost", "b"])
+    assert engine.order_stems(tasks_root, ["a", "b"]) == ["b", "a"]
 
 
 def test_reorder_queue_drops_unknown_and_appends_missing(tmp_path: Path) -> None:
-    _seed(tmp_path, tasks={"one": "1", "two": "2", "three": "3"})
+    tasks_root = _seed(tmp_path, tasks={"one": "1", "two": "2", "three": "3"})
     # Reorder with a spoofed name and an omitted real task.
-    result = engine.reorder_queue(tmp_path, ["three", "one", "ghost"])
+    result = engine.reorder_queue(tasks_root, ["three", "one", "ghost"])
     # ghost is dropped (no file); two is appended in filename order.
     assert result == ["three", "one", "two"]
-    assert engine.load_order(tmp_path) == ["three", "one", "two"]
-    assert [q["task"] for q in list_queue(tmp_path)] == ["three", "one", "two"]
+    assert engine.load_order(tasks_root) == ["three", "one", "two"]
+    assert [q["task"] for q in list_queue(tasks_root)] == ["three", "one", "two"]
 
 
 def test_save_queue_config_value_preserves_siblings(tmp_path: Path) -> None:
     # Persisting the per-queue validate command must keep the order (and any
     # other sibling keys) intact, and clearing it (None) removes the key.
-    _seed(tmp_path, tasks={"one": "1", "two": "2"})
-    engine.save_order(tmp_path, ["two", "one"])
+    tasks_root = _seed(tmp_path, tasks={"one": "1", "two": "2"})
+    engine.save_order(tasks_root, ["two", "one"])
 
-    engine.save_queue_config_value(tmp_path, "validate", "just check")
-    cfg = json.loads((tmp_path / ".tasks/config.json").read_text())
+    engine.save_queue_config_value(tasks_root, "validate", "just check")
+    cfg = json.loads((tasks_root / "main/config.json").read_text())
     assert cfg["validate"] == "just check"
     assert cfg["order"] == ["two", "one"]  # sibling preserved
 
-    engine.save_queue_config_value(tmp_path, "validate", None)
-    cfg = json.loads((tmp_path / ".tasks/config.json").read_text())
+    engine.save_queue_config_value(tasks_root, "validate", None)
+    cfg = json.loads((tasks_root / "main/config.json").read_text())
     assert "validate" not in cfg
     assert cfg["order"] == ["two", "one"]
 
@@ -545,27 +558,30 @@ def test_resolve_config_empty_validate_overrides_parent_default(tmp_path: Path) 
     # resolve_validate_cmd then reads it as "validation disabled".
     from nightshift.spawn_daily import resolve_config
 
-    _seed(tmp_path)
-    (tmp_path / ".tasks/config.json").write_text(json.dumps({"validate": "just validate"}))
-    (tmp_path / ".tasks/ns").mkdir(parents=True)
-    (tmp_path / ".tasks/ns/config.json").write_text(
+    tasks_root = _seed(tmp_path)
+    # In the two-root model the layer a queue inherits is the content-store
+    # config (``<tasks_root>/config.json``), not a sibling queue — that's the
+    # "parent default" the playlist overrides (formerly ``.tasks/config.json``).
+    (tasks_root / "config.json").write_text(json.dumps({"validate": "just validate"}))
+    (tasks_root / "ns").mkdir(parents=True)
+    (tasks_root / "ns/config.json").write_text(
         json.dumps({"validate": "", "order": []})
     )
 
-    pl = resolve_config(tmp_path, ".tasks/ns")
+    pl = resolve_config(tmp_path, tasks_root, "ns")
     assert pl["validate"] == ""
     assert engine.resolve_validate_cmd(pl) is None
 
-    # The main queue still validates with its own command.
-    main = resolve_config(tmp_path, ".tasks")
+    # The main queue still validates with the inherited parent command.
+    main = resolve_config(tmp_path, tasks_root, "main")
     assert engine.resolve_validate_cmd(main) == ["just", "validate"]
 
 
 def test_delete_task_removes_from_order(tmp_path: Path) -> None:
-    _seed(tmp_path, tasks={"one": "1", "two": "2"})
-    engine.save_order(tmp_path, ["two", "one"])
-    delete_task(tmp_path, "two")
-    assert engine.load_order(tmp_path) == ["one"]
+    tasks_root = _seed(tmp_path, tasks={"one": "1", "two": "2"})
+    engine.save_order(tasks_root, ["two", "one"])
+    delete_task(tasks_root, "two")
+    assert engine.load_order(tasks_root) == ["one"]
 
 
 # --------------------------------------------------------------------------- #
@@ -576,27 +592,27 @@ def test_delete_task_removes_from_order(tmp_path: Path) -> None:
 def test_create_task_writes_unnumbered_file(tmp_path: Path) -> None:
     # Spec: "remove the numbering from tasks" — new tasks are named by their
     # slugified title with no NN. prefix, and appended to the execution order.
-    _seed(tmp_path)
-    created = create_task(tmp_path, "Fix the ops screen", "Make it nicer.")
+    tasks_root = _seed(tmp_path)
+    created = create_task(tasks_root, "Fix the ops screen", "Make it nicer.")
     assert created["task"] == "fix-the-ops-screen"
-    dest = tmp_path / ".tasks/fix-the-ops-screen.md"
+    dest = tasks_root / "main/fix-the-ops-screen.md"
     assert dest.exists()
     text = dest.read_text()
     assert "title: Fix the ops screen" in text
     assert "Make it nicer." in text
     # The new task lands at the end of the configured order.
-    assert engine.load_order(tmp_path) == ["fix-the-ops-screen"]
+    assert engine.load_order(tasks_root) == ["fix-the-ops-screen"]
 
 
 def test_create_task_rejects_empty_title_and_collision(tmp_path: Path) -> None:
     # Spec: numbering is gone, so there is no longer a numeric `pri` to reject;
     # the remaining guards are an empty title and a name collision.
-    _seed(tmp_path)
+    tasks_root = _seed(tmp_path)
     with pytest.raises(ValueError):
-        create_task(tmp_path, "   ", "body")
-    create_task(tmp_path, "Dup", "body")
+        create_task(tasks_root, "   ", "body")
+    create_task(tasks_root, "Dup", "body")
     with pytest.raises(FileExistsError):
-        create_task(tmp_path, "Dup", "body")
+        create_task(tasks_root, "Dup", "body")
 
 
 # --------------------------------------------------------------------------- #
@@ -635,7 +651,11 @@ def test_settings_round_trip_and_validation(tmp_path: Path) -> None:
 
 
 def _fake_worker(sleep_steps: int = 200):
-    def fake(root, task, *, emit=lambda e: None, abort_reason=None, backend_name=None, tasks_rel=".tasks"):
+    def fake(
+        workspace, tasks_root, task, *,
+        repo=None, emit=lambda e: None, abort_reason=None,
+        backend_name=None, tasks_rel="main",
+    ):
         emit(Event(TASK_STARTED, {"task": task, "title": task, "frontmatter": {}}))
         for _ in range(sleep_steps):
             reason = abort_reason() if callable(abort_reason) else None
@@ -669,7 +689,7 @@ def test_run_queue_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     out: list = []
     th = threading.Thread(
         target=lambda: out.append(
-            run_queue(tmp_path, ["A", "B", "C", "D"], listeners=[track], controller=controller)
+            run_queue(tmp_path, tmp_path, ["A", "B", "C", "D"], listeners=[track], controller=controller)
         )
     )
     th.start()
@@ -688,7 +708,7 @@ def test_run_queue_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     out: list = []
     th = threading.Thread(
         target=lambda: out.append(
-            run_queue(tmp_path, ["A", "B"], controller=controller)
+            run_queue(tmp_path, tmp_path, ["A", "B"], controller=controller)
         )
     )
     th.start()
@@ -712,7 +732,7 @@ def test_run_queue_pause_holds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     controller = Controller()
     controller.pause()
     th = threading.Thread(
-        target=lambda: run_queue(tmp_path, ["A", "B"], listeners=[track], controller=controller)
+        target=lambda: run_queue(tmp_path, tmp_path, ["A", "B"], listeners=[track], controller=controller)
     )
     th.start()
     time.sleep(0.15)
@@ -730,7 +750,7 @@ def test_run_queue_pause_holds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 def test_player_oneshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _seed(tmp_path)
     monkeypatch.setattr(engine, "run_task", _fake_worker(sleep_steps=2))
-    monkeypatch.setattr("nightshift.server.player.build_task_list", lambda root, arg, tasks_rel=".tasks": [arg])
+    monkeypatch.setattr("nightshift.server.player.build_task_list", lambda root, arg, tasks_rel="main": [arg])
 
     player = Player(tmp_path)
     player.play(mode="oneshot", task="10.solo")
@@ -744,7 +764,7 @@ def test_player_oneshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
 def test_player_repeat_loops_then_stops(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _seed(tmp_path)
     monkeypatch.setattr(engine, "run_task", _fake_worker(sleep_steps=2))
-    monkeypatch.setattr("nightshift.server.player.build_task_list", lambda root, arg, tasks_rel=".tasks": ["10.x"])
+    monkeypatch.setattr("nightshift.server.player.build_task_list", lambda root, arg, tasks_rel="main": ["10.x"])
     save_settings(tmp_path, {"transport_mode": "repeat", "repeat_interval": "1s"})
 
     player = Player(tmp_path)
@@ -805,7 +825,7 @@ def test_server_settings_exposes_queue_validate(tmp_path: Path) -> None:
     # Spec: "the 'validate' setting in the config.json for the active queue
     # should be editable in the settings pane." The settings endpoint surfaces
     # the active queue's validate command and persists edits to its config.json.
-    _seed(tmp_path, tasks={"alpha": "Do alpha."})
+    tasks_root = _seed(tmp_path, tasks={"alpha": "Do alpha."})
     client = _client(tmp_path)
 
     settings = client.get("/api/settings").json()
@@ -818,7 +838,7 @@ def test_server_settings_exposes_queue_validate(tmp_path: Path) -> None:
     resp = client.put("/api/settings", json={"validate": "just check"})
     assert resp.status_code == 200
     assert resp.json()["values"]["validate"] == "just check"
-    cfg = json.loads((tmp_path / ".tasks/config.json").read_text())
+    cfg = json.loads((tasks_root / "main/config.json").read_text())
     assert cfg["validate"] == "just check"
     assert "validate" not in json.loads(
         (tmp_path / ".nightshift/settings.json").read_text()
@@ -831,14 +851,14 @@ def test_server_settings_exposes_queue_validate(tmp_path: Path) -> None:
         resp = client.put("/api/settings", json={"validate": blank})
         assert resp.status_code == 200
         assert resp.json()["values"]["validate"] == ""
-        cfg = json.loads((tmp_path / ".tasks/config.json").read_text())
+        cfg = json.loads((tasks_root / "main/config.json").read_text())
         assert cfg["validate"] == ""
 
 
 def test_server_settings_validate_follows_active_queue(tmp_path: Path) -> None:
     # The validate field is per-queue: switching the active queue surfaces and
     # edits that queue's config.json, leaving the main queue's untouched.
-    _seed(tmp_path, tasks={"alpha": "a"})
+    tasks_root = _seed(tmp_path, tasks={"alpha": "a"})
     client = _client(tmp_path)
     assert client.post("/api/playlists", json={"name": "Nightshift"}).status_code == 201
     assert client.post("/api/active", json={"playlist": "nightshift"}).status_code == 200
@@ -846,10 +866,10 @@ def test_server_settings_validate_follows_active_queue(tmp_path: Path) -> None:
     resp = client.put("/api/settings", json={"validate": "just validate-nightshift"})
     assert resp.status_code == 200
     assert resp.json()["values"]["validate"] == "just validate-nightshift"
-    pl_cfg = json.loads((tmp_path / ".tasks/nightshift/config.json").read_text())
+    pl_cfg = json.loads((tasks_root / "nightshift/config.json").read_text())
     assert pl_cfg["validate"] == "just validate-nightshift"
     # The main queue's config is not touched by the playlist edit.
-    main_cfg_path = tmp_path / ".tasks/config.json"
+    main_cfg_path = tasks_root / "main/config.json"
     main_cfg = json.loads(main_cfg_path.read_text()) if main_cfg_path.exists() else {}
     assert "validate" not in main_cfg
 
@@ -1004,7 +1024,7 @@ def test_server_reorder_queue(tmp_path: Path) -> None:
 def test_server_queue_sort_mode_round_trips(tmp_path: Path) -> None:
     # The sort toggle persists per-queue in config.json and drives both the UI
     # display order and the engine's play order (both via order_stems).
-    _seed(tmp_path, tasks={
+    tasks_root = _seed(tmp_path, tasks={
         "alpha": "---\npriority: 5\n---\nDo alpha.",
         "beta": "---\npriority: 0\n---\nDo beta.",
     })
@@ -1016,7 +1036,7 @@ def test_server_queue_sort_mode_round_trips(tmp_path: Path) -> None:
     resp = client.put("/api/queue/sort", json={"sort": "priority"})
     assert resp.status_code == 200 and resp.json()["sort"] == "priority"
     assert client.get("/api/queue/sort").json()["sort"] == "priority"
-    cfg = json.loads((tmp_path / ".tasks/config.json").read_text())
+    cfg = json.loads((tasks_root / "main/config.json").read_text())
     assert cfg["sort"] == "priority"
 
     # Priority mode floats beta (P0) above alpha (P5) in the queue listing.
@@ -1052,7 +1072,7 @@ def test_server_play_priorities_round_trips(tmp_path: Path) -> None:
     # The play-priority filter persists per-queue in config.json and restricts
     # the engine's play/execute set (live_ordered_queue) without hiding tasks
     # from the management listing (/api/queue stays full).
-    _seed(tmp_path, tasks={
+    tasks_root = _seed(tmp_path, tasks={
         "alpha": "---\npriority: 0\n---\nDo alpha.",
         "beta": "---\npriority: 3\n---\nDo beta.",
     })
@@ -1065,16 +1085,16 @@ def test_server_play_priorities_round_trips(tmp_path: Path) -> None:
     resp = client.put("/api/queue/play-priorities", json={"priorities": [3, 0, 0, 9]})
     assert resp.status_code == 200 and resp.json()["priorities"] == [0, 3]
     assert client.get("/api/queue/play-priorities").json()["priorities"] == [0, 3]
-    cfg = json.loads((tmp_path / ".tasks/config.json").read_text())
+    cfg = json.loads((tasks_root / "main/config.json").read_text())
     assert cfg["play_priorities"] == [0, 3]
 
     # /api/queue still lists every task (filter is a play scope, not a view).
     assert {q["task"] for q in client.get("/api/queue").json()} == {"alpha", "beta"}
 
     # The engine's play source honours the filter.
-    assert live_ordered_queue(tmp_path) == ["alpha", "beta"]
+    assert live_ordered_queue(tasks_root) == ["alpha", "beta"]
     client.put("/api/queue/play-priorities", json={"priorities": [0]})
-    assert live_ordered_queue(tmp_path) == ["alpha"]
+    assert live_ordered_queue(tasks_root) == ["alpha"]
 
     # An empty list clears the filter again.
     assert client.put("/api/queue/play-priorities", json={"priorities": []}).json()[
@@ -1083,7 +1103,7 @@ def test_server_play_priorities_round_trips(tmp_path: Path) -> None:
 
 
 def test_server_clear_runs_and_delete_task(tmp_path: Path) -> None:
-    _seed(tmp_path, tasks={"alpha": "Do alpha.", "beta": "Do beta."})
+    tasks_root = _seed(tmp_path, tasks={"alpha": "Do alpha.", "beta": "Do beta."})
     client = _client(tmp_path)
 
     # Delete a queue task file.
@@ -1093,7 +1113,7 @@ def test_server_clear_runs_and_delete_task(tmp_path: Path) -> None:
     assert client.delete("/api/tasks/does-not-exist").status_code == 404
 
     # Seed a finished run, then clear all completed.
-    store = RunStore(tmp_path)
+    store = RunStore(tasks_root)
     writer = store.start("ui")
     writer.emit(Event(TASK_STARTED, {"task": "beta", "title": "B", "frontmatter": {}}))
     writer.emit(Event(RUN_FINISHED, {"run_id": writer.run_id}))
@@ -1396,11 +1416,11 @@ def test_run_task_no_changes_completes_cleanly(
     as 'completed (no changes)' rather than failing the squash step."""
     from nightshift import backends
 
-    _seed(tmp_path, tasks={"10.x": "do x"})
-    monkeypatch.setattr(engine, "setup_worktree", lambda root, task, *, queue=None: tmp_path)
-    monkeypatch.setattr(engine, "teardown_worktree", lambda root, task, *, queue=None: None)
-    monkeypatch.setattr(engine, "build_prompt", lambda root, task, tasks_rel=".tasks": "p")
-    monkeypatch.setattr(engine, "_worktree_has_commits", lambda root, task, *, queue=None: False)
+    tasks_root = _seed(tmp_path, tasks={"10.x": "do x"})
+    monkeypatch.setattr(engine, "setup_worktree", lambda ws, repo, task, *, queue=None: tmp_path)
+    monkeypatch.setattr(engine, "teardown_worktree", lambda ws, repo, task, *, queue=None: None)
+    monkeypatch.setattr(engine, "build_prompt", lambda task, *, task_file=None, validate_cmd=None: "p")
+    monkeypatch.setattr(engine, "_worktree_has_commits", lambda ws, repo, task, *, queue=None: False)
 
     class _NoopBackend:
         name = "noop"
@@ -1412,7 +1432,7 @@ def test_run_task_no_changes_completes_cleanly(
     monkeypatch.setattr(backends, "get_backend", lambda name=None: _NoopBackend())
 
     events: list[Event] = []
-    result = engine.run_task(tmp_path, "10.x", emit=events.append)
+    result = engine.run_task(tmp_path, tasks_root, "10.x", emit=events.append)
 
     assert result.success is True
     assert "no changes" in (result.result_line or "")
@@ -1421,35 +1441,35 @@ def test_run_task_no_changes_completes_cleanly(
     assert "timings" in last.payload and "worker" in last.payload["timings"]
     # A completed regular task leaves the queue even on the no-changes path
     # (the worker produced no branch to git-rm its own file).
-    assert not (tmp_path / ".tasks/10.x.md").exists()
+    assert not (tasks_root / "main/10.x.md").exists()
 
 
 def test_drop_completed_task_removes_lingering_file(tmp_path: Path) -> None:
     """A landed regular task whose worker forgot to git-rm its own file is
     dropped from the queue (file + execution-order entry) so the UI stops
     listing a completed task."""
-    _seed(tmp_path, tasks={"alpha": "do alpha", "beta": "do beta"})
-    engine.save_order(tmp_path, ["alpha", "beta"])
+    tasks_root = _seed(tmp_path, tasks={"alpha": "do alpha", "beta": "do beta"})
+    engine.save_order(tasks_root, ["alpha", "beta"])
 
-    assert engine.drop_completed_task(tmp_path, "alpha") is True
-    assert not (tmp_path / ".tasks/alpha.md").exists()
-    assert [q["task"] for q in list_queue(tmp_path)] == ["beta"]
-    assert engine.load_order(tmp_path) == ["beta"]
+    assert engine.drop_completed_task(tasks_root, "alpha") is True
+    assert not (tasks_root / "main/alpha.md").exists()
+    assert [q["task"] for q in list_queue(tasks_root)] == ["beta"]
+    assert engine.load_order(tasks_root) == ["beta"]
 
     # Idempotent: a file that's already gone (the worker did remove it) is a no-op.
-    assert engine.drop_completed_task(tmp_path, "alpha") is False
+    assert engine.drop_completed_task(tasks_root, "alpha") is False
 
 
 def test_drop_completed_task_keeps_evergreen_file(tmp_path: Path) -> None:
     """An evergreen task keeps its file (it resets and re-runs), so the engine's
     completion backstop must not touch it — only regular tasks call it."""
-    _seed(tmp_path, tasks={"green": "---\nevergreen: true\n---\nrecurring"})
-    config = engine.resolve_config(tmp_path)
-    meta = engine.split_frontmatter((tmp_path / ".tasks/green.md").read_text())[0]
+    tasks_root = _seed(tmp_path, tasks={"green": "---\nevergreen: true\n---\nrecurring"})
+    config = engine.resolve_config(tmp_path, tasks_root)
+    meta = engine.split_frontmatter((tasks_root / "main/green.md").read_text())[0]
     assert engine.task_is_evergreen(meta, "green", config) is True
     # The run paths only call drop_completed_task for non-evergreen tasks; the
     # file is left in place for evergreen ones.
-    assert (tmp_path / ".tasks/green.md").exists()
+    assert (tasks_root / "main/green.md").exists()
 
 
 def test_server_backends_endpoint(tmp_path: Path) -> None:
@@ -1486,53 +1506,56 @@ def test_worker_backend_setting_validation(tmp_path: Path) -> None:
 def test_playlists_crud_round_trip(tmp_path: Path) -> None:
     from nightshift import playlists
 
-    _seed(tmp_path)
-    assert playlists.list_playlists(tmp_path) == []
+    tasks_root = _seed(tmp_path)
+    assert playlists.list_playlists(tasks_root) == []
 
-    created = playlists.create_playlist(tmp_path, "Morning Open")
+    created = playlists.create_playlist(tasks_root, "Morning Open")
     assert created["name"] == "morning-open"
     # A fresh playlist's config holds only an empty queue order.
-    cfg = json.loads((tmp_path / ".tasks/morning-open/config.json").read_text())
+    cfg = json.loads((tasks_root / "morning-open/config.json").read_text())
     assert cfg == {"order": []}
 
     # duplicate name → FileExistsError; empty name → ValueError.
     with pytest.raises(FileExistsError):
-        playlists.create_playlist(tmp_path, "Morning Open")
+        playlists.create_playlist(tasks_root, "Morning Open")
     with pytest.raises(ValueError):
-        playlists.create_playlist(tmp_path, "   ")
+        playlists.create_playlist(tasks_root, "   ")
 
-    assert playlists.exists(tmp_path, "morning-open")
-    assert playlists.list_playlists(tmp_path) == [{"name": "morning-open", "task_count": 0}]
+    assert playlists.exists(tasks_root, "morning-open")
+    assert playlists.list_playlists(tasks_root) == [{"name": "morning-open", "task_count": 0}]
 
-    assert playlists.delete_playlist(tmp_path, "morning-open") is True
-    assert playlists.delete_playlist(tmp_path, "morning-open") is False
+    assert playlists.delete_playlist(tasks_root, "morning-open") is True
+    assert playlists.delete_playlist(tasks_root, "morning-open") is False
     # traversal-shaped names are rejected outright.
-    assert playlists.delete_playlist(tmp_path, "../../etc") is False
+    assert playlists.delete_playlist(tasks_root, "../../etc") is False
 
 
 def test_resolve_config_layers_shipped_tasks_and_playlist(tmp_path: Path) -> None:
-    """Runner config resolves shipped defaults <- .tasks/config.json <- playlist
-    config.json, so a playlist inherits anything it doesn't override."""
+    """Runner config resolves operator/shipped defaults <- content-store
+    config.json <- per-queue config.json, so a queue inherits anything it doesn't
+    override. The store config (``<tasks_root>/config.json``) is the shared layer
+    that replaces the old nested ``.tasks/config.json`` parent."""
     from nightshift.spawn_daily import resolve_config
 
-    _seed(tmp_path)  # shipped: model claude-sonnet-4-6
-    (tmp_path / ".tasks/config.json").write_text(
+    tasks_root = _seed(tmp_path)  # operator config: model claude-sonnet-4-6
+    # The content-store layer every queue inherits (formerly .tasks/config.json).
+    (tasks_root / "config.json").write_text(
         json.dumps({"validate": "just validate", "automerge": True})
     )
-    (tmp_path / ".tasks/ns").mkdir(parents=True)
-    (tmp_path / ".tasks/ns/config.json").write_text(
+    (tasks_root / "ns").mkdir(parents=True)
+    (tasks_root / "ns/config.json").write_text(
         json.dumps({"validate": "just validate-nightshift", "order": []})
     )
 
-    main = resolve_config(tmp_path, ".tasks")
+    main = resolve_config(tmp_path, tasks_root, "main")
     assert main["validate"] == "just validate"
-    assert main["model"] == "claude-sonnet-4-6"   # from shipped defaults
-    assert main["automerge"] is True              # from .tasks
+    assert main["model"] == "claude-sonnet-4-6"   # from operator defaults
+    assert main["automerge"] is True              # from the store layer
 
-    pl = resolve_config(tmp_path, ".tasks/ns")
-    assert pl["validate"] == "just validate-nightshift"  # playlist override
-    assert pl["model"] == "claude-sonnet-4-6"            # inherited from shipped
-    assert pl["automerge"] is True                       # inherited from .tasks
+    pl = resolve_config(tmp_path, tasks_root, "ns")
+    assert pl["validate"] == "just validate-nightshift"  # queue override
+    assert pl["model"] == "claude-sonnet-4-6"            # inherited from operator
+    assert pl["automerge"] is True                       # inherited from the store layer
 
 
 def test_queue_ops_operate_on_playlist_dir(tmp_path: Path) -> None:
@@ -1540,21 +1563,21 @@ def test_queue_ops_operate_on_playlist_dir(tmp_path: Path) -> None:
     points at one, leaving the main queue untouched."""
     from nightshift.engine import create_task, delete_task, list_queue, reorder_queue
 
-    _seed(tmp_path, tasks={"main-a": "a"})
-    (tmp_path / ".tasks/ns").mkdir(parents=True)
-    (tmp_path / ".tasks/ns/config.json").write_text(json.dumps({"order": []}))
+    tasks_root = _seed(
+        tmp_path, tasks={"main-a": "a"}, queues={"ns": {"config": {"order": []}}}
+    )
 
-    create_task(tmp_path, "Beta", "b", ".tasks/ns")
-    create_task(tmp_path, "Alpha", "a", ".tasks/ns")
-    assert (tmp_path / ".tasks/ns/beta.md").exists()
+    create_task(tasks_root, "Beta", "b", "ns")
+    create_task(tasks_root, "Alpha", "a", "ns")
+    assert (tasks_root / "ns/beta.md").exists()
     # main queue only sees its own task (sub-dirs are skipped).
-    assert [q["task"] for q in list_queue(tmp_path)] == ["main-a"]
+    assert [q["task"] for q in list_queue(tasks_root)] == ["main-a"]
 
-    reorder_queue(tmp_path, ["alpha", "beta"], ".tasks/ns")
-    assert [q["task"] for q in list_queue(tmp_path, ".tasks/ns")] == ["alpha", "beta"]
+    reorder_queue(tasks_root, ["alpha", "beta"], "ns")
+    assert [q["task"] for q in list_queue(tasks_root, "ns")] == ["alpha", "beta"]
 
-    delete_task(tmp_path, "beta", ".tasks/ns")
-    assert [q["task"] for q in list_queue(tmp_path, ".tasks/ns")] == ["alpha"]
+    delete_task(tasks_root, "beta", "ns")
+    assert [q["task"] for q in list_queue(tasks_root, "ns")] == ["alpha"]
 
 
 def test_run_record_playlist_provenance_round_trip(tmp_path: Path) -> None:
@@ -1578,21 +1601,19 @@ def test_run_record_playlist_provenance_round_trip(tmp_path: Path) -> None:
 def test_player_set_active_switches_queue_and_store(tmp_path: Path) -> None:
     """Activating a playlist points the player at the playlist's tasks dir and
     its own runs store; switching back to main restores the default."""
-    _seed(tmp_path)
-    (tmp_path / ".tasks/ns").mkdir(parents=True)
-    (tmp_path / ".tasks/ns/config.json").write_text(json.dumps({"order": []}))
+    tasks_root = _seed(tmp_path, queues={"ns": {"config": {"order": []}}})
 
     player = Player(tmp_path)
-    assert player.tasks_rel() == ".tasks"
-    assert player.store.base == tmp_path / ".tasks/runs"
+    assert player.tasks_rel() == "main"
+    assert player.store.base == tasks_root / "main/runs"
 
     assert player.set_active("ns")["ok"] is True
     assert player.active_playlist() == "ns"
-    assert player.tasks_rel() == ".tasks/ns"
-    assert player.store.base == tmp_path / ".tasks/ns/runs"
+    assert player.tasks_rel() == "ns"
+    assert player.store.base == tasks_root / "ns/runs"
 
     assert player.set_active(None)["ok"] is True
-    assert player.tasks_rel() == ".tasks"
+    assert player.tasks_rel() == "main"
 
 
 def test_player_set_active_focus_decoupled_from_running_queue(
@@ -1602,13 +1623,11 @@ def test_player_set_active_focus_decoupled_from_running_queue(
     is a no-op that leaves the store identity untouched, and switching focus to a
     *different* queue mid-run is now allowed — it never stops the run, the
     running queue stays pinned, and the focused store follows the new queue."""
-    _seed(tmp_path)
-    (tmp_path / ".tasks/ns").mkdir(parents=True)
-    (tmp_path / ".tasks/ns/config.json").write_text(json.dumps({"order": []}))
+    tasks_root = _seed(tmp_path, queues={"ns": {"config": {"order": []}}})
     monkeypatch.setattr(engine, "run_task", _fake_worker(sleep_steps=2000))
     monkeypatch.setattr(
         "nightshift.server.player.build_task_list",
-        lambda root, arg, tasks_rel=".tasks": ["10.x"],
+        lambda root, arg, tasks_rel="main": ["10.x"],
     )
 
     player = Player(tmp_path)
@@ -1634,7 +1653,7 @@ def test_player_set_active_focus_decoupled_from_running_queue(
         assert player.active_playlist() == "ns"
         assert player.running_playlist() is None  # run still pinned to main
         assert player.state()["state"] == "playing"
-        assert player.store.base == tmp_path / ".tasks/ns/runs"
+        assert player.store.base == tasks_root / "ns/runs"
     finally:
         player.stop()
         _wait_idle(player)
@@ -1718,15 +1737,15 @@ def test_registry_runs_two_queues_concurrently(
 ) -> None:
     """Two queues' runners run independently and land into their own stores;
     histories never cross."""
-    _seed(tmp_path, tasks={"10.x": "x"})
-    (tmp_path / ".tasks/ns").mkdir(parents=True)
-    (tmp_path / ".tasks/ns/config.json").write_text(json.dumps({"order": []}))
+    tasks_root = _seed(
+        tmp_path, tasks={"10.x": "x"}, queues={"ns": {"config": {"order": []}}}
+    )
 
     monkeypatch.setattr(engine, "run_task", _fake_worker(sleep_steps=20))
     monkeypatch.setattr(
         "nightshift.server.player.build_task_list",
-        lambda root, arg, tasks_rel=".tasks": (
-            ["10.x"] if tasks_rel == ".tasks" else ["20.y"]
+        lambda root, arg, tasks_rel="main": (
+            ["10.x"] if tasks_rel == "main" else ["20.y"]
         ),
     )
 
@@ -1744,8 +1763,8 @@ def test_registry_runs_two_queues_concurrently(
 
     main_runs = reg.runner(None).store.list_runs()
     ns_runs = reg.runner("ns").store.list_runs()
-    assert reg.runner(None).store.base == tmp_path / ".tasks/runs"
-    assert reg.runner("ns").store.base == tmp_path / ".tasks/ns/runs"
+    assert reg.runner(None).store.base == tasks_root / "main/runs"
+    assert reg.runner("ns").store.base == tasks_root / "ns/runs"
     assert main_runs and main_runs[0]["tasks"][0]["task"] == "10.x"
     assert ns_runs and ns_runs[0]["tasks"][0]["task"] == "20.y"
     # Each queue's history holds only its own task.
@@ -1764,7 +1783,7 @@ def test_disk_admission_fails_task_without_cutting_worktree(
     )
     monkeypatch.setattr(
         "nightshift.server.player.build_task_list",
-        lambda root, arg, tasks_rel=".tasks": ["10.x"],
+        lambda root, arg, tasks_rel="main": ["10.x"],
     )
     ran = {"n": 0}
 
@@ -1796,16 +1815,17 @@ def test_disk_admission_fails_task_without_cutting_worktree(
 # --------------------------------------------------------------------------- #
 
 
-def _make_playlist(root: Path, name: str) -> None:
-    (root / ".tasks" / name).mkdir(parents=True, exist_ok=True)
-    (root / ".tasks" / name / "config.json").write_text(json.dumps({"order": []}))
+def _make_playlist(tasks_root: Path, name: str) -> None:
+    """Create an alternate queue ``<tasks_root>/<name>/`` in the content store."""
+    (tasks_root / name).mkdir(parents=True, exist_ok=True)
+    (tasks_root / name / "config.json").write_text(json.dumps({"order": []}))
 
 
 def test_state_endpoint_exposes_per_queue_map(tmp_path: Path) -> None:
     """GET /api/state returns a ``queues`` map keyed by queue, including the
     focused queue's card, plus a flat back-compat focused state."""
-    _seed(tmp_path, tasks={"10.x": "x"})
-    _make_playlist(tmp_path, "ns")
+    tasks_root = _seed(tmp_path, tasks={"10.x": "x"})
+    _make_playlist(tasks_root, "ns")
     client = _client(tmp_path)
 
     body = client.get("/api/state").json()
@@ -1825,13 +1845,13 @@ def test_transport_drives_explicit_queue_without_moving_focus(
 ) -> None:
     """A transport call with an explicit ``queue`` runs that queue's runner and
     leaves both the focused queue and the other queue untouched."""
-    _seed(tmp_path, tasks={"10.x": "x"})
-    _make_playlist(tmp_path, "ns")
+    tasks_root = _seed(tmp_path, tasks={"10.x": "x"})
+    _make_playlist(tasks_root, "ns")
     monkeypatch.setattr(engine, "run_task", _fake_worker(sleep_steps=400))
     monkeypatch.setattr(
         "nightshift.server.player.build_task_list",
-        lambda root, arg, tasks_rel=".tasks": (
-            ["10.x"] if tasks_rel == ".tasks" else ["20.y"]
+        lambda root, arg, tasks_rel="main": (
+            ["10.x"] if tasks_rel == "main" else ["20.y"]
         ),
     )
     client = _client(tmp_path)
@@ -1861,13 +1881,13 @@ def test_transport_omitted_queue_falls_back_to_focused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """With no explicit queue, transport targets the focused queue."""
-    _seed(tmp_path, tasks={"10.x": "x"})
-    _make_playlist(tmp_path, "ns")
+    tasks_root = _seed(tmp_path, tasks={"10.x": "x"})
+    _make_playlist(tasks_root, "ns")
     monkeypatch.setattr(engine, "run_task", _fake_worker(sleep_steps=400))
     monkeypatch.setattr(
         "nightshift.server.player.build_task_list",
-        lambda root, arg, tasks_rel=".tasks": (
-            ["10.x"] if tasks_rel == ".tasks" else ["20.y"]
+        lambda root, arg, tasks_rel="main": (
+            ["10.x"] if tasks_rel == "main" else ["20.y"]
         ),
     )
     client = _client(tmp_path)
@@ -1941,7 +1961,7 @@ def test_run_interruptible_kills_on_abort(tmp_path: Path) -> None:
 
 
 def test_server_playlists_and_active_api(tmp_path: Path) -> None:
-    _seed(tmp_path, tasks={"alpha": "a"})
+    tasks_root = _seed(tmp_path, tasks={"alpha": "a"})
     client = _client(tmp_path)
 
     assert client.get("/api/playlists").json() == []
@@ -1964,8 +1984,8 @@ def test_server_playlists_and_active_api(tmp_path: Path) -> None:
 
     # A task created now lands in the playlist dir, not the main queue.
     assert client.post("/api/tasks", json={"title": "PL task", "text": "x"}).status_code == 201
-    assert (tmp_path / ".tasks/nightshift/pl-task.md").exists()
-    assert not (tmp_path / ".tasks/pl-task.md").exists()
+    assert (tasks_root / "nightshift/pl-task.md").exists()
+    assert not (tasks_root / "main/pl-task.md").exists()
 
     # Activating an unknown playlist is a 404.
     assert client.post("/api/active", json={"playlist": "nope"}).status_code == 404
@@ -1983,7 +2003,7 @@ def test_server_crud_targets_explicit_queue_regardless_of_focus(tmp_path: Path) 
     """Phase 0: CRUD routes accept an explicit ``?queue=`` so any queue can be
     read and edited while another is focused. An empty value targets main, a
     name targets that playlist, and an unknown queue is a 404."""
-    _seed(tmp_path, tasks={"main-task": "m"})
+    tasks_root = _seed(tmp_path, tasks={"main-task": "m"})
     client = _client(tmp_path)
     assert client.post("/api/playlists", json={"name": "Nightshift"}).status_code == 201
 
@@ -1992,8 +2012,8 @@ def test_server_crud_targets_explicit_queue_regardless_of_focus(tmp_path: Path) 
         "/api/tasks", params={"queue": "nightshift"}, json={"title": "PL one", "text": "x"}
     )
     assert created.status_code == 201
-    assert (tmp_path / ".tasks/nightshift/pl-one.md").exists()
-    assert not (tmp_path / ".tasks/pl-one.md").exists()
+    assert (tasks_root / "nightshift/pl-one.md").exists()
+    assert not (tasks_root / "main/pl-one.md").exists()
     # Focus never moved.
     assert client.get("/api/active").json() == {"active_playlist": None}
 
@@ -2050,3 +2070,172 @@ def test_server_edit_guard_only_blocks_running_queue_live_task(
     # The same task name in another (idle) queue is editable.
     assert client.patch("/api/tasks/alpha", params={"queue": "other"}, json={"draft": True}).status_code == 200
     assert client.delete("/api/tasks/alpha", params={"queue": "other"}).status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# repos surface (two-root multi-repo): /api/repos, rescan, queue/repo binding,
+# per-task repo override, and the repo_unavailable → paused run lifecycle.
+# --------------------------------------------------------------------------- #
+
+
+def test_server_repos_endpoint_known_set_bindings_and_warnings(tmp_path: Path) -> None:
+    """`GET /api/repos` mirrors the manager: the workspace path + tasks-store
+    name, the known-repos set (every workspace child with a `.git`, including the
+    content store), each queue's bound repo + availability, and one warning per
+    queue whose configured repo is currently absent."""
+    _seed(
+        tmp_path,
+        tasks={"alpha": "a"},
+        repos=("longitude", "horizon"),  # two present target repos
+        # An alternate queue bound to a repo that was never created on disk.
+        queues={"ghost": {"config": {"repo": "telescope"}}},
+    )
+    client = _client(tmp_path)
+
+    payload = client.get("/api/repos").json()
+    assert payload["workspace"] == str(tmp_path)
+    assert payload["tasks_repo"] == DEFAULT_TASKS_REPO
+
+    # Known set: every workspace child with a `.git` — the two target repos plus
+    # the content-store repo — sorted, each flagged available.
+    assert payload["repos"] == [
+        {"name": "horizon", "available": True},
+        {"name": "longitude", "available": True},
+        {"name": DEFAULT_TASKS_REPO, "available": True},
+    ]
+
+    # Per-queue bindings: main → longitude (present), ghost → telescope (absent).
+    by_queue = {q["queue"]: q for q in payload["queues"]}
+    assert by_queue["main"] == {"queue": "main", "repo": "longitude", "available": True}
+    assert by_queue["ghost"] == {"queue": "ghost", "repo": "telescope", "available": False}
+
+    # Exactly the absent binding raises a warning.
+    assert payload["warnings"] == [{"queue": "ghost", "repo": "telescope"}]
+
+
+def test_server_repos_rescan_clears_warning_when_repo_appears(tmp_path: Path) -> None:
+    """`POST /api/repos/rescan` recomputes the known set live from disk: cloning a
+    previously-absent repo into the workspace and rescanning makes it available
+    and clears its queue's warning (no restart, no DB-backed paused table)."""
+    _seed(
+        tmp_path,
+        tasks={"alpha": "a"},
+        queues={"deploy": {"config": {"repo": "satellite"}}},  # absent on disk
+    )
+    client = _client(tmp_path)
+
+    before = client.get("/api/repos").json()
+    assert {"queue": "deploy", "repo": "satellite"} in before["warnings"]
+    assert "satellite" not in {r["name"] for r in before["repos"]}
+    assert next(q for q in before["queues"] if q["queue"] == "deploy")["available"] is False
+
+    # Clone/create the missing repo on disk, then rescan.
+    make_target_repo(tmp_path, "satellite")
+    after = client.post("/api/repos/rescan").json()
+
+    assert {"name": "satellite", "available": True} in after["repos"]
+    assert {"queue": "deploy", "repo": "satellite"} not in after["warnings"]
+    assert next(q for q in after["queues"] if q["queue"] == "deploy")["available"] is True
+
+
+def test_server_queue_repo_get_put_round_trip_and_validation(tmp_path: Path) -> None:
+    """`GET/PUT /api/queue/repo` reads and persists a queue's default target repo:
+    the binding round-trips per queue, a null clears it, and a malformed
+    reference (the path-traversal guard) is a 400 that leaves the value intact."""
+    _seed(
+        tmp_path,
+        tasks={"alpha": "a"},
+        repos=("longitude", "horizon"),
+        queues={"ns": {"config": {"repo": "horizon"}}},
+    )
+    client = _client(tmp_path)
+
+    # Defaults seeded by the builder, read back per queue.
+    assert client.get("/api/queue/repo").json() == {"repo": "longitude"}
+    assert client.get("/api/queue/repo", params={"queue": "ns"}).json() == {"repo": "horizon"}
+
+    # Re-point main to horizon; the value round-trips and the alternate queue is
+    # untouched (each queue owns its own binding).
+    assert client.put("/api/queue/repo", json={"repo": "horizon"}).status_code == 200
+    assert client.get("/api/queue/repo").json() == {"repo": "horizon"}
+    assert client.get("/api/queue/repo", params={"queue": "ns"}).json() == {"repo": "horizon"}
+
+    # A malformed reference (path traversal) is rejected and never persisted.
+    bad = client.put("/api/queue/repo", json={"repo": "../evil"})
+    assert bad.status_code == 400
+    assert client.get("/api/queue/repo").json() == {"repo": "horizon"}
+
+    # Null clears the binding (the queue then has no default repo).
+    assert client.put("/api/queue/repo", json={"repo": None}).status_code == 200
+    assert client.get("/api/queue/repo").json() == {"repo": None}
+
+    # An unknown queue is a 404 (not a silent write).
+    assert client.put(
+        "/api/queue/repo", params={"queue": "nope"}, json={"repo": "longitude"}
+    ).status_code == 404
+
+
+def test_server_task_repo_override_round_trip_and_validation(tmp_path: Path) -> None:
+    """A per-task `repo` override on create/edit round-trips into the brief's
+    frontmatter, clearing it (``""``/``default``) drops the key so the task
+    inherits the queue default, and a malformed reference is a 400."""
+    _seed(tmp_path, tasks={}, repos=("longitude", "horizon"))
+    client = _client(tmp_path)
+
+    # Create with an explicit override.
+    created = client.post(
+        "/api/tasks", json={"title": "Repo Task", "text": "x", "repo": "horizon"}
+    )
+    assert created.status_code == 201
+    slug = created.json()["task"]
+    assert client.get(f"/api/tasks/{slug}").json()["frontmatter_raw"]["repo"] == "horizon"
+
+    # Edit the override to a different (valid) repo.
+    assert client.patch(f"/api/tasks/{slug}", json={"repo": "longitude"}).status_code == 200
+    assert client.get(f"/api/tasks/{slug}").json()["frontmatter_raw"]["repo"] == "longitude"
+
+    # Clearing the override ("") drops the key → inherit the queue default.
+    assert client.patch(f"/api/tasks/{slug}", json={"repo": ""}).status_code == 200
+    assert "repo" not in client.get(f"/api/tasks/{slug}").json()["frontmatter_raw"]
+
+    # A malformed override is a 400 on edit …
+    assert client.patch(f"/api/tasks/{slug}", json={"repo": "../evil"}).status_code == 400
+    # … and on create — and a rejected create must not orphan a brief.
+    main_dir = tmp_path / "nightshift-tasks" / "main"
+    before = {p.name for p in main_dir.glob("*.md")}
+    assert client.post(
+        "/api/tasks", json={"title": "Bad Repo", "text": "x", "repo": "Not A Slug"}
+    ).status_code == 400
+    assert {p.name for p in main_dir.glob("*.md")} == before
+
+
+def test_server_absent_repo_run_pauses_in_runs_without_worktree(tmp_path: Path) -> None:
+    """A queue whose configured repo is absent pauses (not fails) each task it
+    runs: the run record surfaces `status: "paused"` (repo_unavailable), no run is
+    aborted/failed, and no worktree is cut under `<workspace>/.worktrees/`."""
+    # main is bound to a repo that does not exist on disk; no target repos created.
+    _seed(tmp_path, tasks={"alpha": "Do alpha."}, main_repo="satellite", repos=())
+    client = _client(tmp_path)
+
+    # No worker is ever launched — run_task pauses before cutting a worktree — so
+    # this drives the real player end-to-end with no monkeypatch.
+    assert client.post("/api/transport", json={"action": "play", "mode": "auto"}).status_code == 200
+
+    deadline = time.monotonic() + 5.0
+    runs: list = []
+    while time.monotonic() < deadline:
+        runs = client.get("/api/runs").json()
+        if runs and any(t["status"] == "paused" for t in runs[0]["tasks"]):
+            break
+        time.sleep(0.02)
+
+    assert runs, "expected a run record"
+    tasks = runs[0]["tasks"]
+    alpha = next(t for t in tasks if t["task"] == "alpha")
+    assert alpha["status"] == "paused"
+    assert "satellite" in alpha["result_line"]
+    # Paused, not failed/aborted: the run is clean and re-runnable.
+    assert runs[0]["aborted"] is False
+    assert all(t["status"] == "paused" for t in tasks)
+    # No worktree was cut for the absent repo.
+    assert not (tmp_path / ".worktrees").exists()

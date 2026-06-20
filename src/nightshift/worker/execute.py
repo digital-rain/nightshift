@@ -9,6 +9,9 @@ Outcomes:
 
 * ``completed`` + ``landable=True``  — validated commit(s) on the branch (kept).
 * ``completed`` + ``landable=False`` — worker produced no commit (nothing to land).
+* ``blocked``                        — the agent emitted ``NIGHTSHIFT_BLOCKED:``
+  and made no commits (an honest hold for the manager to record + a human/agent
+  to resolve). No ``.BLOCKED`` file is written anywhere.
 * ``error``                          — worker/launch/validation failure (branch
   kept on validation failure so the work can be resolved).
 """
@@ -17,12 +20,15 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
-from nightshift._paths import asset
+from nightshift import playlists, repos
 from nightshift.engine import (
+    DEFAULT_VALIDATE_CMD,
     _worktree_has_commits,
+    build_prompt,
+    extract_blocked_reason,
+    materialize_brief,
     resolve_validate_cmd,
     run_interruptible,
     setup_worktree,
@@ -40,7 +46,7 @@ LogCb = Callable[[str], None]
 
 @dataclass
 class ExecuteOutcome:
-    status: str                 # completed | error
+    status: str                 # completed | blocked | error
     result_line: str
     landable: bool
     resolved_model: str
@@ -54,31 +60,6 @@ class ExecuteOutcome:
     cost_usd: float | None = None
 
 
-def _queue_internal(label: str | None) -> str | None:
-    return None if label in (None, "", "main") else label
-
-
-def build_worker_prompt(root: Path, order: dict[str, Any]) -> str:
-    """Build the worker prompt from the work order (not the centralized config).
-
-    Mirrors ``engine.build_prompt``'s injected header so the agent gets the same
-    contract, but sources the validate command from the work order's config blob
-    rather than re-reading ``config.json``.
-    """
-    prompt_file = asset("prompts", "nightshift-local.md")
-    prompt_body = prompt_file.read_text() if prompt_file.exists() else ""
-    validate_cmd = order["config"].get("validate") or "just validate-nightshift"
-    task = order["task"]
-    task_file = order["task_path"]
-    return (
-        f"Your task file is: {task_file}\n"
-        f"The TASK variable is: {task}\n"
-        f"The TASK_FILE variable is: {task_file}\n"
-        f"The VALIDATE command is: {validate_cmd}\n\n"
-        f"{prompt_body}"
-    )
-
-
 def execute_work_order(
     cfg: WorkerConfig,
     order: dict[str, Any],
@@ -89,9 +70,12 @@ def execute_work_order(
     """Run one work order to a landable (or failed) state. Never touches main."""
     from nightshift.backends import LAUNCH_FAILED, WorkerSpec, get_backend
 
-    root = cfg.root
+    workspace = cfg.workspace
     task = order["task"]
-    queue = _queue_internal(order.get("queue"))
+    repo = order["repo"]
+    # The work order carries the queue *label* ("main"/<name>); the engine's
+    # worktree/brief helpers take the internal queue arg (main -> None).
+    queue = playlists.queue_from_tasks_rel(order.get("queue") or "main")
     config_blob = order.get("config", {})
 
     # Worker-owned model resolution. A vendor mismatch fails the task with a
@@ -108,6 +92,17 @@ def execute_work_order(
         )
     assert model is not None
 
+    # Defensive availability guard. The manager pauses tasks whose repo is absent
+    # before dispatch (repo availability is its concern), so reaching here means
+    # the workspace changed under us. Fail the order without cutting a worktree.
+    if not repos.repo_available(workspace, repo):
+        reason = f"repo '{repo}' is not available in the workspace"
+        return ExecuteOutcome(
+            status="error", result_line=reason, landable=False,
+            resolved_model=model, failure_kind="repo_unavailable",
+            failure_reason=reason,
+        )
+
     backend = get_backend(cfg.backend)
     if not backend.available(config_blob):
         reason = f"backend '{cfg.backend}' is not available on this worker"
@@ -118,10 +113,25 @@ def execute_work_order(
         )
 
     on_phase("worker")
-    wt_dir = setup_worktree(root, task, queue=queue)
+    # Deliver the brief via a run-scratch file OUTSIDE the target repo (so it
+    # never enters the worktree's tracked tree), then cut the worktree from the
+    # target repo. base_ref for landing/diff comes from order["base_ref"] (the
+    # manager's canonical_head); the worker never recomputes it.
+    scratch = materialize_brief(workspace, repo, task, order["body"], queue=queue)
+    wt_dir = setup_worktree(workspace, repo, task, queue=queue)
     preserve = False
+    captured: list[str] = []
+
+    def capture_log(line: str) -> None:
+        captured.append(line)
+        on_log(line)
+
     try:
-        prompt = build_worker_prompt(root, order)
+        prompt = build_prompt(
+            task,
+            task_file=str(scratch),
+            validate_cmd=str(config_blob.get("validate") or DEFAULT_VALIDATE_CMD),
+        )
         env = worker_env()
         max_turns = config_blob.get("max_turns")
         spec = WorkerSpec(
@@ -134,7 +144,7 @@ def execute_work_order(
             config=config_blob,
         )
         on_log(f"  running worker [{cfg.backend}] ({model})...\n")
-        result = backend.run(spec, on_log, lambda: None)
+        result = backend.run(spec, capture_log, lambda: None)
 
         # Best-effort telemetry the agent reported; attached to every outcome
         # below (a failed/validation-failed run still consumed turns + tokens).
@@ -153,6 +163,23 @@ def execute_work_order(
                 failure_kind="worker_launch", failure_reason=result.error,
                 **tele,
             )
+
+        has_commits = _worktree_has_commits(workspace, repo, task, queue=queue)
+
+        # Honest block (file-free sentinel): the agent emitted a final
+        # NIGHTSHIFT_BLOCKED line and made no commits. This is an explicit intent
+        # signal, so it takes precedence over a generic non-zero exit; surface a
+        # `blocked` status + reason for the manager to record. Nothing to land.
+        blocked_reason = extract_blocked_reason("".join(captured))
+        if blocked_reason and not has_commits:
+            return ExecuteOutcome(
+                status="blocked",
+                result_line=f"blocked: {blocked_reason}",
+                landable=False, resolved_model=model,
+                failure_kind="blocked", failure_reason=blocked_reason,
+                **tele,
+            )
+
         if result.returncode != 0:
             reason = result.error or f"worker [{cfg.backend}] exited {result.returncode}"
             return ExecuteOutcome(
@@ -163,7 +190,7 @@ def execute_work_order(
             )
 
         # No commits → nothing to land; finish cleanly.
-        if not _worktree_has_commits(root, task, queue=queue):
+        if not has_commits:
             return ExecuteOutcome(
                 status="completed",
                 result_line="no changes produced (worker emitted output only)",
@@ -201,4 +228,4 @@ def execute_work_order(
         )
     finally:
         if not preserve:
-            teardown_worktree(root, task, queue=queue)
+            teardown_worktree(workspace, repo, task, queue=queue)

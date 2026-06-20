@@ -33,8 +33,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, TextIO
 
+from nightshift import playlists, repos
 from nightshift.engine import (
-    FAILURE_LOG_DIR,
     MIN_FREE_PCT,
     SYMLINK_TARGETS,
     Controller,
@@ -68,7 +68,9 @@ from nightshift.events import (
     Event,
     RunStore,
 )
+from nightshift.server.player import resolve_tasks_root
 from nightshift.slack import listener_for_queue
+from nightshift.spawn_daily import load_queue_config
 
 
 try:
@@ -78,7 +80,6 @@ except ImportError:
 
 
 __all__ = [
-    "FAILURE_LOG_DIR",
     "MIN_FREE_PCT",
     "SYMLINK_TARGETS",
     "Controller",
@@ -129,7 +130,10 @@ def load_dotenv(root: Path) -> None:
                 os.environ[key] = value
 
 
-LOG_DIR = ".tasks/logs"
+# Run logs stay local and gitignored under the main queue's ``logs/`` in the
+# content store (the store's ``.gitignore`` ignores ``*/logs/``), so they are
+# never committed and never written into a target repo.
+LOG_DIR = "main/logs"
 
 
 class _Tee:
@@ -157,9 +161,12 @@ class _Tee:
         return False
 
 
-def open_run_log(root: Path) -> IO[str]:
-    """Create .tasks/logs/ and open a timestamped run log for writing."""
-    log_dir = root / LOG_DIR
+def open_run_log(tasks_root: Path) -> IO[str]:
+    """Create ``<tasks_root>/main/logs/`` and open a timestamped run log.
+
+    The log lives under the content store's gitignored ``logs/`` dir so the run
+    transcript is local-only and never committed."""
+    log_dir = tasks_root / LOG_DIR
     log_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%SZ")
     return (log_dir / f"nightshift-local-{stamp}.log").open(
@@ -207,7 +214,7 @@ def print_summary(summary: RunSummary) -> None:
         print(f"\n{RED}Failed ({len(summary.failed)}):{RESET}")
         for r in summary.failed:
             print(f"  {r.task}: {r.error}")
-        print(f"\n  Failure logs: {FAILURE_LOG_DIR}/")
+        print("\n  Failure logs: <workspace>/.worktrees/<repo>/failures/")
 
     if not summary.results:
         print("\n  No tasks to run.")
@@ -219,33 +226,48 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run nightshift tasks locally via Claude Code CLI."
     )
-    parser.add_argument("--root", type=Path, default=Path.cwd())
+    parser.add_argument("--workspace", type=Path, default=Path.cwd())
     parser.add_argument(
         "--task",
         default="all",
         help="Single task name or 'all' to run the full queue",
     )
     args = parser.parse_args(argv)
-    root = args.root.resolve()
+    workspace = args.workspace.resolve()
+    # Briefs + queue config live in the content store ``<workspace>/<tasks_repo>``;
+    # git ops run per task in ``<workspace>/<repo>`` (resolved inside the engine).
+    tasks_root = resolve_tasks_root(workspace)
 
-    load_dotenv(root)
+    load_dotenv(workspace)
 
     # Mirror everything from here on to a timestamped log file (tee). Set this
     # up before check_preconditions so the pre-flight validate, lock messages,
     # and any sys.exit failure reason are captured too.
-    log_file = open_run_log(root)
+    log_file = open_run_log(tasks_root)
     orig_stdout, orig_stderr = sys.stdout, sys.stderr
     sys.stdout = _Tee(orig_stdout, log_file)  # type: ignore[assignment]
     sys.stderr = _Tee(orig_stderr, log_file)  # type: ignore[assignment]
     print(f"Logging this run to {log_file.name}")
 
     try:
-        check_preconditions(root)
+        # Pre-flight (disk + tracked-code WIP + `just validate`) runs against the
+        # main queue's default target repo. A missing/unset repo isn't fatal
+        # here — each task re-resolves its own repo inside run_task and pauses
+        # (repo_unavailable) rather than failing, so we only pre-check a repo
+        # that is actually present.
+        try:
+            main_repo: str | None = repos.resolve_repo(
+                None, load_queue_config(tasks_root, "main").get("repo")
+            )
+        except repos.RepoConfigError:
+            main_repo = None
+        if main_repo and repos.repo_available(workspace, main_repo):
+            check_preconditions(workspace, main_repo)
 
-        lock_fd = acquire_lock(root)
+        lock_fd = acquire_lock(workspace)
 
         print(f"Building task list (task={args.task})...")
-        tasks = build_task_list(root, args.task)
+        tasks = build_task_list(tasks_root, args.task)
 
         if not tasks:
             print("No tasks to run.")
@@ -254,12 +276,17 @@ def main(argv: list[str] | None = None) -> int:
 
         print(f"Running {len(tasks)} task(s) sequentially: {', '.join(tasks)}\n")
 
-        store = RunStore(root)
+        # Run records live under the main queue's gitignored ``runs/`` in the
+        # content store (never committed, never written into a target repo).
+        store = RunStore(tasks_root, playlists.runs_rel(None))
         writer = store.start(launched_by="cli")
-        slack_listener = listener_for_queue(root, tasks_rel=".tasks", queue=None)
+        slack_listener = listener_for_queue(
+            workspace, tasks_root, tasks_rel="main", queue=None
+        )
         try:
             summary = run_queue(
-                root,
+                workspace,
+                tasks_root,
                 tasks,
                 listeners=[make_stdout_listener(), writer.emit, slack_listener],
                 run_id=writer.run_id,

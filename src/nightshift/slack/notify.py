@@ -485,26 +485,27 @@ def make_slack_listener(
 
 
 def listener_for_queue(
-    root: Path,
+    workspace: Path,
+    tasks_root: Path,
     *,
-    tasks_rel: str = ".tasks",
+    tasks_rel: str = "main",
     queue: str | None = None,
 ) -> Listener:
     """Convenience wiring used by ``run_local.py`` / ``server/player.py``.
 
-    Resolves the layered ``slack`` config for the queue and builds a notifier
-    backed by the queue's thread store. The result is always a valid listener;
-    when Slack is unconfigured it short-circuits to a no-op (so callers can
-    attach it unconditionally without changing run behaviour). Never raises:
-    any setup error degrades to a disabled no-op.
+    Resolves the layered ``slack`` config for the queue (across the two roots)
+    and builds a notifier backed by the queue's thread store. The result is
+    always a valid listener; when Slack is unconfigured it short-circuits to a
+    no-op (so callers can attach it unconditionally without changing run
+    behaviour). Never raises: any setup error degrades to a disabled no-op.
     """
     try:
         from nightshift.spawn_daily import resolve_config
 
-        runner_config = resolve_config(root, tasks_rel)
+        runner_config = resolve_config(workspace, tasks_root, tasks_rel)
     except Exception as exc:  # noqa: BLE001 — config problems must not break wiring
         _log.warning("slack_config_resolve_failed error=%s", exc)
         runner_config = {}
     config = resolve_slack_config(runner_config)
-    store = ThreadStore.for_queue(root, tasks_rel)
+    store = ThreadStore.for_queue(tasks_root, tasks_rel)
     return make_slack_listener(config, store, queue=queue)

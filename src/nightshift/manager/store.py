@@ -87,10 +87,17 @@ class NightshiftStore(Protocol):
 
     # task state overlay
     async def set_task_state(
-        self, queue: str | None, task: str, state: str, *, blocked_reason: str | None = None
+        self,
+        queue: str | None,
+        task: str,
+        state: str,
+        *,
+        blocked_reason: str | None = None,
+        repo: str | None = None,
     ) -> None: ...
     async def get_task_state(self, queue: str | None, task: str) -> dict[str, Any] | None: ...
     async def list_blocked(self) -> list[dict[str, Any]]: ...
+    async def tasks_in_state(self, state: str) -> list[dict[str, Any]]: ...
     async def clear_task_state(self, queue: str | None, task: str) -> None: ...
 
     # queue dedication (manager-side queue -> worker binding)
@@ -112,6 +119,7 @@ class NightshiftStore(Protocol):
         title: str | None = None,
         body: str | None = None,
         required_mcps: list[str] | None = None,
+        repo: str | None = None,
     ) -> dict[str, Any]: ...
     async def update_run(self, run_id: str, **fields: Any) -> None: ...
     async def get_run(self, run_id: str) -> dict[str, Any] | None: ...
@@ -346,7 +354,13 @@ class MemoryStore:
     # ---- task state ------------------------------------------------------- #
 
     async def set_task_state(
-        self, queue: str | None, task: str, state: str, *, blocked_reason: str | None = None
+        self,
+        queue: str | None,
+        task: str,
+        state: str,
+        *,
+        blocked_reason: str | None = None,
+        repo: str | None = None,
     ) -> None:
         with self._lock:
             self._tasks[(_qkey(queue), task)] = {
@@ -354,6 +368,7 @@ class MemoryStore:
                 "task": task,
                 "state": state,
                 "blocked_reason": blocked_reason,
+                "repo": repo,
                 "updated_at": _now(),
             }
 
@@ -365,6 +380,19 @@ class MemoryStore:
     async def list_blocked(self) -> list[dict[str, Any]]:
         with self._lock:
             return [dict(r) for r in self._tasks.values() if r["state"] == "blocked"]
+
+    async def tasks_in_state(self, state: str) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                {
+                    "queue": r["queue"],
+                    "task": r["task"],
+                    "repo": r.get("repo"),
+                    "blocked_reason": r.get("blocked_reason"),
+                }
+                for r in self._tasks.values()
+                if r["state"] == state
+            ]
 
     async def clear_task_state(self, queue: str | None, task: str) -> None:
         with self._lock:
@@ -400,6 +428,7 @@ class MemoryStore:
         title: str | None = None,
         body: str | None = None,
         required_mcps: list[str] | None = None,
+        repo: str | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             row = {
@@ -409,6 +438,7 @@ class MemoryStore:
                 "worker_id": worker_id,
                 "backend": backend,
                 "model": model,
+                "repo": repo,
                 "required_mcps": required_mcps or [],
                 "status": "running",
                 "phase": None,
@@ -766,19 +796,26 @@ class PgStore:
         return [_lease_row(r) for r in rows]
 
     async def set_task_state(
-        self, queue: str | None, task: str, state: str, *, blocked_reason: str | None = None
+        self,
+        queue: str | None,
+        task: str,
+        state: str,
+        *,
+        blocked_reason: str | None = None,
+        repo: str | None = None,
     ) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO nightshift.tasks (queue, task, state, blocked_reason, updated_at)
-                VALUES ($1, $2, $3, $4, now())
+                INSERT INTO nightshift.tasks (queue, task, state, blocked_reason, repo, updated_at)
+                VALUES ($1, $2, $3, $4, $5, now())
                 ON CONFLICT (queue, task) DO UPDATE SET
                     state = EXCLUDED.state,
                     blocked_reason = EXCLUDED.blocked_reason,
+                    repo = EXCLUDED.repo,
                     updated_at = now()
                 """,
-                _qkey(queue), task, state, blocked_reason,
+                _qkey(queue), task, state, blocked_reason, repo,
             )
 
     async def get_task_state(self, queue: str | None, task: str) -> dict[str, Any] | None:
@@ -792,6 +829,14 @@ class PgStore:
     async def list_blocked(self) -> list[dict[str, Any]]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch("SELECT * FROM nightshift.tasks WHERE state = 'blocked'")
+        return [dict(r) for r in rows]
+
+    async def tasks_in_state(self, state: str) -> list[dict[str, Any]]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT queue, task, repo, blocked_reason FROM nightshift.tasks WHERE state = $1",
+                state,
+            )
         return [dict(r) for r in rows]
 
     async def clear_task_state(self, queue: str | None, task: str) -> None:
@@ -842,6 +887,7 @@ class PgStore:
         title: str | None = None,
         body: str | None = None,
         required_mcps: list[str] | None = None,
+        repo: str | None = None,
     ) -> dict[str, Any]:
         import json
 
@@ -849,12 +895,12 @@ class PgStore:
             row = await conn.fetchrow(
                 """
                 INSERT INTO nightshift.runs
-                    (id, task, queue, worker_id, backend, model, required_mcps,
+                    (id, task, queue, worker_id, backend, model, repo, required_mcps,
                      status, title, body, started_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'running', $8, $9, now())
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'running', $9, $10, now())
                 RETURNING *
                 """,
-                run_id, task, _qkey(queue), worker_id, backend, model,
+                run_id, task, _qkey(queue), worker_id, backend, model, repo,
                 json.dumps(required_mcps or []), title, body,
             )
         return _run_row(row)

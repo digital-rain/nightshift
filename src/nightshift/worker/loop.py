@@ -144,7 +144,12 @@ class WorkerLoop:
             "lease_id": order["lease_id"],
             "task": task,
             "queue": order.get("queue", "main"),
+            # The manager is authoritative for repo (it reads it from the run);
+            # echo it back when the order carried it, as an optional convenience.
+            "repo": order.get("repo"),
             "title": order.get("title", task),
+            # status may be "completed" | "blocked" | "error"; a blocked status
+            # carries its reason in failure_reason (no .BLOCKED file).
             "status": outcome.status,
             "result_line": outcome.result_line,
             "backend": self.cfg.backend,

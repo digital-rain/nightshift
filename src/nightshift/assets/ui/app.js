@@ -26,6 +26,7 @@ const state = {
   detailReturn: "now",   // view to return to when the detail pane's back is pressed
   detailDraft: null,     // buffered, unsaved edits for the open detail pane (discarded on back)
   libraryTasks: null,    // cached main-queue tasks for the Add-from "library" source
+  repos: null,           // /api/repos payload (workspace, known repos, per-queue bindings, warnings)
 };
 
 // Transport glyphs for the Now box (borderless triangle / pause bars).
@@ -106,6 +107,9 @@ const STATE_LABELS = {
   pending: "Queued",
   running: "Running",
   paused: "Paused",
+  // A task whose resolved target repo isn't present in the workspace is paused
+  // (auto-resumable), never failed — it reads as "Paused" with the warn pill.
+  repo_unavailable: "Paused",
   completed: "Completed",
   error: "Failed",
   stopped: "Cancelled",
@@ -115,9 +119,16 @@ const STATE_LABELS = {
 function stateLabel(status) {
   return STATE_LABELS[status] || (status ? status[0].toUpperCase() + status.slice(1) : "—");
 }
+// The CSS class that colours a status pill. Most statuses map to a same-named
+// class, but a few synonyms collapse onto a shared visual: `repo_unavailable`
+// (a paused, auto-resumable task) reuses the `.status.paused` warn treatment.
+function statusClass(status) {
+  if (status === "repo_unavailable") return "paused";
+  return status || "running";
+}
 function statusPill(status) {
   const span = document.createElement("span");
-  span.className = "status " + (status || "running");
+  span.className = "status " + statusClass(status);
   span.textContent = stateLabel(status);
   return span;
 }
@@ -311,6 +322,7 @@ function setView(view) {
   else if (view === "playlists") renderPlaylists();
   else if (view === "history") renderHistory();
   else if (view === "stats") renderStats();
+  else if (view === "repos") { renderRepos(); loadRepos(); }
   else if (view === "detail") renderDetailScreen();
 }
 
@@ -630,6 +642,191 @@ async function loadPlaylists() {
     catch { /* keep the last known count on a transient error */ }
   }
   renderPlaylists();
+}
+
+// --------------------------------------------------------------------------
+// Repos screen (multi-repo workspace)
+// --------------------------------------------------------------------------
+// The Repos page is a thin view over `GET /api/repos`: the read-only workspace
+// path, the known-repos set (workspace children with a `.git`), and each
+// queue's default-repo binding + availability. A Rescan button re-scans the
+// workspace and auto-resumes any task paused because its repo was absent.
+
+// Pull the repos payload into state, then refresh the Repos screen if it's the
+// one on display. Kept resilient: a transient error leaves the last snapshot.
+async function loadRepos() {
+  try {
+    state.repos = await getJSON("/api/repos");
+  } catch { /* keep the last known repos on a transient error */ }
+  if (state.view === "repos") renderRepos();
+}
+
+// A <select> of known workspace repos for binding a queue/task to a target
+// repo. `current` is the bound value ("" / null = the empty option, named by
+// `emptyLabel`: "— none —" clears a queue default; "Inherit" for a per-task
+// override). A `current` value that isn't among the known repos (an absent
+// repo a binding still points at) is preserved as an extra option so the
+// selector round-trips it instead of silently dropping it.
+function repoSelect(current, emptyLabel) {
+  const select = document.createElement("select");
+  select.className = "ctl-select repo-select";
+  const cur = current || "";
+  const known = (state.repos && Array.isArray(state.repos.repos))
+    ? state.repos.repos.map((r) => r.name)
+    : [];
+  const values = [""];
+  for (const name of known) values.push(name);
+  if (cur && !values.includes(cur)) values.push(cur);
+  for (const v of values) {
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = v === ""
+      ? emptyLabel
+      : (known.includes(v) ? v : `${v} (absent)`);
+    select.append(opt);
+  }
+  select.value = cur;
+  return select;
+}
+
+// A repo-availability pill, reusing the shared status vocabulary: present repos
+// read as the green "completed" treatment; absent ones reuse the warn
+// `.status.paused` look (matching the paused tasks they cause).
+function availabilityBadge(available) {
+  const span = document.createElement("span");
+  span.className = "status " + (available ? "completed" : "paused");
+  span.textContent = available ? "Available" : "Absent";
+  return span;
+}
+
+function renderRepos() {
+  const wsEl = $("repos-workspace");
+  if (!wsEl) return;  // screen markup not present in this build
+  const data = state.repos || {};
+
+  wsEl.textContent = data.workspace || "—";
+
+  // Warnings — one per queue whose bound repo is absent (deduped server-side).
+  const warn = $("repos-warnings");
+  if (warn) {
+    warn.innerHTML = "";
+    const warnings = data.warnings || [];
+    warn.hidden = warnings.length === 0;
+    for (const w of warnings) {
+      const row = document.createElement("div");
+      row.className = "repos-warning";
+      row.textContent =
+        `Queue \u201c${w.queue}\u201d is bound to \u201c${w.repo}\u201d, which `
+        + "isn\u2019t present in the workspace \u2014 its tasks are paused until "
+        + "you clone it and rescan.";
+      warn.append(row);
+    }
+  }
+
+  // Known repos (workspace children with a `.git`); the tasks store is tagged.
+  const list = $("repos-list");
+  if (list) {
+    list.innerHTML = "";
+    const repos = data.repos || [];
+    const count = $("repos-count");
+    if (count) count.textContent = repos.length ? `(${repos.length})` : "";
+    const empty = $("repos-empty");
+    if (empty) empty.hidden = repos.length > 0;
+    for (const r of repos) list.append(repoRow(r, data.tasks_repo));
+  }
+
+  // Per-queue default-repo bindings + selectors.
+  const queues = $("repos-queues");
+  if (queues) {
+    queues.innerHTML = "";
+    for (const q of data.queues || []) queues.append(repoQueueRow(q));
+  }
+}
+
+function repoRow(r, tasksRepo) {
+  const li = document.createElement("li");
+  li.className = "repo-item";
+  const main = document.createElement("div");
+  main.className = "repo-main";
+  const name = document.createElement("span");
+  name.className = "repo-name";
+  name.textContent = r.name;
+  main.append(name);
+  if (tasksRepo && r.name === tasksRepo) {
+    const tag = document.createElement("span");
+    tag.className = "repo-tag";
+    tag.textContent = "tasks store";
+    main.append(tag);
+  }
+  li.append(main, availabilityBadge(r.available));
+  return li;
+}
+
+// One per-queue binding row: the queue label + its bound repo's availability,
+// and a default-repo selector that persists via PUT /api/queue/repo. The 400
+// (malformed name) is surfaced inline without tearing down the row.
+function repoQueueRow(q) {
+  const li = document.createElement("li");
+  li.className = "repo-queue-item";
+
+  const head = document.createElement("div");
+  head.className = "repo-queue-head";
+  const label = document.createElement("span");
+  label.className = "repo-queue-name";
+  label.textContent = q.queue;
+  head.append(label);
+  if (q.repo) head.append(availabilityBadge(q.available));
+  li.append(head);
+
+  const ctl = document.createElement("label");
+  ctl.className = "repo-queue-ctl";
+  const span = document.createElement("span");
+  span.className = "repo-queue-ctl-label";
+  span.textContent = "Default repo";
+  const select = repoSelect(q.repo, "\u2014 none \u2014");
+  const err = document.createElement("p");
+  err.className = "error repo-queue-error";
+  err.hidden = true;
+  select.addEventListener("change", () => setQueueRepo(q.queue, select.value, err));
+  ctl.append(span, select);
+  li.append(ctl, err);
+  return li;
+}
+
+// Persist a queue's default target repo. The default queue's label is "main";
+// an empty selection clears the binding (the queue then has no default and
+// tasks must set their own). Threads the queue label explicitly so any queue
+// is editable from this page, not just the focused one.
+async function setQueueRepo(label, value, errEl) {
+  const repo = value ? value : null;
+  const url = `/api/queue/repo?queue=${encodeURIComponent(label)}`;
+  const { ok, data } = await sendJSON(url, "PUT", { repo });
+  if (!ok) {
+    if (errEl) {
+      errEl.textContent = (data && data.error) || "could not set queue repo";
+      errEl.hidden = false;
+    }
+    return;
+  }
+  if (errEl) errEl.hidden = true;
+  // The binding (and thus availability/warnings) changed; re-pull repos and
+  // refresh the queue/run views so resumed/paused tasks reflect the new repo.
+  await loadRepos();
+  await Promise.all([loadQueue(), loadRuns()]);
+}
+
+// Re-scan the workspace for repos (auto-resuming any task paused on a now
+// present repo), then refresh this page and the queue/history views.
+async function rescanRepos(btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const { ok, data } = await sendJSON("/api/repos/rescan", "POST", {});
+    if (ok && data) state.repos = data;
+    renderRepos();
+    await Promise.all([loadQueue(), loadRuns(), loadPlaylists()]);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -1803,6 +2000,16 @@ function historyRow(run, task) {
     tag.textContent = run.playlist;
     title.append(tag);
   }
+  // The target repo this run ran against (workspace-relative child name), shown
+  // as a neutral tag beside the title; absent on runs that predate the column.
+  const repo = task.repo || run.repo;
+  if (repo) {
+    const rtag = document.createElement("span");
+    rtag.className = "hrow-tag hrow-repo";
+    rtag.textContent = repo;
+    rtag.title = `Target repo: ${repo}`;
+    title.append(rtag);
+  }
   const meta = document.createElement("div");
   meta.className = "hrow-meta";
   const badge = task.status === "error" ? failureBadge(task.failure_kind) : null;
@@ -2173,7 +2380,12 @@ function settingsControls(brief, draft, rerender, locked) {
     });
     seg.append(seg_btn);
   }
-  row.append(seg, modelSelect(brief, draft, locked), prioritySegment(draft, rerender, locked));
+  row.append(
+    seg,
+    modelSelect(brief, draft, locked),
+    prioritySegment(draft, rerender, locked),
+    repoOverride(draft, locked),
+  );
   wrap.append(row);
 
   if (locked) {
@@ -2246,6 +2458,23 @@ function modelSelect(brief, draft, locked) {
   return wrap;
 }
 
+// The optional per-task target-repo override, in line with the model dropdown
+// and populated from `/api/repos`. The empty "Inherit" choice clears the
+// override so the task uses its queue's default repo; a value pins this task to
+// that repo regardless of the queue default.
+function repoOverride(draft, locked) {
+  const wrap = document.createElement("label");
+  wrap.className = "model-select repo-override";
+  const span = document.createElement("span");
+  span.className = "model-label";
+  span.textContent = "Repo";
+  const select = repoSelect(draft.repo, "Inherit");
+  select.disabled = locked;
+  select.addEventListener("change", () => { draft.repo = select.value; });
+  wrap.append(span, select);
+  return wrap;
+}
+
 // Seed a fresh edit buffer from a freshly-read brief. `model` carries the raw,
 // file-only pin ("default" when the file inherits the config default) so the
 // dropdown round-trips without forcing a model onto an inheriting task.
@@ -2265,6 +2494,9 @@ function draftFromBrief(brief) {
     priority: (brief.frontmatter && typeof brief.frontmatter.priority === "number")
       ? brief.frontmatter.priority
       : 5,
+    // The per-task target-repo override, file-only (empty = inherit the queue
+    // default). Read from the raw frontmatter so an inheriting task stays empty.
+    repo: raw.repo || "",
   };
 }
 
@@ -2330,6 +2562,10 @@ function runDetailPairs(run, rec) {
     ["Finished", rec.finished_at || run.finished_at ? new Date(rec.finished_at || run.finished_at).toLocaleString() : "—"],
     ["Duration", taskDuration(rec) || formatDuration(run.started_at, run.finished_at) || "—"],
   ];
+  // The target repo the run ran against (workspace-relative child name). Carried
+  // on the task record or the run; older runs that predate the column omit it.
+  const repo = rec.repo || run.repo;
+  if (repo) pairs.push(["Repo", repo]);
   const t = rec.timings;
   if (t && typeof t === "object") {
     for (const [key, label] of [["worker", "Worker"], ["validate", "Validate"], ["commit", "Commit"]]) {
@@ -2523,6 +2759,13 @@ async function saveDetail(brief, draft, errEl) {
     model: draft.model || "default",
     priority: typeof draft.priority === "number" ? draft.priority : 5,
   };
+  // The per-task repo override is only sent when the user actually changed it
+  // (PATCH semantics — unsent fields are left untouched). A new value pins the
+  // task to that repo; clearing it sends null so the override is removed and the
+  // task inherits its queue's default repo again.
+  const repoNow = (draft.repo || "").trim();
+  const repoWas = ((brief.frontmatter_raw && brief.frontmatter_raw.repo) || "").trim();
+  if (repoNow !== repoWas) payload.repo = repoNow || null;
   if (!payload.title) {
     if (errEl) { errEl.textContent = "title is required"; errEl.hidden = false; }
     return;
@@ -2556,6 +2799,9 @@ async function createDetail(draft, errEl) {
     model: draft.model || "default",
     priority: typeof draft.priority === "number" ? draft.priority : 5,
   };
+  // Per-task repo override: included only when set (empty ⇒ inherit the queue
+  // default). Omitted entirely otherwise, matching the create contract.
+  if (draft.repo && draft.repo.trim()) payload.repo = draft.repo.trim();
   const { ok, data } = await sendJSON("/api/tasks", "POST", payload);
   if (!ok) {
     if (errEl) { errEl.textContent = (data && data.error) || "could not create task"; errEl.hidden = false; }
@@ -3277,6 +3523,9 @@ function wire() {
   $("btn-add-playlist").addEventListener("click", openPlaylistCreate);
   $("playlist-cancel").addEventListener("click", () => ($("playlist-modal").hidden = true));
   $("playlist-save").addEventListener("click", savePlaylist);
+  // Repos page: re-scan the workspace for repos (auto-resumes paused tasks).
+  const rescanBtn = $("btn-rescan");
+  if (rescanBtn) rescanBtn.addEventListener("click", () => rescanRepos(rescanBtn));
   // Back/forward and manual hash edits drive the deep-linked detail view.
   window.addEventListener("hashchange", applyHash);
 }
@@ -3307,7 +3556,7 @@ async function init() {
     const active = await getJSON("/api/active");
     syncActivePlaylist(active && active.active_playlist);
   } catch { /* default to main */ }
-  await Promise.all([loadQueue(), loadRuns(), loadPlaylists()]);
+  await Promise.all([loadQueue(), loadRuns(), loadPlaylists(), loadRepos()]);
   // Seed the per-queue state map, then drive the focused queue's view from it
   // (the aggregate flat state follows whichever queue is running, which may not
   // be the focused one).

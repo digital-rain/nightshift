@@ -22,7 +22,7 @@ from nightshift.worker.ui_app import create_worker_app
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=Path.cwd())
+    parser.add_argument("--workspace", type=Path, default=Path.cwd())
     parser.add_argument("--ui-host", default=None)
     parser.add_argument("--ui-port", type=int, default=None)
     parser.add_argument(
@@ -30,8 +30,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    cfg = load_worker_config(args.root.resolve())
-    local = LocalStore(cfg.root)
+    workspace = args.workspace.resolve()
+    # The workspace must exist as a directory at startup. Per-task repo
+    # availability is the manager's concern (it pauses unavailable repos), not a
+    # worker startup failure.
+    if not workspace.is_dir():
+        parser.error(f"workspace is not an existing directory: {workspace}")
+
+    cfg = load_worker_config(workspace)
+    local = LocalStore(cfg.workspace)
     client = ManagerClient(cfg.manager_url, shared_secret=cfg.shared_secret)
     loop = WorkerLoop(cfg, client, local)
 

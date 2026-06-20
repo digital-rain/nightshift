@@ -14,8 +14,6 @@ specific failure is described above under "Why the merge to main failed".
   sides: keep the task's feature changes and `main`'s newer changes.
 - Do **not** redesign, refactor, or add unrelated changes. The diff was already
   reviewed; you are reconciling it with `main`, nothing more.
-- If `main` and the task changed the same task file under `.tasks/` such that the task
-  deleted it while `main` edited it, the task is complete — keep the deletion.
 
 ## Lifecycle
 
@@ -40,5 +38,6 @@ specific failure is described above under "Why the merge to main failed".
 ## Honest failure
 
 If the conflicts genuinely require human judgment (e.g. both sides changed the same
-logic in incompatible ways), leave the rebase aborted and write `.tasks/$TASK.BLOCKED`
-describing the precise conflict. The runner will report it to the operator.
+logic in incompatible ways), leave the rebase aborted, make no commits, and emit a
+single final line, exactly `NIGHTSHIFT_BLOCKED: <one-line reason>`. The runner detects
+this line and reports the blocker to the operator.
