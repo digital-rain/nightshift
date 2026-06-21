@@ -266,6 +266,11 @@ body {
 }
 .add-menu-item:hover { background: var(--border); color: var(--accent); }
 
+/* Gear popup menu in the top bar: reuses the .add-menu surface, anchored to
+   the gear button. Fronts Settings + the Workers/Repos screens. */
+.gear-menu-wrap { position: relative; display: inline-flex; }
+.gear-menu { top: calc(100% + 6px); right: 0; }
+
 /* Playlist chevron is a borderless button now. */
 .pl-chev { background: none; border: 0; cursor: pointer; padding: 0 2px; line-height: 1; }
 .pl-chev:hover { color: var(--accent); }

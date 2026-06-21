@@ -9,6 +9,7 @@ file is absent.
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -91,6 +92,65 @@ def parse_duration(value: str) -> int:
     if total <= 0:
         raise ValueError("interval must be greater than zero")
     return total
+
+
+# --------------------------------------------------------------------------
+# User-level (cross-workspace) config.
+#
+# A handful of settings can't live in the workspace-relative settings file
+# because they *select* the workspace (a chicken-and-egg). They live in a fixed
+# user-level config the launcher consults before the workspace is known. Today
+# that is just ``workspace`` (the default root the server binds to), editable
+# from the Settings UI and applied on the next launch.
+# --------------------------------------------------------------------------
+
+
+def user_config_path() -> Path:
+    """Path to the user-level Nightshift config (``~/.nightshift/config.json``).
+
+    ``NIGHTSHIFT_USER_CONFIG`` overrides the full path (used in tests so they
+    never read or write a developer's real home config)."""
+    override = os.environ.get("NIGHTSHIFT_USER_CONFIG")
+    if override:
+        return Path(override)
+    return Path.home() / ".nightshift" / "config.json"
+
+
+def load_user_config() -> dict[str, Any]:
+    """Return the user-level config dict (``{}`` when absent or malformed)."""
+    path = user_config_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_user_config_value(key: str, value: Any) -> Any:
+    """Set one key in the user-level config, preserving siblings. Returns it."""
+    path = user_config_path()
+    data = load_user_config()
+    data[key] = value
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    return value
+
+
+def resolve_launch_workspace(cli_workspace: Path | None) -> Path:
+    """The workspace the server binds to at launch.
+
+    Precedence: an explicit ``--workspace`` flag wins; else the persisted
+    user-level ``workspace`` (set from the Settings UI); else the current
+    directory. This is what makes the Settings ``workspace`` field take effect
+    on the next launch without a flag."""
+    if cli_workspace is not None:
+        return cli_workspace.expanduser().resolve()
+    stored = load_user_config().get("workspace")
+    if stored:
+        return Path(str(stored)).expanduser().resolve()
+    return Path.cwd().resolve()
 
 
 def settings_path(workspace: Path) -> Path:

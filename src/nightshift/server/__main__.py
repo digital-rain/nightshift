@@ -18,7 +18,7 @@ from pathlib import Path
 import uvicorn
 
 from nightshift.server.app import create_app
-from nightshift.server.settings import DEFAULTS, load_settings
+from nightshift.server.settings import DEFAULTS, load_settings, resolve_launch_workspace
 
 
 def resolve_port(workspace: Path, cli_port: int | None) -> int:
@@ -33,12 +33,14 @@ def resolve_port(workspace: Path, cli_port: int | None) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the Nightshift UI server.")
-    parser.add_argument("--workspace", type=Path, default=Path.cwd())
+    # No flag → fall back to the persisted user-level workspace (set in the
+    # Settings UI), then the current directory. An explicit flag always wins.
+    parser.add_argument("--workspace", type=Path, default=None)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=None)
     args = parser.parse_args(argv)
 
-    workspace = args.workspace.resolve()
+    workspace = resolve_launch_workspace(args.workspace)
     port = resolve_port(workspace, args.port)
     app = create_app(workspace)
     print(f"Nightshift UI → http://{args.host}:{port}  (workspace: {workspace})")

@@ -2293,11 +2293,58 @@ function playlistRow(pl) {
   return li;
 }
 
+// Fill the add-queue repo dropdown from the known-repos snapshot, keeping the
+// leading "inherit / none" option. Best-effort: an empty snapshot just leaves
+// the single inherit option.
+function fillPlaylistRepoOptions() {
+  const select = $("playlist-repo");
+  if (!select) return;
+  const known = (state.repos && Array.isArray(state.repos.repos))
+    ? state.repos.repos.map((r) => r.name)
+    : [];
+  select.innerHTML = "";
+  const blank = document.createElement("option");
+  blank.value = "";
+  blank.textContent = "— inherit / none —";
+  select.append(blank);
+  for (const name of known) {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = name;
+    select.append(opt);
+  }
+  select.value = "";
+}
+
 function openPlaylistCreate() {
   $("playlist-name").value = "";
+  if ($("playlist-branch")) $("playlist-branch").value = "";
+  if ($("playlist-validate")) $("playlist-validate").value = "";
+  if ($("playlist-auto-resolve")) $("playlist-auto-resolve").value = "";
+  fillPlaylistRepoOptions();
   $("playlist-error").hidden = true;
   $("playlist-modal").hidden = false;
   $("playlist-name").focus();
+}
+
+// Collect the queue-specific options from the add-queue form. Only fields the
+// operator actually set are returned, so unset fields inherit the main queue's
+// value rather than being written as blanks.
+function collectPlaylistConfig() {
+  const out = {};
+  const repo = $("playlist-repo") ? $("playlist-repo").value : "";
+  if (repo) out.repo = repo;
+  const branch = $("playlist-branch") ? $("playlist-branch").value.trim() : "";
+  if (branch) out.branch = branch;
+  // Validate is intentionally not trimmed away: a single space is the explicit
+  // "disable validation" sentinel the backend understands.
+  if ($("playlist-validate")) {
+    const validate = $("playlist-validate").value;
+    if (validate !== "") out.validate = validate;
+  }
+  const ar = $("playlist-auto-resolve") ? $("playlist-auto-resolve").value : "";
+  if (ar) out.auto_resolve = ar;
+  return out;
 }
 
 async function savePlaylist() {
@@ -2312,6 +2359,20 @@ async function savePlaylist() {
     $("playlist-error").textContent = (data && data.error) || "could not create playlist";
     $("playlist-error").hidden = false;
     return;
+  }
+  // Persist the queue-specific options against the freshly-created queue. The
+  // endpoint is server-only, so a manager backend (which lacks it) simply skips
+  // this step — the queue is still created with its defaults.
+  const config = collectPlaylistConfig();
+  if (data && data.name && Object.keys(config).length) {
+    const res = await sendJSON(
+      `/api/queue/config?queue=${encodeURIComponent(data.name)}`, "PUT", config,
+    );
+    if (!res.ok && res.data && res.data.error) {
+      $("playlist-error").textContent = res.data.error;
+      $("playlist-error").hidden = false;
+      return;
+    }
   }
   $("playlist-modal").hidden = true;
   await loadPlaylists();
@@ -3212,6 +3273,19 @@ function toggleAddMenu(force) {
 }
 function closeAddMenu() { toggleAddMenu(false); }
 
+// ----- Gear dropdown (Settings / Workers / Repos) ------------------------
+// The gear no longer opens Settings directly: it fronts a small menu that also
+// reaches the Workers and Repos screens (formerly bottom-bar tabs).
+function toggleSettingsMenu(force) {
+  const menu = $("settings-menu");
+  const btn = $("btn-settings");
+  if (!menu || !btn) return;
+  const show = force !== undefined ? force : menu.hidden;
+  menu.hidden = !show;
+  btn.setAttribute("aria-expanded", show ? "true" : "false");
+}
+function closeSettingsMenu() { toggleSettingsMenu(false); }
+
 // ----- Add from another playlist -----------------------------------------
 async function openAddFrom() {
   await loadPlaylists();
@@ -3391,7 +3465,12 @@ async function importFrom(source, tasks) {
 // --------------------------------------------------------------------------
 let settingsSchema = [];
 async function openSettings() {
-  const { values, schema } = await getJSON("/api/settings");
+  // The server returns `{values, schema}`; the manager returns `{settings,
+  // schema}`. Accept either so the modal opens reliably under both backends —
+  // a mismatch used to throw here and silently abort the popup.
+  const data = await getJSON("/api/settings");
+  const values = data.values || data.settings || {};
+  const schema = data.schema || [];
   settingsSchema = schema;
   const wrap = $("settings-fields");
   wrap.innerHTML = "";
@@ -3449,12 +3528,13 @@ async function saveSettings() {
     return;
   }
   $("settings-modal").hidden = true;
-  if (data.values && data.values.transport_mode) setMode(data.values.transport_mode);
+  const saved = (data && (data.values || data.settings)) || {};
+  if (saved.transport_mode) setMode(saved.transport_mode);
   // The theme control now lives only in Settings, so saving it is authoritative:
   // apply immediately and remember the choice for this browser.
-  if (data.values && data.values.theme) {
-    localStorage.setItem(THEME_KEY, data.values.theme);
-    applyTheme(data.values.theme);
+  if (saved.theme) {
+    localStorage.setItem(THEME_KEY, saved.theme);
+    applyTheme(saved.theme);
   }
 }
 
@@ -3513,7 +3593,21 @@ function wire() {
   $("addfrom-modal").addEventListener("click", (e) => {
     if (e.target === $("addfrom-modal")) $("addfrom-modal").hidden = true;
   });
-  $("btn-settings").addEventListener("click", openSettings);
+  // Gear → popup menu (Settings / Workers / Repos), mirroring the Add dropdown.
+  $("btn-settings").addEventListener("click", (e) => {
+    e.stopPropagation();
+    toggleSettingsMenu();
+  });
+  for (const item of document.querySelectorAll("#settings-menu .add-menu-item")) {
+    item.addEventListener("click", () => {
+      closeSettingsMenu();
+      const act = item.dataset.act;
+      if (act === "settings") openSettings();
+      else if (act === "workers") setView("workers");
+      else if (act === "repos") setView("repos");
+    });
+  }
+  document.addEventListener("click", closeSettingsMenu);
   $("settings-cancel").addEventListener("click", () => ($("settings-modal").hidden = true));
   $("settings-save").addEventListener("click", saveSettings);
   $("btn-clear").addEventListener("click", clearCompleted);
