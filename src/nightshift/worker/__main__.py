@@ -30,7 +30,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    workspace = args.workspace.resolve()
+    # ``expanduser`` first so a ``~``-prefixed value (e.g. from an ``.env`` /
+    # ``NIGHTSHIFT_WORKSPACE``, which shells don't tilde-expand) resolves against
+    # ``$HOME`` rather than being treated as a relative dir joined to the cwd.
+    workspace = args.workspace.expanduser().resolve()
     # The workspace must exist as a directory at startup. Per-task repo
     # availability is the manager's concern (it pauses unavailable repos), not a
     # worker startup failure.

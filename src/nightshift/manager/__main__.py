@@ -24,7 +24,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=None)
     args = parser.parse_args(argv)
 
-    workspace = args.workspace.resolve()
+    # ``expanduser`` first so a ``~``-prefixed value (e.g. from an ``.env`` /
+    # ``NIGHTSHIFT_WORKSPACE``, which shells don't tilde-expand) resolves against
+    # ``$HOME`` rather than being treated as a relative dir joined to the cwd.
+    workspace = args.workspace.expanduser().resolve()
     cfg = load_manager_config(workspace)
     app = create_app(workspace)
     # Build the Server explicitly (rather than uvicorn.run) so the SSE endpoint
