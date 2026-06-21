@@ -11,7 +11,7 @@ For a guided bring-up, start with the [Setup Guide](setup-guide.md).
 | `<workspace>/.nightshift/manager.json` | Manager | Manager + task policy config (flat keys, `cadences` nested) | Yes |
 | `<workspace>/.nightshift/worker.json` | Worker | That worker's identity, backend, capabilities | Yes |
 | `<workspace>/.nightshift/player.json` | Operator | Operator UI/player preferences | Yes |
-| `<workspace>/.env` | Both | Secrets + environment overrides (`NIGHTSHIFT_*`, backend creds) | No (gitignored) |
+| `<repo-root>/.env` | Both | Secrets + environment overrides (`NIGHTSHIFT_*`, backend creds) | No (gitignored) |
 | Process environment | Both | Same keys as `.env`, highest precedence | n/a |
 | Per-queue `config.json` (content-store queue dir) | Manager | Queue order, sort mode, play-priorities, repo, validate, conflict policy | Yes (in `nightshift-tasks`) |
 | `nightshift` Postgres schema | Manager | Runtime state: workers, leases, runs, events, queue dedication | n/a |
@@ -21,6 +21,9 @@ For a guided bring-up, start with the [Setup Guide](setup-guide.md).
 
 Precedence for a given setting, low to high: built-in default, then the `.nightshift/*.json` file, then `.env`, then the process environment.
 Environment variables always win.
+
+> **Note:** `.env` lives at the **repo root** (where the `justfile` is), not in the workspace.
+> The `justfile` loads it before launching the manager or worker, making its variables available as process environment.
 
 ## The workspace
 
@@ -50,6 +53,33 @@ Run `just init` (or `python -m nightshift init --workspace <dir>`) to scaffold `
 - Creates `<workspace>/.env` from `.env.example` if absent.
 
 The command is idempotent and additive — safe to re-run, never destructive.
+
+## `.env` reference
+
+The `.env` file at the repo root holds secrets and launch variables.
+The `justfile` sources it before running any recipe.
+Only `NIGHTSHIFT_WORKSPACE` and `NIGHTSHIFT_MANAGER_URL` are strictly required for a local setup; the rest is optional or backend-specific.
+
+| Variable | Required? | Default | Purpose |
+|---|---|---|---|
+| `NIGHTSHIFT_WORKSPACE` | Yes | repo dir | Absolute path to the workspace (parents target repos + `nightshift-tasks`). |
+| `NIGHTSHIFT_MANAGER_URL` | Yes (worker) | `http://localhost:8800` | Where workers reach the manager. |
+| `NIGHTSHIFT_PG_DSN` | Recommended | (in-memory) | Postgres DSN for durable state. Omit for ephemeral in-memory store. |
+| `NIGHTSHIFT_SHARED_SECRET` | If remote | — | Shared secret protecting the manager API. Must match on both sides. |
+| `ANTHROPIC_API_KEY` | If using `claude-code` or `anthropic` backend | — | Anthropic API key. |
+| `GEMINI_API_KEY` | If using `gemini` backend | — | Gemini API key. |
+| `CLAUDE_CLI_PATH` | No | auto-detect | Path to the `claude` CLI binary. |
+| `CURSOR_CLI_PATH` | No | auto-detect | Path to the `cursor-agent` CLI binary. |
+| `OLLAMA_BASE_URL` | If using `ollama` backend | `http://localhost:11434` | Ollama daemon address. |
+
+**Minimal working `.env`** (single box, `claude-code` backend, Postgres):
+
+```bash
+NIGHTSHIFT_WORKSPACE=$HOME/workspaces
+NIGHTSHIFT_MANAGER_URL=http://localhost:8800
+NIGHTSHIFT_PG_DSN=postgresql://nightshift:nightshift@127.0.0.1:5432/nightshift
+ANTHROPIC_API_KEY=sk-ant-api03-...
+```
 
 ## Manager configuration
 
@@ -241,6 +271,13 @@ Nightshift owns its own DSN. The store is selected from `NIGHTSHIFT_PG_DSN` (env
 |---|---|---|
 | `just migrate` | `NIGHTSHIFT_PG_DSN` (required) | Apply `src/nightshift/assets/migrations/*.sql`. |
 | `just rollback` | `NIGHTSHIFT_PG_DSN` (required) | Reverse them newest-first. |
+
+## Startup order
+
+1. **Manager first** — `just manager` (or `just server` for single-host mode).
+2. **Workers after** — `just worker [port]`. Each worker connects to `NIGHTSHIFT_MANAGER_URL` immediately on startup; if the manager isn't reachable, the worker exits with `httpx.ConnectError: Connection refused`.
+
+The operator UI is served by the manager; open it in a browser once the manager logs `Uvicorn running on …`.
 
 ## HTTP surface (reference)
 

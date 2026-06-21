@@ -61,7 +61,7 @@ This runs the manager and one worker co-located on a single box, both bound to `
 
 ### 1. Configure the environment
 
-Put secrets and launch vars in `.env` at the repo root:
+Put secrets and launch vars in `.env` at the **repo root** (not in the workspace — the `justfile` loads this `.env` before launching anything):
 
 ```bash
 # The workspace that parents your target repos + the nightshift-tasks content
@@ -77,9 +77,22 @@ NIGHTSHIFT_PG_DSN=postgresql://nightshift@localhost:5432/nightshift
 
 # A backend credential — whichever backend this worker will use.
 ANTHROPIC_API_KEY=sk-ant-...
+
+# CLI paths (blank = auto-detect via $PATH).
+# CLAUDE_CLI_PATH=
+# CURSOR_CLI_PATH=
 ```
 
-If you expose the manager beyond localhost, also set a shared secret on both sides (see step 4 and the reference): `NIGHTSHIFT_SHARED_SECRET=...`.
+If you expose the manager beyond localhost, also set a shared secret on both sides (see step 5 and the reference): `NIGHTSHIFT_SHARED_SECRET=...`.
+
+**Minimum `.env` for a local setup** (manager + one `claude-code` worker on the same box):
+
+```bash
+NIGHTSHIFT_WORKSPACE=$HOME/workspaces
+NIGHTSHIFT_MANAGER_URL=http://localhost:8800
+NIGHTSHIFT_PG_DSN=postgresql://nightshift:nightshift@127.0.0.1:5432/nightshift
+ANTHROPIC_API_KEY=sk-ant-...
+```
 
 ### 2. Scaffold the config files
 
@@ -110,8 +123,11 @@ just manager        # binds :8800 (override: just manager 8801)
 ```
 
 Open `http://localhost:8800` — that is the operator UI.
+Wait for the `Uvicorn running on …` line before starting a worker.
 
 ### 5. Start a worker
+
+> **The manager must be running first.** The worker immediately tries to reach `NIGHTSHIFT_MANAGER_URL` on startup; if the manager isn't up yet, the worker will crash with `httpx.ConnectError: [Errno 111] Connection refused`.
 
 In a second terminal, declare the worker's backend and capabilities in `<workspace>/.nightshift/worker.json` (committed; per-box overrides come from env):
 
@@ -127,6 +143,7 @@ In a second terminal, declare the worker's backend and capabilities in `<workspa
 
 ```bash
 just worker         # polls the manager; worker UI on :8810
+just worker 8811    # a second worker's UI on a different port
 ```
 
 The same settings can come from `NIGHTSHIFT_*` environment variables instead (env wins over `worker.json`); see the reference.
@@ -215,9 +232,11 @@ Two mechanisms let you steer tasks:
 
 ## Troubleshooting
 
+- **Worker crashes with `Connection refused` on startup.** The manager isn't running (or hasn't finished binding its port yet). Start the manager first (`just manager`) and wait for its `Uvicorn running on …` message before launching workers. If the manager *is* running, check that `NIGHTSHIFT_MANAGER_URL` in `.env` (or `manager_url` in `worker.json`) points to the correct host and port.
 - **Tasks stay pending.** Check the Workers page for blocked reasons. A pinned `model:` or declared `mcp:` with no live worker advertising it will block until a matching worker checks in.
 - **A worker never appears.** Confirm `manager_url` is reachable from the worker and the `NIGHTSHIFT_SHARED_SECRET` matches on both sides.
 - **Two workers fight on one box.** They must have distinct `worker_id` and `ui_port` and their own clones.
 - **State resets on restart.** You are on the in-memory fallback; set `NIGHTSHIFT_PG_DSN` and run `just migrate` for durable state.
+- **Settings UI shows no fields.** The workspace is missing `.nightshift/manager.json` (or `worker.json` / `player.json`). Run `just init` to scaffold them from the shipped templates.
 - **Cross-machine task errors with `publish_failed`.** The worker validated but could not push to its `rendezvous_remote`. Confirm the remote name resolves in the target repo on the worker and that its credential may push `<wip_ref_prefix>/*` (default `nightshift-wip/*`). Nothing lands; the branch is kept for a retry.
 - **Cross-machine land is rejected (`merge_rejected`).** The fetched branch tip did not match the submitted `head_sha` (or no `rendezvous_remote`/`head_sha` reached the manager) — a fail-closed refusal so unverified content never lands. The WIP ref is kept; the next attempt re-fetches and re-verifies. A transient fetch error instead fails *recoverable* and is retried.
