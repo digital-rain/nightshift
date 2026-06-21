@@ -17,8 +17,7 @@ Push detail into the linked docs below.
    `git worktree add .worktrees/<branch> -b <branch>`.
 
 2. **Commit policy.**
-   Preferred: squash and commit to local `main` when finished in the worktree.
-   Allowed when multiple agents run concurrently: commit to your own branch and open a PR *from the worktree*.
+   Always: squash and commit to local `main` when finished in the worktree -- exception: when there are errors preventing a clean validate step and you require operator assistance or review to resolve them.  this should be extremely rare as you are expected to resolve issues that arise from validation failures.
    Never push to `main` directly, but stage your commits and allow the operator to do this when running locally.
    When finished with your worktree and changes have been committed, delete your worktree.
 
