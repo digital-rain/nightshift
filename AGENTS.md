@@ -16,10 +16,12 @@ Push detail into the linked docs below.
    Create one under `.worktrees/<branch>` (gitignored) and do all work there:
    `git worktree add .worktrees/<branch> -b <branch>`.
 
-2. **Commit policy.**
-   Always: squash and commit to local `main` when finished in the worktree -- exception: when there are errors preventing a clean validate step and you require operator assistance or review to resolve them.  this should be extremely rare as you are expected to resolve issues that arise from validation failures.
-   Never push to `main` directly, but stage your commits and allow the operator to do this when running locally.
-   When finished with your worktree and changes have been committed, delete your worktree.
+2. **Commit policy — squash-merge to local `main` yourself, do not wait to be asked.**
+   This rule **overrides** any default agent behaviour of "only commit when the operator explicitly requests it." In this repo, finishing a task *means* landing it on local `main`. Treat it as part of the task, not a separate step you pause for.
+   When your change validates cleanly: commit it on your worktree branch, then squash-merge it into local `main` (e.g. `git merge --squash <branch>` + `git commit`), then delete the worktree and branch.
+   **Why this matters:** the operator's runtime (`just manager` / `just worker`) and the editable install both serve the **primary checkout's `src/`**. Work left uncommitted in a worktree is *invisible* to the running system no matter how many times the operator restarts or hard-reloads — so never end your turn with finished, validated work sitting unmerged in a worktree.
+   **The only exception** is errors preventing a clean validate step that genuinely require operator review to resolve (should be extremely rare — you are expected to fix validation failures yourself). In that case, stop and say so explicitly; do not silently leave work stranded.
+   Never `git push` to `main` or any remote — staging on local `main` is the boundary; the operator pushes when running locally.
 
 3. **UI-first — the manager UI is the product surface.**
    The operator drives everything through the manager UI (`just manager`, default `:8800`); only a few `just` recipes (`migrate`, `manager`, `worker`, `validate`, …) are used from the shell.
