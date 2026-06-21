@@ -16,7 +16,7 @@ For a guided bring-up, start with the [Setup Guide](setup-guide.md).
 | `nightshift` Postgres schema | Manager | Runtime state: workers, leases, runs, events, queue dedication | n/a |
 | `src/nightshift/assets/migrations/*.sql` | Manager | Nightshift's own schema migrations (separate from longitude's `migrations/`) | Yes |
 | `justfile` | Operator | `migrate` / `rollback` / `manager` / `worker` recipes | Yes |
-| Per-task frontmatter (`.tasks/*.md`) | Manager | Per-task overrides (model, mcp, caps, …) | Yes |
+| Per-task frontmatter (`<tasks_repo>/<queue>/*.md`) | Manager | Per-task overrides (model, mcp, caps, …) | Yes (in `nightshift-tasks`) |
 
 Precedence for a given setting, low to high: built-in default, then `config.json` / `config.json.local`, then `.env`, then the process environment. Environment variables always win.
 
@@ -101,7 +101,7 @@ These live at the root of `config.json` and are resolved into each work order or
 | `wip_ref_prefix` | `nightshift-wip` | WIP namespace a cross-machine worker publishes its validated branch under (`refs/heads/<wip_ref_prefix>/<queue>/<task>`). Read at manager launch and handed to workers in the work order (the worker never reads this config). Editable in the Settings UI ("Branch prefix") — a change is saved to `config.json` and applies on the **next manager restart**. Scope worker push credentials to `<wip_ref_prefix>/*`; changing it after tasks exist orphans any in-flight WIP refs under the old prefix. |
 | `scheduled_models` | (list) | Pin-only allow-set: an explicit `model:` must be in this list. |
 | `diff_cap_lines` | `1500` | Default max changed lines for a task's result. |
-| `diff_cap_exempt_paths` | (regex list) | Paths excluded from the diff cap (docs, fixtures, `.tasks/`, …). |
+| `diff_cap_exempt_paths` | (regex list) | Target-repo paths excluded from the diff cap (test fixtures, docs, prompts, markdown — see the file). |
 | `forbidden_paths` | (regex list) | Paths a worker may never modify (workflow files, Nightshift internals, agent docs). |
 | `forbidden_template_paths` | (regex list) | Paths forbidden specifically in template/decomposition runs. |
 | `automerge` | `false` | Default automerge for PR-mode landings. |
@@ -188,7 +188,7 @@ Optional path overrides (`claude_bin`, `cursor_bin`, `gemini_bin`, `ollama_host`
 
 ## Task frontmatter
 
-Per-task overrides in a brief's YAML frontmatter (`.tasks/<NN>.<name>.md`), parsed in [`spawn_daily.py`](../src/nightshift/spawn_daily.py) and the [scheduler](../src/nightshift/manager/scheduler.py).
+Per-task overrides in a brief's YAML frontmatter (`<tasks_repo>/<queue>/<NN>.<name>.md`), parsed in [`spawn_daily.py`](../src/nightshift/spawn_daily.py) and the [scheduler](../src/nightshift/manager/scheduler.py).
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
@@ -209,7 +209,7 @@ Legacy plain headers are still honored: `after: <NN>.<name>.md` (blocked until t
 
 ## Queue configuration
 
-A queue is either the default `.tasks/` queue (`main`) or a playlist (`.tasks/<name>/` with its own `config.json`). Per-queue settings, edited from the operator UI:
+A queue is a top-level directory of the `nightshift-tasks` content store, identified by holding a `config.json`: the default `main/` queue, or an additional queue `<name>/` (the former "playlists"). Per-queue settings, edited from the operator UI:
 
 | Setting | Storage | API |
 |---|---|---|

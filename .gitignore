@@ -232,3 +232,4 @@ config.json.local
 .nightshift/
 # Saved playlists (machine-local, like player settings).
 workflows.json
+.superpowers/

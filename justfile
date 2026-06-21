@@ -32,6 +32,7 @@ manager port="":
     set -euo pipefail
     args=(--workspace "{{workspace}}")
     if [ -n "{{port}}" ]; then args+=(--port "{{port}}"); fi
+    echo "launching manager on {{workspace}}:{{port}}"
     {{py}} -m nightshift.manager "${args[@]}"
 
 # Launch a worker: polls the manager, runs/validates/submits (worker UI :8810).
@@ -40,10 +41,12 @@ worker port="":
     set -euo pipefail
     args=(--workspace "{{workspace}}")
     if [ -n "{{port}}" ]; then args+=(--ui-port "{{port}}"); fi
+    echo "launching worker on {{workspace}}:{{port}}"
     {{py}} -m nightshift.worker "${args[@]}"
 
 # Launch a worker with no UI (poll loop only).
 worker-headless:
+    echo "launching worker-headless on {{workspace}}"
     {{py}} -m nightshift.worker --workspace "{{workspace}}" --no-ui
 
 # Launch the legacy single-box UI server (viewer + player; default :8799).
@@ -52,10 +55,12 @@ server port="":
     set -euo pipefail
     args=(--workspace "{{workspace}}")
     if [ -n "{{port}}" ]; then args+=(--port "{{port}}"); fi
+    echo "launching server on {{workspace}}:{{port}}"
     {{py}} -m nightshift.server "${args[@]}"
 
 # Launch the Slack Socket Mode capture daemon (needs the `slack` extra + tokens).
 slackd:
+    echo "launching slackd on {{workspace}}"
     {{py}} -m nightshift.slack.slackd --workspace "{{workspace}}"
 
 # Stop whatever server is listening on `port` (default 8800).

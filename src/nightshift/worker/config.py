@@ -4,7 +4,7 @@ A worker resolves its identity, backend, routing constraints, and manager
 location from (in precedence order, later wins):
 
 1. built-in defaults,
-2. ``tools/nightshift/config.json.local`` (gitignored; the worker's own knobs),
+2. ``<workspace>/config.json.local`` (gitignored; the worker's own knobs),
 3. process environment / ``.env`` (``NIGHTSHIFT_*``).
 
 The worker does **not** read the centralized ``config.json``; per-task config

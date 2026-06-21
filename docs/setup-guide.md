@@ -99,7 +99,7 @@ Open `http://localhost:8800` — that is the operator UI.
 
 ### 4. Start a worker
 
-In a second terminal, declare the worker's backend and capabilities, then run it. The cleanest place for a worker's own knobs is `config.json.local` at the repo root (gitignored):
+In a second terminal, declare the worker's backend and capabilities, then run it. A worker's own knobs live in `config.json.local` at the **workspace** root (`<workspace>/config.json.local`, worker-local and never committed):
 
 ```json
 {
@@ -121,7 +121,7 @@ The same settings can come from `NIGHTSHIFT_*` environment variables instead (en
 
 In the operator UI (`:8800`): add a task to a queue, and the worker will pick it up on its next poll, run it, validate, and submit. The manager fast-forwards canonical `main` under its landing lock. The worker's own UI at `:8810` shows what it is doing now plus its local history; the manager's Workers page shows all workers, per-backend/model/queue stats, advertised capabilities, and blocked tasks.
 
-> Operator-only commands (`just long-ui`, `just expunge`, `just kill-all`) are global and not worker-scoped — run them from your console, never from an agent worktree.
+> The full recipe list is `just --list`; the day-to-day ones are `manager`, `worker`, `worker-headless`, `server`, `migrate` / `rollback`, and `validate`.
 
 ## Add a second worker
 
@@ -129,31 +129,18 @@ The point of a second worker is to run more tasks in parallel, or to compare bac
 
 ### Same VM
 
-The runtime on one box is global, so a second co-located worker must not collide with the first. Give it three distinct things: its own clone (or worktree), a distinct `worker_id`, and a distinct worker-UI port.
+A second co-located worker shares the manager's workspace — the same target repos and `nightshift-tasks/` store — so it only needs a distinct **identity** and **worker-UI port**. Each task runs in its own git worktree and the manager serializes landing, so co-located workers can share the workspace's repo clones safely.
 
-1. Use a separate checkout of the repo for the second worker (its own working tree; workers each need their own clone). Share the `.venv` by symlink if you like.
-2. In that checkout's `config.json.local`:
-
-```json
-{
-  "worker_id": "vm-2",
-  "backend": "cursor",
-  "manager_url": "http://localhost:8800",
-  "models": ["claude-opus-4-8", "gpt-5.5"],
-  "mcps": [],
-  "ui_port": 8811
-}
-```
-
-3. Start it:
+Because `config.json.local` is read from the shared `<workspace>`, give the second worker its distinguishing knobs as environment variables when you launch it (the environment wins over `config.json.local`):
 
 ```bash
-just worker         # uses ui_port 8811 from config.json.local
-# or override on the CLI:
-just worker 8811
+NIGHTSHIFT_WORKER_ID=vm-2 \
+NIGHTSHIFT_WORKER_BACKEND=cursor \
+NIGHTSHIFT_WORKER_MODELS=claude-opus-4-8,gpt-5.5 \
+just worker 8811        # second worker UI on :8811 (the CLI arg overrides ui_port)
 ```
 
-Both workers now poll the same manager. Because the first advertises `claude-code` models and the second advertises a Cursor model set, the manager can compare them on identical tasks — the Workers page breaks down turns/tokens/cost per worker, backend, and model.
+Both workers now poll the same manager. Because the first advertises `claude-code` models and the second a Cursor model set, the manager can compare them on identical tasks — the Workers page breaks down turns/tokens/cost per worker, backend, and model.
 
 ### A second (or remote) machine
 
