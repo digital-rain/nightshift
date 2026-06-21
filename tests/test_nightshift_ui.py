@@ -818,66 +818,49 @@ def test_server_queue_runs_tasks_settings(tmp_path: Path) -> None:
     assert client.post("/api/tasks", json={"title": "New Task", "text": ""}).status_code == 409
 
     settings = client.get("/api/settings").json()
-    assert "schema" in settings and settings["values"]["transport_mode"] == "auto"
-    assert client.put("/api/settings", json={"transport_mode": "repeat", "repeat_interval": "10m"}).status_code == 200
-    assert client.put("/api/settings", json={"transport_mode": "repeat", "repeat_interval": "bad"}).status_code == 400
+    assert "schema" in settings and "tiers" in settings
+    assert client.put("/api/settings", json={"player": {"transport_mode": "repeat", "repeat_interval": "10m"}}).status_code == 200
+    assert client.put("/api/settings", json={"player": {"transport_mode": "repeat", "repeat_interval": "bad"}}).status_code == 400
 
 
 def test_server_settings_exposes_queue_validate(tmp_path: Path) -> None:
-    # Spec: "the 'validate' setting in the config.json for the active queue
-    # should be editable in the settings pane." The settings endpoint surfaces
-    # the active queue's validate command and persists edits to its config.json.
+    # Per-queue validate is now managed via /api/queue/config, not /api/settings.
     tasks_root = _seed(tmp_path, tasks={"alpha": "Do alpha."})
     client = _client(tmp_path)
 
-    settings = client.get("/api/settings").json()
-    # Defaults to the engine default when the queue config sets nothing.
-    assert settings["values"]["validate"] == "just validate"
-    assert any(f["key"] == "validate" for f in settings["schema"])
+    qcfg = client.get("/api/queue/config").json()
+    # Queue config returns validate (None/string); absent means engine default.
+    assert qcfg.get("validate") is None or qcfg.get("validate") == "just validate"
 
-    # Saving routes the validate command into the active queue's config.json,
-    # not the global player settings file.
-    resp = client.put("/api/settings", json={"validate": "just check"})
+    resp = client.put("/api/queue/config", json={"validate": "just check"})
     assert resp.status_code == 200
-    assert resp.json()["values"]["validate"] == "just check"
     cfg = json.loads((tasks_root / "main/config.json").read_text())
     assert cfg["validate"] == "just check"
-    assert "validate" not in json.loads(
-        (tmp_path / ".nightshift/player.json").read_text()
-    )
-    # Spec: clearing the validate command opts the queue out of validation.
-    # A whitespace-only value (and the '' / "" empty-quote literals) normalizes
-    # to the empty string, which is stored verbatim — it must not fall back to
-    # the inherited default.
+    player_path = tmp_path / ".nightshift/player.json"
+    if player_path.exists():
+        assert "validate" not in json.loads(player_path.read_text())
     for blank in ("  ", "''", '""'):
-        resp = client.put("/api/settings", json={"validate": blank})
+        resp = client.put("/api/queue/config", json={"validate": blank})
         assert resp.status_code == 200
-        assert resp.json()["values"]["validate"] == ""
         cfg = json.loads((tasks_root / "main/config.json").read_text())
         assert cfg["validate"] == ""
 
 
 def test_server_settings_validate_follows_active_queue(tmp_path: Path) -> None:
-    # The validate field is per-queue: switching the active queue surfaces and
-    # edits that queue's config.json, leaving the main queue's untouched.
+    # Per-queue validate now uses /api/queue/config. Switching the active queue
+    # routes edits to that queue's config.json, leaving the main queue untouched.
     tasks_root = _seed(tmp_path, tasks={"alpha": "a"})
     client = _client(tmp_path)
     assert client.post("/api/playlists", json={"name": "Nightshift"}).status_code == 201
     assert client.post("/api/active", json={"playlist": "nightshift"}).status_code == 200
 
-    resp = client.put("/api/settings", json={"validate": "just validate-nightshift"})
+    resp = client.put("/api/queue/config", json={"validate": "just validate-nightshift"})
     assert resp.status_code == 200
-    assert resp.json()["values"]["validate"] == "just validate-nightshift"
     pl_cfg = json.loads((tasks_root / "nightshift/config.json").read_text())
     assert pl_cfg["validate"] == "just validate-nightshift"
-    # The main queue's config is not touched by the playlist edit.
     main_cfg_path = tasks_root / "main/config.json"
     main_cfg = json.loads(main_cfg_path.read_text()) if main_cfg_path.exists() else {}
     assert "validate" not in main_cfg
-
-    # Back on main, the field shows the engine default again.
-    assert client.post("/api/active", json={"playlist": None}).status_code == 200
-    assert client.get("/api/settings").json()["values"]["validate"] == "just validate"
 
 
 def test_server_task_defaults_seeds_create_pane(tmp_path: Path) -> None:

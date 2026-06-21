@@ -1,11 +1,12 @@
-"""Minimal worker UI server — Now + History (local) screens.
+"""Minimal worker UI server — Now + History (local) screens + settings.
 
-Exposes a tiny read-only status API over the worker's :class:`LocalStore` and
-serves the shared-branding ``ui-worker/`` SPA. This is intentionally small: the
-manager owns the full operator console and durable cross-worker history.
+Exposes a status API over the worker's :class:`LocalStore`, settings
+GET/PUT over ``worker.json``, and serves the ``ui-worker/`` SPA.
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -13,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from nightshift._paths import UI_DIR as SHARED_UI_DIR
 from nightshift._paths import WORKER_UI_DIR as UI_DIR
+from nightshift.config.validate import build_get_response, validate_delta, write_delta
 from nightshift.worker.config import WorkerConfig
 from nightshift.worker.local_store import LocalStore
 
@@ -47,6 +49,30 @@ def create_worker_app(cfg: WorkerConfig, local: LocalStore) -> FastAPI:
     @app.get("/api/stats")
     def stats() -> JSONResponse:
         return JSONResponse(local.stats())
+
+    _WORKER_SURFACES = ["worker"]
+
+    @app.get("/api/settings")
+    def get_settings() -> JSONResponse:
+        return JSONResponse(
+            build_get_response(cfg.workspace, _WORKER_SURFACES)
+        )
+
+    @app.put("/api/settings")
+    def put_settings(body: dict[str, Any]) -> JSONResponse:
+        allowed = set(_WORKER_SURFACES)
+        resolved, errors = validate_delta(body, allowed)
+        if errors:
+            return JSONResponse({"ok": False, "errors": errors}, status_code=400)
+
+        applied_live, restart_required = write_delta(cfg.workspace, resolved)
+
+        return JSONResponse({
+            "ok": True,
+            "applied_live": applied_live,
+            "restart_required": restart_required,
+            **build_get_response(cfg.workspace, _WORKER_SURFACES),
+        })
 
     # Shared branding (style.css, logo.png) is reused from the operator UI dir,
     # mounted at /shared so the worker SPA can reference it without duplication.

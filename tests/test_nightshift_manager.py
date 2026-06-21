@@ -11,6 +11,7 @@ import asyncio
 import json
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from starlette.testclient import TestClient
 
@@ -20,6 +21,19 @@ from nightshift.manager.app import _jsonable, create_app
 from nightshift.manager.hub import Hub
 from nightshift.manager.landing import canonical_head
 from nightshift.manager.store import MemoryStore
+
+
+def _find_field(
+    resp: dict[str, Any], surface: str, key: str,
+) -> dict[str, Any] | None:
+    for tier in resp.get("tiers", []):
+        if tier["surface"] != surface:
+            continue
+        for cat in tier["categories"]:
+            for field in cat["fields"]:
+                if field["key"] == key:
+                    return field
+    return None
 
 
 def _seed(tmp_path: Path, tasks: dict[str, str], **kwargs) -> Path:
@@ -134,7 +148,10 @@ def test_operator_endpoints(tmp_path: Path) -> None:
         stats = client.get("/api/stats").json()
         # The rollups the Workers page renders are all present.
         assert {"overall", "by_worker", "by_backend", "by_model", "by_queue"} <= set(stats)
-        assert client.get("/api/settings").json()["landing_mode"] == "none"
+        resp = client.get("/api/settings").json()
+        landing_field = _find_field(resp, "manager", "landing_mode")
+        assert landing_field is not None
+        assert landing_field["effective"] == "none"
         assert client.get("/api/workers").json() == []
         assert client.get("/api/leases").json() == []
 
@@ -143,25 +160,31 @@ def test_settings_wip_ref_prefix_roundtrip(tmp_path: Path) -> None:
     root = _seed(tmp_path, {"10.hello": "Do a thing."})
     with _client(root) as client:
         data = client.get("/api/settings").json()
-        # Surfaced as an editable Settings field, defaulting to the namespace.
-        assert data["settings"]["wip_ref_prefix"] == "nightshift-wip"
-        assert any(f["key"] == "wip_ref_prefix" for f in data["schema"])
+        wip_field = _find_field(data, "manager", "wip_ref_prefix")
+        assert wip_field is not None
+        assert wip_field["stored"] == "nightshift-wip"
 
-        # A valid value is normalized + persisted to config.json.
-        ok = client.put("/api/settings", json={"wip_ref_prefix": "  acme/wip/ "})
+        # A valid value is normalized + persisted to manager.json.
+        ok = client.put(
+            "/api/settings",
+            json={"manager": {"wip_ref_prefix": "  acme/wip/ "}},
+        )
         assert ok.status_code == 200
-        assert ok.json()["settings"]["wip_ref_prefix"] == "acme/wip"
+        wip_after = _find_field(ok.json(), "manager", "wip_ref_prefix")
+        assert wip_after["stored"] == "acme/wip"
 
         # An unsafe value is rejected and persists nothing.
         assert client.put(
-            "/api/settings", json={"wip_ref_prefix": "bad prefix"}
+            "/api/settings",
+            json={"manager": {"wip_ref_prefix": "bad prefix"}},
         ).status_code == 400
 
-    # Saved to config.json, so a fresh manager (restart) reads the new value.
+    # Saved to manager.json, so a fresh manager (restart) reads the new value.
     with _client(root) as restarted:
+        resp = restarted.get("/api/settings").json()
+        wip_restarted = _find_field(resp, "manager", "wip_ref_prefix")
         assert (
-            restarted.get("/api/settings").json()["settings"]["wip_ref_prefix"]
-            == "acme/wip"
+            wip_restarted["stored"] == "acme/wip"
         )
 
 

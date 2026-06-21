@@ -178,7 +178,7 @@ class ManagerSettings:
     # as a nested object for code ergonomics, serialized flat.
     operator: OperatorConfig = field(default_factory=OperatorConfig, metadata=meta(
         category="Scheduling", label="Operator config",
-        desc="Task-policy keys.", apply="next-task", editable=False))
+        desc="Task-policy keys.", apply="next-task", editable=False, flatten=True))
 
     # Internal: the raw dict from disk for pass-through access by legacy readers.
     raw: dict[str, Any] = field(default_factory=dict, metadata=meta(
