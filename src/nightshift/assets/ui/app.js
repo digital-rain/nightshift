@@ -3458,81 +3458,571 @@ async function importFrom(source, tasks) {
 }
 
 // --------------------------------------------------------------------------
-// Settings modal
+// Settings — full-page multi-tier editor
 // --------------------------------------------------------------------------
-let settingsSchema = [];
+const settingsState = {
+  tiers: [],
+  activeSurface: null,
+  activeCategory: null,
+  dirty: {},
+  errors: {},
+  searchQuery: "",
+};
+
 async function openSettings() {
-  // The server returns `{values, schema}`; the manager returns `{settings,
-  // schema}`. Accept either so the modal opens reliably under both backends —
-  // a mismatch used to throw here and silently abort the popup.
   const data = await getJSON("/api/settings");
-  const values = data.values || data.settings || {};
-  const schema = data.schema || [];
-  settingsSchema = schema;
-  const wrap = $("settings-fields");
-  wrap.innerHTML = "";
-  for (const f of schema) {
-    const field = document.createElement("div");
-    field.className = "field";
-    const label = document.createElement("div");
-    label.className = "field-label";
-    label.textContent = f.label;
-    const desc = document.createElement("div");
-    desc.className = "field-desc";
-    desc.textContent = f.description || "";
-    let input;
-    if (f.type === "enum") {
-      input = document.createElement("select");
-      for (const opt of f.options) {
-        const o = document.createElement("option");
-        o.value = opt; o.textContent = opt;
-        input.append(o);
-      }
-    } else {
-      input = document.createElement("input");
-      input.type = f.type === "int" ? "number" : "text";
+  settingsState.tiers = data.tiers || [];
+  settingsState.dirty = {};
+  settingsState.errors = {};
+  settingsState.searchQuery = "";
+
+  if (settingsState.tiers.length && !settingsState.activeSurface) {
+    const first = settingsState.tiers[0];
+    settingsState.activeSurface = first.surface;
+    if (first.categories.length) {
+      settingsState.activeCategory = first.categories[0].name;
     }
-    input.id = `set-${f.key}`;
-    input.value = values[f.key];
-    field.append(label, desc, input);
-    wrap.append(field);
   }
-  $("settings-raw").value = JSON.stringify(values, null, 2);
-  $("settings-error").hidden = true;
-  $("settings-modal").hidden = false;
+
+  setView("settings");
+  renderSettingsSidebar();
+  renderSettingsFields();
+  updateSaveBar();
+  $("settings-search").value = "";
 }
 
-function collectSettings() {
-  const raw = $("settings-raw").value.trim();
-  if (raw) {
-    try { return JSON.parse(raw); } catch { /* fall through to fields */ }
+function renderSettingsSidebar() {
+  const tree = $("settings-tree");
+  tree.innerHTML = "";
+  for (const tier of settingsState.tiers) {
+    const div = document.createElement("div");
+    div.className = "st-tier";
+    const label = document.createElement("div");
+    label.className = "st-tier-label";
+    label.textContent = tier.surface.charAt(0).toUpperCase() + tier.surface.slice(1);
+    div.append(label);
+    for (const cat of tier.categories) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "st-cat";
+      if (tier.surface === settingsState.activeSurface && cat.name === settingsState.activeCategory) {
+        btn.classList.add("active");
+      }
+      btn.textContent = cat.name;
+      btn.setAttribute("role", "treeitem");
+      btn.addEventListener("click", () => {
+        settingsState.activeSurface = tier.surface;
+        settingsState.activeCategory = cat.name;
+        settingsState.searchQuery = "";
+        $("settings-search").value = "";
+        renderSettingsSidebar();
+        renderSettingsFields();
+      });
+      div.append(btn);
+    }
+    tree.append(div);
   }
-  const out = {};
-  for (const f of settingsSchema) {
-    const el = $(`set-${f.key}`);
-    if (!el) continue;
-    out[f.key] = f.type === "int" ? Number(el.value) : el.value;
+}
+
+function renderSettingsFields() {
+  const pane = $("settings-fields-pane");
+  pane.innerHTML = "";
+
+  const query = settingsState.searchQuery.toLowerCase().trim();
+  if (query) {
+    renderSearchResults(pane, query);
+    return;
   }
-  return out;
+
+  const tier = settingsState.tiers.find(t => t.surface === settingsState.activeSurface);
+  if (!tier) return;
+  const cat = tier.categories.find(c => c.name === settingsState.activeCategory);
+  if (!cat) return;
+
+  const title = document.createElement("h2");
+  title.className = "settings-cat-title";
+  title.textContent = cat.name;
+  pane.append(title);
+
+  for (const field of cat.fields) {
+    pane.append(buildFieldRow(field, tier.surface));
+  }
+
+  const rawDetails = document.createElement("details");
+  rawDetails.className = "sf-raw-json";
+  const summary = document.createElement("summary");
+  summary.textContent = "Raw JSON";
+  const textarea = document.createElement("textarea");
+  textarea.rows = 8;
+  textarea.spellcheck = false;
+  const rawData = {};
+  for (const f of cat.fields) {
+    if (!f.secret) rawData[f.key] = f.stored;
+  }
+  textarea.value = JSON.stringify(rawData, null, 2);
+  textarea.dataset.surface = tier.surface;
+  textarea.dataset.category = cat.name;
+  rawDetails.append(summary, textarea);
+  pane.append(rawDetails);
+}
+
+function renderSearchResults(pane, query) {
+  const title = document.createElement("h2");
+  title.className = "settings-cat-title";
+  title.textContent = `Search: "${query}"`;
+  pane.append(title);
+
+  let count = 0;
+  for (const tier of settingsState.tiers) {
+    for (const cat of tier.categories) {
+      for (const field of cat.fields) {
+        const searchable = `${field.label} ${field.key} ${field.desc}`.toLowerCase();
+        if (searchable.includes(query)) {
+          pane.append(buildFieldRow(field, tier.surface));
+          count++;
+        }
+      }
+    }
+  }
+  if (!count) {
+    const empty = document.createElement("div");
+    empty.className = "sf-empty-search";
+    empty.textContent = "No settings match your search.";
+    pane.append(empty);
+  }
+}
+
+function buildFieldRow(field, surface) {
+  const row = document.createElement("div");
+  row.className = "sf-row";
+  const fullKey = `${surface}.${field.key}`;
+  if (fullKey in settingsState.dirty) row.classList.add("sf-dirty");
+  if (fullKey in settingsState.errors) row.classList.add("sf-error");
+
+  const head = document.createElement("div");
+  head.className = "sf-head";
+  const label = document.createElement("span");
+  label.className = "sf-label";
+  label.textContent = field.label;
+  const key = document.createElement("code");
+  key.className = "sf-key";
+  key.textContent = field.key;
+  head.append(label, key);
+
+  const badges = document.createElement("span");
+  badges.className = "sf-badges";
+  if (field.apply === "restart") {
+    const b = document.createElement("span");
+    b.className = "sf-badge sf-badge-restart";
+    b.textContent = "restart";
+    badges.append(b);
+  } else if (field.apply === "live") {
+    const b = document.createElement("span");
+    b.className = "sf-badge sf-badge-live";
+    b.textContent = "live";
+    badges.append(b);
+  } else if (field.apply === "next-task") {
+    const b = document.createElement("span");
+    b.className = "sf-badge sf-badge-next-task";
+    b.textContent = "next-task";
+    badges.append(b);
+  }
+  if (field.secret) {
+    const b = document.createElement("span");
+    b.className = "sf-badge sf-badge-secret";
+    b.textContent = "secret";
+    badges.append(b);
+  }
+  head.append(badges);
+  row.append(head);
+
+  const desc = document.createElement("div");
+  desc.className = "sf-desc";
+  desc.textContent = field.desc;
+  desc.id = `sf-desc-${fullKey}`;
+  row.append(desc);
+
+  if (field.env_shadowed) {
+    const warn = document.createElement("div");
+    warn.className = "sf-env-warn";
+    warn.textContent = `Overridden by \`${field.env}\`; editing the file won't change the running value until the env var is unset.`;
+    row.append(warn);
+  }
+
+  const control = document.createElement("div");
+  control.className = "sf-control";
+  control.setAttribute("aria-describedby", `sf-desc-${fullKey}`);
+  control.append(buildControl(field, surface, fullKey));
+  row.append(control);
+
+  if (fullKey in settingsState.errors) {
+    const errMsg = document.createElement("div");
+    errMsg.className = "sf-error-msg";
+    errMsg.textContent = settingsState.errors[fullKey];
+    row.append(errMsg);
+  }
+
+  return row;
+}
+
+function buildControl(field, surface, fullKey) {
+  const currentValue = fullKey in settingsState.dirty
+    ? settingsState.dirty[fullKey]
+    : field.stored;
+
+  switch (field.type) {
+    case "bool": return buildToggle(field, surface, fullKey, currentValue);
+    case "enum": return buildSelect(field, surface, fullKey, currentValue);
+    case "int":
+    case "float": return buildNumber(field, surface, fullKey, currentValue);
+    case "duration": return buildDuration(field, surface, fullKey, currentValue);
+    case "string": return field.secret
+      ? buildSecret(field, surface, fullKey)
+      : buildText(field, surface, fullKey, currentValue);
+    case "string_list":
+    case "int_list":
+    case "regex_list": return buildChipEditor(field, surface, fullKey, currentValue);
+    case "str_map": return buildMapEditor(field, surface, fullKey, currentValue);
+    default: return buildText(field, surface, fullKey, currentValue);
+  }
+}
+
+function markDirty(surface, field, fullKey, value) {
+  const original = field.stored;
+  if (JSON.stringify(value) === JSON.stringify(original)) {
+    delete settingsState.dirty[fullKey];
+  } else {
+    settingsState.dirty[fullKey] = value;
+  }
+  delete settingsState.errors[fullKey];
+  updateSaveBar();
+  const row = document.querySelector(`[data-sf-key="${fullKey}"]`)?.closest(".sf-row");
+  if (row) {
+    row.classList.toggle("sf-dirty", fullKey in settingsState.dirty);
+    row.classList.remove("sf-error");
+    const errEl = row.querySelector(".sf-error-msg");
+    if (errEl) errEl.remove();
+  }
+}
+
+function buildToggle(field, surface, fullKey, value) {
+  const wrap = document.createElement("div");
+  wrap.className = "sf-toggle";
+  const track = document.createElement("div");
+  track.className = "sf-toggle-track" + (value ? " on" : "");
+  track.dataset.sfKey = fullKey;
+  const thumb = document.createElement("div");
+  thumb.className = "sf-toggle-thumb";
+  track.append(thumb);
+  const lbl = document.createElement("span");
+  lbl.className = "sf-toggle-label";
+  lbl.textContent = value ? "On" : "Off";
+  track.addEventListener("click", () => {
+    const newVal = !track.classList.contains("on");
+    track.classList.toggle("on", newVal);
+    lbl.textContent = newVal ? "On" : "Off";
+    markDirty(surface, field, fullKey, newVal);
+  });
+  wrap.append(track, lbl);
+  return wrap;
+}
+
+function buildSelect(field, surface, fullKey, value) {
+  const select = document.createElement("select");
+  for (const opt of (field.options || [])) {
+    const o = document.createElement("option");
+    o.value = opt;
+    o.textContent = opt;
+    if (opt === value) o.selected = true;
+    select.append(o);
+  }
+  select.dataset.sfKey = fullKey;
+  select.addEventListener("change", () => {
+    markDirty(surface, field, fullKey, select.value);
+  });
+  return select;
+}
+
+function buildNumber(field, surface, fullKey, value) {
+  const input = document.createElement("input");
+  input.type = "number";
+  input.value = value != null ? value : "";
+  input.dataset.sfKey = fullKey;
+  if (field.type === "float") input.step = "any";
+  input.addEventListener("input", () => {
+    const v = field.type === "int" ? parseInt(input.value, 10) : parseFloat(input.value);
+    if (!isNaN(v)) markDirty(surface, field, fullKey, v);
+  });
+  return input;
+}
+
+function buildDuration(field, surface, fullKey, value) {
+  const wrap = document.createElement("div");
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = value || "";
+  input.placeholder = "e.g. 45s, 30m, 1h30m";
+  input.dataset.sfKey = fullKey;
+  const hint = document.createElement("div");
+  hint.className = "sf-duration-hint";
+  const validate = () => {
+    const v = input.value.trim();
+    if (!v) { hint.textContent = ""; hint.className = "sf-duration-hint"; return; }
+    if (/^(\d+[smh]\s*)+$/i.test(v)) {
+      hint.textContent = "Valid duration";
+      hint.className = "sf-duration-hint valid";
+      markDirty(surface, field, fullKey, v);
+    } else {
+      hint.textContent = "Invalid format (use 45s, 30m, 1h30m)";
+      hint.className = "sf-duration-hint invalid";
+    }
+  };
+  input.addEventListener("input", validate);
+  validate();
+  wrap.append(input, hint);
+  return wrap;
+}
+
+function buildText(field, surface, fullKey, value) {
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = value != null ? value : "";
+  input.dataset.sfKey = fullKey;
+  input.addEventListener("input", () => {
+    const v = input.value;
+    markDirty(surface, field, fullKey, v || null);
+  });
+  return input;
+}
+
+function buildSecret(field, surface, fullKey) {
+  const wrap = document.createElement("div");
+  const status = document.createElement("div");
+  status.className = "sf-secret-status" + (field.is_set ? " is-set" : "");
+  status.textContent = field.is_set ? "Currently set" : "Not set";
+  const input = document.createElement("input");
+  input.type = "password";
+  input.placeholder = "Leave blank to keep current value";
+  input.dataset.sfKey = fullKey;
+  input.addEventListener("input", () => {
+    if (input.value) {
+      markDirty(surface, field, fullKey, input.value);
+    } else {
+      delete settingsState.dirty[fullKey];
+      updateSaveBar();
+    }
+  });
+  wrap.append(status, input);
+  return wrap;
+}
+
+function buildChipEditor(field, surface, fullKey, value) {
+  const items = Array.isArray(value) ? [...value] : [];
+  const wrap = document.createElement("div");
+  wrap.className = "sf-chips";
+  wrap.dataset.sfKey = fullKey;
+
+  const rerender = () => {
+    wrap.innerHTML = "";
+    items.forEach((item, i) => {
+      const row = document.createElement("div");
+      row.className = "sf-chip-row";
+      const input = document.createElement("input");
+      input.className = "sf-chip-input";
+      input.type = field.type === "int_list" ? "number" : "text";
+      input.value = item;
+      input.addEventListener("input", () => {
+        const v = field.type === "int_list" ? parseInt(input.value, 10) : input.value;
+        items[i] = v;
+        if (field.type === "regex_list") {
+          try { new RegExp(input.value); input.classList.remove("invalid"); }
+          catch { input.classList.add("invalid"); }
+        }
+        markDirty(surface, field, fullKey, [...items]);
+      });
+      if (field.type === "regex_list") {
+        try { new RegExp(item); } catch { input.classList.add("invalid"); }
+      }
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "sf-chip-del";
+      del.textContent = "\u00d7";
+      del.addEventListener("click", () => {
+        items.splice(i, 1);
+        markDirty(surface, field, fullKey, [...items]);
+        rerender();
+      });
+      row.append(input, del);
+      wrap.append(row);
+    });
+    const addBtn = document.createElement("button");
+    addBtn.type = "button";
+    addBtn.className = "sf-chip-add";
+    addBtn.textContent = "+ Add";
+    addBtn.addEventListener("click", () => {
+      items.push(field.type === "int_list" ? 0 : "");
+      markDirty(surface, field, fullKey, [...items]);
+      rerender();
+    });
+    wrap.append(addBtn);
+  };
+  rerender();
+  return wrap;
+}
+
+function buildMapEditor(field, surface, fullKey, value) {
+  const entries = Object.entries(value || {}).map(([k, v]) => ({ k, v }));
+  const wrap = document.createElement("div");
+  wrap.className = "sf-map";
+  wrap.dataset.sfKey = fullKey;
+
+  const collectMap = () => {
+    const obj = {};
+    for (const e of entries) { if (e.k) obj[e.k] = e.v; }
+    return obj;
+  };
+
+  const rerender = () => {
+    wrap.innerHTML = "";
+    entries.forEach((entry, i) => {
+      const row = document.createElement("div");
+      row.className = "sf-map-row";
+      const ki = document.createElement("input");
+      ki.className = "sf-map-key";
+      ki.placeholder = "key";
+      ki.value = entry.k;
+      ki.addEventListener("input", () => {
+        entries[i].k = ki.value;
+        markDirty(surface, field, fullKey, collectMap());
+      });
+      const sep = document.createElement("span");
+      sep.className = "sf-map-sep";
+      sep.textContent = "\u2192";
+      const vi = document.createElement("input");
+      vi.className = "sf-map-val";
+      vi.placeholder = "value";
+      vi.value = entry.v;
+      vi.addEventListener("input", () => {
+        entries[i].v = vi.value;
+        markDirty(surface, field, fullKey, collectMap());
+      });
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "sf-chip-del";
+      del.textContent = "\u00d7";
+      del.addEventListener("click", () => {
+        entries.splice(i, 1);
+        markDirty(surface, field, fullKey, collectMap());
+        rerender();
+      });
+      row.append(ki, sep, vi, del);
+      wrap.append(row);
+    });
+    const addBtn = document.createElement("button");
+    addBtn.type = "button";
+    addBtn.className = "sf-chip-add";
+    addBtn.textContent = "+ Add entry";
+    addBtn.addEventListener("click", () => {
+      entries.push({ k: "", v: "" });
+      rerender();
+    });
+    wrap.append(addBtn);
+  };
+  rerender();
+  return wrap;
+}
+
+function updateSaveBar() {
+  const bar = $("settings-savebar");
+  const count = Object.keys(settingsState.dirty).length;
+  if (count === 0) {
+    bar.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+  $("settings-dirty-count").textContent =
+    `${count} unsaved change${count === 1 ? "" : "s"}`;
+}
+
+function discardSettings() {
+  settingsState.dirty = {};
+  settingsState.errors = {};
+  updateSaveBar();
+  renderSettingsFields();
 }
 
 async function saveSettings() {
-  const values = collectSettings();
-  const { ok, data } = await sendJSON("/api/settings", "PUT", values);
+  const delta = {};
+  for (const [fullKey, value] of Object.entries(settingsState.dirty)) {
+    const [surface, ...rest] = fullKey.split(".");
+    const key = rest.join(".");
+    if (!delta[surface]) delta[surface] = {};
+    delta[surface][key] = value;
+  }
+
+  const { ok, data } = await sendJSON("/api/settings", "PUT", delta);
   if (!ok) {
-    $("settings-error").textContent = data.error || "invalid settings";
-    $("settings-error").hidden = false;
+    if (data && data.errors) {
+      settingsState.errors = data.errors;
+      renderSettingsFields();
+    }
     return;
   }
-  $("settings-modal").hidden = true;
-  const saved = (data && (data.values || data.settings)) || {};
-  if (saved.transport_mode) setMode(saved.transport_mode);
-  // The theme control now lives only in Settings, so saving it is authoritative:
-  // apply immediately and remember the choice for this browser.
-  if (saved.theme) {
-    localStorage.setItem(THEME_KEY, saved.theme);
-    applyTheme(saved.theme);
+
+  settingsState.dirty = {};
+  settingsState.errors = {};
+  settingsState.tiers = data.tiers || settingsState.tiers;
+  updateSaveBar();
+  renderSettingsFields();
+
+  if (data.restart_required && data.restart_required.length) {
+    const banner = $("settings-restart-banner");
+    banner.textContent = "Restart required to apply: " +
+      data.restart_required.map(k => k.split(".").slice(1).join(".")).join(", ");
+    banner.hidden = false;
   }
+
+  if (data.applied_live && data.applied_live.length) {
+    for (const key of data.applied_live) {
+      if (key === "player.theme" || key.endsWith(".theme")) {
+        const tier = settingsState.tiers.find(t => t.surface === "player");
+        if (tier) {
+          for (const cat of tier.categories) {
+            const f = cat.fields.find(f => f.key === "theme");
+            if (f) {
+              localStorage.setItem(THEME_KEY, f.stored);
+              applyTheme(f.stored);
+            }
+          }
+        }
+      }
+      if (key === "player.transport_mode" || key.endsWith(".transport_mode")) {
+        const tier = settingsState.tiers.find(t => t.surface === "player");
+        if (tier) {
+          for (const cat of tier.categories) {
+            const f = cat.fields.find(f => f.key === "transport_mode");
+            if (f && f.stored) setMode(f.stored);
+          }
+        }
+      }
+    }
+  }
+}
+
+function initSettingsSearch() {
+  const input = $("settings-search");
+  if (!input) return;
+  input.addEventListener("input", () => {
+    settingsState.searchQuery = input.value;
+    renderSettingsFields();
+  });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      input.value = "";
+      settingsState.searchQuery = "";
+      renderSettingsFields();
+    }
+  });
 }
 
 // --------------------------------------------------------------------------
@@ -3605,8 +4095,9 @@ function wire() {
     });
   }
   document.addEventListener("click", closeSettingsMenu);
-  $("settings-cancel").addEventListener("click", () => ($("settings-modal").hidden = true));
-  $("settings-save").addEventListener("click", saveSettings);
+  $("settings-discard").addEventListener("click", discardSettings);
+  $("settings-save-btn").addEventListener("click", saveSettings);
+  initSettingsSearch();
   $("btn-clear").addEventListener("click", clearCompleted);
   $("btn-stats").addEventListener("click", openStats);
   $("stats-back").addEventListener("click", closeStats);
@@ -3638,8 +4129,20 @@ async function init() {
   let defaultTheme = "dark";
   try {
     const s = await getJSON("/api/settings");
-    defaultTheme = (s.values && s.values.theme) || defaultTheme;
-    if (s.values && s.values.transport_mode) setMode(s.values.transport_mode);
+    if (s.tiers) {
+      const player = s.tiers.find(t => t.surface === "player");
+      if (player) {
+        for (const cat of player.categories) {
+          for (const f of cat.fields) {
+            if (f.key === "theme" && f.stored) defaultTheme = f.stored;
+            if (f.key === "transport_mode" && f.stored) setMode(f.stored);
+          }
+        }
+      }
+    } else {
+      defaultTheme = (s.values && s.values.theme) || defaultTheme;
+      if (s.values && s.values.transport_mode) setMode(s.values.transport_mode);
+    }
   } catch { /* settings optional at boot */ }
   initTheme(defaultTheme);
   // Establish the active queue first so queue/runs load against the right one.

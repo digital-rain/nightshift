@@ -87,3 +87,116 @@ table.history th, table.history td {
 }
 .status-completed { color: #4ade80; }
 .status-error { color: #f87171; }
+
+/* ---- Worker Settings ---- */
+.w-settings-fields { padding: 0 1rem 4rem; }
+.w-cat-title {
+  font-size: 14px;
+  font-weight: 700;
+  margin: 20px 0 10px;
+  color: var(--text, #e6e8ec);
+}
+.w-cat-title:first-child { margin-top: 0; }
+.w-sf-row {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border, #2a2a2a);
+}
+.w-sf-row.w-sf-dirty { background: rgba(110, 168, 254, 0.04); padding: 12px 8px; border-radius: 6px; }
+.w-sf-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 3px; }
+.w-sf-label { font-weight: 600; font-size: 13px; }
+.w-sf-key {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  color: var(--muted, #888);
+}
+.w-sf-badges { display: inline-flex; gap: 4px; }
+.w-sf-badge {
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+.w-sf-badge-restart { background: rgba(230, 192, 104, 0.16); color: #e6c068; }
+.w-sf-badge-secret { background: rgba(240, 120, 111, 0.12); color: #e88; }
+.w-sf-desc { font-size: 11px; color: var(--muted, #888); margin-bottom: 6px; }
+.w-sf-env-warn {
+  font-size: 11px;
+  color: #e6c068;
+  margin-bottom: 6px;
+  padding: 4px 8px;
+  background: rgba(230, 192, 104, 0.08);
+  border: 1px solid rgba(230, 192, 104, 0.3);
+  border-radius: 4px;
+}
+.w-sf-error { font-size: 11px; color: #f87171; margin-top: 3px; }
+.w-sf-control { max-width: 400px; }
+.w-sf-control input,
+.w-sf-control select {
+  width: 100%;
+  padding: 6px 8px;
+  background: #0d0d0d;
+  color: var(--fg, #ddd);
+  border: 1px solid var(--border, #2a2a2a);
+  border-radius: 6px;
+  font: inherit;
+  font-size: 12px;
+}
+.w-sf-control input:focus,
+.w-sf-control select:focus { outline: none; border-color: var(--accent, #3b82f6); }
+.w-sf-secret-status { font-size: 11px; color: var(--muted, #888); margin-bottom: 3px; }
+.w-sf-toggle { display: flex; align-items: center; gap: 8px; }
+.w-sf-toggle-track {
+  position: relative; width: 36px; height: 20px; border-radius: 10px;
+  background: var(--border, #2a2a2a); cursor: pointer; transition: background 0.15s;
+}
+.w-sf-toggle-track.on { background: var(--accent, #3b82f6); }
+.w-sf-toggle-thumb {
+  position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+  border-radius: 50%; background: #fff; transition: left 0.15s;
+}
+.w-sf-toggle-track.on .w-sf-toggle-thumb { left: 18px; }
+.w-sf-chips, .w-sf-map { display: flex; flex-direction: column; gap: 4px; }
+.w-sf-chip-row, .w-sf-map-row { display: flex; align-items: center; gap: 6px; }
+.w-sf-chip-row input, .w-sf-map-row input {
+  flex: 1; padding: 5px 8px; background: #0d0d0d; color: var(--fg, #ddd);
+  border: 1px solid var(--border, #2a2a2a); border-radius: 5px; font: inherit; font-size: 12px;
+}
+.w-sf-chip-del {
+  background: none; border: none; color: var(--muted, #888);
+  cursor: pointer; font-size: 14px; padding: 2px 4px;
+}
+.w-sf-chip-del:hover { color: #f87171; }
+.w-sf-chip-add {
+  background: none; border: 1px dashed var(--border, #2a2a2a); color: var(--muted, #888);
+  border-radius: 5px; padding: 3px 8px; font-size: 11px; cursor: pointer; align-self: flex-start;
+}
+.w-sf-chip-add:hover { border-color: var(--accent, #3b82f6); color: var(--accent, #3b82f6); }
+
+/* Save bar */
+.w-settings-savebar {
+  position: sticky; bottom: 0;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 1rem;
+  background: var(--panel, #1c1c1c);
+  border-top: 1px solid var(--border, #2a2a2a);
+}
+.w-settings-savebar[hidden] { display: none; }
+.w-settings-dirty-count { font-size: 12px; color: var(--muted, #888); }
+.w-settings-savebar-actions { display: flex; gap: 6px; }
+.w-btn {
+  padding: 6px 12px; border-radius: 6px;
+  border: 1px solid var(--border, #2a2a2a);
+  background: var(--panel, #1c1c1c); color: var(--fg, #ddd);
+  font-size: 12px; cursor: pointer;
+}
+.w-btn-primary { background: var(--accent, #3b82f6); border-color: var(--accent, #3b82f6); color: #fff; }
+.w-settings-restart-banner {
+  padding: 8px 1rem;
+  background: rgba(230, 192, 104, 0.12);
+  border-top: 1px solid rgba(230, 192, 104, 0.3);
+  color: #e6c068;
+  font-size: 12px;
+}
+.w-settings-restart-banner[hidden] { display: none; }

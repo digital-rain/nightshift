@@ -21,6 +21,7 @@ function setView(view) {
   });
   document.getElementById("view-now").hidden = view !== "now";
   document.getElementById("view-history").hidden = view !== "history";
+  document.getElementById("view-settings").hidden = view !== "settings";
 }
 
 async function loadInfo() {
@@ -108,13 +109,315 @@ async function tick() {
   timer = setTimeout(tick, refreshMs);
 }
 
+// --------------------------------------------------------------------------
+// Worker Settings (compact renderer over worker surface)
+// --------------------------------------------------------------------------
+const wSettings = { tiers: [], dirty: {}, errors: {} };
+
+async function loadWorkerSettings() {
+  try {
+    const data = await getJSON("/api/settings");
+    wSettings.tiers = data.tiers || [];
+    wSettings.dirty = {};
+    wSettings.errors = {};
+    renderWorkerSettings();
+    updateWorkerSaveBar();
+  } catch (_e) { /* settings endpoint may not exist yet */ }
+}
+
+function renderWorkerSettings() {
+  const pane = document.getElementById("w-settings-fields");
+  pane.innerHTML = "";
+  for (const tier of wSettings.tiers) {
+    for (const cat of tier.categories) {
+      const title = document.createElement("h3");
+      title.className = "w-cat-title";
+      title.textContent = cat.name;
+      pane.appendChild(title);
+      for (const field of cat.fields) {
+        pane.appendChild(buildWorkerFieldRow(field, tier.surface));
+      }
+    }
+  }
+}
+
+function buildWorkerFieldRow(field, surface) {
+  const fullKey = `${surface}.${field.key}`;
+  const row = document.createElement("div");
+  row.className = "w-sf-row";
+  if (fullKey in wSettings.dirty) row.classList.add("w-sf-dirty");
+
+  const head = document.createElement("div");
+  head.className = "w-sf-head";
+  const label = document.createElement("span");
+  label.className = "w-sf-label";
+  label.textContent = field.label;
+  const key = document.createElement("code");
+  key.className = "w-sf-key";
+  key.textContent = field.key;
+  const badges = document.createElement("span");
+  badges.className = "w-sf-badges";
+  if (field.apply === "restart") {
+    const b = document.createElement("span");
+    b.className = "w-sf-badge w-sf-badge-restart";
+    b.textContent = "restart";
+    badges.appendChild(b);
+  }
+  if (field.secret) {
+    const b = document.createElement("span");
+    b.className = "w-sf-badge w-sf-badge-secret";
+    b.textContent = "secret";
+    badges.appendChild(b);
+  }
+  head.append(label, key, badges);
+  row.appendChild(head);
+
+  const desc = document.createElement("div");
+  desc.className = "w-sf-desc";
+  desc.textContent = field.desc;
+  row.appendChild(desc);
+
+  if (field.env_shadowed) {
+    const warn = document.createElement("div");
+    warn.className = "w-sf-env-warn";
+    warn.textContent = `Overridden by ${field.env}`;
+    row.appendChild(warn);
+  }
+
+  const control = document.createElement("div");
+  control.className = "w-sf-control";
+  control.appendChild(buildWorkerControl(field, surface, fullKey));
+  row.appendChild(control);
+
+  if (fullKey in wSettings.errors) {
+    const err = document.createElement("div");
+    err.className = "w-sf-error";
+    err.textContent = wSettings.errors[fullKey];
+    row.appendChild(err);
+  }
+
+  return row;
+}
+
+function buildWorkerControl(field, surface, fullKey) {
+  const value = fullKey in wSettings.dirty ? wSettings.dirty[fullKey] : field.stored;
+
+  if (field.secret) {
+    const wrap = document.createElement("div");
+    const status = document.createElement("div");
+    status.className = "w-sf-secret-status";
+    status.textContent = field.is_set ? "Currently set" : "Not set";
+    const input = document.createElement("input");
+    input.type = "password";
+    input.placeholder = "Leave blank to keep current";
+    input.addEventListener("input", () => {
+      if (input.value) wSettings.dirty[fullKey] = input.value;
+      else delete wSettings.dirty[fullKey];
+      updateWorkerSaveBar();
+    });
+    wrap.append(status, input);
+    return wrap;
+  }
+
+  switch (field.type) {
+    case "bool": {
+      const wrap = document.createElement("div");
+      wrap.className = "w-sf-toggle";
+      const track = document.createElement("div");
+      track.className = "w-sf-toggle-track" + (value ? " on" : "");
+      const thumb = document.createElement("div");
+      thumb.className = "w-sf-toggle-thumb";
+      track.appendChild(thumb);
+      const lbl = document.createElement("span");
+      lbl.textContent = value ? "On" : "Off";
+      track.addEventListener("click", () => {
+        const nv = !track.classList.contains("on");
+        track.classList.toggle("on", nv);
+        lbl.textContent = nv ? "On" : "Off";
+        wMarkDirty(field, fullKey, nv);
+      });
+      wrap.append(track, lbl);
+      return wrap;
+    }
+    case "enum": {
+      const select = document.createElement("select");
+      for (const opt of (field.options || [])) {
+        const o = document.createElement("option");
+        o.value = opt; o.textContent = opt;
+        if (opt === value) o.selected = true;
+        select.appendChild(o);
+      }
+      select.addEventListener("change", () => wMarkDirty(field, fullKey, select.value));
+      return select;
+    }
+    case "int":
+    case "float": {
+      const input = document.createElement("input");
+      input.type = "number";
+      input.value = value != null ? value : "";
+      if (field.type === "float") input.step = "any";
+      input.addEventListener("input", () => {
+        const v = field.type === "int" ? parseInt(input.value, 10) : parseFloat(input.value);
+        if (!isNaN(v)) wMarkDirty(field, fullKey, v);
+      });
+      return input;
+    }
+    case "string_list":
+    case "int_list":
+    case "regex_list": {
+      const items = Array.isArray(value) ? [...value] : [];
+      const wrap = document.createElement("div");
+      wrap.className = "w-sf-chips";
+      const rerender = () => {
+        wrap.innerHTML = "";
+        items.forEach((item, i) => {
+          const row = document.createElement("div");
+          row.className = "w-sf-chip-row";
+          const input = document.createElement("input");
+          input.type = field.type === "int_list" ? "number" : "text";
+          input.value = item;
+          input.addEventListener("input", () => {
+            items[i] = field.type === "int_list" ? parseInt(input.value, 10) : input.value;
+            wMarkDirty(field, fullKey, [...items]);
+          });
+          const del = document.createElement("button");
+          del.type = "button";
+          del.className = "w-sf-chip-del";
+          del.textContent = "\u00d7";
+          del.addEventListener("click", () => {
+            items.splice(i, 1);
+            wMarkDirty(field, fullKey, [...items]);
+            rerender();
+          });
+          row.append(input, del);
+          wrap.appendChild(row);
+        });
+        const addBtn = document.createElement("button");
+        addBtn.type = "button";
+        addBtn.className = "w-sf-chip-add";
+        addBtn.textContent = "+ Add";
+        addBtn.addEventListener("click", () => {
+          items.push(field.type === "int_list" ? 0 : "");
+          wMarkDirty(field, fullKey, [...items]);
+          rerender();
+        });
+        wrap.appendChild(addBtn);
+      };
+      rerender();
+      return wrap;
+    }
+    case "str_map": {
+      const entries = Object.entries(value || {}).map(([k, v]) => ({ k, v }));
+      const wrap = document.createElement("div");
+      wrap.className = "w-sf-map";
+      const collectMap = () => {
+        const obj = {};
+        for (const e of entries) { if (e.k) obj[e.k] = e.v; }
+        return obj;
+      };
+      const rerender = () => {
+        wrap.innerHTML = "";
+        entries.forEach((entry, i) => {
+          const row = document.createElement("div");
+          row.className = "w-sf-map-row";
+          const ki = document.createElement("input");
+          ki.placeholder = "key"; ki.value = entry.k;
+          ki.addEventListener("input", () => { entries[i].k = ki.value; wMarkDirty(field, fullKey, collectMap()); });
+          const vi = document.createElement("input");
+          vi.placeholder = "value"; vi.value = entry.v;
+          vi.addEventListener("input", () => { entries[i].v = vi.value; wMarkDirty(field, fullKey, collectMap()); });
+          const del = document.createElement("button");
+          del.type = "button"; del.className = "w-sf-chip-del"; del.textContent = "\u00d7";
+          del.addEventListener("click", () => { entries.splice(i, 1); wMarkDirty(field, fullKey, collectMap()); rerender(); });
+          row.append(ki, vi, del);
+          wrap.appendChild(row);
+        });
+        const addBtn = document.createElement("button");
+        addBtn.type = "button"; addBtn.className = "w-sf-chip-add"; addBtn.textContent = "+ Add";
+        addBtn.addEventListener("click", () => { entries.push({ k: "", v: "" }); rerender(); });
+        wrap.appendChild(addBtn);
+      };
+      rerender();
+      return wrap;
+    }
+    default: {
+      const input = document.createElement("input");
+      input.type = "text";
+      input.value = value != null ? value : "";
+      input.addEventListener("input", () => wMarkDirty(field, fullKey, input.value || null));
+      return input;
+    }
+  }
+}
+
+function wMarkDirty(field, fullKey, value) {
+  if (JSON.stringify(value) === JSON.stringify(field.stored)) {
+    delete wSettings.dirty[fullKey];
+  } else {
+    wSettings.dirty[fullKey] = value;
+  }
+  delete wSettings.errors[fullKey];
+  updateWorkerSaveBar();
+}
+
+function updateWorkerSaveBar() {
+  const bar = document.getElementById("w-settings-savebar");
+  const count = Object.keys(wSettings.dirty).length;
+  if (count === 0) { bar.hidden = true; return; }
+  bar.hidden = false;
+  document.getElementById("w-settings-dirty-count").textContent =
+    `${count} unsaved change${count === 1 ? "" : "s"}`;
+}
+
+async function saveWorkerSettings() {
+  const delta = {};
+  for (const [fullKey, value] of Object.entries(wSettings.dirty)) {
+    const [surface, ...rest] = fullKey.split(".");
+    const key = rest.join(".");
+    if (!delta[surface]) delta[surface] = {};
+    delta[surface][key] = value;
+  }
+  const resp = await fetch("/api/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(delta),
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    if (data.errors) {
+      wSettings.errors = data.errors;
+      renderWorkerSettings();
+    }
+    return;
+  }
+  wSettings.dirty = {};
+  wSettings.errors = {};
+  wSettings.tiers = data.tiers || wSettings.tiers;
+  updateWorkerSaveBar();
+  renderWorkerSettings();
+  if (data.restart_required && data.restart_required.length) {
+    const banner = document.getElementById("w-settings-restart-banner");
+    banner.textContent = "Restart this worker to apply: " +
+      data.restart_required.map(k => k.split(".").slice(1).join(".")).join(", ");
+    banner.hidden = false;
+  }
+}
+
 document.addEventListener("DOMContentLoaded", async () => {
   document.querySelectorAll(".nav-opt").forEach((b) => {
     b.addEventListener("click", () => {
       setView(b.dataset.view);
       if (b.dataset.view === "history") refreshHistory();
+      if (b.dataset.view === "settings") loadWorkerSettings();
     });
   });
+  document.getElementById("w-settings-discard").addEventListener("click", () => {
+    wSettings.dirty = {};
+    wSettings.errors = {};
+    updateWorkerSaveBar();
+    renderWorkerSettings();
+  });
+  document.getElementById("w-settings-save").addEventListener("click", saveWorkerSettings);
   await loadInfo();
   if (timer) clearTimeout(timer);
   tick();

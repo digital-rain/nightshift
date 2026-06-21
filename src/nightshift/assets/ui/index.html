@@ -196,6 +196,32 @@
         <p id="stats-empty" class="empty" hidden>No runs yet.</p>
       </section>
 
+      <!-- Settings: full-page multi-tier editor (VS Code style). Replaces the
+           old #settings-modal. A left sidebar (tier + category tree) + right
+           pane (typed field controls) + sticky save bar. -->
+      <section id="screen-settings" class="screen screen-settings" aria-label="Settings">
+        <div class="settings-layout">
+          <aside class="settings-sidebar" role="tree" aria-label="Settings categories">
+            <div class="settings-search-wrap">
+              <input id="settings-search" class="settings-search" type="search"
+                     placeholder="Search settings…" aria-label="Search settings" />
+            </div>
+            <nav id="settings-tree" class="settings-tree"></nav>
+          </aside>
+          <div class="settings-main">
+            <div id="settings-fields-pane" class="settings-fields-pane"></div>
+          </div>
+        </div>
+        <div id="settings-savebar" class="settings-savebar" hidden>
+          <span id="settings-dirty-count" class="settings-dirty-count"></span>
+          <div class="settings-savebar-actions">
+            <button id="settings-discard" class="btn">Discard</button>
+            <button id="settings-save-btn" class="btn primary">Save</button>
+          </div>
+        </div>
+        <div id="settings-restart-banner" class="settings-restart-banner" hidden></div>
+      </section>
+
       <!-- Workers: registered worker fleet (backend, routing, status, current
            task) plus per-worker and per-backend comparison stats. Driven by the
            manager API + live SSE convergence (manager-events.js). -->
@@ -299,22 +325,6 @@
       </nav>
     </div>
 
-    <!-- Settings modal -->
-    <div id="settings-modal" class="modal" hidden>
-      <div class="modal-card">
-        <h3>Settings</h3>
-        <div id="settings-fields" class="settings-fields"></div>
-        <details class="raw-json">
-          <summary>Raw JSON</summary>
-          <textarea id="settings-raw" rows="8" spellcheck="false"></textarea>
-        </details>
-        <p id="settings-error" class="error" hidden></p>
-        <div class="modal-actions">
-          <button id="settings-cancel" class="btn">Cancel</button>
-          <button id="settings-save" class="btn primary">Save</button>
-        </div>
-      </div>
-    </div>
 
     <!-- Add-from-playlist picker -->
     <div id="addfrom-modal" class="modal" hidden>

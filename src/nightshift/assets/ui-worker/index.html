@@ -26,6 +26,7 @@
     <nav class="worker-nav">
       <button type="button" class="nav-opt active" data-view="now">Now</button>
       <button type="button" class="nav-opt" data-view="history">History</button>
+      <button type="button" class="nav-opt" data-view="settings">Settings</button>
     </nav>
 
     <main>
@@ -62,6 +63,18 @@
           </thead>
           <tbody id="history-body"></tbody>
         </table>
+      </section>
+
+      <section id="view-settings" class="worker-view" hidden>
+        <div id="w-settings-fields" class="w-settings-fields"></div>
+        <div id="w-settings-savebar" class="w-settings-savebar" hidden>
+          <span id="w-settings-dirty-count" class="w-settings-dirty-count"></span>
+          <div class="w-settings-savebar-actions">
+            <button id="w-settings-discard" class="w-btn">Discard</button>
+            <button id="w-settings-save" class="w-btn w-btn-primary">Save</button>
+          </div>
+        </div>
+        <div id="w-settings-restart-banner" class="w-settings-restart-banner" hidden></div>
       </section>
     </main>
 
