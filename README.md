@@ -16,6 +16,8 @@ flowchart LR
 
 ## Layout
 
+For the full component map, data flow, state model, and design rationale see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
 ```
 src/nightshift/            the package (run as `python -m nightshift.<entry>`)
   manager/                 operator + worker HTTP API, operator UI, store, landing, scheduler
