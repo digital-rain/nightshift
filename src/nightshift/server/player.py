@@ -523,6 +523,20 @@ class PlayerRegistry:
             self._focused = playlist
         return {"ok": True, "active_playlist": playlist}
 
+    def rename_queue(self, old: str, new: str) -> None:
+        """Forget any cached runner for ``old`` (its on-disk dir has moved under
+        the new name, so a fresh runner is lazily recreated pointing at it) and
+        carry the UI focus across when the renamed queue was focused.
+
+        The caller renames the directory only after confirming the queue is not
+        running, so no live thread is dropped here."""
+        if not old or old == new:
+            return
+        with self._lock:
+            self._runners.pop(old, None)
+            if self._focused == old:
+                self._focused = new
+
     @property
     def store(self) -> RunStore:
         """The store the single-context view reads/browses: always the *focused*

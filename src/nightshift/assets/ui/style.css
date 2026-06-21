@@ -968,7 +968,8 @@ body {
 #screen-detail .meta-k,
 #screen-detail .detail-field-label,
 #screen-detail .detail-h,
-#screen-detail .model-label { text-transform: uppercase; letter-spacing: 0.05em; font-size: 11px; }
+#screen-detail .model-label,
+#screen-playlist-info .detail-field-label { text-transform: uppercase; letter-spacing: 0.05em; font-size: 11px; }
 
 /* A read-only segmented control: it *displays* recorded flags (history detail),
    so its options aren't interactive and never dim like a disabled control. */
@@ -986,6 +987,7 @@ body[data-view="history"] #screen-history,
 body[data-view="stats"] #screen-stats,
 body[data-view="repos"] #screen-repos,
 body[data-view="settings"] #screen-settings,
+body[data-view="playlist-info"] #screen-playlist-info,
 body[data-view="detail"] #screen-detail { display: flex; flex: 1; }
 
 /* ---- full-area task detail takeover ---- */
@@ -998,11 +1000,29 @@ body[data-view="detail"] #screen-detail { display: flex; flex: 1; }
 }
 .detail-back:hover { color: var(--accent); background: var(--bg-sunken); }
 .detail-back svg { width: 24px; height: 24px; display: block; }
-#screen-detail #detail-screen-title {
+#screen-detail #detail-screen-title,
+#screen-playlist-info #playlist-info-title {
   margin: 0; font-size: 17px; font-weight: 600;
   text-transform: none; letter-spacing: 0; color: var(--text);
 }
-#screen-detail .detail-body { max-width: 760px; width: 100%; margin: 0 auto; }
+#screen-detail .detail-body,
+#screen-playlist-info .detail-body { max-width: 760px; width: 100%; margin: 0 auto; }
+
+/* The info button on a playlist row: mirrors the delete affordance but reveals
+   the playlist-info takeover instead. */
+.pl-info {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 6px;
+  opacity: 0;
+}
+.pl-item:hover .pl-info { opacity: 1; }
+.pl-info:hover { color: var(--accent); background: var(--bg-sunken); }
 
 /* ---- wide screens: Now grows a right-hand detail column when a task is
    selected (body.has-detail). Narrow widths use the detail modal instead. ---- */

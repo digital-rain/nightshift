@@ -164,6 +164,20 @@ class QueueConfig(BaseModel):
     repo: str | None = None
 
 
+class PlaylistCreate(BaseModel):
+    name: str
+
+
+class PlaylistUpdate(BaseModel):
+    """Edit a playlist from its info page. ``name`` renames the queue (its
+    on-disk dir + every queue-keyed DB row); ``repository`` is the alias the UI
+    shows for the queue's default ``repo`` binding. Both are optional; only the
+    fields present in the request are applied."""
+
+    name: str | None = None
+    repository: str | None = None
+
+
 class TaskCreate(BaseModel):
     title: str
     text: str
@@ -911,6 +925,114 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
     @app.get("/api/playlists")
     def get_playlists() -> JSONResponse:
         return JSONResponse(playlists_mod.list_playlists(tasks_root))
+
+    @app.post("/api/playlists")
+    async def post_playlist(req: PlaylistCreate) -> JSONResponse:
+        try:
+            created = playlists_mod.create_playlist(tasks_root, req.name)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except FileExistsError as exc:
+            return JSONResponse(
+                {"error": f"playlist already exists: {exc}"}, status_code=409
+            )
+        commit_tasks(tasks_root, f"nightshift: create playlist {created['name']}")
+        await _emit("queue_changed", queue=created["name"])
+        return JSONResponse(created, status_code=201)
+
+    def _playlist_info(name: str) -> dict[str, Any]:
+        """The playlist-info payload: its name, task count, and the ``repo``
+        binding aliased to ``repository`` for the info page."""
+        count = len(list((tasks_root / name).glob("*.md")))
+        return {
+            "name": name,
+            "task_count": count,
+            "repository": _queue_repo(name),
+        }
+
+    @app.get("/api/playlists/{name}")
+    def get_playlist(name: str) -> JSONResponse:
+        if not playlists_mod.exists(tasks_root, name):
+            return JSONResponse({"error": "playlist not found"}, status_code=404)
+        return JSONResponse(_playlist_info(name))
+
+    @app.put("/api/playlists/{name}")
+    async def put_playlist(name: str, req: PlaylistUpdate) -> JSONResponse:
+        if not playlists_mod.exists(tasks_root, name):
+            return JSONResponse({"error": "playlist not found"}, status_code=404)
+        current = name
+        # An active lease on this queue means a worker is mid-run against it;
+        # renaming the dir + DB rows under it would strand that run.
+        if req.name is not None and playlists_mod.slugify_name(req.name) != name:
+            active = await _store().active_leases()
+            if any(_queue_from_label(le["queue"]) == name for le in active):
+                return JSONResponse(
+                    {"error": "playlist has a running task; stop it first"},
+                    status_code=409,
+                )
+            try:
+                new_name = playlists_mod.rename_playlist(tasks_root, name, req.name)
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            except FileExistsError as exc:
+                return JSONResponse(
+                    {"error": f"playlist already exists: {exc}"}, status_code=409
+                )
+            except FileNotFoundError:
+                return JSONResponse({"error": "playlist not found"}, status_code=404)
+            await _store().rename_queue(name, new_name)
+            commit_tasks(tasks_root, f"nightshift: rename playlist {name} -> {new_name}")
+            await _emit(
+                "queue_changed",
+                queue=new_name,
+                payload={"renamed_from": name},
+            )
+            current = new_name
+        # ``repository`` aliases the queue's default repo binding. A sent value
+        # (incl. "" -> cleared) is normalized + persisted; an unset field is left
+        # untouched (PATCH-like semantics on a PUT body of optional fields).
+        if "repository" in req.model_dump(exclude_unset=True):
+            try:
+                repo_value = _normalize_repo(req.repository)
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            save_queue_config_value(
+                tasks_root, "repo", repo_value, playlists_mod.tasks_rel(current)
+            )
+            commit_tasks(tasks_root, f"nightshift: set repo {queue_label(current)}")
+            await _emit("queue_changed", queue=current, payload={"repo": repo_value})
+        return JSONResponse(_playlist_info(current))
+
+    @app.delete("/api/playlists/{name}")
+    async def remove_playlist(name: str) -> JSONResponse:
+        active = await _store().active_leases()
+        if any(_queue_from_label(le["queue"]) == name for le in active):
+            return JSONResponse(
+                {"error": "playlist has a running task; stop it first"},
+                status_code=409,
+            )
+        if not playlists_mod.delete_playlist(tasks_root, name):
+            return JSONResponse({"error": "playlist not found"}, status_code=404)
+        commit_tasks(tasks_root, f"nightshift: delete playlist {name}")
+        await _emit("queue_changed", queue=name)
+        return JSONResponse({"name": name, "deleted": True})
+
+    @app.post("/api/playlists/rescan")
+    async def rescan_playlists() -> JSONResponse:
+        """Scan the workspace's immediate children for git repos and materialise
+        one playlist per repo (name = repo dir name), binding each playlist's
+        default repo to the discovered repo. The content-store repo is skipped.
+        """
+        repo_names = repos.known_repos(workspace)
+        result = playlists_mod.rescan_into_playlists(
+            tasks_root, repo_names, skip={tasks_repo}
+        )
+        if result["created"] or result["configured"]:
+            commit_tasks(tasks_root, "nightshift: rescan workspace repos into playlists")
+        await _emit("queue_changed", payload=result)
+        return JSONResponse(
+            {**result, "playlists": playlists_mod.list_playlists(tasks_root)}
+        )
 
     # ----- repos (multi-repo workspace) ----------------------------------- #
 

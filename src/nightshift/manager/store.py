@@ -106,6 +106,9 @@ class NightshiftStore(Protocol):
         self, queue_label: str, worker_ids: list[str]
     ) -> None: ...
 
+    # queue rename (migrate every row keyed on a queue name)
+    async def rename_queue(self, old: str, new: str) -> None: ...
+
     # runs
     async def create_run(
         self,
@@ -413,6 +416,31 @@ class MemoryStore:
                 self._dedication[queue_label] = cleaned
             else:
                 self._dedication.pop(queue_label, None)
+
+    # ---- queue rename ----------------------------------------------------- #
+
+    async def rename_queue(self, old: str, new: str) -> None:
+        """Repoint every queue-keyed row from ``old`` to ``new`` (playlists only;
+        the main queue is never renamed)."""
+        if not old or old == new:
+            return
+        with self._lock:
+            ok, nk = _qkey(old), _qkey(new)
+            for lease in self._leases.values():
+                if lease["queue"] == ok:
+                    lease["queue"] = nk
+            for run in self._runs.values():
+                if run["queue"] == ok:
+                    run["queue"] = nk
+            for event in self._events:
+                if event.get("queue") == old:
+                    event["queue"] = new
+            for key, row in list(self._tasks.items()):
+                if row["queue"] == ok:
+                    row["queue"] = nk
+                    self._tasks[(nk, row["task"])] = self._tasks.pop(key)
+            if old in self._dedication:
+                self._dedication[new] = self._dedication.pop(old)
 
     # ---- runs ------------------------------------------------------------- #
 
@@ -873,6 +901,20 @@ class PgStore:
                     ON CONFLICT (queue, worker_id) DO NOTHING
                     """,
                     queue_label, wid,
+                )
+
+    async def rename_queue(self, old: str, new: str) -> None:
+        """Repoint every queue-keyed row from ``old`` to ``new`` (playlists only;
+        the main queue is never renamed). Playlist queue keys equal the playlist
+        name across runs/leases/tasks/events/queue_routing, so one value maps
+        them all."""
+        if not old or old == new:
+            return
+        async with self._pool.acquire() as conn:
+            for table in ("runs", "leases", "tasks", "events", "queue_routing"):
+                await conn.execute(
+                    f"UPDATE nightshift.{table} SET queue = $2 WHERE queue = $1",
+                    old, new,
                 )
 
     async def create_run(

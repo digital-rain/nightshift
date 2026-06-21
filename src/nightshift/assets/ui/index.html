@@ -139,10 +139,31 @@
       <section id="screen-playlists" class="screen screen-playlists" aria-label="Playlists">
         <div class="pane-head">
           <h2>Playlists <span id="playlists-count" class="count"></span></h2>
-          <button id="btn-add-playlist" class="ghost-btn" title="Create a playlist">+ New</button>
+          <div class="pane-head-actions">
+            <button id="btn-rescan-playlists" class="ghost-btn"
+                    title="Scan the workspace for git repos and create a playlist for each">Rescan</button>
+            <button id="btn-add-playlist" class="ghost-btn" title="Create a playlist">+ New</button>
+          </div>
         </div>
         <ul id="playlists" class="playlists"></ul>
         <p id="playlists-empty" class="empty" hidden>No playlists yet. Create one — a self-contained queue under .tasks/&lt;name&gt;.</p>
+      </section>
+
+      <!-- Full-area playlist-info pane: the same takeover style as the task
+           detail view. A `<` chevron at the top-left cancels (discards edits and
+           returns to Playlists); the name + repository fields are saved with the
+           bottom Save button. -->
+      <section id="screen-playlist-info" class="screen screen-playlist-info" aria-label="Playlist info">
+        <div class="detail-takeover-head">
+          <button id="playlist-info-back" class="detail-back" title="Cancel" aria-label="Cancel">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M15 5l-7 7 7 7" />
+            </svg>
+          </button>
+          <h2 id="playlist-info-title">Playlist info</h2>
+        </div>
+        <div id="playlist-info-body" class="detail-body"></div>
       </section>
 
       <!-- Repos: the multi-repo workspace surface. Read-only workspace path,

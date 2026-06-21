@@ -185,6 +185,16 @@ class PlaylistCreate(BaseModel):
     name: str
 
 
+class PlaylistUpdate(BaseModel):
+    """Edit a playlist from its info page. ``name`` renames the queue (its
+    on-disk dir, which carries its tasks + run records); ``repository`` is the
+    alias the UI shows for the queue's default ``repo`` binding. Both optional;
+    only fields present in the request are applied."""
+
+    name: str | None = None
+    repository: str | None = None
+
+
 class QueueImport(BaseModel):
     """Copy tasks from another queue into the active one. ``source`` is a
     playlist name, or null for the main ``.tasks`` queue; ``tasks`` names the
@@ -787,6 +797,51 @@ def create_app(workspace: Path) -> FastAPI:
             )
         return JSONResponse(created, status_code=201)
 
+    def _playlist_info(name: str) -> dict[str, Any]:
+        """The playlist-info payload: name, task count, and the queue's ``repo``
+        binding aliased to ``repository`` for the info page."""
+        count = len(list_queue(tasks_root, playlists_mod.tasks_rel(name)))
+        repo = load_queue_config(tasks_root, playlists_mod.tasks_rel(name)).get("repo")
+        return {"name": name, "task_count": count, "repository": repo}
+
+    @app.get("/api/playlists/{name}")
+    def get_playlist(name: str) -> JSONResponse:
+        if not playlists_mod.exists(tasks_root, name):
+            return JSONResponse({"error": "playlist not found"}, status_code=404)
+        return JSONResponse(_playlist_info(name))
+
+    @app.put("/api/playlists/{name}")
+    def put_playlist(name: str, req: PlaylistUpdate) -> JSONResponse:
+        if not playlists_mod.exists(tasks_root, name):
+            return JSONResponse({"error": "playlist not found"}, status_code=404)
+        current = name
+        if req.name is not None and playlists_mod.slugify_name(req.name) != name:
+            if player.is_running(name):
+                return JSONResponse(
+                    {"error": "playlist is currently running; stop it first"},
+                    status_code=409,
+                )
+            try:
+                current = playlists_mod.rename_playlist(tasks_root, name, req.name)
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            except FileExistsError as exc:
+                return JSONResponse(
+                    {"error": f"playlist already exists: {exc}"}, status_code=409
+                )
+            except FileNotFoundError:
+                return JSONResponse({"error": "playlist not found"}, status_code=404)
+            player.rename_queue(name, current)
+        if "repository" in req.model_dump(exclude_unset=True):
+            try:
+                repo = _normalize_repo(req.repository)
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            save_queue_config_value(
+                tasks_root, "repo", repo, playlists_mod.tasks_rel(current)
+            )
+        return JSONResponse(_playlist_info(current))
+
     @app.delete("/api/playlists/{name}")
     def remove_playlist(name: str) -> JSONResponse:
         # Only refuse when the playlist is the queue a run is actively draining;
@@ -802,6 +857,19 @@ def create_app(workspace: Path) -> FastAPI:
         if not playlists_mod.delete_playlist(tasks_root, name):
             return JSONResponse({"error": "playlist not found"}, status_code=404)
         return JSONResponse({"name": name, "deleted": True})
+
+    @app.post("/api/playlists/rescan")
+    def rescan_playlists() -> JSONResponse:
+        """Scan the workspace's immediate children for git repos and materialise
+        one playlist per repo (name = repo dir name), binding each playlist's
+        default repo to the discovered repo. The content-store repo is skipped."""
+        repo_names = repos_mod.known_repos(workspace)
+        result = playlists_mod.rescan_into_playlists(
+            tasks_root, repo_names, skip={tasks_repo}
+        )
+        return JSONResponse(
+            {**result, "playlists": playlists_mod.list_playlists(tasks_root)}
+        )
 
     @app.get("/api/backends")
     def get_backends() -> dict:

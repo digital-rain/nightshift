@@ -27,6 +27,8 @@ const state = {
   detailDraft: null,     // buffered, unsaved edits for the open detail pane (discarded on back)
   libraryTasks: null,    // cached main-queue tasks for the Add-from "library" source
   repos: null,           // /api/repos payload (workspace, known repos, per-queue bindings, warnings)
+  playlistInfoName: null, // playlist open in the full-area info pane (view "playlist-info")
+  playlistInfoData: null, // loaded {name, repository, task_count} for the info pane
 };
 
 // Transport glyphs for the Now box (borderless triangle / pause bars).
@@ -311,6 +313,8 @@ function setView(view) {
   let navView = view;
   if (view === "detail") navView = "now";
   else if (view === "stats") navView = "history";
+  // The playlist-info takeover is a sub-view of Playlists — keep that tab lit.
+  else if (view === "playlist-info") navView = "playlists";
   for (const b of document.querySelectorAll("#bottomnav .navbtn")) {
     let on = b.dataset.view === navView;
     if (b.dataset.view === "home") on = state.activePlaylist === null && navView === "now";
@@ -324,6 +328,7 @@ function setView(view) {
   else if (view === "stats") renderStats();
   else if (view === "repos") { renderRepos(); loadRepos(); }
   else if (view === "detail") renderDetailScreen();
+  else if (view === "playlist-info") renderPlaylistInfo();
 }
 
 // --------------------------------------------------------------------------
@@ -2270,6 +2275,17 @@ function playlistRow(pl) {
   main.append(name, meta);
   li.append(main);
 
+  // Info: opens the full-area playlist-info pane (name + repository).
+  const info = document.createElement("button");
+  info.className = "pl-info";
+  info.title = "Playlist info";
+  info.innerHTML = "&#9432;";
+  info.addEventListener("click", (e) => {
+    e.stopPropagation();
+    openPlaylistInfo(pl.name);
+  });
+  li.append(info);
+
   const del = document.createElement("button");
   del.className = "pl-del";
   del.title = "Delete this playlist (and its tasks)";
@@ -2396,6 +2412,142 @@ async function deletePlaylist(name) {
   } catch { /* keep current focus on a transient error */ }
   applyFocusedState();
   if (state.activePlaylist === null) await Promise.all([loadQueue(), loadRuns()]);
+}
+
+// --------------------------------------------------------------------------
+// Playlist-info pane (full-area takeover, task-detail style)
+// --------------------------------------------------------------------------
+// Exposes two editable string properties of a playlist — its name and its
+// repository (the queue's default-repo binding) — with a bottom Save button.
+// The `<` chevron at the top-left cancels (discards edits, returns to
+// Playlists). Opened from the ⓘ button on a playlist row.
+
+function openPlaylistInfo(name) {
+  if (!name) return;
+  state.playlistInfoName = name;
+  state.playlistInfoData = null;  // loaded in renderPlaylistInfo
+  setView("playlist-info");
+}
+
+function closePlaylistInfo() {
+  state.playlistInfoName = null;
+  state.playlistInfoData = null;
+  setView("playlists");
+}
+
+function renderPlaylistInfo() {
+  const name = state.playlistInfoName;
+  const body = $("playlist-info-body");
+  if (!name || !body) return;
+  $("playlist-info-title").textContent = "Playlist info";
+  getJSON(`/api/playlists/${encodeURIComponent(name)}`)
+    .then((info) => {
+      if (state.playlistInfoName !== name) return;
+      if (!info || info.error) {
+        body.innerHTML = "";
+        const p = document.createElement("p");
+        p.className = "empty";
+        p.textContent = (info && info.error) || "playlist not found";
+        body.append(p);
+        return;
+      }
+      state.playlistInfoData = info;
+      buildPlaylistInfoContent(info);
+    })
+    .catch(() => { /* keep the current render on a transient error */ });
+}
+
+function buildPlaylistInfoContent(info) {
+  const body = $("playlist-info-body");
+  if (!body) return;
+  body.innerHTML = "";
+  $("playlist-info-title").textContent = info.name;
+
+  const nameField = playlistInfoField("Name", info.name, "playlist-info-name",
+    "the playlist's name (also its on-disk queue)");
+  const repoField = playlistInfoField("Repository", info.repository || "",
+    "playlist-info-repo", "the workspace repo this playlist's tasks target");
+  body.append(nameField, repoField);
+
+  const actions = document.createElement("div");
+  actions.className = "detail-actions";
+  const err = document.createElement("p");
+  err.className = "error detail-save-error";
+  err.hidden = true;
+  const saveBtn = document.createElement("button");
+  saveBtn.className = "btn primary";
+  saveBtn.textContent = "Save";
+  saveBtn.addEventListener("click", () => savePlaylistInfo(info, err));
+  actions.append(err, saveBtn);
+  body.append(actions);
+}
+
+function playlistInfoField(label, value, id, placeholder) {
+  const field = document.createElement("label");
+  field.className = "detail-field";
+  const span = document.createElement("span");
+  span.className = "detail-field-label";
+  span.textContent = label;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.id = id;
+  input.value = value || "";
+  if (placeholder) input.placeholder = placeholder;
+  field.append(span, input);
+  return field;
+}
+
+async function savePlaylistInfo(info, errEl) {
+  const nameEl = $("playlist-info-name");
+  const repoEl = $("playlist-info-repo");
+  const newName = (nameEl ? nameEl.value : info.name).trim();
+  const newRepo = (repoEl ? repoEl.value : "").trim();
+  if (!newName) {
+    if (errEl) { errEl.textContent = "name is required"; errEl.hidden = false; }
+    return;
+  }
+  // Send only the fields that changed: a rename is a separate, heavier op than
+  // a repo edit, so leaving name untouched avoids a needless directory move.
+  const payload = {};
+  if (newName !== info.name) payload.name = newName;
+  if (newRepo !== (info.repository || "")) payload.repository = newRepo;
+  if (!Object.keys(payload).length) { closePlaylistInfo(); return; }
+  const { ok, data } = await sendJSON(
+    `/api/playlists/${encodeURIComponent(info.name)}`, "PUT", payload);
+  if (!ok) {
+    if (errEl) { errEl.textContent = (data && data.error) || "could not save playlist"; errEl.hidden = false; }
+    return;
+  }
+  // A rename changes the active queue's identity; reload the list and, when the
+  // renamed queue was the focused one, carry the focus label across locally
+  // (the backend already migrated its own focus/state on rename).
+  await loadPlaylists();
+  const finalName = (data && data.name) || newName;
+  if (state.activePlaylist === info.name && finalName !== info.name) {
+    syncActivePlaylist(finalName);
+  }
+  closePlaylistInfo();
+}
+
+// Scan the workspace for git repos and create/refresh a playlist for each, then
+// refresh the Playlists list. Disabled-on-click to avoid double submits.
+async function rescanPlaylists(btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const { ok, data } = await sendJSON("/api/playlists/rescan", "POST", {});
+    if (!ok) {
+      alert((data && data.error) || "could not rescan workspace");
+      return;
+    }
+    if (data && Array.isArray(data.playlists)) {
+      state.playlists = data.playlists;
+      renderPlaylists();
+    } else {
+      await loadPlaylists();
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 // The editable settings inside the detail pane's SETTINGS panel: a single
@@ -4105,6 +4257,12 @@ function wire() {
   $("btn-add-playlist").addEventListener("click", openPlaylistCreate);
   $("playlist-cancel").addEventListener("click", () => ($("playlist-modal").hidden = true));
   $("playlist-save").addEventListener("click", savePlaylist);
+  // Playlists page: scan the workspace for git repos -> one playlist per repo.
+  const rescanPlBtn = $("btn-rescan-playlists");
+  if (rescanPlBtn) rescanPlBtn.addEventListener("click", () => rescanPlaylists(rescanPlBtn));
+  // Playlist-info pane: the top-left chevron cancels (discards edits).
+  const plInfoBack = $("playlist-info-back");
+  if (plInfoBack) plInfoBack.addEventListener("click", closePlaylistInfo);
   // Repos page: re-scan the workspace for repos (auto-resumes paused tasks).
   const rescanBtn = $("btn-rescan");
   if (rescanBtn) rescanBtn.addEventListener("click", () => rescanRepos(rescanBtn));
