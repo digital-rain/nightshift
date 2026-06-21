@@ -30,6 +30,7 @@ from _workspace import (
 from nightshift.backends import WorkerResult
 from nightshift.engine import (
     fetch_rendezvous_branch,
+    normalize_wip_prefix,
     prune_rendezvous_branch,
     publish_task_branch,
     setup_worktree,
@@ -178,6 +179,40 @@ def test_publish_fetch_prune_roundtrip(tmp_path: Path) -> None:
 
     prune_rendezvous_branch(workspace, repo, "origin", wip_ref)
     assert _ls_remote(bare, wip_ref) == ""
+
+
+def test_publish_custom_prefix_roundtrip(tmp_path: Path) -> None:
+    """A configured ``wip_ref_prefix`` (here multi-segment) is honored end to
+    end: publish lands under the custom namespace and the manager fetch/prune
+    use the worker-reported ref verbatim, so the two sides stay consistent."""
+    workspace, repo, repo_root, bare = _setup_manager_repo(tmp_path)
+    wt = setup_worktree(workspace, repo, "10.add")
+    (wt / "new.txt").write_text("hi\n")
+    git(wt, "add", "-A")
+    git(wt, "commit", "-m", "work")
+
+    wip_ref, head = publish_task_branch(
+        workspace, repo, "10.add", "origin", prefix="acme/wip"
+    )
+    assert wip_ref == "refs/heads/acme/wip/main/10.add"
+    assert head in _ls_remote(bare, wip_ref)
+
+    subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=repo_root, capture_output=True)
+    git(repo_root, "branch", "-D", worktree_branch("10.add"))
+    assert fetch_rendezvous_branch(workspace, repo, "origin", wip_ref, "10.add") == head
+    prune_rendezvous_branch(workspace, repo, "origin", wip_ref)
+    assert _ls_remote(bare, wip_ref) == ""
+
+
+def test_normalize_wip_prefix() -> None:
+    assert normalize_wip_prefix("nightshift-wip") == "nightshift-wip"
+    assert normalize_wip_prefix("  acme/wip/  ") == "acme/wip"
+    for bad in ["", "   ", "-bad", "a..b", "a//b", "has space", "carrot^"]:
+        try:
+            normalize_wip_prefix(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {bad!r}")  # pragma: no cover
 
 
 def test_publish_raises_without_branch(tmp_path: Path) -> None:
@@ -487,6 +522,22 @@ def test_manager_config_rendezvous_remote(tmp_path: Path, monkeypatch) -> None:
 
     monkeypatch.setenv("NIGHTSHIFT_RENDEZVOUS_REMOTE", "rdv")
     assert load_manager_config(tmp_path).rendezvous_remote == "rdv"
+
+
+def test_manager_config_wip_ref_prefix(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("NIGHTSHIFT_WIP_REF_PREFIX", raising=False)
+    build_workspace(
+        tmp_path, repos=("longitude",), main_repo="longitude",
+        config={"wip_ref_prefix": "acme/wip"},
+    )
+    # Top-level config key is honored.
+    assert load_manager_config(tmp_path).wip_ref_prefix == "acme/wip"
+    # Env wins over the config key.
+    monkeypatch.setenv("NIGHTSHIFT_WIP_REF_PREFIX", "team/wip")
+    assert load_manager_config(tmp_path).wip_ref_prefix == "team/wip"
+    # An unsafe value falls back to the default rather than crashing the manager.
+    monkeypatch.setenv("NIGHTSHIFT_WIP_REF_PREFIX", "bad prefix")
+    assert load_manager_config(tmp_path).wip_ref_prefix == "nightshift-wip"
 
 
 def test_manager_config_rendezvous_remote_explicit_null_disables(tmp_path: Path, monkeypatch) -> None:

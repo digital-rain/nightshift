@@ -1773,9 +1773,34 @@ def squash_to_main(
 WIP_REF_PREFIX = "nightshift-wip"
 
 
-def _wip_ref(task: str, queue: str | None) -> str:
-    """Remote ref a worker publishes its task branch to (transport-only)."""
-    return f"refs/heads/{WIP_REF_PREFIX}/{_queue_slug(queue)}/{task}"
+def normalize_wip_prefix(value: object) -> str:
+    """Normalize the WIP-namespace prefix — the ``<prefix>`` segment of the
+    rendezvous ref ``refs/heads/<prefix>/<queue>/<task>``.
+
+    Returns a git-ref-safe namespace (one or more ``/``-joined segments).
+    Raises ``ValueError`` on an unsafe value (empty, a leading ``-``, ``..``,
+    ``//``, or characters outside ``[A-Za-z0-9._/-]``) so a bad operator value
+    is surfaced at edit time rather than corrupting a push refspec.
+    """
+    text = str(value or "").strip().strip("/")
+    if not text:
+        raise ValueError("branch prefix must not be empty")
+    if text.startswith("-") or ".." in text or "//" in text:
+        raise ValueError(f"invalid branch prefix {text!r}")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", text):
+        raise ValueError(
+            f"invalid branch prefix {text!r}: use letters, digits, '.', '_', "
+            "'-', or '/' (no spaces, leading '-', '..', or '//')"
+        )
+    return text
+
+
+def _wip_ref(task: str, queue: str | None, prefix: str = WIP_REF_PREFIX) -> str:
+    """Remote ref a worker publishes its task branch to (transport-only). The
+    ``prefix`` (the WIP namespace) defaults to :data:`WIP_REF_PREFIX` and is
+    operator-configurable (manager ``wip_ref_prefix``, threaded via the work
+    order)."""
+    return f"refs/heads/{prefix or WIP_REF_PREFIX}/{_queue_slug(queue)}/{task}"
 
 
 def _rev_parse(repo_root: Path, ref: str) -> str | None:
@@ -1786,9 +1811,18 @@ def _rev_parse(repo_root: Path, ref: str) -> str | None:
 
 
 def publish_task_branch(
-    workspace: Path, repo: str, task: str, remote: str, *, queue: str | None = None
+    workspace: Path,
+    repo: str,
+    task: str,
+    remote: str,
+    *,
+    queue: str | None = None,
+    prefix: str | None = None,
 ) -> tuple[str, str]:
     """Force-push the task's local worktree branch to ``<remote>`` as its WIP ref.
+
+    ``prefix`` is the WIP namespace (the manager's ``wip_ref_prefix``, delivered
+    in the work order); ``None`` falls back to :data:`WIP_REF_PREFIX`.
 
     Returns ``(wip_ref, head_sha)`` where ``head_sha`` is the full SHA of the
     pushed branch tip (the manager re-verifies it after fetching). Raises
@@ -1797,7 +1831,7 @@ def publish_task_branch(
     """
     repo_root = workspace / repo
     branch = worktree_branch(task, queue)
-    wip_ref = _wip_ref(task, queue)
+    wip_ref = _wip_ref(task, queue, prefix or WIP_REF_PREFIX)
 
     head_sha = _rev_parse(repo_root, branch)
     if head_sha is None:

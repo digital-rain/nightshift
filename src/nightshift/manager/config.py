@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from nightshift.engine import WIP_REF_PREFIX, normalize_wip_prefix
 from nightshift.repos import DEFAULT_TASKS_REPO
 from nightshift.spawn_daily import load_config
 
@@ -51,6 +52,11 @@ class ManagerConfig:
     # in PR mode. Default ``origin``; set null to disable (cross-machine submits
     # then fail closed).
     rendezvous_remote: str | None = "origin"
+    # WIP namespace a cross-machine worker publishes its validated branch under
+    # (``refs/heads/<wip_ref_prefix>/<queue>/<task>``). Operator-configurable so
+    # worker push credentials can be scoped to any namespace; read at launch and
+    # delivered to workers in the work order. Default :data:`WIP_REF_PREFIX`.
+    wip_ref_prefix: str = WIP_REF_PREFIX
     cadences: Cadences = field(default_factory=Cadences)
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -75,7 +81,8 @@ def load_manager_config(workspace: Path) -> ManagerConfig:
     Environment overrides (operator/deploy-time): ``NIGHTSHIFT_MANAGER_HOST``,
     ``NIGHTSHIFT_MANAGER_PORT``, ``NIGHTSHIFT_LANDING_MODE``,
     ``NIGHTSHIFT_SHARED_SECRET``, ``NIGHTSHIFT_DEFAULT_MODEL``,
-    ``NIGHTSHIFT_PG_DSN``, ``NIGHTSHIFT_TASKS_REPO``.
+    ``NIGHTSHIFT_PG_DSN``, ``NIGHTSHIFT_TASKS_REPO``,
+    ``NIGHTSHIFT_WIP_REF_PREFIX``.
 
     The store DSN is Nightshift's own (``NIGHTSHIFT_PG_DSN`` env > ``manager.dsn``
     block); it deliberately does **not** fall back to longitude's ``LONG_PG_DSN``,
@@ -120,6 +127,19 @@ def load_manager_config(workspace: Path) -> ManagerConfig:
         or DEFAULT_TASKS_REPO
     )
 
+    # Env wins over the top-level config key; an unsafe value falls back to the
+    # default so a bad operator entry never crashes the manager (the Settings
+    # PUT validates strictly and surfaces a 400 at edit time instead).
+    raw_wip_prefix = (
+        os.environ.get("NIGHTSHIFT_WIP_REF_PREFIX")
+        or (cfg.get("wip_ref_prefix") if isinstance(cfg, dict) else None)
+        or WIP_REF_PREFIX
+    )
+    try:
+        wip_ref_prefix = normalize_wip_prefix(raw_wip_prefix)
+    except ValueError:
+        wip_ref_prefix = WIP_REF_PREFIX
+
     # Env wins; an explicit ``manager.rendezvous_remote: null`` disables it; an
     # absent key defaults to ``origin``.
     env_rendezvous = os.environ.get("NIGHTSHIFT_RENDEZVOUS_REMOTE")
@@ -140,6 +160,7 @@ def load_manager_config(workspace: Path) -> ManagerConfig:
         dsn=dsn,
         tasks_repo=str(tasks_repo),
         rendezvous_remote=rendezvous_remote,
+        wip_ref_prefix=wip_ref_prefix,
         cadences=cadences,
         raw=cfg if isinstance(cfg, dict) else {},
     )

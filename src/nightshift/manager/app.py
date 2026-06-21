@@ -30,6 +30,7 @@ from nightshift import playlists as playlists_mod
 from nightshift import repos
 from nightshift._paths import UI_DIR
 from nightshift.engine import (
+    WIP_REF_PREFIX,
     commit_tasks,
     compute_code_loc,
     create_task,
@@ -38,6 +39,7 @@ from nightshift.engine import (
     list_queue,
     load_play_priorities,
     load_sort_mode,
+    normalize_wip_prefix,
     read_task,
     reorder_queue,
     resolve_title,
@@ -64,7 +66,13 @@ from nightshift.manager.scheduler import (
 )
 from nightshift.manager.store import NightshiftStore, open_store
 from nightshift.server import settings as settings_mod
-from nightshift.spawn_daily import load_queue_config, resolve_config, split_frontmatter
+from nightshift.spawn_daily import (
+    load_config,
+    load_queue_config,
+    resolve_config,
+    save_config_value,
+    split_frontmatter,
+)
 
 
 # UI assets ship inside the package (see nightshift._paths.UI_DIR).
@@ -993,12 +1001,33 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
     async def get_blocked() -> JSONResponse:
         return JSONResponse([_jsonable(b) for b in await _store().list_blocked()])
 
+    # The WIP-namespace prefix is a global, launch-time knob persisted in
+    # ``<workspace>/config.json`` (not a player setting), surfaced here so the
+    # operator edits it from the same Settings UI. It is read into ``cfg`` at
+    # launch and baked into work orders, so a change applies on the next restart.
+    _WIP_PREFIX_FIELD = {
+        "key": "wip_ref_prefix",
+        "label": "Branch prefix",
+        "description": (
+            "Namespace a cross-machine worker publishes its validated branch "
+            "under (refs/heads/<prefix>/<queue>/<task>). Scope worker push "
+            "credentials to '<prefix>/*'. Saved to config.json; applies on the "
+            "next manager restart."
+        ),
+        "type": "string",
+        "default": WIP_REF_PREFIX,
+    }
+
     @app.get("/api/settings")
     def get_settings() -> JSONResponse:
+        settings = {
+            **settings_mod.load_settings(workspace),
+            "wip_ref_prefix": cfg.wip_ref_prefix,
+        }
         return JSONResponse(
             {
-                "settings": settings_mod.load_settings(workspace),
-                "schema": settings_mod.SCHEMA,
+                "settings": settings,
+                "schema": [*settings_mod.SCHEMA, _WIP_PREFIX_FIELD],
                 "cadences": {
                     "poll_seconds": cfg.cadences.poll_seconds,
                     "heartbeat_seconds": cfg.cadences.heartbeat_seconds,
@@ -1011,10 +1040,26 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
 
     @app.put("/api/settings")
     async def put_settings(body: dict[str, Any]) -> JSONResponse:
+        # ``wip_ref_prefix`` is a config.json knob, not a player setting: pull it
+        # out, validate strictly (a 400 at edit time, writing nothing), and
+        # persist it to config.json. The running manager keeps its launch-time
+        # value until restart.
+        body = dict(body)
+        wip_prefix = body.pop("wip_ref_prefix", None)
+        if wip_prefix is not None:
+            try:
+                save_config_value(
+                    workspace, "wip_ref_prefix", normalize_wip_prefix(wip_prefix)
+                )
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
         try:
             merged = settings_mod.save_settings(workspace, body)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
+        merged["wip_ref_prefix"] = str(
+            load_config(workspace).get("wip_ref_prefix", cfg.wip_ref_prefix)
+        )
         await _emit("settings_changed", payload={"settings": merged})
         return JSONResponse({"ok": True, "settings": merged})
 
@@ -1132,6 +1177,10 @@ def _build_work_order(
         # MCP connectors the brief declares (informational for the worker; the
         # manager already routed to a worker that advertises this superset).
         "required_mcps": list(parse_required_mcps(meta)),
+        # WIP namespace the worker publishes its cross-machine branch under. The
+        # worker never reads the centralized config, so the manager hands it the
+        # operator-configured prefix here (co-located workers ignore it).
+        "wip_ref_prefix": cfg.wip_ref_prefix,
     }
     return {
         "lease_id": lease_id,

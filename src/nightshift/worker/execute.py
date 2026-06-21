@@ -77,6 +77,7 @@ def _finish_landable(
     result_line: str,
     tele: dict[str, Any],
     on_log: LogCb,
+    wip_ref_prefix: str | None = None,
 ) -> ExecuteOutcome:
     """Finalize a validated (landable) run.
 
@@ -94,7 +95,8 @@ def _finish_landable(
         )
     try:
         branch_ref, head_sha = publish_task_branch(
-            cfg.workspace, repo, task, cfg.rendezvous_remote, queue=queue
+            cfg.workspace, repo, task, cfg.rendezvous_remote,
+            queue=queue, prefix=wip_ref_prefix,
         )
     except RuntimeError as exc:
         on_log(f"  publish to rendezvous remote failed: {exc}\n")
@@ -262,6 +264,7 @@ def execute_work_order(
                 cfg, repo, task, queue, model=model,
                 result_line="validation skipped (no validate command)",
                 tele=tele, on_log=on_log,
+                wip_ref_prefix=config_blob.get("wip_ref_prefix"),
             )
         on_phase("validate")
         on_log(f"  running {' '.join(validate_cmd)}...\n")
@@ -281,6 +284,7 @@ def execute_work_order(
         return _finish_landable(
             cfg, repo, task, queue, model=model, result_line="validated",
             tele=tele, on_log=on_log,
+            wip_ref_prefix=config_blob.get("wip_ref_prefix"),
         )
     finally:
         if not preserve:
