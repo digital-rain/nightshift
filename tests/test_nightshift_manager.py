@@ -139,6 +139,32 @@ def test_operator_endpoints(tmp_path: Path) -> None:
         assert client.get("/api/leases").json() == []
 
 
+def test_settings_wip_ref_prefix_roundtrip(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {"10.hello": "Do a thing."})
+    with _client(root) as client:
+        data = client.get("/api/settings").json()
+        # Surfaced as an editable Settings field, defaulting to the namespace.
+        assert data["settings"]["wip_ref_prefix"] == "nightshift-wip"
+        assert any(f["key"] == "wip_ref_prefix" for f in data["schema"])
+
+        # A valid value is normalized + persisted to config.json.
+        ok = client.put("/api/settings", json={"wip_ref_prefix": "  acme/wip/ "})
+        assert ok.status_code == 200
+        assert ok.json()["settings"]["wip_ref_prefix"] == "acme/wip"
+
+        # An unsafe value is rejected and persists nothing.
+        assert client.put(
+            "/api/settings", json={"wip_ref_prefix": "bad prefix"}
+        ).status_code == 400
+
+    # Saved to config.json, so a fresh manager (restart) reads the new value.
+    with _client(root) as restarted:
+        assert (
+            restarted.get("/api/settings").json()["settings"]["wip_ref_prefix"]
+            == "acme/wip"
+        )
+
+
 def test_jsonable_coerces_decimal_cost() -> None:
     # Postgres hands `numeric` (cost_usd, avg_turns) back as Decimal; the stats
     # endpoints must not 500 serializing it under the PgStore.

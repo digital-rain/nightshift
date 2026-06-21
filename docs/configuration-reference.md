@@ -87,6 +87,7 @@ Cadences are config-driven, never hardcoded (invariant 13). The manager sends th
 | `NIGHTSHIFT_SHARED_SECRET` | `manager.shared_secret` |
 | `NIGHTSHIFT_DEFAULT_MODEL` | top-level `default_model` |
 | `NIGHTSHIFT_TASKS_REPO` | top-level `tasks_repo` (the content-store repo's child name) |
+| `NIGHTSHIFT_WIP_REF_PREFIX` | top-level `wip_ref_prefix` (the cross-machine WIP namespace) |
 | `NIGHTSHIFT_PG_DSN` | `manager.dsn` — store selection (see [Database](#database--state-store)) |
 
 ### Top-level task-policy keys
@@ -97,6 +98,7 @@ These live at the root of `config.json` and are resolved into each work order or
 |---|---|---|
 | `tasks_repo` | `nightshift-tasks` | Name of the content-store repo (a workspace child) holding briefs + queue config; `tasks_root = <workspace>/<tasks_repo>`. |
 | `default_model` | `auto` | Model a brief inherits when it sets no `model:`. |
+| `wip_ref_prefix` | `nightshift-wip` | WIP namespace a cross-machine worker publishes its validated branch under (`refs/heads/<wip_ref_prefix>/<queue>/<task>`). Read at manager launch and handed to workers in the work order (the worker never reads this config). Editable in the Settings UI ("Branch prefix") — a change is saved to `config.json` and applies on the **next manager restart**. Scope worker push credentials to `<wip_ref_prefix>/*`; changing it after tasks exist orphans any in-flight WIP refs under the old prefix. |
 | `scheduled_models` | (list) | Pin-only allow-set: an explicit `model:` must be in this list. |
 | `diff_cap_lines` | `1500` | Default max changed lines for a task's result. |
 | `diff_cap_exempt_paths` | (regex list) | Paths excluded from the diff cap (docs, fixtures, `.tasks/`, …). |
@@ -132,7 +134,7 @@ A worker resolves its config in [`worker/config.py`](../src/nightshift/worker/co
 | `priorities` | `NIGHTSHIFT_WORKER_PRIORITIES` | any | Comma-separated 0–5 levels this worker accepts. Unset = any. |
 | `models` | `NIGHTSHIFT_WORKER_MODELS` | `[]` | Request-facing model ids this worker advertises. A task pinning one of these routes here. |
 | `mcps` | `NIGHTSHIFT_WORKER_MCPS` | `[]` | MCP connectors wired into this worker's harness. |
-| `rendezvous_remote` | `NIGHTSHIFT_RENDEZVOUS_REMOTE` | `null` | Git remote *name* (resolved in each `repo_root`) this worker publishes its validated task branch to for cross-machine landing, as `refs/heads/nightshift-wip/<queue>/<task>`. Unset = co-located (publishes nothing; the manager squashes from the shared workspace). |
+| `rendezvous_remote` | `NIGHTSHIFT_RENDEZVOUS_REMOTE` | `null` | Git remote *name* (resolved in each `repo_root`) this worker publishes its validated task branch to for cross-machine landing, as `refs/heads/<wip_ref_prefix>/<queue>/<task>` (the namespace comes from the manager's `wip_ref_prefix`, default `nightshift-wip`, delivered in the work order). Unset = co-located (publishes nothing; the manager squashes from the shared workspace). |
 | `model_aliases` | — | `{}` | `{requested: actual}` remap applied at execution (identity by default). |
 | `auto_model` | — | per-backend | Map overriding the model `auto` resolves to, per backend. |
 | `max_model` | — | per-backend | Map overriding the model `max` resolves to, per backend. |

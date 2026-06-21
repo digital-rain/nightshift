@@ -57,7 +57,7 @@ The WIP ref is transport-only: once the manager has consumed it (landed, or buil
 
 ## Engine helpers (new, `engine.py`), threaded (workspace, repo)
 
-- `publish_task_branch(workspace, repo, task, remote, *, queue=None) -> tuple[str, str]`: force-push local `worktree_branch(task, queue)` from `repo_root` to `<remote>` as `refs/heads/nightshift-wip/<queue_slug>/<task>`; return `(wip_ref, head_sha)` (full SHA).
+- `publish_task_branch(workspace, repo, task, remote, *, queue=None, prefix=None) -> tuple[str, str]`: force-push local `worktree_branch(task, queue)` from `repo_root` to `<remote>` as `refs/heads/<prefix>/<queue_slug>/<task>` (`prefix` defaults to `WIP_REF_PREFIX`, `nightshift-wip`); return `(wip_ref, head_sha)` (full SHA).
 - `fetch_rendezvous_branch(workspace, repo, remote, wip_ref, task, *, queue=None) -> str | None`: force-fetch `<remote> <wip_ref>:refs/heads/<worktree_branch>` into `repo_root`; return the fetched tip SHA, or `None` on a fetch error.
 - `prune_rendezvous_branch(workspace, repo, remote, wip_ref) -> None`: best-effort `git -C repo_root push <remote> --delete <wip_ref>`.
 - `sync_main_to_origin(workspace, repo, remote, *, autostash=True) -> str | None`: fetch `<remote> main` and bring local `main` to it (fast-forward, or `reset --hard` over an orphaned ephemeral pr-mode squash), guarding operator WIP with the same stash posture `squash_to_main` uses; return the new HEAD, or `None` when the remote has no `main` (the caller falls back to local HEAD).
@@ -132,8 +132,8 @@ v1 wires the landing decision and reads the frontmatter key; surfacing `make_pr`
 
 ## Credentials and safety
 
-- A worker needs push access to `nightshift-wip/*` only on each target repo's rendezvous; never `main`.
-  On GitHub: a deploy key/token plus branch protection on `main`; on a bare repo: an `update`/`pre-receive` hook rejecting writes outside `refs/heads/nightshift-wip/*`.
+- A worker needs push access to `<wip_ref_prefix>/*` (default `nightshift-wip/*`) only on each target repo's rendezvous; never `main`.
+  On GitHub: a deploy key/token plus branch protection on `main`; on a bare repo: an `update`/`pre-receive` hook rejecting writes outside `refs/heads/<wip_ref_prefix>/*`. If you change `wip_ref_prefix`, move this scope with it.
 - The manager keeps sole `origin` push / `gh` authority for `main` and PRs.
 - The HTTP trust model is unchanged: the shared secret still guards every `/api/worker/*` call.
 
@@ -162,7 +162,7 @@ Briefs are delivered to the worker by value in the work order (`materialize_brie
   Worker: unset disables publishing (co-located).
   Manager: default `origin`, used to fetch a cross-machine branch and to sync `origin/main` in pr mode.
 - `make_pr` (task brief frontmatter, boolean) — force PR mode for that task.
-- The WIP namespace prefix is fixed (`nightshift-wip/`) in v1.
+- `wip_ref_prefix` (top-level `config.json`; env `NIGHTSHIFT_WIP_REF_PREFIX`) — the WIP namespace (default `nightshift-wip`). Owned by the manager (the worker never reads central config), read at launch and delivered to workers in the work order; editable in the Settings UI ("Branch prefix") and applied on the next restart. The manager fetches/prunes the worker-reported `branch_ref` verbatim, so the prefix is constructed in exactly one place (the worker's `publish_task_branch`). Worker push credentials must be scoped to `<wip_ref_prefix>/*`.
 
 ## Files touched
 
@@ -172,7 +172,7 @@ Briefs are delivered to the worker by value in the work order (`materialize_brie
 - `src/nightshift/worker/config.py` — `WorkerConfig.rendezvous_remote`.
 - `src/nightshift/manager/landing.py` — obtain (fetch + verify) / pr-mode sync / prune / keep-on-conflict in `land()`.
 - `src/nightshift/manager/app.py` — `SubmitBody` fields; dispatch sync; effective-mode resolution; pass into `land()`.
-- `src/nightshift/manager/config.py` — `ManagerConfig.rendezvous_remote`.
+- `src/nightshift/manager/config.py` — `ManagerConfig.rendezvous_remote`, `ManagerConfig.wip_ref_prefix`.
 - `docs/setup-guide.md`, `docs/configuration-reference.md` — the cross-machine workflow + env var + `make_pr`.
 - Prompts unchanged.
 

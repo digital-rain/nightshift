@@ -184,11 +184,13 @@ Expose the manager's `:8800` to the worker's network and protect it with `NIGHTS
 
 Co-located workers share the manager's workspace, so the manager can squash the worker's branch directly. A worker on a *different* machine has its own clones, so its commits must reach the manager over git. Set `NIGHTSHIFT_RENDEZVOUS_REMOTE` (default `origin`) on both sides and the flow becomes:
 
-1. The worker runs and **validates** the task (validation is the trust boundary), then pushes its branch to the rendezvous remote as `refs/heads/nightshift-wip/<queue>/<task>` and submits `branch_ref` + `head_sha` over the API.
+1. The worker runs and **validates** the task (validation is the trust boundary), then pushes its branch to the rendezvous remote as `refs/heads/<prefix>/<queue>/<task>` and submits `branch_ref` + `head_sha` over the API. The `<prefix>` is the manager's `wip_ref_prefix` (default `nightshift-wip`), handed to the worker in the work order.
 2. The manager fetches that ref into its own clone, verifies the tip matches `head_sha` (fail-closed on any mismatch), then runs its normal squash/drift/conflict landing. It prunes the WIP ref once consumed and keeps it on conflict for a resolve re-fetch.
-3. The manager stays the **sole** writer of `main` and the sole PR author. A worker only ever pushes `nightshift-wip/*`.
+3. The manager stays the **sole** writer of `main` and the sole PR author. A worker only ever pushes `<prefix>/*`.
 
-Credentials: give each worker push access scoped to `nightshift-wip/*` only — never `main` or `task/*`. On GitHub use a deploy key/token plus branch protection on `main`; on a bare rendezvous host use a `pre-receive` hook rejecting writes outside `refs/heads/nightshift-wip/*`. Leave `NIGHTSHIFT_RENDEZVOUS_REMOTE` unset on a worker that shares the manager's workspace (co-located) — it then publishes nothing and the manager squashes locally as before.
+Credentials: give each worker push access scoped to `<prefix>/*` only — never `main` or `task/*`. On GitHub use a deploy key/token plus branch protection on `main`; on a bare rendezvous host use a `pre-receive` hook rejecting writes outside `refs/heads/<prefix>/*`. Leave `NIGHTSHIFT_RENDEZVOUS_REMOTE` unset on a worker that shares the manager's workspace (co-located) — it then publishes nothing and the manager squashes locally as before.
+
+The WIP namespace is configurable via the top-level `wip_ref_prefix` key (editable in the manager Settings UI as "Branch prefix"). It's read at launch, so a change applies on the next manager restart — and the credential scope above must move with it (`<new-prefix>/*`).
 
 In `pr` landing mode the manager keeps `origin/main` authoritative: it resyncs its local `main` to `origin/main` before pinning each task's base and before each squash, so its local `main` and `origin/main` never diverge after GitHub re-squashes the merged PR. A task can force PR mode regardless of the manager default with `make_pr: true` in its brief frontmatter. See the [cross-machine landing spec](spec/remote-landing.md) for the full design.
 
@@ -215,5 +217,5 @@ Two mechanisms let you steer tasks:
 - **A worker never appears.** Confirm `manager_url` is reachable from the worker and the `NIGHTSHIFT_SHARED_SECRET` matches on both sides.
 - **Two workers fight on one box.** They must have distinct `worker_id` and `ui_port` and their own clones.
 - **State resets on restart.** You are on the in-memory fallback; set `NIGHTSHIFT_PG_DSN` and run `just migrate` for durable state.
-- **Cross-machine task errors with `publish_failed`.** The worker validated but could not push to its `rendezvous_remote`. Confirm the remote name resolves in the target repo on the worker and that its credential may push `nightshift-wip/*`. Nothing lands; the branch is kept for a retry.
+- **Cross-machine task errors with `publish_failed`.** The worker validated but could not push to its `rendezvous_remote`. Confirm the remote name resolves in the target repo on the worker and that its credential may push `<wip_ref_prefix>/*` (default `nightshift-wip/*`). Nothing lands; the branch is kept for a retry.
 - **Cross-machine land is rejected (`merge_rejected`).** The fetched branch tip did not match the submitted `head_sha` (or no `rendezvous_remote`/`head_sha` reached the manager) — a fail-closed refusal so unverified content never lands. The WIP ref is kept; the next attempt re-fetches and re-verifies. A transient fetch error instead fails *recoverable* and is retried.
