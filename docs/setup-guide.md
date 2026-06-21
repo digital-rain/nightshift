@@ -193,3 +193,5 @@ Two mechanisms let you steer tasks:
 - **A worker never appears.** Confirm `manager_url` is reachable from the worker and the `NIGHTSHIFT_SHARED_SECRET` matches on both sides.
 - **Two workers fight on one box.** They must have distinct `worker_id` and `ui_port` and their own clones.
 - **State resets on restart.** You are on the in-memory fallback; set `NIGHTSHIFT_PG_DSN` and run `just migrate-nightshift` (from `tools/nightshift`) for durable state.
+- **Cross-machine task errors with `publish_failed`.** The worker validated but could not push to its `rendezvous_remote`. Confirm the remote name resolves in the target repo on the worker and that its credential may push `nightshift-wip/*`. Nothing lands; the branch is kept for a retry.
+- **Cross-machine land is rejected (`merge_rejected`).** The fetched branch tip did not match the submitted `head_sha` (or no `rendezvous_remote`/`head_sha` reached the manager) — a fail-closed refusal so unverified content never lands. The WIP ref is kept; the next attempt re-fetches and re-verifies. A transient fetch error instead fails *recoverable* and is retried.
