@@ -93,24 +93,6 @@ def _normalize_repo(value: object) -> str | None:
     return repo
 
 
-def _normalize_branch(value: object) -> str | None:
-    """Normalize a queue's base-branch from a request. ``None``, "", and
-    "default" clear it (the queue then has no recorded base branch). Any other
-    value is a stripped branch name; whitespace, control chars, or a leading
-    ``-`` are rejected as malformed (a 400 at edit time)."""
-    if value in (None, "", "default"):
-        return None
-    branch = str(value).strip()
-    if not branch:
-        return None
-    if branch.startswith("-") or any(c.isspace() or ord(c) < 0x20 for c in branch):
-        raise ValueError(
-            f"invalid branch {branch!r}: must be a bare branch name with no "
-            "whitespace or control characters"
-        )
-    return branch
-
-
 class NoCacheStaticFiles(StaticFiles):
     """Serve UI assets with revalidation so swapped files (e.g. logo.png) show up
     immediately instead of being served stale from the browser cache."""
@@ -186,15 +168,14 @@ class QueueRepo(BaseModel):
 class QueueConfigUpdate(BaseModel):
     """Several per-queue config values in one request — used by the Add-queue
     screen to configure a new queue on creation. Every field is optional; only
-    the fields actually present are written. ``repo``/``branch`` set to "" or
-    "default" clear that key (the queue inherits instead)."""
+    the fields actually present are written. ``repo`` set to "" or "default"
+    clears that key (the queue inherits instead)."""
 
     # ``validate`` on the wire; the field is named ``validate_cmd`` to avoid
     # shadowing ``BaseModel.validate``.
     model_config = ConfigDict(populate_by_name=True)
 
     repo: str | None = None
-    branch: str | None = None
     validate_cmd: str | None = Field(default=None, alias="validate")
     # "on"/"off" (also accepts true/false/1/0); conflict-handling policy.
     auto_resolve: str | None = None
@@ -386,9 +367,9 @@ def create_app(workspace: Path) -> FastAPI:
 
     @app.get("/api/queue/config")
     def get_queue_config(queue: str | None = None) -> JSONResponse:
-        """The target queue's editable per-queue options (repo, base branch,
-        validate command, conflict policy) read straight from its
-        ``config.json`` — the surface the Add-queue screen seeds and edits."""
+        """The target queue's editable per-queue options (repo, validate
+        command, conflict policy) read straight from its ``config.json`` — the
+        surface the Add-queue screen seeds and edits."""
         target = _resolve_queue(queue)
         if not _queue_exists(target):
             return JSONResponse({"error": "queue not found"}, status_code=404)
@@ -396,7 +377,6 @@ def create_app(workspace: Path) -> FastAPI:
         return JSONResponse(
             {
                 "repo": cfg.get("repo"),
-                "branch": cfg.get("branch"),
                 "validate": cfg.get("validate"),
                 "auto_resolve": bool(cfg.get("auto_resolve", False)),
             }
@@ -410,7 +390,7 @@ def create_app(workspace: Path) -> FastAPI:
         ``config.json``. Only the fields present in the request are written, so
         an Add-queue form leaves unset options inheriting the main queue. Each
         value is validated/normalized the same way its dedicated endpoint does;
-        a malformed repo or branch is a 400 that writes nothing."""
+        a malformed repo is a 400 that writes nothing."""
         target = _resolve_queue(queue)
         if not _queue_exists(target):
             return JSONResponse({"error": "queue not found"}, status_code=404)
@@ -420,10 +400,6 @@ def create_app(workspace: Path) -> FastAPI:
             if "repo" in fields:
                 save_queue_config_value(
                     tasks_root, "repo", _normalize_repo(fields["repo"]), rel
-                )
-            if "branch" in fields:
-                save_queue_config_value(
-                    tasks_root, "branch", _normalize_branch(fields["branch"]), rel
                 )
             if "validate_cmd" in fields:
                 cmd = normalize_validate_command(str(fields["validate_cmd"]))
@@ -437,7 +413,6 @@ def create_app(workspace: Path) -> FastAPI:
         return JSONResponse(
             {
                 "repo": cfg.get("repo"),
-                "branch": cfg.get("branch"),
                 "validate": cfg.get("validate"),
                 "auto_resolve": bool(cfg.get("auto_resolve", False)),
             }
@@ -861,8 +836,8 @@ def create_app(workspace: Path) -> FastAPI:
 
     def _settings_schema() -> list[dict[str, Any]]:
         """Player settings schema plus the workspace root, a global concurrency
-        cap, and the active queue's per-queue ``branch``, ``validate`` command,
-        and ``auto_resolve`` policy — each labelled with where it is persisted
+        cap, and the active queue's per-queue ``validate`` command and
+        ``auto_resolve`` policy — each labelled with where it is persisted
         (user config / global config / that queue's config) so it's clear what
         each field edits."""
         queue = player.active_playlist() or "main queue"
@@ -875,16 +850,6 @@ def create_app(workspace: Path) -> FastAPI:
                     "Root directory that parents every repo Nightshift touches "
                     "and holds the content store. Saved to your user config "
                     "(~/.nightshift/config.json) and applied on the next launch."
-                ),
-                "type": "string",
-                "default": "",
-            },
-            {
-                "key": "branch",
-                "label": "Base branch",
-                "description": (
-                    f"Base branch recorded for the “{queue}” queue (saved to "
-                    "its config.json). Blank inherits the repo's default branch."
                 ),
                 "type": "string",
                 "default": "",
@@ -929,14 +894,6 @@ def create_app(workspace: Path) -> FastAPI:
         cfg = resolve_config(workspace, tasks_root, player.tasks_rel())
         return "on" if cfg.get("auto_resolve", False) else "off"
 
-    def _queue_branch() -> str:
-        """The active queue's own recorded base branch (its ``config.json``
-        ``branch`` key), or "" when unset. Read unlayered — a base branch is a
-        per-queue choice, never inherited from the global/store config."""
-        return str(
-            load_queue_config(tasks_root, player.tasks_rel()).get("branch") or ""
-        )
-
     def _settings_values() -> dict[str, Any]:
         return {
             **load_settings(workspace),
@@ -944,7 +901,6 @@ def create_app(workspace: Path) -> FastAPI:
             # edited (takes effect next launch); it is not a workspace-relative
             # setting, so it is sourced from the live binding, not the file.
             "workspace": str(workspace),
-            "branch": _queue_branch(),
             "max_concurrent_queues": int(
                 load_config(workspace).get("max_concurrent_queues", 2)
             ),
@@ -957,12 +913,12 @@ def create_app(workspace: Path) -> FastAPI:
         return {"values": _settings_values(), "schema": _settings_schema()}
 
     _NON_PLAYER_KEYS = {
-        "workspace", "branch", "validate", "auto_resolve", "max_concurrent_queues",
+        "workspace", "validate", "auto_resolve", "max_concurrent_queues",
     }
 
     @app.put("/api/settings")
     def put_settings(values: dict[str, Any]) -> JSONResponse:
-        # `branch`/`validate`/`auto_resolve` are per-queue (the active queue's
+        # `validate`/`auto_resolve` are per-queue (the active queue's
         # config.json); `max_concurrent_queues` is a global workspace-config knob
         # (`<workspace>/config.json`); `workspace` is a user-level launch setting
         # (`~/.nightshift/config.json`, applied next launch); everything else is
@@ -976,12 +932,6 @@ def create_app(workspace: Path) -> FastAPI:
             # Persisted for the next launch — the running server stays bound to
             # the workspace it started with (the whole app is built around it).
             save_user_config_value("workspace", str(values["workspace"]).strip())
-        if "branch" in values:
-            try:
-                branch = _normalize_branch(values["branch"])
-            except ValueError as exc:
-                return JSONResponse({"error": str(exc)}, status_code=400)
-            save_queue_config_value(tasks_root, "branch", branch, player.tasks_rel())
         if "validate" in values:
             cmd = normalize_validate_command(str(values["validate"]))
             save_queue_config_value(tasks_root, "validate", cmd, player.tasks_rel())

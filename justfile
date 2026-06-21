@@ -70,6 +70,30 @@ stop port="8800":
         echo "nothing listening on :{{port}}"
     fi
 
+# Restart the manager: stop whatever holds `port` (default 8800), then relaunch it.
+restart port="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    p="{{port}}"
+    p="${p:-8800}"
+    pid=$(lsof -nP -iTCP:"$p" -sTCP:LISTEN -t 2>/dev/null || true)
+    if [ -n "$pid" ]; then
+        echo "stopping nightshift (pid $pid) on :$p"
+        kill "$pid" 2>/dev/null || true
+        for _ in $(seq 1 20); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.25
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "still alive after SIGTERM; sending SIGKILL"
+            kill -9 "$pid" 2>/dev/null || true
+            sleep 0.5
+        fi
+    else
+        echo "nothing listening on :$p"
+    fi
+    just manager "{{port}}"
+
 # ----- database -----
 
 # Apply Nightshift's migrations to NIGHTSHIFT_PG_DSN (idempotent).

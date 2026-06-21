@@ -441,6 +441,40 @@ def test_hub_snapshot_then_deltas() -> None:
     assert frames[1]["kind"] == "queue_changed"
 
 
+def test_hub_stream_ends_on_server_shutdown() -> None:
+    """A still-connected browser must not pin the SSE stream open when the
+    server is shutting down (Ctrl-C). Without this, uvicorn hangs at "Waiting
+    for connections to close" because the long-lived /api/events stream never
+    ends on its own."""
+    import anyio
+
+    async def run() -> tuple[list[str], bool]:
+        hub = Hub()
+
+        async def snapshot():
+            return {"cursor": 0, "workers": []}
+
+        shutting_down = {"on": False}
+
+        def is_shutting_down() -> bool:
+            return shutting_down["on"]
+
+        chunks: list[str] = []
+        # Bounded so a regression (loop never exits) fails loudly here instead
+        # of hanging the whole test run.
+        with anyio.move_on_after(5) as scope:
+            async for chunk in hub.stream(
+                snapshot, heartbeat_seconds=0.01, is_shutting_down=is_shutting_down
+            ):
+                chunks.append(chunk)
+                shutting_down["on"] = True  # flip after the snapshot frame
+        return chunks, scope.cancel_called
+
+    chunks, timed_out = anyio.run(run)
+    assert not timed_out, "hub.stream did not exit on server shutdown"
+    assert chunks
+
+
 # --------------------------------------------------------------------------- #
 # DSN resolution — Nightshift owns its own store DSN
 # --------------------------------------------------------------------------- #

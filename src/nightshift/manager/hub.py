@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
@@ -26,6 +27,10 @@ SnapshotFn = Callable[[], Awaitable[dict[str, Any]]]
 # Bounded so a stalled browser can't grow memory without limit; an overflowing
 # subscriber is dropped and must reconnect (its next snapshot re-syncs it).
 _QUEUE_MAX = 1000
+
+# How often the stream wakes to check for shutdown while idle (seconds). Keeps
+# Ctrl-C responsive without coupling it to the (much longer) heartbeat cadence.
+_SHUTDOWN_POLL_SECONDS = 0.5
 
 
 def sse_frame(obj: dict[str, Any]) -> str:
@@ -52,12 +57,21 @@ class Hub:
         snapshot_fn: SnapshotFn,
         *,
         heartbeat_seconds: float = 15.0,
+        is_shutting_down: Callable[[], bool] | None = None,
     ) -> AsyncIterator[str]:
         """Yield SSE frames: a snapshot frame, then live deltas.
 
         Subscribes *before* snapshotting and records the snapshot's event cursor,
         so any event that races the snapshot is delivered exactly once (deltas at
         or below the cursor are already reflected in the snapshot and skipped).
+
+        ``is_shutting_down`` is an optional sync predicate that ends the stream
+        when the server is stopping (Ctrl-C). Without it, this long-lived
+        connection stays open while a browser is connected and blocks uvicorn's
+        graceful shutdown ("Waiting for connections to close"). When supplied it
+        is polled every ``_SHUTDOWN_POLL_SECONDS`` (independent of the heartbeat
+        cadence) so Ctrl-C ends the stream promptly and cleanly instead of being
+        force-cancelled by the graceful-shutdown timeout.
         """
         q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=_QUEUE_MAX)
         self._subscribers.add(q)
@@ -65,11 +79,24 @@ class Hub:
             snap = await snapshot_fn()
             cursor = int(snap.get("cursor", 0))
             yield sse_frame({"type": "snapshot", **snap})
+            last_beat = time.monotonic()
             while True:
+                if is_shutting_down is not None and is_shutting_down():
+                    break
+                # Wake at least every shutdown-poll tick (when shutdown-aware) so
+                # Ctrl-C is noticed quickly, but still only emit a keep-alive once
+                # a full heartbeat has elapsed.
+                if is_shutting_down is None:
+                    timeout = heartbeat_seconds
+                else:
+                    until_beat = heartbeat_seconds - (time.monotonic() - last_beat)
+                    timeout = max(0.0, min(_SHUTDOWN_POLL_SECONDS, until_beat))
                 try:
-                    event = await asyncio.wait_for(q.get(), timeout=heartbeat_seconds)
+                    event = await asyncio.wait_for(q.get(), timeout=timeout)
                 except TimeoutError:
-                    yield ": keep-alive\n\n"
+                    if time.monotonic() - last_beat >= heartbeat_seconds:
+                        yield ": keep-alive\n\n"
+                        last_beat = time.monotonic()
                     continue
                 if int(event.get("id", 0)) <= cursor:
                     continue

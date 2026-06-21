@@ -1,4 +1,20 @@
 {
+  "manager": {
+    "host": "0.0.0.0",
+    "port": 8800,
+    "landing_mode": "none",
+    "rendezvous_remote": "origin",
+    "shared_secret": null,
+    "dsn": null,
+    "cadences": {
+      "poll_seconds": 5.0,
+      "heartbeat_seconds": 10.0,
+      "lease_ttl_seconds": 120.0,
+      "worker_stale_seconds": 45.0,
+      "refresh_ms": 20000
+    }
+  },
+  "tasks_repo": "nightshift-tasks",
   "max_per_day": 200,
   "automerge": false,
   "draft": false,

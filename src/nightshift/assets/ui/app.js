@@ -2318,7 +2318,6 @@ function fillPlaylistRepoOptions() {
 
 function openPlaylistCreate() {
   $("playlist-name").value = "";
-  if ($("playlist-branch")) $("playlist-branch").value = "";
   if ($("playlist-validate")) $("playlist-validate").value = "";
   if ($("playlist-auto-resolve")) $("playlist-auto-resolve").value = "";
   fillPlaylistRepoOptions();
@@ -2334,8 +2333,6 @@ function collectPlaylistConfig() {
   const out = {};
   const repo = $("playlist-repo") ? $("playlist-repo").value : "";
   if (repo) out.repo = repo;
-  const branch = $("playlist-branch") ? $("playlist-branch").value.trim() : "";
-  if (branch) out.branch = branch;
   // Validate is intentionally not trimmed away: a single space is the explicit
   // "disable validation" sentinel the backend understands.
   if ($("playlist-validate")) {

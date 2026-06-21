@@ -1032,9 +1032,19 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
 
     @app.get("/api/events")
     async def events(request: Request) -> StreamingResponse:
+        server = getattr(request.app.state, "uvicorn_server", None)
+
+        def is_shutting_down() -> bool:
+            # End the stream once the server starts shutting down (Ctrl-C) so this
+            # long-lived connection doesn't block graceful shutdown. None under
+            # the test client / uvicorn.run (no handle) → never shutting down.
+            return server is not None and bool(server.should_exit)
+
         async def gen():
             async for frame in app.state.hub.stream(
-                _snapshot, heartbeat_seconds=cfg.cadences.heartbeat_seconds
+                _snapshot,
+                heartbeat_seconds=cfg.cadences.heartbeat_seconds,
+                is_shutting_down=is_shutting_down,
             ):
                 if await request.is_disconnected():
                     break

@@ -7,21 +7,35 @@ For a guided bring-up, start with the [Setup Guide](setup-guide.md).
 
 | Source | Owner | Scope | Committed? |
 |---|---|---|---|
-| `tools/nightshift/config.json` | Manager | Centralized task policy + `manager` block | Yes |
-| `tools/nightshift/config.json.local` | Worker | That worker's identity, backend, capabilities | No (gitignored) |
+| `--workspace` / `NIGHTSHIFT_WORKSPACE` | Both | The workspace dir bound at launch (see [The workspace](#the-workspace)) | n/a |
+| `<workspace>/config.json` | Manager | Centralized task policy + `manager` block | Operator-managed |
+| `<workspace>/config.json.local` | Worker | That worker's identity, backend, capabilities | No (gitignored) |
 | `.env` (repo root) | Both | Environment overrides (`NIGHTSHIFT_*`, DB DSN, backend creds) | No |
 | Process environment | Both | Same keys as `.env`, highest precedence | n/a |
-| Per-queue `config.json` (playlist dir) | Manager | Queue order, sort mode, play-priorities | Yes |
+| Per-queue `config.json` (content-store queue dir) | Manager | Queue order, sort mode, play-priorities, repo, validate, conflict policy | Yes (in `nightshift-tasks`) |
 | `nightshift` Postgres schema | Manager | Runtime state: workers, leases, runs, events, queue dedication | n/a |
-| `tools/nightshift/migrations/*.sql` | Manager | Nightshift's own schema migrations (separate from longitude's `migrations/`) | Yes |
-| `tools/nightshift/justfile` | Operator | Standalone `migrate-nightshift` / `rollback-nightshift` recipes | Yes |
+| `src/nightshift/assets/migrations/*.sql` | Manager | Nightshift's own schema migrations (separate from longitude's `migrations/`) | Yes |
+| `justfile` | Operator | `migrate` / `rollback` / `manager` / `worker` recipes | Yes |
 | Per-task frontmatter (`.tasks/*.md`) | Manager | Per-task overrides (model, mcp, caps, …) | Yes |
 
 Precedence for a given setting, low to high: built-in default, then `config.json` / `config.json.local`, then `.env`, then the process environment. Environment variables always win.
 
+## The workspace
+
+The **workspace** is the directory passed as `--workspace` to the manager and each worker. It parents every git repo your workers operate on (each a direct child, e.g. `longitude/`), the `nightshift-tasks/` content-store repo (briefs + queue config), and the runtime dirs (`.worktrees/`, `.nightshift/`). The operator `config.json` is read from `<workspace>/config.json`.
+
+It is **not** a `config.json` key — `config.json` lives inside the workspace, so the workspace must be selected before any config is read. Resolution order (high to low):
+
+| Source | Notes |
+|---|---|
+| `--workspace <dir>` | Explicit CLI flag (highest). The manager/worker entry points default to the current directory when unset. |
+| `NIGHTSHIFT_WORKSPACE` | Read by the `justfile`, which forwards it as `--workspace`. Falls back to the repo dir (`just`'s directory) when unset. Set it in `.env` (e.g. `NIGHTSHIFT_WORKSPACE=$HOME/workspaces`); use an absolute path or `$HOME/…` — a literal `~` is not expanded. |
+
+The operator UI displays the bound workspace **read-only**: it is fixed for the life of the process, so change `NIGHTSHIFT_WORKSPACE` (or `--workspace`) and relaunch rather than editing it in the UI. A manager and a co-located worker on one box must share the same workspace.
+
 ## Manager configuration
 
-The manager reads `tools/nightshift/config.json`. Service-level settings live under a `manager` block; task-policy settings are top-level. All of it is resolved in [`manager/config.py`](../../tools/nightshift/manager/config.py).
+The manager reads `<workspace>/config.json`. Service-level settings live under a `manager` block; task-policy settings are top-level. All of it is resolved in [`manager/config.py`](../src/nightshift/manager/config.py).
 
 ### `manager` block
 
@@ -65,12 +79,14 @@ Cadences are config-driven, never hardcoded (invariant 13). The manager sends th
 
 | Variable | Overrides |
 |---|---|
+| `NIGHTSHIFT_WORKSPACE` | The `--workspace` launch dir (see [The workspace](#the-workspace)) |
 | `NIGHTSHIFT_MANAGER_HOST` | `manager.host` |
 | `NIGHTSHIFT_MANAGER_PORT` | `manager.port` |
 | `NIGHTSHIFT_LANDING_MODE` | `manager.landing_mode` (`none` / `push` / `pr`) |
 | `NIGHTSHIFT_RENDEZVOUS_REMOTE` | `manager.rendezvous_remote` (and the worker's `rendezvous_remote`) |
 | `NIGHTSHIFT_SHARED_SECRET` | `manager.shared_secret` |
 | `NIGHTSHIFT_DEFAULT_MODEL` | top-level `default_model` |
+| `NIGHTSHIFT_TASKS_REPO` | top-level `tasks_repo` (the content-store repo's child name) |
 | `NIGHTSHIFT_PG_DSN` | `manager.dsn` — store selection (see [Database](#database--state-store)) |
 
 ### Top-level task-policy keys
@@ -79,6 +95,7 @@ These live at the root of `config.json` and are resolved into each work order or
 
 | Key | Default | Meaning |
 |---|---|---|
+| `tasks_repo` | `nightshift-tasks` | Name of the content-store repo (a workspace child) holding briefs + queue config; `tasks_root = <workspace>/<tasks_repo>`. |
 | `default_model` | `auto` | Model a brief inherits when it sets no `model:`. |
 | `scheduled_models` | (list) | Pin-only allow-set: an explicit `model:` must be in this list. |
 | `diff_cap_lines` | `1500` | Default max changed lines for a task's result. |
@@ -101,7 +118,7 @@ These live at the root of `config.json` and are resolved into each work order or
 
 ## Worker configuration
 
-A worker resolves its config in [`worker/config.py`](../../tools/nightshift/worker/config.py) from built-in defaults, then `tools/nightshift/config.json.local`, then the environment. The only strictly required setting is `manager_url`.
+A worker resolves its config in [`worker/config.py`](../src/nightshift/worker/config.py) from built-in defaults, then `<workspace>/config.json.local`, then the environment. The only strictly required setting is `manager_url`.
 
 ### `config.json.local` keys / environment variables
 
@@ -169,7 +186,7 @@ Optional path overrides (`claude_bin`, `cursor_bin`, `gemini_bin`, `ollama_host`
 
 ## Task frontmatter
 
-Per-task overrides in a brief's YAML frontmatter (`.tasks/<NN>.<name>.md`), parsed in [`spawn_daily.py`](../../tools/nightshift/spawn_daily.py) and the [scheduler](../../tools/nightshift/manager/scheduler.py).
+Per-task overrides in a brief's YAML frontmatter (`.tasks/<NN>.<name>.md`), parsed in [`spawn_daily.py`](../src/nightshift/spawn_daily.py) and the [scheduler](../src/nightshift/manager/scheduler.py).
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
@@ -207,21 +224,21 @@ Nightshift owns its own DSN. The store is selected from `NIGHTSHIFT_PG_DSN` (env
 
 | Setting | Effect |
 |---|---|
-| `NIGHTSHIFT_PG_DSN` (or `manager.dsn`) | Use Postgres (`PgStore`) for durable state. Run `just migrate-nightshift` to create/upgrade the `nightshift` schema in that DB. |
+| `NIGHTSHIFT_PG_DSN` (or `manager.dsn`) | Use Postgres (`PgStore`) for durable state. Run `just migrate` to create/upgrade the `nightshift` schema in that DB. |
 | (unset) | In-memory store (`MemoryStore`): no DB needed, but state is lost on restart and not shared across processes. |
 
-The `nightshift` schema lives in its own migrations directory, **separate from longitude's** root `migrations/`, so the two databases evolve independently. The files (`tools/nightshift/migrations/20260730000001_nightshift_schema.sql` + `…0002_nightshift_capability_routing.sql`) create `workers` (incl. advertised `models`/`mcps`), `leases`, `tasks`, `runs` (incl. `required_mcps` + telemetry), `events` (the SSE source), the stats views, and `queue_routing` (dedication). Worker capabilities and queue dedication are runtime state, not committed config.
+The `nightshift` schema lives in its own migrations directory (`src/nightshift/assets/migrations/`), **separate from longitude's** root `migrations/`, so the two databases evolve independently. The files (`20260730000001_nightshift_schema.sql`, `…0002_nightshift_capability_routing.sql`, `…0003_nightshift_repo_column.sql`) create `workers` (incl. advertised `models`/`mcps`), `leases`, `tasks`, `runs` (incl. `required_mcps` + telemetry), `events` (the SSE source), the stats views, and `queue_routing` (dedication). Worker capabilities and queue dedication are runtime state, not committed config.
 
 ### Applying the schema
 
-Run from the `tools/nightshift` directory (or pass `--justfile tools/nightshift/justfile`):
+Run from the repo root:
 
 | Recipe | DSN | Scope |
 |---|---|---|
-| `just migrate-nightshift` | `NIGHTSHIFT_PG_DSN` (required) | Apply `tools/nightshift/migrations/*.sql` — a clean dedicated DB with just the `nightshift` schema. |
-| `just rollback-nightshift` | `NIGHTSHIFT_PG_DSN` (required) | Reverse them newest-first (drops the `nightshift` schema). |
+| `just migrate` | `NIGHTSHIFT_PG_DSN` (required) | Apply `src/nightshift/assets/migrations/*.sql` — a clean dedicated DB with just the `nightshift` schema. |
+| `just rollback` | `NIGHTSHIFT_PG_DSN` (required) | Reverse them newest-first (drops the `nightshift` schema). |
 
-Idempotent, tracking applied files in `_meta.schema_migrations` *in the target DB*. The longitude root `just migrate` no longer touches the Nightshift schema. Plain-SQL fallback when `just` is unavailable: `psql "$NIGHTSHIFT_PG_DSN" -f tools/nightshift/migrations/<file>.sql`.
+Idempotent, tracking applied files in `_meta.schema_migrations` *in the target DB*. Plain-SQL fallback when `just` is unavailable: `psql "$NIGHTSHIFT_PG_DSN" -f src/nightshift/assets/migrations/<file>.sql`.
 
 ## HTTP surface (reference)
 

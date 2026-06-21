@@ -27,12 +27,25 @@ def main(argv: list[str] | None = None) -> int:
     workspace = args.workspace.resolve()
     cfg = load_manager_config(workspace)
     app = create_app(workspace)
-    uvicorn.run(
+    # Build the Server explicitly (rather than uvicorn.run) so the SSE endpoint
+    # can poll `server.should_exit` and end its stream on Ctrl-C; the graceful
+    # timeout is a backstop so any lingering long-lived connection (an open
+    # /api/events browser tab) can't hang the process indefinitely.
+    config = uvicorn.Config(
         app,
         host=args.host or cfg.host,
         port=args.port or cfg.port,
         log_level="info",
+        timeout_graceful_shutdown=5,
     )
+    server = uvicorn.Server(config)
+    app.state.uvicorn_server = server
+    try:
+        server.run()
+    except KeyboardInterrupt:
+        # Ctrl-C: uvicorn re-raises after shutting down. Swallow it so the exit
+        # is quiet rather than dumping a traceback.
+        print("\nNightshift manager stopped.")
     return 0
 
 

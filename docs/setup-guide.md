@@ -7,8 +7,8 @@ For the full list of every knob, see the [Configuration Reference](configuration
 
 Nightshift is three cooperating pieces:
 
-- **Manager** (`just nightshift-manager`, default `:8800`) — owns the queues, the canonical `.tasks/` briefs, the centralized `config.json`, Postgres-backed state and stats, the landing lock, and the git authority. It serves the operator UI and the worker/operator HTTP API.
-- **Worker** (`just nightshift-worker`, worker UI default `:8810`) — has its own clone, owns its backend (`claude-code` / `cursor` / `gemini` / `anthropic` / `ollama`), polls the manager for work, runs and validates it, then squash-submits the result for the manager to land. It also serves a minimal worker UI (Now + History).
+- **Manager** (`just manager`, default `:8800`) — owns the queues, the canonical briefs, the centralized `config.json`, Postgres-backed state and stats, the landing lock, and the git authority. It serves the operator UI and the worker/operator HTTP API.
+- **Worker** (`just worker`, worker UI default `:8810`) — has its own clone, owns its backend (`claude-code` / `cursor` / `gemini` / `anthropic` / `ollama`), polls the manager for work, runs and validates it, then squash-submits the result for the manager to land. It also serves a minimal worker UI (Now + History).
 - **Operator UI** — served by the manager at `:8800`; this is the product surface, where you add tasks, watch runs, compare backends, and configure routing.
 
 Routing is pull-based: a worker advertises its capabilities (queues, priorities, models, MCP connectors) on every poll, and the manager hands back the first runnable task that fits.
@@ -23,7 +23,7 @@ flowchart LR
 
 ## Prerequisites
 
-- The repo is cloned and its Python environment is installed (`.venv` present — see the top-level [`README.md`](../../README.md) bring-up).
+- The repo is cloned and its Python environment is installed (`.venv` present — see the top-level [`README.md`](../README.md) bring-up).
 - At least one backend's tooling is available on the worker machine (you only need the ones you intend to use):
   - `claude-code` — the `claude` CLI on `PATH`.
   - `cursor` — the `cursor-agent` CLI on `PATH`.
@@ -32,15 +32,38 @@ flowchart LR
   - `ollama` — the `ollama` CLI on `PATH` (or an `ollama_host`).
 - **Postgres is recommended but optional.** With a DSN (`NIGHTSHIFT_PG_DSN`) the manager persists state durably and every browser converges on the same source of truth. Without one it falls back to an in-memory store — fine for a quick try, but state is lost on restart and there is no cross-restart history. Nightshift owns its own DSN; it never reuses longitude's `LONG_PG_DSN`, so a clean Nightshift-only database on a separate host is the default posture (point `NIGHTSHIFT_PG_DSN` at the longitude DB explicitly if you want them to share one).
 
+## The workspace
+
+Everything Nightshift touches lives under a single **workspace** directory — the value passed as `--workspace` to the manager and each worker. The workspace parents every git repo your workers operate on (each a direct child, e.g. `longitude/`), the `nightshift-tasks/` content-store repo (briefs + queue config), and the runtime dirs (`.worktrees/`, `.nightshift/`). The operator `config.json` is read from `<workspace>/config.json`.
+
+Because `config.json` lives *inside* the workspace, the workspace itself is **not** a `config.json` key (that would be circular). It is set, in precedence order:
+
+1. `--workspace <dir>` on the command line (highest), then
+2. `NIGHTSHIFT_WORKSPACE` from `.env` / the environment — read by the `just` recipes, which forward it as `--workspace`, then
+3. the repo dir (`just`'s own directory) when neither is set.
+
+`just manager` / `just worker` already forward `--workspace "$NIGHTSHIFT_WORKSPACE"` (falling back to the repo dir), so the simplest way to pin it is one line in `.env`:
+
+```bash
+# Absolute path (or $HOME/...) — the shell expands it; a literal "~" does not.
+NIGHTSHIFT_WORKSPACE=$HOME/workspaces
+```
+
+The operator UI shows the bound workspace read-only (it is fixed for the life of the process); change it here and relaunch. For a manager and a co-located worker on one VM, point both at the same directory — `$HOME/workspaces` is the recommended default. Put your operator `config.json` at that workspace root (`$HOME/workspaces/config.json`); the copy shipped in this repo is an example you can copy there and tune.
+
 ## Quickstart — everything on one machine
 
-This runs the manager and one worker co-located on a single box.
+This runs the manager and one worker co-located on a single box, both bound to `$HOME/workspaces`.
 
 ### 1. Configure the environment
 
 Put operator/manager settings in `.env` at the repo root:
 
 ```bash
+# The workspace that parents your target repos + the nightshift-tasks content
+# store (see "The workspace" above). Shared by the manager and co-located worker.
+NIGHTSHIFT_WORKSPACE=$HOME/workspaces
+
 # Where workers find the manager (also used by a co-located worker).
 NIGHTSHIFT_MANAGER_URL=http://localhost:8800
 
@@ -56,28 +79,27 @@ If you expose the manager beyond localhost, also set a shared secret on both sid
 
 ### 2. Create the schema (Postgres only)
 
-Nightshift carries its own migrations and its own `just` recipe, separate from longitude. They live in `tools/nightshift/migrations/` and `tools/nightshift/justfile`, so this directory is self-contained — you can copy it to the database host and run it there.
+Nightshift carries its own migrations under `src/nightshift/assets/migrations/`, applied by the repo's `just migrate` recipe against `NIGHTSHIFT_PG_DSN`.
 
 ```bash
-cd tools/nightshift
-NIGHTSHIFT_PG_DSN=postgresql://nightshift@localhost:5432/nightshift just migrate-nightshift
+NIGHTSHIFT_PG_DSN=postgresql://nightshift@localhost:5432/nightshift just migrate
 ```
 
-`migrate-nightshift` applies the migrations in `tools/nightshift/migrations/` against `NIGHTSHIFT_PG_DSN`, so a clean dedicated database gets just the `nightshift` schema (workers, leases, tasks, runs, events, the capability columns, and the `queue_routing` table) — never longitude's schema. It is idempotent (tracked in `_meta.schema_migrations` in that DB) and errors out if `NIGHTSHIFT_PG_DSN` is unset. Skip it if you are using the in-memory fallback.
+`just migrate` applies the migrations against `NIGHTSHIFT_PG_DSN`, so a clean dedicated database gets just the `nightshift` schema (workers, leases, tasks, runs, events, the capability columns, and the `queue_routing` table) — never longitude's schema. It is idempotent (tracked in `_meta.schema_migrations` in that DB) and errors out if `NIGHTSHIFT_PG_DSN` is unset. Skip it if you are using the in-memory fallback.
 
-> The migrations are plain SQL, so on a host without `just` you can apply them directly: `psql "$NIGHTSHIFT_PG_DSN" -f tools/nightshift/migrations/20260730000001_nightshift_schema.sql` (then the `…_capability_routing.sql`). `just rollback-nightshift` reverses them (drops the `nightshift` schema).
+> The migrations are plain SQL, so on a host without `just` you can apply them directly: `psql "$NIGHTSHIFT_PG_DSN" -f src/nightshift/assets/migrations/20260730000001_nightshift_schema.sql` (then the `…_capability_routing.sql` and `…_repo_column.sql`). `just rollback` reverses them (drops the `nightshift` schema).
 
 ### 3. Start the manager
 
 ```bash
-just nightshift-manager        # binds :8800 (override: just nightshift-manager 8801)
+just manager        # binds :8800 (override: just manager 8801)
 ```
 
 Open `http://localhost:8800` — that is the operator UI.
 
 ### 4. Start a worker
 
-In a second terminal, declare the worker's backend and capabilities, then run it. The cleanest place for a worker's own knobs is `tools/nightshift/config.json.local` (gitignored):
+In a second terminal, declare the worker's backend and capabilities, then run it. The cleanest place for a worker's own knobs is `config.json.local` at the repo root (gitignored):
 
 ```json
 {
@@ -90,7 +112,7 @@ In a second terminal, declare the worker's backend and capabilities, then run it
 ```
 
 ```bash
-just nightshift-worker         # polls the manager; worker UI on :8810
+just worker         # polls the manager; worker UI on :8810
 ```
 
 The same settings can come from `NIGHTSHIFT_*` environment variables instead (env wins over `config.json.local`); see the reference.
@@ -110,7 +132,7 @@ The point of a second worker is to run more tasks in parallel, or to compare bac
 The runtime on one box is global, so a second co-located worker must not collide with the first. Give it three distinct things: its own clone (or worktree), a distinct `worker_id`, and a distinct worker-UI port.
 
 1. Use a separate checkout of the repo for the second worker (its own working tree; workers each need their own clone). Share the `.venv` by symlink if you like.
-2. In that checkout's `tools/nightshift/config.json.local`:
+2. In that checkout's `config.json.local`:
 
 ```json
 {
@@ -126,9 +148,9 @@ The runtime on one box is global, so a second co-located worker must not collide
 3. Start it:
 
 ```bash
-just nightshift-worker         # uses ui_port 8811 from config.json.local
+just worker         # uses ui_port 8811 from config.json.local
 # or override on the CLI:
-just nightshift-worker 8811
+just worker 8811
 ```
 
 Both workers now poll the same manager. Because the first advertises `claude-code` models and the second advertises a Cursor model set, the manager can compare them on identical tasks — the Workers page breaks down turns/tokens/cost per worker, backend, and model.
@@ -153,7 +175,7 @@ NIGHTSHIFT_RENDEZVOUS_REMOTE=origin
 3. Start the worker:
 
 ```bash
-just nightshift-worker
+just worker
 ```
 
 Expose the manager's `:8800` to the worker's network and protect it with `NIGHTSHIFT_SHARED_SECRET` (the worker sends it as the `X-Nightshift-Secret` header on every call).
@@ -181,17 +203,17 @@ Two mechanisms let you steer tasks:
 
 | Goal | Command |
 |---|---|
-| Start the manager | `just nightshift-manager [port]` |
-| Start a worker | `just nightshift-worker [ui-port]` |
-| Run a worker with no UI (loop only) | `python -m nightshift.worker --root . --no-ui` |
-| Apply Nightshift DB schema | `cd tools/nightshift && NIGHTSHIFT_PG_DSN=… just migrate-nightshift` |
-| Scoped Nightshift tests | `just validate-nightshift` |
+| Start the manager | `just manager [port]` |
+| Start a worker | `just worker [ui-port]` |
+| Run a worker with no UI (loop only) | `just worker-headless` (or `python -m nightshift.worker --workspace . --no-ui`) |
+| Apply Nightshift DB schema | `NIGHTSHIFT_PG_DSN=… just migrate` |
+| Lint + tests | `just validate` |
 
 ## Troubleshooting
 
 - **Tasks stay pending.** Check the Workers page for blocked reasons. A pinned `model:` or declared `mcp:` with no live worker advertising it will block until a matching worker checks in.
 - **A worker never appears.** Confirm `manager_url` is reachable from the worker and the `NIGHTSHIFT_SHARED_SECRET` matches on both sides.
 - **Two workers fight on one box.** They must have distinct `worker_id` and `ui_port` and their own clones.
-- **State resets on restart.** You are on the in-memory fallback; set `NIGHTSHIFT_PG_DSN` and run `just migrate-nightshift` (from `tools/nightshift`) for durable state.
+- **State resets on restart.** You are on the in-memory fallback; set `NIGHTSHIFT_PG_DSN` and run `just migrate` for durable state.
 - **Cross-machine task errors with `publish_failed`.** The worker validated but could not push to its `rendezvous_remote`. Confirm the remote name resolves in the target repo on the worker and that its credential may push `nightshift-wip/*`. Nothing lands; the branch is kept for a retry.
 - **Cross-machine land is rejected (`merge_rejected`).** The fetched branch tip did not match the submitted `head_sha` (or no `rendezvous_remote`/`head_sha` reached the manager) — a fail-closed refusal so unverified content never lands. The WIP ref is kept; the next attempt re-fetches and re-verifies. A transient fetch error instead fails *recoverable* and is retried.
