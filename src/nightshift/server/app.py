@@ -22,6 +22,7 @@ from nightshift import playlists as playlists_mod
 from nightshift import repos as repos_mod
 from nightshift._paths import UI_DIR
 from nightshift.backends import list_backends
+from nightshift.config.io import load_json, worker_json_path
 from nightshift.engine import (
     DEFAULT_VALIDATE_CMD,
     cleanup_task_worktree,
@@ -45,7 +46,6 @@ from nightshift.server.settings import (
     SCHEMA,
     load_settings,
     save_settings,
-    save_user_config_value,
 )
 from nightshift.spawn_daily import (
     MAX_PRIORITY,
@@ -816,7 +816,8 @@ def create_app(workspace: Path) -> FastAPI:
             config = load_config(workspace)
         except (FileNotFoundError, ValueError):
             config = {}
-        current = load_settings(workspace).get("worker_backend", "claude-code")
+        worker_data = load_json(worker_json_path(workspace))
+        current = worker_data.get("backend", "claude-code")
         return {"backends": list_backends(config), "current": current}
 
     def _queue_validate() -> str:
@@ -929,9 +930,7 @@ def create_app(workspace: Path) -> FastAPI:
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         if "workspace" in values:
-            # Persisted for the next launch — the running server stays bound to
-            # the workspace it started with (the whole app is built around it).
-            save_user_config_value("workspace", str(values["workspace"]).strip())
+            pass  # workspace is a launch input, not a persisted setting (§1)
         if "validate" in values:
             cmd = normalize_validate_command(str(values["validate"]))
             save_queue_config_value(tasks_root, "validate", cmd, player.tasks_rel())

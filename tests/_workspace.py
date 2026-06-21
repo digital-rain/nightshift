@@ -3,7 +3,7 @@
 A Nightshift workspace parents many git repos. This builder creates, under a
 ``tmp_path``:
 
-* ``<workspace>/config.json`` — operator/manager config.
+* ``<workspace>/.nightshift/manager.json`` — operator/manager config.
 * ``<workspace>/nightshift-tasks/`` — the content-store repo (a real git repo),
   with queues hoisted to its root (``main/`` is the default queue; alternates
   are sibling dirs). Each queue dir holds ``*.md`` briefs + ``config.json``.
@@ -124,7 +124,9 @@ def build_workspace(
         "default_model": "auto",
     }
     base_config.update(config or {})
-    (workspace / "config.json").write_text(json.dumps(base_config, indent=2) + "\n")
+    ns_dir = workspace / ".nightshift"
+    ns_dir.mkdir(parents=True, exist_ok=True)
+    (ns_dir / "manager.json").write_text(json.dumps(base_config, indent=2) + "\n")
 
     for name in repos:
         make_target_repo(workspace, name)

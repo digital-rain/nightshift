@@ -7,7 +7,7 @@ For the full list of every knob, see the [Configuration Reference](configuration
 
 Nightshift is three cooperating pieces:
 
-- **Manager** (`just manager`, default `:8800`) — owns the queues, the canonical briefs, the centralized `config.json`, Postgres-backed state and stats, the landing lock, and the git authority. It serves the operator UI and the worker/operator HTTP API.
+- **Manager** (`just manager`, default `:8800`) — owns the queues, the canonical briefs, the centralized config, Postgres-backed state and stats, the landing lock, and the git authority. It serves the operator UI and the worker/operator HTTP API.
 - **Worker** (`just worker`, worker UI default `:8810`) — has its own clone, owns its backend (`claude-code` / `cursor` / `gemini` / `anthropic` / `ollama`), polls the manager for work, runs and validates it, then squash-submits the result for the manager to land. It also serves a minimal worker UI (Now + History).
 - **Operator UI** — served by the manager at `:8800`; this is the product surface, where you add tasks, watch runs, compare backends, and configure routing.
 
@@ -34,9 +34,12 @@ flowchart LR
 
 ## The workspace
 
-Everything Nightshift touches lives under a single **workspace** directory — the value passed as `--workspace` to the manager and each worker. The workspace parents every git repo your workers operate on (each a direct child, e.g. `longitude/`), the `nightshift-tasks/` content-store repo (briefs + queue config), and the runtime dirs (`.worktrees/`, `.nightshift/`). The operator `config.json` is read from `<workspace>/config.json`.
+Everything Nightshift touches lives under a single **workspace** directory — the value passed as `--workspace` to the manager and each worker.
+The workspace parents every git repo your workers operate on (each a direct child, e.g. `longitude/`), the `nightshift-tasks/` content-store repo (briefs + queue config), and the runtime dirs (`.worktrees/`, `.nightshift/`).
+Settings now live in `<workspace>/.nightshift/{manager,worker,player}.json`; secrets in `<workspace>/.env`.
 
-Because `config.json` lives *inside* the workspace, the workspace itself is **not** a `config.json` key (that would be circular). It is set, in precedence order:
+Because the config files live *inside* the workspace, the workspace itself is **not** a config key (that would be circular).
+It is set, in precedence order:
 
 1. `--workspace <dir>` on the command line (highest), then
 2. `NIGHTSHIFT_WORKSPACE` from `.env` / the environment — read by the `just` recipes, which forward it as `--workspace`, then
@@ -49,7 +52,8 @@ Because `config.json` lives *inside* the workspace, the workspace itself is **no
 NIGHTSHIFT_WORKSPACE=$HOME/workspaces
 ```
 
-The operator UI shows the bound workspace read-only (it is fixed for the life of the process); change it here and relaunch. For a manager and a co-located worker on one VM, point both at the same directory — `$HOME/workspaces` is the recommended default. Put your operator `config.json` at that workspace root (`$HOME/workspaces/config.json`); the copy shipped in this repo is an example you can copy there and tune.
+The operator UI shows the bound workspace read-only (it is fixed for the life of the process); change it here and relaunch.
+For a manager and a co-located worker on one VM, point both at the same directory — `$HOME/workspaces` is the recommended default.
 
 ## Quickstart — everything on one machine
 
@@ -57,7 +61,7 @@ This runs the manager and one worker co-located on a single box, both bound to `
 
 ### 1. Configure the environment
 
-Put operator/manager settings in `.env` at the repo root:
+Put secrets and launch vars in `.env` at the repo root:
 
 ```bash
 # The workspace that parents your target repos + the nightshift-tasks content
@@ -77,7 +81,17 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 If you expose the manager beyond localhost, also set a shared secret on both sides (see step 4 and the reference): `NIGHTSHIFT_SHARED_SECRET=...`.
 
-### 2. Create the schema (Postgres only)
+### 2. Scaffold the config files
+
+Run `just init` to create `<workspace>/.nightshift/{manager,worker,player}.json` from the shipped templates and a `.env` from `.env.example`:
+
+```bash
+just init
+```
+
+Then edit the files to taste. The templates carry sensible defaults; see the [Configuration Reference](configuration-reference.md) for every knob.
+
+### 3. Create the schema (Postgres only)
 
 Nightshift carries its own migrations under `src/nightshift/assets/migrations/`, applied by the repo's `just migrate` recipe against `NIGHTSHIFT_PG_DSN`.
 
@@ -89,7 +103,7 @@ NIGHTSHIFT_PG_DSN=postgresql://nightshift@localhost:5432/nightshift just migrate
 
 > The migrations are plain SQL, so on a host without `just` you can apply them directly: `psql "$NIGHTSHIFT_PG_DSN" -f src/nightshift/assets/migrations/20260730000001_nightshift_schema.sql` (then the `…_capability_routing.sql` and `…_repo_column.sql`). `just rollback` reverses them (drops the `nightshift` schema).
 
-### 3. Start the manager
+### 4. Start the manager
 
 ```bash
 just manager        # binds :8800 (override: just manager 8801)
@@ -97,9 +111,9 @@ just manager        # binds :8800 (override: just manager 8801)
 
 Open `http://localhost:8800` — that is the operator UI.
 
-### 4. Start a worker
+### 5. Start a worker
 
-In a second terminal, declare the worker's backend and capabilities, then run it. A worker's own knobs live in `config.json.local` at the **workspace** root (`<workspace>/config.json.local`, worker-local and never committed):
+In a second terminal, declare the worker's backend and capabilities in `<workspace>/.nightshift/worker.json` (committed; per-box overrides come from env):
 
 ```json
 {
@@ -115,13 +129,13 @@ In a second terminal, declare the worker's backend and capabilities, then run it
 just worker         # polls the manager; worker UI on :8810
 ```
 
-The same settings can come from `NIGHTSHIFT_*` environment variables instead (env wins over `config.json.local`); see the reference.
+The same settings can come from `NIGHTSHIFT_*` environment variables instead (env wins over `worker.json`); see the reference.
 
-### 5. Add work and watch it run
+### 6. Add work and watch it run
 
 In the operator UI (`:8800`): add a task to a queue, and the worker will pick it up on its next poll, run it, validate, and submit. The manager fast-forwards canonical `main` under its landing lock. The worker's own UI at `:8810` shows what it is doing now plus its local history; the manager's Workers page shows all workers, per-backend/model/queue stats, advertised capabilities, and blocked tasks.
 
-> The full recipe list is `just --list`; the day-to-day ones are `manager`, `worker`, `worker-headless`, `server`, `migrate` / `rollback`, and `validate`.
+> The full recipe list is `just --list`; the day-to-day ones are `manager`, `worker`, `worker-headless`, `server`, `migrate` / `rollback`, `init`, and `validate`.
 
 ## Add a second worker
 
@@ -131,7 +145,7 @@ The point of a second worker is to run more tasks in parallel, or to compare bac
 
 A second co-located worker shares the manager's workspace — the same target repos and `nightshift-tasks/` store — so it only needs a distinct **identity** and **worker-UI port**. Each task runs in its own git worktree and the manager serializes landing, so co-located workers can share the workspace's repo clones safely.
 
-Because `config.json.local` is read from the shared `<workspace>`, give the second worker its distinguishing knobs as environment variables when you launch it (the environment wins over `config.json.local`):
+Because `worker.json` is read from the shared `<workspace>`, give the second worker its distinguishing knobs as environment variables when you launch it (the environment wins over `worker.json`):
 
 ```bash
 NIGHTSHIFT_WORKER_ID=vm-2 \
@@ -145,7 +159,7 @@ Both workers now poll the same manager. Because the first advertises `claude-cod
 ### A second (or remote) machine
 
 1. Clone and install the repo on the new machine; make sure its backend tooling and credentials are present.
-2. Point it at the manager and give it an identity in `.env` or `config.json.local`:
+2. Point it at the manager and give it an identity in `.env` or `.nightshift/worker.json`:
 
 ```bash
 NIGHTSHIFT_MANAGER_URL=http://manager-host:8800
@@ -192,6 +206,7 @@ Two mechanisms let you steer tasks:
 
 | Goal | Command |
 |---|---|
+| Scaffold workspace config | `just init` |
 | Start the manager | `just manager [port]` |
 | Start a worker | `just worker [ui-port]` |
 | Run a worker with no UI (loop only) | `just worker-headless` (or `python -m nightshift.worker --workspace . --no-ui`) |

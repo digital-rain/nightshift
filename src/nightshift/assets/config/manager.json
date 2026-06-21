@@ -1,0 +1,32 @@
+{
+  "host": "0.0.0.0",
+  "port": 8800,
+  "landing_mode": "none",
+  "rendezvous_remote": "origin",
+  "tasks_repo": "nightshift-tasks",
+  "wip_ref_prefix": "nightshift-wip",
+  "cadences": {
+    "poll_seconds": 5.0,
+    "heartbeat_seconds": 10.0,
+    "lease_ttl_seconds": 120.0,
+    "worker_stale_seconds": 45.0,
+    "refresh_ms": 20000
+  },
+  "default_model": "auto",
+  "scheduled_models": ["claude-sonnet-4-6", "claude-opus-4-8"],
+  "max_per_day": 200,
+  "max_concurrent_queues": 2,
+  "max_nights_before_parking": 2,
+  "automerge": false,
+  "draft": false,
+  "autostash_operator_work": true,
+  "diff_cap_lines": 1500,
+  "diff_cap_exempt_paths": ["^tests/fixtures/", "^docs/", "\\.md$"],
+  "forbidden_paths": ["^\\.github/workflows/", "^CLAUDE\\.md$", "^AGENTS\\.md$"],
+  "forbidden_template_paths": ["^tools/nightshift/templates/"],
+  "max_fix_attempts": 6,
+  "auto_resolve": true,
+  "max_resolve_attempts": 2,
+  "resolve_model": null,
+  "resolve_backend": null
+}

@@ -1,9 +1,9 @@
 """Run the nightshift manager: ``python -m nightshift.manager``.
 
-Serves the worker + operator API and the operator UI. Reads host/port from the
-manager config (``config.json`` ``manager`` block) with env overrides; state
-goes to Postgres when ``NIGHTSHIFT_PG_DSN`` (or the ``manager.dsn`` block) is
-set, else an in-memory store.
+Serves the worker + operator API and the operator UI. Reads host/port from
+``.nightshift/manager.json`` with env overrides; state goes to Postgres when
+``NIGHTSHIFT_PG_DSN`` is set (via .env or the process environment), else an
+in-memory store.
 """
 
 from __future__ import annotations

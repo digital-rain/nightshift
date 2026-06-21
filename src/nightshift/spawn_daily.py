@@ -55,23 +55,23 @@ class ExecuteResult:
 
 
 def load_config(workspace: Path) -> dict:
-    """Read the operator/host config at ``<workspace>/config.json`` (manager
-    block, ``tasks_repo`` name, and global runner defaults). Returns ``{}`` when
-    absent/malformed is *not* tolerated here — callers wrap the FileNotFoundError
-    as today (``resolve_config`` falls back to ``{}``)."""
-    return json.loads((workspace / "config.json").read_text())
+    """Read operator/manager config from ``.nightshift/manager.json``.
+
+    Returns the flat dict (no ``manager`` wrapper — keys are top-level,
+    ``cadences`` nested). Raises FileNotFoundError when the file is absent
+    so callers that expect it (``resolve_config``) can fall back to ``{}``.
+    """
+    path = workspace / ".nightshift" / "manager.json"
+    return json.loads(path.read_text())
 
 
 def save_config_value(workspace: Path, key: str, value: object) -> object:
-    """Set a single key in ``<workspace>/config.json``, preserving sibling keys
-    and their order. Returns the value written.
+    """Set a single key in ``.nightshift/manager.json``, preserving siblings.
 
     Used by the Settings UI for *global* knobs (e.g. ``max_concurrent_queues``)
-    that live in the operator config rather than per-queue config or player
-    settings. ``config.json`` is worker-forbidden but operator-editable, so
-    writing it from the UI is an operator action consistent with the
-    ``forbidden_paths`` model."""
-    path = workspace / "config.json"
+    that live in the operator config. Returns the value written.
+    """
+    path = workspace / ".nightshift" / "manager.json"
     data: dict = {}
     if path.exists():
         try:
@@ -81,6 +81,7 @@ def save_config_value(workspace: Path, key: str, value: object) -> object:
         except (ValueError, OSError):
             data = {}
     data[key] = value
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2) + "\n")
     return value
 
@@ -282,7 +283,7 @@ def resolve_frontmatter(meta: dict, config: dict) -> dict:
     return {
         "model": meta.get("model", config.get("model", "claude-sonnet-4-6")),
         "max_turns": int(raw_turns) if raw_turns is not None else None,
-        "automerge": bool(meta.get("automerge", config.get("automerge", True))),
+        "automerge": bool(meta.get("automerge", config.get("automerge", False))),
         "draft": bool(meta.get("draft", config.get("draft", False))),
     }
 

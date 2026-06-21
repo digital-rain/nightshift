@@ -1,0 +1,15 @@
+{
+  "worker_id": "vm-1",
+  "backend": "claude-code",
+  "manager_url": "http://localhost:8800",
+  "rendezvous_remote": null,
+  "queues": [],
+  "priorities": [],
+  "models": ["claude-opus-4-8", "claude-sonnet-4-6"],
+  "mcps": [],
+  "model_aliases": {},
+  "auto_model": {},
+  "max_model": {},
+  "ui_host": "0.0.0.0",
+  "ui_port": 8810
+}

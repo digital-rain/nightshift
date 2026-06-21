@@ -24,6 +24,10 @@ venv:
     uv venv
     uv sync
 
+# Scaffold workspace config from shipped templates (idempotent, never clobbers).
+init:
+    {{py}} -m nightshift init --workspace "{{workspace}}"
+
 # ----- run -----
 
 # Launch the manager: operator UI + worker/operator API (default :8800).

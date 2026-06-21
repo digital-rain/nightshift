@@ -303,7 +303,9 @@ def test_build_prompt_injects_default_validate(tmp_path: Path) -> None:
     (``just validate``) — the same command run_task resolves and injects."""
     workspace, tasks_root, _repo_root = _full(tmp_path, tasks={"10.hello": "Do something."})
     # Clear the seeded operator ``validate`` so the queue inherits the default.
-    (workspace / "config.json").write_text(json.dumps({"model": "auto"}) + "\n")
+    ns_dir = workspace / ".nightshift"
+    ns_dir.mkdir(parents=True, exist_ok=True)
+    (ns_dir / "manager.json").write_text(json.dumps({"model": "auto"}) + "\n")
     config = resolve_config(workspace, tasks_root, "main")
     validate_cmd = str(config.get("validate") or DEFAULT_VALIDATE_CMD)
     prompt = build_prompt("10.hello", task_file="/scratch.md", validate_cmd=validate_cmd)

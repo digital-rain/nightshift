@@ -61,7 +61,9 @@ def _seed(workspace: Path, tasks: dict[str, str] | None = None, **kw: object) ->
     (``repos``, ``main_repo``, ``queues`` …) pass straight through ``**kw``.
     """
     build_workspace(workspace, tasks=tasks, **kw)
-    (workspace / "config.json").write_text(
+    ns_dir = workspace / ".nightshift"
+    ns_dir.mkdir(parents=True, exist_ok=True)
+    (ns_dir / "manager.json").write_text(
         json.dumps({"model": "claude-sonnet-4-6", "evergreen_tasks": ["00._todo"]})
     )
     return workspace / DEFAULT_TASKS_REPO
@@ -841,7 +843,7 @@ def test_server_settings_exposes_queue_validate(tmp_path: Path) -> None:
     cfg = json.loads((tasks_root / "main/config.json").read_text())
     assert cfg["validate"] == "just check"
     assert "validate" not in json.loads(
-        (tmp_path / ".nightshift/settings.json").read_text()
+        (tmp_path / ".nightshift/player.json").read_text()
     )
     # Spec: clearing the validate command opts the queue out of validation.
     # A whitespace-only value (and the '' / "" empty-quote literals) normalizes
@@ -883,7 +885,7 @@ def test_server_task_defaults_seeds_create_pane(tmp_path: Path) -> None:
     # brief-shaped defaults (effective model/flags + curated model options) for
     # the active queue, without reading or creating any file.
     _seed(tmp_path, tasks={"alpha": "a"})
-    (tmp_path / "config.json").write_text(
+    (tmp_path / ".nightshift" / "manager.json").write_text(
         json.dumps(
             {
                 "model": "claude-sonnet-4-6",
@@ -1487,15 +1489,11 @@ def test_server_backends_endpoint(tmp_path: Path) -> None:
     assert names == ["claude-code", "cursor", "gemini", "anthropic", "ollama"]
 
 
-def test_worker_backend_setting_validation(tmp_path: Path) -> None:
-    from nightshift.server.settings import WORKER_BACKENDS
-
-    assert "claude-code" in WORKER_BACKENDS
-    assert load_settings(tmp_path)["worker_backend"] == "claude-code"
-    merged = save_settings(tmp_path, {"worker_backend": "ollama"})
-    assert merged["worker_backend"] == "ollama"
-    with pytest.raises(ValueError):
-        save_settings(tmp_path, {"worker_backend": "nonesuch"})
+def test_worker_backend_is_not_in_player_settings(tmp_path: Path) -> None:
+    """worker_backend is removed from player settings (§7.4); it lives only
+    as WorkerConfig.backend in worker.json."""
+    settings = load_settings(tmp_path)
+    assert "worker_backend" not in settings
 
 
 # --------------------------------------------------------------------------- #
@@ -1668,7 +1666,7 @@ def test_save_config_value_round_trips_and_preserves_siblings(tmp_path: Path) ->
     """The root-config writer sets one key without disturbing siblings, and
     updates an existing key in place."""
     _seed(tmp_path)
-    cfg = tmp_path / "config.json"
+    cfg = tmp_path / ".nightshift" / "manager.json"
     cfg.write_text(json.dumps(
         {"model": "m", "max_per_day": 5, "auto_resolve": True}, indent=2
     ) + "\n")

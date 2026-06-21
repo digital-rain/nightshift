@@ -27,6 +27,7 @@ WORKER_UI_DIR = ASSETS_DIR / "ui-worker"
 TEMPLATES_DIR = ASSETS_DIR / "templates"
 PROMPTS_DIR = ASSETS_DIR / "prompts"
 MIGRATIONS_DIR = ASSETS_DIR / "migrations"
+CONFIG_TEMPLATES_DIR = ASSETS_DIR / "config"
 
 
 def asset(*parts: str) -> Path:

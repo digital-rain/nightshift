@@ -218,8 +218,6 @@ __marimo__/
 .streamlit/secrets.toml
 
 # ── Nightshift runtime state (machine-local, not for commit) ──────────
-# Worker-owned local config (backend creds, routing overrides).
-config.json.local
 # Per-queue run records + run logs.
 .tasks/runs/
 .tasks/logs/
@@ -228,8 +226,11 @@ config.json.local
 .worktrees/
 # Worker local run history / status.
 .nightshift-worker/
-# UI player settings + other manager-local runtime state.
-.nightshift/
+# Nightshift config dir: runtime state stays ignored, but committed config files do not.
+.nightshift/*
+!.nightshift/manager.json
+!.nightshift/worker.json
+!.nightshift/player.json
 # Saved playlists (machine-local, like player settings).
 workflows.json
 .superpowers/

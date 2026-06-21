@@ -507,8 +507,10 @@ def test_hub_stream_ends_on_server_shutdown() -> None:
 
 
 def _write_manager_block(tmp_path: Path, manager: dict) -> Path:
-    (tmp_path / "config.json").write_text(
-        json.dumps({"default_model": "auto", "manager": manager})
+    ns_dir = tmp_path / ".nightshift"
+    ns_dir.mkdir(parents=True, exist_ok=True)
+    (ns_dir / "manager.json").write_text(
+        json.dumps({"default_model": "auto"})
     )
     return tmp_path
 
@@ -521,11 +523,11 @@ def test_dsn_unset_is_none(tmp_path: Path, monkeypatch) -> None:
     assert load_manager_config(root).dsn is None
 
 
-def test_dsn_from_manager_block(tmp_path: Path, monkeypatch) -> None:
+def test_dsn_from_env(tmp_path: Path, monkeypatch) -> None:
     from nightshift.manager.config import load_manager_config
 
-    monkeypatch.delenv("NIGHTSHIFT_PG_DSN", raising=False)
-    root = _write_manager_block(tmp_path, {"dsn": "postgresql://db/nightshift"})
+    monkeypatch.setenv("NIGHTSHIFT_PG_DSN", "postgresql://db/nightshift")
+    root = _write_manager_block(tmp_path, {})
     assert load_manager_config(root).dsn == "postgresql://db/nightshift"
 
 

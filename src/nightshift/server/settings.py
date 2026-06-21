@@ -1,35 +1,32 @@
-"""Player settings: a small JSON-backed config with a field schema.
+"""Player settings — delegates to the unified config package.
 
-The schema drives a VSCode/Longitude-style settings editor in the UI (labeled
-rows with descriptions and typed inputs). Settings persist to a JSON file
-distinct from the runner's ``config.json``; code-level defaults apply when the
-file is absent.
+Backward-compatible module: callers that import ``SCHEMA``, ``DEFAULTS``,
+``load_settings``, ``save_settings``, ``parse_duration``, and
+``resolve_launch_workspace`` from here continue to work. The authoritative
+model is ``nightshift.config.player.PlayerConfig``.
+
+The ``worker_backend`` key is removed from player settings (§7.4 of the spec):
+the backend selector lives only as ``WorkerConfig.backend`` in worker.json.
 """
 
 from __future__ import annotations
 
-import json
 import os
-import re
 from pathlib import Path
 from typing import Any
 
-from nightshift.backends import backend_names
+from nightshift.config.io import load_json, player_json_path, save_json
+from nightshift.config.player import (
+    parse_duration,
+    validate_player_config,
+)
 
-
-SETTINGS_REL_PATH = ".nightshift/settings.json"
-
-# Derived from the backend registry so a newly registered backend (e.g. gemini)
-# is automatically a valid worker_backend choice — no drift between the shim and
-# the settings allow-list.
-WORKER_BACKENDS = tuple(backend_names())
 
 DEFAULTS: dict[str, Any] = {
     "transport_mode": "auto",
     "repeat_interval": "30m",
     "theme": "dark",
     "port": 8799,
-    "worker_backend": "claude-code",
 }
 
 SCHEMA: list[dict[str, Any]] = [
@@ -63,143 +60,26 @@ SCHEMA: list[dict[str, Any]] = [
         "type": "int",
         "default": DEFAULTS["port"],
     },
-    {
-        "key": "worker_backend",
-        "label": "Worker backend",
-        "description": (
-            "Who runs each task. claude-code/cursor are agentic (edit files); "
-            "anthropic/ollama are single-shot completions (latency baseline, no edits)."
-        ),
-        "type": "enum",
-        "options": list(WORKER_BACKENDS),
-        "default": DEFAULTS["worker_backend"],
-    },
 ]
-
-_DURATION_RE = re.compile(r"(\d+)\s*([smh])", re.IGNORECASE)
-_UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600}
-
-
-def parse_duration(value: str) -> int:
-    """Parse a duration like ``30m`` or ``1h30m`` into seconds. Raises on junk."""
-    text = str(value).strip().lower()
-    if not text:
-        raise ValueError("interval is empty")
-    matches = list(_DURATION_RE.finditer(text))
-    if not matches or "".join(m.group(0).replace(" ", "") for m in matches) != text.replace(" ", ""):
-        raise ValueError(f"invalid duration: {value!r} (use e.g. 30m, 2h, 1h30m)")
-    total = sum(int(m.group(1)) * _UNIT_SECONDS[m.group(2)] for m in matches)
-    if total <= 0:
-        raise ValueError("interval must be greater than zero")
-    return total
-
-
-# --------------------------------------------------------------------------
-# User-level (cross-workspace) config.
-#
-# A handful of settings can't live in the workspace-relative settings file
-# because they *select* the workspace (a chicken-and-egg). They live in a fixed
-# user-level config the launcher consults before the workspace is known. Today
-# that is just ``workspace`` (the default root the server binds to), editable
-# from the Settings UI and applied on the next launch.
-# --------------------------------------------------------------------------
-
-
-def user_config_path() -> Path:
-    """Path to the user-level Nightshift config (``~/.nightshift/config.json``).
-
-    ``NIGHTSHIFT_USER_CONFIG`` overrides the full path (used in tests so they
-    never read or write a developer's real home config)."""
-    override = os.environ.get("NIGHTSHIFT_USER_CONFIG")
-    if override:
-        return Path(override)
-    return Path.home() / ".nightshift" / "config.json"
-
-
-def load_user_config() -> dict[str, Any]:
-    """Return the user-level config dict (``{}`` when absent or malformed)."""
-    path = user_config_path()
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def save_user_config_value(key: str, value: Any) -> Any:
-    """Set one key in the user-level config, preserving siblings. Returns it."""
-    path = user_config_path()
-    data = load_user_config()
-    data[key] = value
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + "\n")
-    return value
-
-
-def resolve_launch_workspace(cli_workspace: Path | None) -> Path:
-    """The workspace the server binds to at launch.
-
-    Precedence: an explicit ``--workspace`` flag wins; else the persisted
-    user-level ``workspace`` (set from the Settings UI); else the current
-    directory. This is what makes the Settings ``workspace`` field take effect
-    on the next launch without a flag."""
-    if cli_workspace is not None:
-        return cli_workspace.expanduser().resolve()
-    stored = load_user_config().get("workspace")
-    if stored:
-        return Path(str(stored)).expanduser().resolve()
-    return Path.cwd().resolve()
 
 
 def settings_path(workspace: Path) -> Path:
-    return workspace / SETTINGS_REL_PATH
+    return player_json_path(workspace)
 
 
 def load_settings(workspace: Path) -> dict[str, Any]:
-    """Return defaults merged with any persisted values.
-
-    Player settings are operator/host-level, so they live at the workspace root
-    (``<workspace>/.nightshift/settings.json``)."""
+    """Return defaults merged with any persisted values from player.json."""
     values = dict(DEFAULTS)
-    path = settings_path(workspace)
-    if path.exists():
-        try:
-            stored = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
-            stored = {}
-        for key in DEFAULTS:
-            if key in stored:
-                values[key] = stored[key]
+    data = load_json(player_json_path(workspace))
+    for key in DEFAULTS:
+        if key in data:
+            values[key] = data[key]
     return values
 
 
 def validate_settings(values: dict[str, Any]) -> list[str]:
     """Return a list of human-readable validation errors (empty when valid)."""
-    errors: list[str] = []
-
-    mode = values.get("transport_mode")
-    if mode not in {"oneshot", "auto", "repeat"}:
-        errors.append("transport_mode must be one of oneshot, auto, repeat")
-
-    if mode == "repeat" or values.get("repeat_interval"):
-        try:
-            parse_duration(values.get("repeat_interval", ""))
-        except ValueError as exc:
-            errors.append(f"repeat_interval: {exc}")
-
-    if values.get("theme") not in {"light", "dark"}:
-        errors.append("theme must be light or dark")
-
-    port = values.get("port")
-    if not isinstance(port, int) or isinstance(port, bool) or not (1 <= port <= 65535):
-        errors.append("port must be an integer between 1 and 65535")
-
-    if values.get("worker_backend") not in WORKER_BACKENDS:
-        errors.append("worker_backend must be one of " + ", ".join(WORKER_BACKENDS))
-
-    return errors
+    return validate_player_config(values)
 
 
 def save_settings(workspace: Path, incoming: dict[str, Any]) -> dict[str, Any]:
@@ -218,7 +98,44 @@ def save_settings(workspace: Path, incoming: dict[str, Any]) -> dict[str, Any]:
     if errors:
         raise ValueError("; ".join(errors))
 
-    path = settings_path(workspace)
+    path = player_json_path(workspace)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(merged, indent=2) + "\n")
+    save_json(path, merged)
     return merged
+
+
+def resolve_launch_workspace(cli_workspace: Path | None) -> Path:
+    """The workspace the server binds to at launch.
+
+    Precedence: explicit ``--workspace`` flag, then ``NIGHTSHIFT_WORKSPACE``
+    env, then the current directory. The user-level config persistence path
+    is removed (workspace is a pure launch input per §1 of the spec).
+    """
+    if cli_workspace is not None:
+        return cli_workspace.expanduser().resolve()
+    env = os.environ.get("NIGHTSHIFT_WORKSPACE")
+    if env:
+        return Path(env).expanduser().resolve()
+    return Path.cwd().resolve()
+
+
+def save_user_config_value(key: str, value: Any) -> Any:
+    """No-op stub: workspace persistence is removed (workspace is a launch input).
+
+    Kept as a no-op so callers that still reference it don't crash during the
+    transition; the call site in server/app.py should be removed.
+    """
+    return value
+
+
+__all__ = [
+    "DEFAULTS",
+    "SCHEMA",
+    "load_settings",
+    "parse_duration",
+    "resolve_launch_workspace",
+    "save_settings",
+    "save_user_config_value",
+    "settings_path",
+    "validate_settings",
+]

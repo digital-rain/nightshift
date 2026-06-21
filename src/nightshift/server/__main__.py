@@ -17,6 +17,7 @@ from pathlib import Path
 
 import uvicorn
 
+from nightshift.config.io import load_dotenv
 from nightshift.server.app import create_app
 from nightshift.server.settings import DEFAULTS, load_settings, resolve_launch_workspace
 
@@ -41,6 +42,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     workspace = resolve_launch_workspace(args.workspace)
+    load_dotenv(workspace)
     port = resolve_port(workspace, args.port)
     app = create_app(workspace)
     print(f"Nightshift UI → http://{args.host}:{port}  (workspace: {workspace})")

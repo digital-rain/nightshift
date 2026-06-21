@@ -501,7 +501,9 @@ def test_worker_config_rendezvous_remote(tmp_path: Path, monkeypatch) -> None:
     build_workspace(tmp_path, repos=("longitude",), main_repo="longitude")
     monkeypatch.setenv("NIGHTSHIFT_MANAGER_URL", "http://m")
     monkeypatch.delenv("NIGHTSHIFT_RENDEZVOUS_REMOTE", raising=False)
-    (tmp_path / "config.json.local").write_text(json.dumps({"rendezvous_remote": "rdv"}))
+    ns_dir = tmp_path / ".nightshift"
+    ns_dir.mkdir(parents=True, exist_ok=True)
+    (ns_dir / "worker.json").write_text(json.dumps({"rendezvous_remote": "rdv"}))
     assert load_worker_config(tmp_path).rendezvous_remote == "rdv"
 
     monkeypatch.setenv("NIGHTSHIFT_RENDEZVOUS_REMOTE", "envwins")
@@ -544,7 +546,7 @@ def test_manager_config_rendezvous_remote_explicit_null_disables(tmp_path: Path,
     monkeypatch.delenv("NIGHTSHIFT_RENDEZVOUS_REMOTE", raising=False)
     build_workspace(
         tmp_path, repos=("longitude",), main_repo="longitude",
-        config={"manager": {"rendezvous_remote": None}},
+        config={"rendezvous_remote": None},
     )
     assert load_manager_config(tmp_path).rendezvous_remote is None
 
