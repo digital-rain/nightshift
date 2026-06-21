@@ -11,26 +11,29 @@ Push detail into the linked docs below.
 
 ## Rules to follow every run
 
-1. **Work in a worktree — always.**
-   Never edit the primary checkout directly.
-   Create one under `.worktrees/<branch>` (gitignored) and do all work there:
-   `git worktree add .worktrees/<branch> -b <branch>`.
+1. **Mandatory lifecycle: worktree → work → validate → squash-merge to `main`. ALWAYS. Both halves, every time.**
+   These two are a single inseparable flow, not separate rules you can half-follow. "Work in a worktree" without "squash-merge to `main` when done" is a **failure**, not a partial success — it strands finished work on a branch the running system never sees, forcing the operator to re-verify on `main`, find nothing there, and ask you to merge. Do not create that cycle.
+   This rule **overrides** any default agent behaviour of "only commit/merge when the operator explicitly asks." Landing on local `main` is the last step *of the task itself*. Never end your turn with finished, validated work sitting on a worktree branch — if you finished it, it is on `main`.
+   **Why both halves are non-negotiable:** the operator's runtime (`just manager` / `just worker`) and the editable install serve the **primary checkout's `src/`**. Work that lives only in a worktree is *invisible* to the running system no matter how many times the operator restarts or hard-reloads.
+   Do exactly this, start to finish:
+   1. **Start in a worktree** — never edit the primary checkout directly:
+      `git worktree add .worktrees/<branch> -b <branch>` (`.worktrees/` is gitignored). Do all work there.
+   2. **Validate** in the worktree (`just validate`, or ruff + pytest) until clean. You are expected to fix any failures yourself.
+   3. **Commit** on the worktree branch.
+   4. **Squash-merge into local `main`** from the primary checkout: `git merge --squash <branch>` + `git commit`.
+   5. **Tear down** — `git worktree remove .worktrees/<branch>` and `git branch -D <branch>`.
+   6. **Tell the operator** to restart the manager/worker so the running runtime picks up your `src/` changes (you must not restart it yourself — see rule 3).
+   **Never `git push`** to `main` or any remote — staging on local `main` is the boundary; the operator pushes when running locally.
+   **The only exception** to landing on `main`: a validate failure that genuinely requires operator review (should be extremely rare). Then stop and say so **explicitly and loudly** — never silently leave work stranded on a branch.
 
-2. **Commit policy — squash-merge to local `main` yourself, do not wait to be asked.**
-   This rule **overrides** any default agent behaviour of "only commit when the operator explicitly requests it." In this repo, finishing a task *means* landing it on local `main`. Treat it as part of the task, not a separate step you pause for.
-   When your change validates cleanly: commit it on your worktree branch, then squash-merge it into local `main` (e.g. `git merge --squash <branch>` + `git commit`), then delete the worktree and branch.
-   **Why this matters:** the operator's runtime (`just manager` / `just worker`) and the editable install both serve the **primary checkout's `src/`**. Work left uncommitted in a worktree is *invisible* to the running system no matter how many times the operator restarts or hard-reloads — so never end your turn with finished, validated work sitting unmerged in a worktree.
-   **The only exception** is errors preventing a clean validate step that genuinely require operator review to resolve (should be extremely rare — you are expected to fix validation failures yourself). In that case, stop and say so explicitly; do not silently leave work stranded.
-   Never `git push` to `main` or any remote — staging on local `main` is the boundary; the operator pushes when running locally.
-
-3. **UI-first — the manager UI is the product surface.**
+2. **UI-first — the manager UI is the product surface.**
    The operator drives everything through the manager UI (`just manager`, default `:8800`); only a few `just` recipes (`migrate`, `manager`, `worker`, `validate`, …) are used from the shell.
    Any feature or capability you add MUST be surfaced in the UI, whether or not the request says so explicitly.
    If how it should be surfaced is unclear, stop and clarify — and recommend an approach.
    The operator UI is served by the manager (`src/nightshift/manager/app.py`): static assets live in `src/nightshift/assets/ui/` and talk only to the manager's HTTP API — no SQL and no third-party REST from the frontend JS.
    Refresh/polling cadence is config-driven (`manager.cadences.refresh_ms` in `config.json`), never hardcoded.
 
-4. **Parallel lanes — the operator owns the runtime.**
+3. **Parallel lanes — the operator owns the runtime.**
    Several agents share one VM; worktrees isolate the source, but the runtime is global.
    The operator alone runs `just manager`, `just worker`, and `just stop` from the console.
    These are not worktree-scoped: `just stop` frees ports (`:8800`, `:8810`) globally, so an agent running it kills the operator's manager and workers.
@@ -39,7 +42,7 @@ Push detail into the linked docs below.
    `just validate` is parallel-safe (ruff + pytest, no live DB required).
    `.venv` is shared, so serialize dependency changes (`uv sync`).
 
-5. **Don't violate the architectural invariants below without an explicit decision.**
+4. **Don't violate the architectural invariants below without an explicit decision.**
 
 ## Architectural invariants
 
@@ -55,7 +58,7 @@ Push detail into the linked docs below.
 - Prefer focused diffs; there is no repo-wide LOC cap.
 - Tests verify behaviour, not implementation; default to scoped `pytest` via `.venv` (`just test` / `just validate`).
   `tests/_workspace.py` (`build_workspace()`) is the canonical fixture builder for multi-repo workspace tests.
-- After changes to `src/nightshift/manager/` or `src/nightshift/worker/`, the running process needs a restart — leave that to the operator (see rule 4).
+- After changes to `src/nightshift/manager/` or `src/nightshift/worker/`, the running process needs a restart — leave that to the operator (see rule 3).
   Static asset changes (`assets/ui/`) are served fresh on next browser reload (no build step).
 - Adding a dependency: add it to `pyproject.toml` and run `uv sync` from a shared terminal (serialize — `.venv` is shared).
 - Touching `src/nightshift/assets/migrations/`: write both `-- migrate:up` and `-- migrate:down` sections; test with `just migrate` + `just rollback`.
