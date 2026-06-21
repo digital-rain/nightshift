@@ -12,6 +12,8 @@ import os
 import threading
 from typing import Any
 
+from nightshift import playlists
+from nightshift.engine import teardown_worktree
 from nightshift.worker.client import ManagerClient
 from nightshift.worker.config import WorkerConfig
 from nightshift.worker.execute import ExecuteOutcome, execute_work_order
@@ -155,6 +157,10 @@ class WorkerLoop:
             "backend": self.cfg.backend,
             "model": outcome.resolved_model,
             "landable": outcome.landable,
+            # Cross-machine landing: the WIP ref + tip SHA the manager fetches +
+            # verifies before squashing (None when co-located).
+            "branch_ref": outcome.branch_ref,
+            "head_sha": outcome.head_sha,
             "failure_kind": outcome.failure_kind,
             "failure_reason": outcome.failure_reason,
             "turns": outcome.turns,
@@ -167,6 +173,14 @@ class WorkerLoop:
             result = self.client.submit(run_id, payload)
         except Exception as exc:
             result = {"landed": False, "error": str(exc)}
+        # Cross-machine: the manager landed from its own clone and cannot reclaim
+        # this worker's worktree, so do it here on a confirmed land. Preserve it on
+        # a failed land so a re-fetch/resolve run can reuse it.
+        if outcome.branch_ref and result.get("landed"):
+            repo = order.get("repo")
+            if repo:
+                queue_internal = playlists.queue_from_tasks_rel(order.get("queue") or "main")
+                teardown_worktree(self.cfg.workspace, repo, task, queue=queue_internal)
         self.local.finish(
             {
                 "run_id": run_id,

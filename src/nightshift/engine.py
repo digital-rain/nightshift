@@ -1236,11 +1236,17 @@ def landing_lock(workspace: Path, repo: str):
 
 
 def setup_worktree(
-    workspace: Path, repo: str, task: str, *, queue: str | None = None
+    workspace: Path, repo: str, task: str, *, queue: str | None = None, base: str = "HEAD"
 ) -> Path:
     """Create a git worktree (checked out from the target ``repo_root`` but
     placed outside it under ``<workspace>/.worktrees/<repo>/``) and symlink build
-    artifacts from the target repo into it."""
+    artifacts from the target repo into it.
+
+    ``base`` is the commit-ish the worktree branch is cut from (default the target
+    repo's ``HEAD``). A cross-machine worker passes the work order's ``base_ref``
+    so its branch is anchored to the same commit the manager will squash onto;
+    the caller must have made ``base`` reachable in ``repo_root`` first (e.g. a
+    fetch of the rendezvous remote)."""
     repo_root = workspace / repo
     wt_dir = worktree_dir(workspace, repo, task, queue)
     branch = worktree_branch(task, queue)
@@ -1259,7 +1265,7 @@ def setup_worktree(
 
     wt_dir.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        ["git", "worktree", "add", str(wt_dir), "-b", branch, "HEAD"],
+        ["git", "worktree", "add", str(wt_dir), "-b", branch, base],
         cwd=repo_root,
         check=True,
         capture_output=True,
@@ -1752,6 +1758,183 @@ def squash_to_main(
             f"restore:\n{restore_detail}"
         ), False
     return sha, "", False
+
+
+# --------------------------------------------------------------------------
+# Cross-machine landing transport (transport B — git rendezvous remote).
+#
+# A worker on a different box publishes its validated task branch to a git
+# remote it has scoped access to; the manager fetches it into its own clone and
+# runs the existing land() path. The WIP namespace (``nightshift-wip/*``) is
+# kept distinct from the manager's PR branch (``task/*``) so a worker credential
+# can be restricted to it. See docs/spec/remote-landing.md.
+# --------------------------------------------------------------------------
+
+WIP_REF_PREFIX = "nightshift-wip"
+
+
+def _wip_ref(task: str, queue: str | None) -> str:
+    """Remote ref a worker publishes its task branch to (transport-only)."""
+    return f"refs/heads/{WIP_REF_PREFIX}/{_queue_slug(queue)}/{task}"
+
+
+def _rev_parse(repo_root: Path, ref: str) -> str | None:
+    res = subprocess.run(
+        ["git", "rev-parse", ref], cwd=repo_root, capture_output=True, text=True
+    )
+    return res.stdout.strip() if res.returncode == 0 else None
+
+
+def publish_task_branch(
+    workspace: Path, repo: str, task: str, remote: str, *, queue: str | None = None
+) -> tuple[str, str]:
+    """Force-push the task's local worktree branch to ``<remote>`` as its WIP ref.
+
+    Returns ``(wip_ref, head_sha)`` where ``head_sha`` is the full SHA of the
+    pushed branch tip (the manager re-verifies it after fetching). Raises
+    ``RuntimeError`` on a push failure or a missing branch so the worker can
+    surface ``publish_failed`` and land nothing.
+    """
+    repo_root = workspace / repo
+    branch = worktree_branch(task, queue)
+    wip_ref = _wip_ref(task, queue)
+
+    head_sha = _rev_parse(repo_root, branch)
+    if head_sha is None:
+        raise RuntimeError(f"no task branch '{branch}' to publish")
+
+    push = subprocess.run(
+        ["git", "push", "-f", remote, f"{branch}:{wip_ref}"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    if push.returncode != 0:
+        raise RuntimeError(
+            f"publish of '{branch}' to {remote} {wip_ref} failed: "
+            f"{(push.stderr or push.stdout).strip()[:300]}"
+        )
+    return wip_ref, head_sha
+
+
+def fetch_rendezvous_branch(
+    workspace: Path,
+    repo: str,
+    remote: str,
+    wip_ref: str,
+    task: str,
+    *,
+    queue: str | None = None,
+) -> str | None:
+    """Force-fetch a worker's published WIP ref into ``repo_root`` as the local
+    ``worktree_branch``. Returns the fetched tip SHA, or ``None`` on a fetch
+    error (the caller maps that to a recoverable land failure)."""
+    repo_root = workspace / repo
+    branch = worktree_branch(task, queue)
+    fetch = subprocess.run(
+        ["git", "fetch", "-f", remote, f"{wip_ref}:refs/heads/{branch}"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    if fetch.returncode != 0:
+        return None
+    return _rev_parse(repo_root, branch)
+
+
+def prune_rendezvous_branch(
+    workspace: Path, repo: str, remote: str, wip_ref: str
+) -> None:
+    """Best-effort delete of a consumed WIP ref on the rendezvous remote. A
+    failure is swallowed: the ref is transport-only and a leftover is harmless
+    (and eligible for a future scheduled GC)."""
+    repo_root = workspace / repo
+    subprocess.run(
+        ["git", "push", remote, "--delete", wip_ref],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+
+
+def prepare_worktree_base(
+    workspace: Path, repo: str, remote: str, base_ref: str | None
+) -> str:
+    """Cross-machine: make the manager's pinned ``base_ref`` reachable in the
+    worker's clone, then return the commit-ish ``setup_worktree`` should cut from.
+
+    Fetches ``<remote> main`` (``base_ref`` is the manager's ``origin/main`` HEAD,
+    so it is reachable as an ancestor) and returns ``base_ref`` when it is now
+    present, else falls back to ``HEAD`` (best-effort; a stale clone still lands
+    co-located-style, and any real divergence surfaces as a land-time conflict).
+    """
+    if not base_ref:
+        return "HEAD"
+    repo_root = workspace / repo
+    subprocess.run(
+        ["git", "fetch", remote, "main"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    return base_ref if _rev_parse(repo_root, base_ref) is not None else "HEAD"
+
+
+def sync_main_to_origin(
+    workspace: Path, repo: str, remote: str, *, autostash: bool = True
+) -> str | None:
+    """Bring local ``main`` to ``<remote>/main`` so PR mode stays
+    ``origin/main``-authoritative (see docs/spec/remote-landing.md, Proposal 1).
+
+    Fetches ``<remote> main`` and resets local ``main`` to the fetched tip, so an
+    orphaned ephemeral pr-mode squash (a local commit GitHub re-squashed into a
+    different SHA at merge) is dropped and local/origin ``main`` cannot diverge.
+    Operator code WIP in ``repo_root`` is set aside with the same stash posture
+    :func:`squash_to_main` uses and restored after. Runs under
+    :func:`landing_lock`. Returns the new ``HEAD``, or ``None`` when the remote
+    has no ``main`` yet (the caller falls back to local ``HEAD``)."""
+    repo_root = workspace / repo
+    with landing_lock(workspace, repo):
+        fetch = subprocess.run(
+            ["git", "fetch", remote, "main"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        if fetch.returncode != 0:
+            return None
+        target = _rev_parse(repo_root, "FETCH_HEAD")
+        if target is None:
+            return None
+        head = _rev_parse(repo_root, "HEAD")
+        if head == target:
+            return head
+
+        blockers = _landing_blockers(repo_root)
+        wip_sha: str | None = None
+        blocker_paths: list[str] = []
+        if blockers:
+            if not autostash:
+                # Leave local main as-is; it is still a usable base. Callers in
+                # pr mode tolerate a one-dispatch lag rather than clobber WIP.
+                return head
+            blocker_paths = [_porcelain_path(line) for line in blockers]
+            wip_sha = _stash_operator_work(repo_root, blocker_paths)
+
+        try:
+            reset = subprocess.run(
+                ["git", "reset", "--hard", target],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            if wip_sha:
+                _restore_operator_work(repo_root, wip_sha, blocker_paths)
+
+        if reset.returncode != 0:
+            return _rev_parse(repo_root, "HEAD")
+        return target
 
 
 def recover_task(

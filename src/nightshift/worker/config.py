@@ -69,6 +69,10 @@ class WorkerConfig:
     model_aliases: dict[str, str] = field(default_factory=dict)
     auto_models: dict[str, str] = field(default_factory=dict)
     max_models: dict[str, str] = field(default_factory=dict)
+    # Git remote name (resolved inside each repo_root) the worker publishes its
+    # validated task branch to for cross-machine landing. Unset => co-located
+    # (the worker shares the manager's workspace and publishes nothing).
+    rendezvous_remote: str | None = None
     ui_host: str = "0.0.0.0"
     ui_port: int = 8810
     refresh_ms: int = 3000  # UI poll cadence; set from the manager at checkin
@@ -201,6 +205,9 @@ def load_worker_config(workspace: Path) -> WorkerConfig:
         model_aliases=model_aliases,
         auto_models=dict(local.get("auto_model", {})) if isinstance(local.get("auto_model"), dict) else {},
         max_models=dict(local.get("max_model", {})) if isinstance(local.get("max_model"), dict) else {},
+        rendezvous_remote=(
+            os.environ.get("NIGHTSHIFT_RENDEZVOUS_REMOTE") or local.get("rendezvous_remote") or None
+        ),
         ui_host=os.environ.get("NIGHTSHIFT_WORKER_UI_HOST") or local.get("ui_host") or "0.0.0.0",
         ui_port=int(os.environ.get("NIGHTSHIFT_WORKER_UI_PORT") or local.get("ui_port") or 8810),
         raw=local,

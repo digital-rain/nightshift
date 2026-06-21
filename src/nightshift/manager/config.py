@@ -46,6 +46,11 @@ class ManagerConfig:
     # Name of the content-store repo (a workspace child) holding briefs + queue
     # config; ``tasks_root = workspace / tasks_repo``.
     tasks_repo: str = DEFAULT_TASKS_REPO
+    # Git remote name (resolved inside each repo_root) used to fetch a worker's
+    # cross-machine task branch and to keep local ``main`` synced to ``origin/main``
+    # in PR mode. Default ``origin``; set null to disable (cross-machine submits
+    # then fail closed).
+    rendezvous_remote: str | None = "origin"
     cadences: Cadences = field(default_factory=Cadences)
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -115,6 +120,17 @@ def load_manager_config(workspace: Path) -> ManagerConfig:
         or DEFAULT_TASKS_REPO
     )
 
+    # Env wins; an explicit ``manager.rendezvous_remote: null`` disables it; an
+    # absent key defaults to ``origin``.
+    env_rendezvous = os.environ.get("NIGHTSHIFT_RENDEZVOUS_REMOTE")
+    if env_rendezvous:
+        rendezvous_remote: str | None = env_rendezvous
+    elif "rendezvous_remote" in block:
+        block_rendezvous = block.get("rendezvous_remote")
+        rendezvous_remote = str(block_rendezvous) if block_rendezvous else None
+    else:
+        rendezvous_remote = "origin"
+
     return ManagerConfig(
         host=os.environ.get("NIGHTSHIFT_MANAGER_HOST") or block.get("host") or "0.0.0.0",
         port=_as_int(os.environ.get("NIGHTSHIFT_MANAGER_PORT") or block.get("port"), 8800),
@@ -123,6 +139,7 @@ def load_manager_config(workspace: Path) -> ManagerConfig:
         shared_secret=os.environ.get("NIGHTSHIFT_SHARED_SECRET") or block.get("shared_secret"),
         dsn=dsn,
         tasks_repo=str(tasks_repo),
+        rendezvous_remote=rendezvous_remote,
         cadences=cadences,
         raw=cfg if isinstance(cfg, dict) else {},
     )

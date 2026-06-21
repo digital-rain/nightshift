@@ -22,10 +22,14 @@ from pathlib import Path
 
 from nightshift.engine import (
     _queue_slug,
+    fetch_rendezvous_branch,
     landing_lock,
+    prune_rendezvous_branch,
     squash_to_main,
+    sync_main_to_origin,
     teardown_worktree,
     worktree_branch,
+    worktree_dir,
 )
 
 
@@ -93,6 +97,9 @@ def land(
     automerge: bool = True,
     draft: bool = False,
     autostash: bool = True,
+    branch_ref: str | None = None,
+    head_sha: str | None = None,
+    rendezvous_remote: str | None = None,
 ) -> LandingResult:
     """Land a submitted task branch onto canonical ``main`` of the target
     ``repo``, then sync remotely.
@@ -102,9 +109,54 @@ def land(
     calls. Returns a :class:`LandingResult`. On a content conflict (whether or
     not the base drifted) the branch is left intact and ``conflict=True`` is
     returned so the caller can issue a resolve work-order.
+
+    Cross-machine (transport B): when the worker ran on another box, the task
+    branch is absent here — only ``branch_ref``/``head_sha`` arrive over the API.
+    With no local worktree dir, ``land`` fetches ``branch_ref`` from
+    ``rendezvous_remote`` and verifies it matches ``head_sha`` (fail-closed)
+    before the existing flow. In PR mode it also resyncs local ``main`` to
+    ``origin/main`` so the squash stays origin-authoritative.
     """
     repo_root = workspace / repo
     branch = worktree_branch(task, queue)
+
+    # Cross-machine obtain: detected by an absent worktree dir + a submitted
+    # branch_ref (gating on the dir, not branch presence, forces a re-fetch +
+    # re-verify on every retry so stale/unverified content is never squashed).
+    cross_machine = branch_ref is not None and not worktree_dir(
+        workspace, repo, task, queue
+    ).exists()
+    if cross_machine:
+        if not rendezvous_remote or not head_sha:
+            return LandingResult(
+                landed=False,
+                recoverable=False,
+                detail="cross-machine land requires a rendezvous remote and head_sha",
+            )
+        fetched = fetch_rendezvous_branch(
+            workspace, repo, rendezvous_remote, branch_ref, task, queue=queue
+        )
+        if fetched is None:
+            return LandingResult(
+                landed=False,
+                recoverable=True,
+                detail=f"failed to fetch '{branch_ref}' from '{rendezvous_remote}'",
+            )
+        if fetched != head_sha:
+            return LandingResult(
+                landed=False,
+                recoverable=False,
+                detail=(
+                    f"head_sha mismatch: worker published {head_sha[:8]}, "
+                    f"fetched {fetched[:8]} — refusing to land unverified content"
+                ),
+            )
+
+    # PR mode is origin/main-authoritative: resync local main to origin/main so the
+    # ephemeral squash sits on the latest merged state and cannot diverge (the next
+    # dispatch resync replaces it with GitHub's merge commit). See remote-landing.md.
+    if landing_mode == "pr" and rendezvous_remote:
+        sync_main_to_origin(workspace, repo, rendezvous_remote, autostash=autostash)
 
     # Pre-check: if main drifted past base_ref and the merge would conflict,
     # refuse cleanly so the caller resolves rather than the squash failing deep.
@@ -139,6 +191,12 @@ def land(
     # The branch has landed on canonical main; reclaim its worktree + branch
     # (mirrors the engine's post-squash teardown in the single-process path).
     teardown_worktree(workspace, repo, task, queue=queue)
+
+    # Cross-machine: the WIP ref is transport-only and now consumed (in PR mode
+    # the PR head is the separate task/* branch), so prune it best-effort. A
+    # conflict/rejection returns earlier and keeps the ref for a resolve re-fetch.
+    if cross_machine and rendezvous_remote and branch_ref:
+        prune_rendezvous_branch(workspace, repo, rendezvous_remote, branch_ref)
 
     if landing_mode == "push":
         result.remote = "push"

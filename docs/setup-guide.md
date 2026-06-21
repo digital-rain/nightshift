@@ -145,6 +145,9 @@ NIGHTSHIFT_WORKER_BACKEND=gemini
 NIGHTSHIFT_WORKER_MODELS=gemini-3-pro,gemini-2.5-flash
 # Must match the manager's secret if one is set:
 NIGHTSHIFT_SHARED_SECRET=...
+# Cross-machine landing: the git remote (resolved in each repo) this worker
+# publishes its validated task branch to for the manager to fetch + land.
+NIGHTSHIFT_RENDEZVOUS_REMOTE=origin
 ```
 
 3. Start the worker:
@@ -154,6 +157,18 @@ just nightshift-worker
 ```
 
 Expose the manager's `:8800` to the worker's network and protect it with `NIGHTSHIFT_SHARED_SECRET` (the worker sends it as the `X-Nightshift-Secret` header on every call).
+
+#### Cross-machine landing (the rendezvous remote)
+
+Co-located workers share the manager's workspace, so the manager can squash the worker's branch directly. A worker on a *different* machine has its own clones, so its commits must reach the manager over git. Set `NIGHTSHIFT_RENDEZVOUS_REMOTE` (default `origin`) on both sides and the flow becomes:
+
+1. The worker runs and **validates** the task (validation is the trust boundary), then pushes its branch to the rendezvous remote as `refs/heads/nightshift-wip/<queue>/<task>` and submits `branch_ref` + `head_sha` over the API.
+2. The manager fetches that ref into its own clone, verifies the tip matches `head_sha` (fail-closed on any mismatch), then runs its normal squash/drift/conflict landing. It prunes the WIP ref once consumed and keeps it on conflict for a resolve re-fetch.
+3. The manager stays the **sole** writer of `main` and the sole PR author. A worker only ever pushes `nightshift-wip/*`.
+
+Credentials: give each worker push access scoped to `nightshift-wip/*` only — never `main` or `task/*`. On GitHub use a deploy key/token plus branch protection on `main`; on a bare rendezvous host use a `pre-receive` hook rejecting writes outside `refs/heads/nightshift-wip/*`. Leave `NIGHTSHIFT_RENDEZVOUS_REMOTE` unset on a worker that shares the manager's workspace (co-located) — it then publishes nothing and the manager squashes locally as before.
+
+In `pr` landing mode the manager keeps `origin/main` authoritative: it resyncs its local `main` to `origin/main` before pinning each task's base and before each squash, so its local `main` and `origin/main` never diverge after GitHub re-squashes the merged PR. A task can force PR mode regardless of the manager default with `make_pr: true` in its brief frontmatter. See the [cross-machine landing spec](spec/remote-landing.md) for the full design.
 
 ## Targeting work at specific workers
 

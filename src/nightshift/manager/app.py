@@ -45,6 +45,7 @@ from nightshift.engine import (
     save_queue_config_value,
     save_sort_mode,
     set_task_meta,
+    sync_main_to_origin,
     task_is_evergreen,
 )
 from nightshift.events import new_run_id
@@ -122,6 +123,11 @@ class SubmitBody(BaseModel):
     # False when the worker completed but produced no commit to land (e.g. a
     # non-agentic backend, or an agentic one that decided nothing was needed).
     landable: bool = True
+    # Cross-machine landing (transport B): the WIP ref the worker published and
+    # the branch tip SHA the manager fetches + verifies before squashing. Both
+    # None for a co-located worker that shares the manager's workspace.
+    branch_ref: str | None = None
+    head_sha: str | None = None
     failure_kind: str | None = None
     failure_reason: str | None = None
     # Best-effort agent telemetry (None when the backend can't report it).
@@ -426,6 +432,15 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         prior = await store.get_task_state(chosen.queue, chosen.task)
         if prior and prior.get("state") in ("repo_unavailable", "blocked"):
             await store.clear_task_state(chosen.queue, chosen.task)
+        # PR mode is origin/main-authoritative: resync local main to origin/main
+        # before pinning base_ref, so an orphaned ephemeral pr-mode squash is
+        # dropped and cross-PR divergence cannot accumulate (see remote-landing.md).
+        poll_meta = _task_meta(tasks_root, chosen.task, chosen.queue)
+        if (
+            ("pr" if poll_meta.get("make_pr") else cfg.landing_mode) == "pr"
+            and cfg.rendezvous_remote
+        ):
+            sync_main_to_origin(workspace, repo, cfg.rendezvous_remote)
         base_ref = canonical_head(workspace / repo)
         lease = await store.acquire_lease(
             task=chosen.task,
@@ -592,6 +607,9 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
 
         tasks_rel = playlists_mod.tasks_rel(queue)
         meta = _task_meta(tasks_root, body.task, queue)
+        # A task may force PR mode with `make_pr: true`; otherwise the manager's
+        # configured landing_mode applies. make_pr never forces squash/push.
+        effective_mode = "pr" if meta.get("make_pr") else cfg.landing_mode
         result = land(
             workspace,
             repo,
@@ -599,7 +617,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             body.title,
             queue=queue,
             base_ref=base_ref,
-            landing_mode=cfg.landing_mode,
+            landing_mode=effective_mode,
             automerge=bool(meta.get("automerge", True)),
             draft=bool(meta.get("draft", False)),
             autostash=bool(
@@ -607,6 +625,9 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                     "autostash_operator_work", True
                 )
             ),
+            branch_ref=body.branch_ref,
+            head_sha=body.head_sha,
+            rendezvous_remote=cfg.rendezvous_remote,
         )
 
         if not result.landed:

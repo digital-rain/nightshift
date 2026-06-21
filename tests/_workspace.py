@@ -60,6 +60,26 @@ def make_target_repo(workspace: Path, name: str, *, files: Mapping[str, str] | N
     return repo
 
 
+def make_bare_remote(path: Path) -> Path:
+    """Init a bare git repo at ``path`` (a stand-in for the rendezvous remote /
+    GitHub ``origin`` used by the cross-machine landing tests). Returns it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(path)],
+        check=True,
+        capture_output=True,
+    )
+    return path
+
+
+def add_remote(repo_root: Path, name: str, url: Path, *, push_main: bool = True) -> None:
+    """Register ``<name> -> url`` on ``repo_root`` and (by default) push ``main``
+    so the remote's ``main`` matches the local clone."""
+    git(repo_root, "remote", "add", name, str(url))
+    if push_main:
+        git(repo_root, "push", name, "main")
+
+
 def _write_queue(
     tasks_root: Path,
     queue: str,

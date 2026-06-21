@@ -29,6 +29,8 @@ from nightshift.engine import (
     build_prompt,
     extract_blocked_reason,
     materialize_brief,
+    prepare_worktree_base,
+    publish_task_branch,
     resolve_validate_cmd,
     run_interruptible,
     setup_worktree,
@@ -52,12 +54,60 @@ class ExecuteOutcome:
     resolved_model: str
     failure_kind: str | None = None
     failure_reason: str | None = None
+    # Cross-machine landing (transport B): the WIP ref the worker published its
+    # validated branch to, and the branch tip SHA the manager re-verifies after
+    # fetching. Both None when co-located (no rendezvous remote configured).
+    branch_ref: str | None = None
+    head_sha: str | None = None
     # Best-effort agent telemetry captured from the backend run (None when the
     # backend can't report it); carried to the manager for per-task rollups.
     turns: int | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
     cost_usd: float | None = None
+
+
+def _finish_landable(
+    cfg: WorkerConfig,
+    repo: str,
+    task: str,
+    queue: str | None,
+    *,
+    model: str,
+    result_line: str,
+    tele: dict[str, Any],
+    on_log: LogCb,
+) -> ExecuteOutcome:
+    """Finalize a validated (landable) run.
+
+    Cross-machine (a rendezvous remote is configured): publish the task branch to
+    it and report ``(branch_ref, head_sha)`` so the manager can fetch + verify +
+    land. A push failure lands nothing (``status="error"``, ``publish_failed``)
+    and the caller keeps the worktree for a retry. Co-located (no remote):
+    publish nothing and leave the branch for the manager to squash from the
+    shared workspace — today's behavior.
+    """
+    if not cfg.rendezvous_remote:
+        return ExecuteOutcome(
+            status="completed", result_line=result_line, landable=True,
+            resolved_model=model, **tele,
+        )
+    try:
+        branch_ref, head_sha = publish_task_branch(
+            cfg.workspace, repo, task, cfg.rendezvous_remote, queue=queue
+        )
+    except RuntimeError as exc:
+        on_log(f"  publish to rendezvous remote failed: {exc}\n")
+        return ExecuteOutcome(
+            status="error", result_line="publish failed", landable=False,
+            resolved_model=model, failure_kind="publish_failed",
+            failure_reason=str(exc), **tele,
+        )
+    on_log(f"  published {branch_ref} ({head_sha[:8]}) to {cfg.rendezvous_remote}\n")
+    return ExecuteOutcome(
+        status="completed", result_line=result_line, landable=True,
+        resolved_model=model, branch_ref=branch_ref, head_sha=head_sha, **tele,
+    )
 
 
 def execute_work_order(
@@ -118,7 +168,13 @@ def execute_work_order(
     # target repo. base_ref for landing/diff comes from order["base_ref"] (the
     # manager's canonical_head); the worker never recomputes it.
     scratch = materialize_brief(workspace, repo, task, order["body"], queue=queue)
-    wt_dir = setup_worktree(workspace, repo, task, queue=queue)
+    # Cross-machine: anchor the worktree on the manager's pinned base_ref (after
+    # fetching the rendezvous remote) so the published branch is based on the same
+    # commit the manager will squash onto. Co-located leaves base at HEAD.
+    base = "HEAD"
+    if cfg.rendezvous_remote:
+        base = prepare_worktree_base(workspace, repo, cfg.rendezvous_remote, order.get("base_ref"))
+    wt_dir = setup_worktree(workspace, repo, task, queue=queue, base=base)
     preserve = False
     captured: list[str] = []
 
@@ -202,10 +258,10 @@ def execute_work_order(
         validate_cmd = resolve_validate_cmd(config_blob)
         if validate_cmd is None:
             preserve = True
-            return ExecuteOutcome(
-                status="completed",
+            return _finish_landable(
+                cfg, repo, task, queue, model=model,
                 result_line="validation skipped (no validate command)",
-                landable=True, resolved_model=model, **tele,
+                tele=tele, on_log=on_log,
             )
         on_phase("validate")
         on_log(f"  running {' '.join(validate_cmd)}...\n")
@@ -222,9 +278,9 @@ def execute_work_order(
             )
 
         preserve = True  # landable branch — the manager squashes it
-        return ExecuteOutcome(
-            status="completed", result_line="validated", landable=True,
-            resolved_model=model, **tele,
+        return _finish_landable(
+            cfg, repo, task, queue, model=model, result_line="validated",
+            tele=tele, on_log=on_log,
         )
     finally:
         if not preserve:

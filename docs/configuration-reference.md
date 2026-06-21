@@ -31,6 +31,7 @@ The manager reads `tools/nightshift/config.json`. Service-level settings live un
     "host": "0.0.0.0",
     "port": 8800,
     "landing_mode": "none",
+    "rendezvous_remote": "origin",
     "shared_secret": null,
     "dsn": null,
     "cadences": {
@@ -48,7 +49,8 @@ The manager reads `tools/nightshift/config.json`. Service-level settings live un
 |---|---|---|
 | `host` | `0.0.0.0` | Bind address for the manager HTTP server. |
 | `port` | `8800` | Bind port (operator UI + worker/operator API). |
-| `landing_mode` | `none` | Remote policy applied *after* the always-on local fast-forward of canonical `main`: `none` (local only), `push` (push `main` to origin), `pr` (open a PR). |
+| `landing_mode` | `none` | Remote policy applied *after* the always-on local fast-forward of canonical `main`: `none` (local only), `push` (push `main` to origin), `pr` (open a PR). In `pr` mode `origin/main` is authoritative — the manager resyncs local `main` to `origin/main` at dispatch and at land, so its local `main` and `origin/main` never diverge after GitHub re-squashes the PR (see [cross-machine landing](spec/remote-landing.md)). |
+| `rendezvous_remote` | `origin` | Git remote *name* (resolved inside each `repo_root`) the manager fetches a cross-machine worker's task branch from, and uses for the `pr`-mode `origin/main` resync. Set `null` to disable (cross-machine submits then fail closed). |
 | `shared_secret` | `null` | If set, every worker call must send a matching `X-Nightshift-Secret` header. |
 | `dsn` | `null` | Nightshift's own Postgres DSN. Set → durable `PgStore`; unset → in-memory store. Never inherited from longitude's `LONG_PG_DSN` (see [Database](#database--state-store)). |
 | `cadences.poll_seconds` | `5.0` | Worker idle poll interval (sent to workers at checkin). |
@@ -66,6 +68,7 @@ Cadences are config-driven, never hardcoded (invariant 13). The manager sends th
 | `NIGHTSHIFT_MANAGER_HOST` | `manager.host` |
 | `NIGHTSHIFT_MANAGER_PORT` | `manager.port` |
 | `NIGHTSHIFT_LANDING_MODE` | `manager.landing_mode` (`none` / `push` / `pr`) |
+| `NIGHTSHIFT_RENDEZVOUS_REMOTE` | `manager.rendezvous_remote` (and the worker's `rendezvous_remote`) |
 | `NIGHTSHIFT_SHARED_SECRET` | `manager.shared_secret` |
 | `NIGHTSHIFT_DEFAULT_MODEL` | top-level `default_model` |
 | `NIGHTSHIFT_PG_DSN` | `manager.dsn` — store selection (see [Database](#database--state-store)) |
@@ -112,6 +115,7 @@ A worker resolves its config in [`worker/config.py`](../../tools/nightshift/work
 | `priorities` | `NIGHTSHIFT_WORKER_PRIORITIES` | any | Comma-separated 0–5 levels this worker accepts. Unset = any. |
 | `models` | `NIGHTSHIFT_WORKER_MODELS` | `[]` | Request-facing model ids this worker advertises. A task pinning one of these routes here. |
 | `mcps` | `NIGHTSHIFT_WORKER_MCPS` | `[]` | MCP connectors wired into this worker's harness. |
+| `rendezvous_remote` | `NIGHTSHIFT_RENDEZVOUS_REMOTE` | `null` | Git remote *name* (resolved in each `repo_root`) this worker publishes its validated task branch to for cross-machine landing, as `refs/heads/nightshift-wip/<queue>/<task>`. Unset = co-located (publishes nothing; the manager squashes from the shared workspace). |
 | `model_aliases` | — | `{}` | `{requested: actual}` remap applied at execution (identity by default). |
 | `auto_model` | — | per-backend | Map overriding the model `auto` resolves to, per backend. |
 | `max_model` | — | per-backend | Map overriding the model `max` resolves to, per backend. |
@@ -177,6 +181,7 @@ Per-task overrides in a brief's YAML frontmatter (`.tasks/<NN>.<name>.md`), pars
 | `loc` | int | `diff_cap_lines` | Max changed lines for this task. |
 | `draft` | bool | config `draft` | Open the PR as a draft (PR landing). |
 | `automerge` | bool | config `automerge` | Enable automerge (PR landing). |
+| `make_pr` | bool | `false` | Force PR landing for this task regardless of the manager's `landing_mode`. `true` wins over the manager default; absent/`false` defers to it (it is *not* the inverse and never forces a squash or push). |
 | `split` | bool | `false` | Decomposition run: split into subtasks instead of implementing. |
 | `evergreen` | bool | `false` | Reset from template instead of deleting on completion. |
 | `disabled` | bool | `false` | Skip this task (never dispatched). |
