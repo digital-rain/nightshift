@@ -66,7 +66,18 @@
       </section>
 
       <section id="view-settings" class="worker-view" hidden>
-        <div id="w-settings-fields" class="w-settings-fields"></div>
+        <div class="w-settings-layout">
+          <aside class="w-settings-sidebar">
+            <div class="w-settings-search-wrap">
+              <input id="w-settings-search" type="search" class="w-settings-search"
+                     placeholder="Search settings…" aria-label="Search settings" />
+            </div>
+            <nav id="w-settings-tree" class="w-settings-tree"></nav>
+          </aside>
+          <div class="w-settings-main">
+            <div id="w-settings-fields" class="w-settings-fields"></div>
+          </div>
+        </div>
         <div id="w-settings-savebar" class="w-settings-savebar" hidden>
           <span id="w-settings-dirty-count" class="w-settings-dirty-count"></span>
           <div class="w-settings-savebar-actions">

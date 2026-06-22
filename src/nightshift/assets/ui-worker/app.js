@@ -112,7 +112,7 @@ async function tick() {
 // --------------------------------------------------------------------------
 // Worker Settings (compact renderer over worker surface)
 // --------------------------------------------------------------------------
-const wSettings = { tiers: [], dirty: {}, errors: {} };
+const wSettings = { tiers: [], activeSurface: null, activeCategory: null, searchQuery: "", dirty: {}, errors: {} };
 
 async function loadWorkerSettings() {
   try {
@@ -120,24 +120,99 @@ async function loadWorkerSettings() {
     wSettings.tiers = data.tiers || [];
     wSettings.dirty = {};
     wSettings.errors = {};
+    wSettings.searchQuery = "";
+    if (wSettings.tiers.length && !wSettings.activeSurface) {
+      const first = wSettings.tiers[0];
+      wSettings.activeSurface = first.surface;
+      if (first.categories.length) {
+        wSettings.activeCategory = first.categories[0].name;
+      }
+    }
+    const searchEl = document.getElementById("w-settings-search");
+    if (searchEl) searchEl.value = "";
+    renderWorkerSidebar();
     renderWorkerSettings();
     updateWorkerSaveBar();
   } catch (_e) { /* settings endpoint may not exist yet */ }
 }
 
+function renderWorkerSidebar() {
+  const tree = document.getElementById("w-settings-tree");
+  if (!tree) return;
+  tree.innerHTML = "";
+  for (const tier of wSettings.tiers) {
+    const div = document.createElement("div");
+    div.className = "w-st-tier";
+    const label = document.createElement("div");
+    label.className = "w-st-tier-label";
+    label.textContent = tier.surface.charAt(0).toUpperCase() + tier.surface.slice(1);
+    div.append(label);
+    for (const cat of tier.categories) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "w-st-cat";
+      if (tier.surface === wSettings.activeSurface && cat.name === wSettings.activeCategory) {
+        btn.classList.add("active");
+      }
+      btn.textContent = cat.name;
+      btn.addEventListener("click", () => {
+        wSettings.activeSurface = tier.surface;
+        wSettings.activeCategory = cat.name;
+        wSettings.searchQuery = "";
+        const searchEl = document.getElementById("w-settings-search");
+        if (searchEl) searchEl.value = "";
+        renderWorkerSidebar();
+        renderWorkerSettings();
+      });
+      div.append(btn);
+    }
+    tree.append(div);
+  }
+}
+
 function renderWorkerSettings() {
   const pane = document.getElementById("w-settings-fields");
   pane.innerHTML = "";
+  const query = wSettings.searchQuery.toLowerCase().trim();
+  if (query) {
+    renderWorkerSearchResults(pane, query);
+    return;
+  }
+  const tier = wSettings.tiers.find(t => t.surface === wSettings.activeSurface);
+  if (!tier) return;
+  const cat = tier.categories.find(c => c.name === wSettings.activeCategory);
+  if (!cat) return;
+  const title = document.createElement("h2");
+  title.className = "w-settings-cat-title";
+  title.textContent = cat.name;
+  pane.append(title);
+  for (const field of cat.fields) {
+    pane.appendChild(buildWorkerFieldRow(field, tier.surface));
+  }
+}
+
+function renderWorkerSearchResults(pane, query) {
+  const title = document.createElement("h2");
+  title.className = "w-settings-cat-title";
+  title.textContent = `Search: "${query}"`;
+  pane.append(title);
+  let count = 0;
   for (const tier of wSettings.tiers) {
     for (const cat of tier.categories) {
-      const title = document.createElement("h3");
-      title.className = "w-cat-title";
-      title.textContent = cat.name;
-      pane.appendChild(title);
       for (const field of cat.fields) {
-        pane.appendChild(buildWorkerFieldRow(field, tier.surface));
+        const searchable = `${field.label} ${field.key} ${field.desc}`.toLowerCase();
+        if (searchable.includes(query)) {
+          pane.appendChild(buildWorkerFieldRow(field, tier.surface));
+          count++;
+        }
       }
     }
+  }
+  if (!count) {
+    const empty = document.createElement("div");
+    empty.className = "w-sf-empty-search";
+    empty.textContent = "No settings match your search.";
+    pane.append(empty);
   }
 }
 
@@ -418,6 +493,13 @@ document.addEventListener("DOMContentLoaded", async () => {
     renderWorkerSettings();
   });
   document.getElementById("w-settings-save").addEventListener("click", saveWorkerSettings);
+  const searchEl = document.getElementById("w-settings-search");
+  if (searchEl) {
+    searchEl.addEventListener("input", () => {
+      wSettings.searchQuery = searchEl.value;
+      renderWorkerSettings();
+    });
+  }
   await loadInfo();
   if (timer) clearTimeout(timer);
   tick();
