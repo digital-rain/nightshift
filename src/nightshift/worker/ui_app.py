@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from nightshift._paths import UI_DIR as SHARED_UI_DIR
 from nightshift._paths import WORKER_UI_DIR as UI_DIR
 from nightshift.config.validate import build_get_response, validate_delta, write_delta
+from nightshift.repos import known_repos
 from nightshift.worker.config import WorkerConfig
 from nightshift.worker.local_store import LocalStore
 
@@ -49,6 +50,11 @@ def create_worker_app(cfg: WorkerConfig, local: LocalStore) -> FastAPI:
     @app.get("/api/stats")
     def stats() -> JSONResponse:
         return JSONResponse(local.stats())
+
+    @app.get("/api/scan-queues")
+    def scan_queues() -> JSONResponse:
+        repos = known_repos(cfg.workspace)
+        return JSONResponse({"queues": repos})
 
     _WORKER_SURFACES = ["worker"]
 

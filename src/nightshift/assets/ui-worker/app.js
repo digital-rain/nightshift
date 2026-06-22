@@ -371,6 +371,9 @@ function buildWorkerControl(field, surface, fullKey) {
     case "string_list":
     case "int_list":
     case "regex_list": {
+      if (field.key === "queues") {
+        return buildQueuesTagControl(field, surface, fullKey, value);
+      }
       const items = Array.isArray(value) ? [...value] : [];
       const wrap = document.createElement("div");
       wrap.className = "w-sf-chips";
@@ -454,6 +457,75 @@ function buildWorkerControl(field, surface, fullKey) {
       return input;
     }
   }
+}
+
+function buildQueuesTagControl(field, surface, fullKey, value) {
+  const items = Array.isArray(value) ? [...value] : [];
+  const wrap = document.createElement("div");
+  wrap.className = "w-sf-queue-tags";
+
+  const tagContainer = document.createElement("div");
+  tagContainer.className = "w-sf-queue-tag-list";
+  wrap.appendChild(tagContainer);
+
+  const actions = document.createElement("div");
+  actions.className = "w-sf-queue-actions";
+  const rescanBtn = document.createElement("button");
+  rescanBtn.type = "button";
+  rescanBtn.className = "w-sf-queue-rescan";
+  rescanBtn.textContent = "\u21BB Rescan";
+  actions.appendChild(rescanBtn);
+  wrap.appendChild(actions);
+
+  const renderTags = () => {
+    tagContainer.innerHTML = "";
+    if (items.length === 0) {
+      const empty = document.createElement("span");
+      empty.className = "w-sf-queue-empty";
+      empty.textContent = "No queues — click Rescan to populate from workspace";
+      tagContainer.appendChild(empty);
+      return;
+    }
+    for (let i = 0; i < items.length; i++) {
+      const tag = document.createElement("span");
+      tag.className = "w-sf-queue-tag";
+      const name = document.createElement("span");
+      name.className = "w-sf-queue-tag-name";
+      name.textContent = items[i];
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "w-sf-queue-tag-del";
+      del.textContent = "\u00d7";
+      del.addEventListener("click", () => {
+        items.splice(i, 1);
+        wMarkDirty(field, fullKey, items.length ? [...items] : null);
+        renderTags();
+      });
+      tag.append(name, del);
+      tagContainer.appendChild(tag);
+    }
+  };
+
+  rescanBtn.addEventListener("click", async () => {
+    rescanBtn.disabled = true;
+    rescanBtn.textContent = "\u21BB Scanning\u2026";
+    try {
+      const resp = await fetch("/api/scan-queues");
+      if (resp.ok) {
+        const data = await resp.json();
+        items.length = 0;
+        for (const q of (data.queues || [])) items.push(q);
+        wMarkDirty(field, fullKey, items.length ? [...items] : null);
+        renderTags();
+      }
+    } finally {
+      rescanBtn.disabled = false;
+      rescanBtn.textContent = "\u21BB Rescan";
+    }
+  });
+
+  renderTags();
+  return wrap;
 }
 
 function wMarkDirty(field, fullKey, value) {
