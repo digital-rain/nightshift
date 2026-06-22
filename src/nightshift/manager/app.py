@@ -168,6 +168,13 @@ class ActivePlaylistRequest(BaseModel):
     playlist: str | None = None
 
 
+class TransportRequest(BaseModel):
+    action: str
+    mode: str | None = None
+    task: str | None = None
+    queue: str | None = None
+
+
 class PlaylistCreate(BaseModel):
     name: str
 
@@ -363,9 +370,11 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
 
         # Build candidates across every queue from the canonical briefs in the
         # content store (each candidate already carries its resolved target repo).
+        # Queues paused via the transport controls are excluded from dispatch.
         candidates_by_queue = {
             q: build_candidates(tasks_root, q, default_model=cfg.default_model)
             for q in _all_queues()
+            if queue_label(q) not in _paused_queues
         }
 
         # Manager-side queue dedication (queue label -> bound worker ids).
@@ -954,6 +963,90 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             return JSONResponse({"error": "playlist not found"}, status_code=404)
         _active_playlist = req.playlist
         return JSONResponse({"active_playlist": _active_playlist})
+
+    # ----- transport (play/pause/stop/skip) -------------------------------- #
+
+    _VALID_ACTIONS = {"play", "pause", "stop", "skip", "select"}
+    _VALID_MODES = {"oneshot", "auto", "repeat"}
+
+    _paused_queues: set[str] = set()
+    _queue_modes: dict[str, str] = {}
+    _queue_cursors: dict[str, str | None] = {}
+
+    def _queue_state(queue: str | None, leases: list[dict[str, Any]]) -> dict[str, Any]:
+        """Build a per-queue state dict in the shape the UI expects."""
+        key = queue_label(queue)
+        lease = next((le for le in leases if le.get("queue", "main") == key), None)
+        paused = key in _paused_queues
+        if paused:
+            st = "paused"
+        elif lease:
+            st = "playing"
+        else:
+            st = "idle"
+        return {
+            "state": st,
+            "mode": _queue_modes.get(key, "auto"),
+            "now_playing": lease["task"] if lease else None,
+            "cursor": _queue_cursors.get(key),
+            "run_id": lease.get("run_id") if lease else None,
+            "active_playlist": queue,
+            "running_playlist": queue if lease else None,
+        }
+
+    async def _state_payload() -> dict[str, Any]:
+        leases = await _store().active_leases()
+        focused = _active_playlist
+        focused_state = _queue_state(focused, leases)
+        queues: dict[str, dict[str, Any]] = {}
+        queues[queue_label(focused)] = focused_state
+        for q in _all_queues():
+            key = queue_label(q)
+            if key not in queues:
+                queues[key] = _queue_state(q, leases)
+        return {**focused_state, "active_playlist": focused, "queues": queues}
+
+    @app.get("/api/state")
+    async def get_state() -> JSONResponse:
+        return JSONResponse(await _state_payload())
+
+    @app.post("/api/transport")
+    async def post_transport(req: TransportRequest) -> JSONResponse:
+        if req.action not in _VALID_ACTIONS:
+            return JSONResponse(
+                {"error": f"unknown action: {req.action}"}, status_code=400
+            )
+        if req.mode is not None and req.mode not in _VALID_MODES:
+            return JSONResponse(
+                {"error": f"unknown mode: {req.mode}"}, status_code=400
+            )
+        target = req.queue if req.queue not in (None, "") else _active_playlist
+        key = queue_label(target)
+        if not _queue_exists(target):
+            return JSONResponse({"error": "queue not found"}, status_code=404)
+        if req.mode is not None:
+            _queue_modes[key] = req.mode
+        if req.action == "play":
+            _paused_queues.discard(key)
+        elif req.action == "pause":
+            _paused_queues.add(key)
+        elif req.action == "stop":
+            _paused_queues.add(key)
+            store = _store()
+            for le in await store.active_leases():
+                if le.get("queue", "main") == key:
+                    await store.set_lease_status(le["id"], "cancelled")
+                    await _emit("run_finished", run_id=le.get("run_id"), queue=target)
+            _paused_queues.discard(key)
+        elif req.action == "skip":
+            store = _store()
+            for le in await store.active_leases():
+                if le.get("queue", "main") == key:
+                    await store.set_lease_status(le["id"], "cancelled")
+                    await _emit("run_finished", run_id=le.get("run_id"), queue=target)
+        elif req.action == "select":
+            _queue_cursors[key] = req.task
+        return JSONResponse(await _state_payload())
 
     # ----- playlists ------------------------------------------------------ #
 
