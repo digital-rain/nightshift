@@ -108,6 +108,25 @@ if [[ "$DO_DB" -eq 1 ]]; then
       APT_UPDATED=0
     fi
     apt_install "postgresql-${PG_VERSION}" "postgresql-client-${PG_VERSION}"
+    # Bind PostgreSQL to all interfaces so non-localhost DSNs work.
+    PG_CONF="/etc/postgresql/${PG_VERSION}/main/postgresql.conf"
+    PG_HBA="/etc/postgresql/${PG_VERSION}/main/pg_hba.conf"
+    if [[ -f "$PG_CONF" ]]; then
+      HOST_IP=$(hostname -I | awk '{print $1}')
+      if grep -q "^#listen_addresses" "$PG_CONF"; then
+        $SUDO sed -i "s/^#listen_addresses.*/listen_addresses = '*'/" "$PG_CONF"
+        note "postgresql.conf: listen_addresses = '*'"
+      elif ! grep -q "listen_addresses.*\*" "$PG_CONF"; then
+        $SUDO sed -i "s/^listen_addresses.*/listen_addresses = '*'/" "$PG_CONF"
+        note "postgresql.conf: listen_addresses = '*'"
+      fi
+      if [[ -n "$HOST_IP" ]] && ! $SUDO grep -q "${HOST_IP%.*}.0/24" "$PG_HBA" 2>/dev/null; then
+        SUBNET="${HOST_IP%.*}.0/24"
+        $SUDO sed -i "/^host.*all.*all.*127.0.0.1/a host    all             all             ${SUBNET}          scram-sha-256" "$PG_HBA"
+        note "pg_hba.conf: allowed connections from ${SUBNET}"
+      fi
+    fi
+
     if have systemctl; then $SUDO systemctl restart postgresql 2>/dev/null || true; else
       $SUDO pg_ctlcluster "${PG_VERSION}" main restart 2>/dev/null || note "start Postgres manually."
     fi
