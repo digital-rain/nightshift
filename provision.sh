@@ -186,6 +186,13 @@ export PATH="$HOME/.local/bin:$PATH"
 uv sync
 note ".venv ready."
 
+# ── scaffold workspace config ─────────────────────────────────────────────
+step "Scaffold workspace config (.nightshift/)"
+WORKSPACE="${NIGHTSHIFT_WORKSPACE:-$HOME/workspaces}"
+WORKSPACE="${WORKSPACE/#\~/$HOME}"
+"$REPO/.venv/bin/python" -m nightshift init --workspace "$WORKSPACE"
+note "workspace config at ${WORKSPACE}/.nightshift/"
+
 # ── done ────────────────────────────────────────────────────────────────────
 step "Done"
 printf '\n%sProvisioning complete.%s\n' "$GREEN" "$NC"
