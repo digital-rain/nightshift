@@ -245,6 +245,7 @@ def test_server_playlist_info_rename_rescan(tmp_path: Path) -> None:
             "name": "beta",
             "task_count": 0,
             "repository": "longitude",
+            "validate": None,
             "disabled": False,
         }
         assert client.get("/api/playlists/alpha").status_code == 404

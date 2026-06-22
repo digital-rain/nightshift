@@ -193,6 +193,7 @@ class PlaylistUpdate(BaseModel):
 
     name: str | None = None
     repository: str | None = None
+    validate: str | None = None
     # Hide the playlist from the default Playlists view and exclude it from
     # scheduling; ``False`` re-enables it. ``None`` leaves the flag untouched.
     disabled: bool | None = None
@@ -804,12 +805,13 @@ def create_app(workspace: Path) -> FastAPI:
         """The playlist-info payload: name, task count, and the queue's ``repo``
         binding aliased to ``repository`` for the info page."""
         count = len(list_queue(tasks_root, playlists_mod.tasks_rel(name)))
-        repo = load_queue_config(tasks_root, playlists_mod.tasks_rel(name)).get("repo")
+        cfg = load_queue_config(tasks_root, playlists_mod.tasks_rel(name))
         disabled = playlists_mod.is_disabled(tasks_root, name)
         return {
             "name": name,
             "task_count": count,
-            "repository": repo,
+            "repository": cfg.get("repo"),
+            "validate": cfg.get("validate"),
             "disabled": disabled,
         }
 
@@ -848,6 +850,11 @@ def create_app(workspace: Path) -> FastAPI:
                 return JSONResponse({"error": str(exc)}, status_code=400)
             save_queue_config_value(
                 tasks_root, "repo", repo, playlists_mod.tasks_rel(current)
+            )
+        if "validate" in req.model_dump(exclude_unset=True):
+            cmd = normalize_validate_command(str(req.validate or ""))
+            save_queue_config_value(
+                tasks_root, "validate", cmd, playlists_mod.tasks_rel(current)
             )
         if req.disabled is not None:
             playlists_mod.set_playlist_disabled(tasks_root, current, req.disabled)

@@ -6,6 +6,8 @@ GET/PUT over ``worker.json``, and serves the ``ui-worker/`` SPA.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI
@@ -18,6 +20,40 @@ from nightshift.config.validate import build_get_response, validate_delta, write
 from nightshift.repos import known_repos
 from nightshift.worker.config import WorkerConfig
 from nightshift.worker.local_store import LocalStore
+
+
+def _workspace_tier(workspace: Path) -> dict:
+    """Build a read-only 'Workspace' tier for the worker /api/settings response."""
+    env_var = "NIGHTSHIFT_WORKSPACE"
+    env_val = os.environ.get(env_var)
+    return {
+        "surface": "workspace",
+        "categories": [
+            {
+                "name": "Workspace",
+                "fields": [
+                    {
+                        "key": "location",
+                        "label": "Location",
+                        "desc": (
+                            "The workspace directory this worker operates in. "
+                            f"Set via --workspace flag or {env_var} env var; "
+                            "resolved at launch."
+                        ),
+                        "type": "readonly",
+                        "apply": "restart",
+                        "store": "—",
+                        "default": None,
+                        "secret": False,
+                        "stored": str(workspace),
+                        "effective": str(workspace),
+                        "env": env_var,
+                        "env_shadowed": bool(env_val),
+                    }
+                ],
+            }
+        ],
+    }
 
 
 def create_worker_app(cfg: WorkerConfig, local: LocalStore) -> FastAPI:
@@ -60,9 +96,9 @@ def create_worker_app(cfg: WorkerConfig, local: LocalStore) -> FastAPI:
 
     @app.get("/api/settings")
     def get_settings() -> JSONResponse:
-        return JSONResponse(
-            build_get_response(cfg.workspace, _WORKER_SURFACES)
-        )
+        response = build_get_response(cfg.workspace, _WORKER_SURFACES)
+        response["tiers"].insert(0, _workspace_tier(cfg.workspace))
+        return JSONResponse(response)
 
     @app.put("/api/settings")
     def put_settings(body: dict[str, Any]) -> JSONResponse:

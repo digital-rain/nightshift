@@ -444,6 +444,12 @@ function buildWorkerControl(field, surface, fullKey) {
       rerender();
       return wrap;
     }
+    case "readonly": {
+      const el = document.createElement("code");
+      el.className = "w-sf-readonly-value";
+      el.textContent = value != null ? String(value) : "—";
+      return el;
+    }
     default: {
       const input = document.createElement("input");
       input.type = "text";
