@@ -14,7 +14,10 @@ async function getJSON(path) {
   return resp.json();
 }
 
+let prevView = "now";
 function setView(view) {
+  const current = document.body.dataset.view;
+  if (view === "settings" && current !== "settings") prevView = current || "now";
   document.body.dataset.view = view;
   document.querySelectorAll(".nav-opt").forEach((b) => {
     b.classList.toggle("active", b.dataset.view === view);
@@ -189,6 +192,26 @@ function renderWorkerSettings() {
   for (const field of cat.fields) {
     pane.appendChild(buildWorkerFieldRow(field, tier.surface));
   }
+
+  const allReadonly = cat.fields.every(f => f.type === "readonly");
+  if (!allReadonly) {
+    const rawDetails = document.createElement("details");
+    rawDetails.className = "sf-raw-json";
+    const summary = document.createElement("summary");
+    summary.textContent = "Raw JSON";
+    const textarea = document.createElement("textarea");
+    textarea.rows = 8;
+    textarea.spellcheck = false;
+    const rawData = {};
+    for (const f of cat.fields) {
+      if (!f.secret && f.type !== "readonly") rawData[f.key] = f.stored;
+    }
+    textarea.value = JSON.stringify(rawData, null, 2);
+    textarea.dataset.surface = tier.surface;
+    textarea.dataset.category = cat.name;
+    rawDetails.append(summary, textarea);
+    pane.append(rawDetails);
+  }
 }
 
 function renderWorkerSearchResults(pane, query) {
@@ -221,6 +244,7 @@ function buildWorkerFieldRow(field, surface) {
   const row = document.createElement("div");
   row.className = "w-sf-row";
   if (fullKey in wSettings.dirty) row.classList.add("w-sf-dirty");
+  if (fullKey in wSettings.errors) row.classList.add("w-sf-error");
 
   const head = document.createElement("div");
   head.className = "w-sf-head";
@@ -236,6 +260,16 @@ function buildWorkerFieldRow(field, surface) {
     const b = document.createElement("span");
     b.className = "w-sf-badge w-sf-badge-restart";
     b.textContent = "restart";
+    badges.appendChild(b);
+  } else if (field.apply === "live") {
+    const b = document.createElement("span");
+    b.className = "w-sf-badge w-sf-badge-live";
+    b.textContent = "live";
+    badges.appendChild(b);
+  } else if (field.apply === "next-task") {
+    const b = document.createElement("span");
+    b.className = "w-sf-badge w-sf-badge-next-task";
+    b.textContent = "next-task";
     badges.appendChild(b);
   }
   if (field.secret) {
@@ -266,7 +300,7 @@ function buildWorkerFieldRow(field, surface) {
 
   if (fullKey in wSettings.errors) {
     const err = document.createElement("div");
-    err.className = "w-sf-error";
+    err.className = "w-sf-error-msg";
     err.textContent = wSettings.errors[fullKey];
     row.appendChild(err);
   }
@@ -486,6 +520,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (b.dataset.view === "settings") loadWorkerSettings();
     });
   });
+  document.getElementById("w-settings-close").addEventListener("click", () => setView(prevView));
   document.getElementById("w-settings-discard").addEventListener("click", () => {
     wSettings.dirty = {};
     wSettings.errors = {};

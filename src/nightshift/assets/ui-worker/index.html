@@ -67,7 +67,10 @@
 
       <section id="view-settings" class="worker-view" hidden>
         <div class="w-settings-layout">
-          <aside class="w-settings-sidebar">
+          <aside class="w-settings-sidebar" role="tree" aria-label="Settings categories">
+            <div class="w-settings-back-wrap">
+              <button id="w-settings-close" type="button" class="w-settings-back">&#8592; Back</button>
+            </div>
             <div class="w-settings-search-wrap">
               <input id="w-settings-search" type="search" class="w-settings-search"
                      placeholder="Search settings…" aria-label="Search settings" />
@@ -81,8 +84,8 @@
         <div id="w-settings-savebar" class="w-settings-savebar" hidden>
           <span id="w-settings-dirty-count" class="w-settings-dirty-count"></span>
           <div class="w-settings-savebar-actions">
-            <button id="w-settings-discard" class="w-btn">Discard</button>
-            <button id="w-settings-save" class="w-btn w-btn-primary">Save</button>
+            <button id="w-settings-discard" class="btn">Discard</button>
+            <button id="w-settings-save" class="btn primary">Save</button>
           </div>
         </div>
         <div id="w-settings-restart-banner" class="w-settings-restart-banner" hidden></div>
