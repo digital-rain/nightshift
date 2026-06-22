@@ -8,7 +8,8 @@ const state = {
   sortMode: "manual",    // active queue's sort mode: "manual" (drag order) or "priority"
   playPriorities: [],    // play-priority filter (0-5 levels allowed to play); [] = all
   runs: [],
-  playlists: [],         // [{name, task_count}]
+  playlists: [],         // [{name, task_count, disabled}]
+  showHidden: false,     // Playlists view: reveal disabled (hidden) playlists when true
   libraryCount: 0,       // main `.tasks` queue's task count (the "library" row)
   activePlaylist: null,  // focused queue: null = main `.tasks`, else playlist name
   player: { state: "idle", mode: "auto", now_playing: null, cursor: null, run_id: null, active_playlist: null, running_playlist: null },
@@ -44,6 +45,11 @@ const PAUSE_SVG = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="tru
 // point down when open (the rotation lives in CSS, 150ms). Mirrors longitude's
 // CollapsibleSection from the style guide, built on Nightshift's vanilla stack.
 const CHEVRON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>';
+
+// Playlist hide/unhide affordance: an eye (visible/unhide) and a crossed-out
+// eye (hidden/hide). Same 24×24 stroked style as the other inline icons.
+const EYE_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></svg>';
+const EYE_OFF_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
 
 // Build an expando panel: a section whose head is the whole toggle (chevron +
 // UPPERCASE caption, with an optional right-aligned collapsed-state preview).
@@ -2202,12 +2208,22 @@ function renderPlaylists() {
   const ul = $("playlists");
   if (!ul) return;
   ul.innerHTML = "";
-  const items = state.playlists;
+  // Disabled playlists are hidden from the default view; the "Hidden" toggle
+  // reveals them (rendered muted, with their hide button flipped to "unhide").
+  const items = state.showHidden
+    ? state.playlists
+    : state.playlists.filter((pl) => !pl.disabled);
   // The library always counts as one selectable queue alongside the playlists.
   const total = items.length + 1;
   $("playlists-count").textContent = `(${total})`;
   // The library row is always present, so the list is never empty.
   $("playlists-empty").hidden = true;
+  // Reflect the toggle's pressed state (the click handler flips state.showHidden).
+  const hiddenBtn = $("btn-show-hidden");
+  if (hiddenBtn) {
+    hiddenBtn.setAttribute("aria-pressed", state.showHidden ? "true" : "false");
+    hiddenBtn.classList.toggle("on", state.showHidden);
+  }
 
   ul.append(libraryRow());
   for (const pl of items) ul.append(playlistRow(pl));
@@ -2259,6 +2275,7 @@ function playlistRow(pl) {
   li.className = "pl-item";
   const active = state.activePlaylist === pl.name;
   if (active) li.classList.add("active");
+  if (pl.disabled) li.classList.add("pl-hidden");
   li.addEventListener("click", () => activatePlaylist(pl.name, "queue"));
 
   li.append(playlistSpinner(isQueueRunning(pl.name)));
@@ -2274,6 +2291,18 @@ function playlistRow(pl) {
   meta.textContent = active ? `${count} \u00b7 active queue` : count;
   main.append(name, meta);
   li.append(main);
+
+  // Hide / unhide: disabling a playlist hides it from the default view and
+  // parks it (the scheduler skips it). Sits just left of the info button.
+  const hide = document.createElement("button");
+  hide.className = "pl-hide";
+  hide.title = pl.disabled ? "Unhide this playlist" : "Hide and disable this playlist";
+  hide.innerHTML = pl.disabled ? EYE_ICON : EYE_OFF_ICON;
+  hide.addEventListener("click", (e) => {
+    e.stopPropagation();
+    togglePlaylistHidden(pl.name, !pl.disabled);
+  });
+  li.append(hide);
 
   // Info: opens the full-area playlist-info pane (name + repository).
   const info = document.createElement("button");
@@ -2391,6 +2420,19 @@ async function savePlaylist() {
   await loadPlaylists();
   // Activating a freshly-created playlist drops you straight into its queue.
   if (data && data.name) activatePlaylist(data.name, "queue");
+}
+
+// Toggle a playlist's hidden/disabled flag via the playlist PUT endpoint, then
+// reload the list so the row re-renders (muted + "unhide" when revealed, gone
+// when re-hidden with the toggle off). Disabling also parks it server-side.
+async function togglePlaylistHidden(name, disabled) {
+  const { ok, data } = await sendJSON(
+    `/api/playlists/${encodeURIComponent(name)}`, "PUT", { disabled });
+  if (!ok) {
+    alert((data && data.error) || "could not update playlist");
+    return;
+  }
+  await loadPlaylists();
 }
 
 async function deletePlaylist(name) {
@@ -4260,6 +4302,12 @@ function wire() {
   // Playlists page: scan the workspace for git repos -> one playlist per repo.
   const rescanPlBtn = $("btn-rescan-playlists");
   if (rescanPlBtn) rescanPlBtn.addEventListener("click", () => rescanPlaylists(rescanPlBtn));
+  // Playlists page: toggle visibility of hidden (disabled) playlists.
+  const showHiddenBtn = $("btn-show-hidden");
+  if (showHiddenBtn) showHiddenBtn.addEventListener("click", () => {
+    state.showHidden = !state.showHidden;
+    renderPlaylists();
+  });
   // Playlist-info pane: the top-left chevron cancels (discards edits).
   const plInfoBack = $("playlist-info-back");
   if (plInfoBack) plInfoBack.addEventListener("click", closePlaylistInfo);

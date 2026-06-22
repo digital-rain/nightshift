@@ -241,7 +241,12 @@ def test_server_playlist_info_rename_rescan(tmp_path: Path) -> None:
             "/api/playlists/alpha", json={"name": "beta", "repository": "longitude"}
         )
         assert r.status_code == 200
-        assert r.json() == {"name": "beta", "task_count": 0, "repository": "longitude"}
+        assert r.json() == {
+            "name": "beta",
+            "task_count": 0,
+            "repository": "longitude",
+            "disabled": False,
+        }
         assert client.get("/api/playlists/alpha").status_code == 404
 
         # Rescan materialises a playlist per workspace repo.

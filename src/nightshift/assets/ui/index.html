@@ -140,8 +140,13 @@
         <div class="pane-head">
           <h2>Playlists <span id="playlists-count" class="count"></span></h2>
           <div class="pane-head-actions">
-            <button id="btn-rescan-playlists" class="ghost-btn"
-                    title="Scan the workspace for git repos and create a playlist for each">Rescan</button>
+            <div class="seg-group" role="group" aria-label="Playlist view actions">
+              <button id="btn-show-hidden" type="button" class="seg-opt"
+                      aria-pressed="false"
+                      title="Show hidden (disabled) playlists">Hidden</button>
+              <button id="btn-rescan-playlists" type="button" class="seg-opt"
+                      title="Scan the workspace for git repos and create a playlist for each">Rescan</button>
+            </div>
             <button id="btn-add-playlist" class="ghost-btn" title="Create a playlist">+ New</button>
           </div>
         </div>

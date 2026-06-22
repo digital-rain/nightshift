@@ -176,6 +176,10 @@ class PlaylistUpdate(BaseModel):
 
     name: str | None = None
     repository: str | None = None
+    # Hide the playlist from the default Playlists view and exclude it from the
+    # scheduler's candidate set; ``False`` re-enables it. ``None`` leaves it
+    # untouched.
+    disabled: bool | None = None
 
 
 class TaskCreate(BaseModel):
@@ -301,7 +305,16 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         return queue is None or playlists_mod.exists(tasks_root, queue)
 
     def _all_queues() -> list[str | None]:
-        return [None, *[p["name"] for p in playlists_mod.list_playlists(tasks_root)]]
+        # Disabled playlists are hidden + parked: excluded here so the scheduler
+        # never builds candidates from them. The main queue is always included.
+        return [
+            None,
+            *[
+                p["name"]
+                for p in playlists_mod.list_playlists(tasks_root)
+                if not p.get("disabled")
+            ],
+        ]
 
     def _queue_repo(queue: str | None) -> str | None:
         """The queue's configured default target repo (or ``None`` when unset)."""
@@ -948,6 +961,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             "name": name,
             "task_count": count,
             "repository": _queue_repo(name),
+            "disabled": playlists_mod.is_disabled(tasks_root, name),
         }
 
     @app.get("/api/playlists/{name}")
@@ -1001,6 +1015,15 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             )
             commit_tasks(tasks_root, f"nightshift: set repo {queue_label(current)}")
             await _emit("queue_changed", queue=current, payload={"repo": repo_value})
+        # Disabling hides the queue and drops it from the scheduler's candidate
+        # set; a no-op for an in-flight lease, which keeps draining until done.
+        if req.disabled is not None:
+            playlists_mod.set_playlist_disabled(tasks_root, current, req.disabled)
+            verb = "disable" if req.disabled else "enable"
+            commit_tasks(tasks_root, f"nightshift: {verb} playlist {current}")
+            await _emit(
+                "queue_changed", queue=current, payload={"disabled": req.disabled}
+            )
         return JSONResponse(_playlist_info(current))
 
     @app.delete("/api/playlists/{name}")

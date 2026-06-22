@@ -193,6 +193,9 @@ class PlaylistUpdate(BaseModel):
 
     name: str | None = None
     repository: str | None = None
+    # Hide the playlist from the default Playlists view and exclude it from
+    # scheduling; ``False`` re-enables it. ``None`` leaves the flag untouched.
+    disabled: bool | None = None
 
 
 class QueueImport(BaseModel):
@@ -802,7 +805,13 @@ def create_app(workspace: Path) -> FastAPI:
         binding aliased to ``repository`` for the info page."""
         count = len(list_queue(tasks_root, playlists_mod.tasks_rel(name)))
         repo = load_queue_config(tasks_root, playlists_mod.tasks_rel(name)).get("repo")
-        return {"name": name, "task_count": count, "repository": repo}
+        disabled = playlists_mod.is_disabled(tasks_root, name)
+        return {
+            "name": name,
+            "task_count": count,
+            "repository": repo,
+            "disabled": disabled,
+        }
 
     @app.get("/api/playlists/{name}")
     def get_playlist(name: str) -> JSONResponse:
@@ -840,6 +849,8 @@ def create_app(workspace: Path) -> FastAPI:
             save_queue_config_value(
                 tasks_root, "repo", repo, playlists_mod.tasks_rel(current)
             )
+        if req.disabled is not None:
+            playlists_mod.set_playlist_disabled(tasks_root, current, req.disabled)
         return JSONResponse(_playlist_info(current))
 
     @app.delete("/api/playlists/{name}")

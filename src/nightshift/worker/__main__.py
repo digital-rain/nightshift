@@ -61,11 +61,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     app = create_worker_app(cfg, local)
+    ui_host = args.ui_host or cfg.ui_host
+    ui_port = args.ui_port or cfg.ui_port
+    print(f"[nightshift-worker] UI running on http://{ui_host}:{ui_port}")
     try:
         uvicorn.run(
             app,
-            host=args.ui_host or cfg.ui_host,
-            port=args.ui_port or cfg.ui_port,
+            host=ui_host,
+            port=ui_port,
             log_level="warning",
         )
     finally:

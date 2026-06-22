@@ -88,11 +88,40 @@ def list_playlists(tasks_root: Path) -> list[dict]:
             continue
         if child.name.startswith("."):
             continue
-        if not (child / PLAYLIST_CONFIG).exists():
+        config_path = child / PLAYLIST_CONFIG
+        if not config_path.exists():
             continue
         task_count = len(list(child.glob("*.md")))
-        out.append({"name": child.name, "task_count": task_count})
+        out.append({
+            "name": child.name,
+            "task_count": task_count,
+            "disabled": _is_disabled(config_path),
+        })
     return out
+
+
+def _read_config(config_path: Path) -> dict:
+    """Best-effort load of a queue's ``config.json`` as a dict (``{}`` on any
+    read/parse error or non-object content)."""
+    if not config_path.exists():
+        return {}
+    try:
+        loaded = json.loads(config_path.read_text())
+    except (ValueError, OSError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _is_disabled(config_path: Path) -> bool:
+    return bool(_read_config(config_path).get("disabled"))
+
+
+def is_disabled(tasks_root: Path, name: str | None) -> bool:
+    """Whether a queue is disabled (hidden + excluded from scheduling). The main
+    queue is never disablable, so it always reports ``False``."""
+    if name is None:
+        return False
+    return _is_disabled(tasks_root / tasks_rel(name) / PLAYLIST_CONFIG)
 
 
 def exists(tasks_root: Path, name: str) -> bool:
@@ -192,6 +221,27 @@ def set_playlist_repo(tasks_root: Path, name: str, repo: str | None) -> str | No
         data["repo"] = repo
     config_path.write_text(json.dumps(data, indent=2) + "\n")
     return repo
+
+
+def set_playlist_disabled(tasks_root: Path, name: str, disabled: bool) -> bool:
+    """Set (``True``) or clear (``False``) a queue's ``disabled`` flag in its
+    ``config.json``, preserving sibling keys. A disabled queue is hidden from the
+    default Playlists view and excluded from the scheduler's candidate set. The
+    key is omitted entirely when ``False`` so configs stay clean. Returns the
+    value written.
+
+    Mirrors :func:`set_playlist_repo`: a low-level config edit with no engine
+    dependency. The default ``main`` queue is never disablable.
+    """
+    config_path = tasks_root / tasks_rel(name) / PLAYLIST_CONFIG
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    data = _read_config(config_path)
+    if disabled:
+        data["disabled"] = True
+    else:
+        data.pop("disabled", None)
+    config_path.write_text(json.dumps(data, indent=2) + "\n")
+    return disabled
 
 
 def rescan_into_playlists(

@@ -1503,7 +1503,9 @@ def test_playlists_crud_round_trip(tmp_path: Path) -> None:
         playlists.create_playlist(tasks_root, "   ")
 
     assert playlists.exists(tasks_root, "morning-open")
-    assert playlists.list_playlists(tasks_root) == [{"name": "morning-open", "task_count": 0}]
+    assert playlists.list_playlists(tasks_root) == [
+        {"name": "morning-open", "task_count": 0, "disabled": False}
+    ]
 
     assert playlists.delete_playlist(tasks_root, "morning-open") is True
     assert playlists.delete_playlist(tasks_root, "morning-open") is False

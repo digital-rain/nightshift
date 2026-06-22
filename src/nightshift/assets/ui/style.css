@@ -206,6 +206,28 @@ body {
   cursor: pointer;
 }
 .ghost-btn:hover { color: var(--accent); border-color: var(--accent); }
+/* Segmented control of text actions (e.g. Playlists' [Hidden|Rescan]); shares
+   the ghost-btn palette but joins the buttons into one bordered pill, like the
+   transport mode group. The "Hidden" member is a toggle (.on / aria-pressed). */
+.seg-group {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.seg-opt {
+  background: none;
+  border: none;
+  border-left: 1px solid var(--border);
+  color: var(--text-dim);
+  padding: 2px 12px;
+  font-size: 12px;
+  line-height: 24px;
+  cursor: pointer;
+}
+.seg-opt:first-child { border-left: none; }
+.seg-opt:hover { color: var(--accent); }
+.seg-opt.on { background: var(--accent-soft); color: var(--accent); }
 .count { color: var(--text-dim); font-weight: 400; }
 .empty { color: var(--text-dim); font-style: italic; }
 
@@ -1023,6 +1045,27 @@ body[data-view="detail"] #screen-detail { display: flex; flex: 1; }
 }
 .pl-item:hover .pl-info { opacity: 1; }
 .pl-info:hover { color: var(--accent); background: var(--bg-sunken); }
+
+/* Hide/unhide affordance on a playlist row: same reveal-on-hover treatment as
+   the info button, sitting just to its left. */
+.pl-hide {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  line-height: 0;
+  padding: 2px 6px;
+  border-radius: 6px;
+  opacity: 0;
+}
+.pl-hide svg { width: 16px; height: 16px; display: block; }
+.pl-item:hover .pl-hide { opacity: 1; }
+.pl-hide:hover { color: var(--accent); background: var(--bg-sunken); }
+/* A hidden (disabled) playlist, surfaced by the "Hidden" toggle: muted, with a
+   dashed border, and its unhide button always visible so it's easy to restore. */
+.pl-item.pl-hidden { opacity: 0.55; border-style: dashed; }
+.pl-item.pl-hidden:hover { opacity: 0.8; }
+.pl-item.pl-hidden .pl-hide { opacity: 1; color: var(--accent); }
 
 /* ---- wide screens: Now grows a right-hand detail column when a task is
    selected (body.has-detail). Narrow widths use the detail modal instead. ---- */
