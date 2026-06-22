@@ -197,6 +197,13 @@ async function sendJSON(url, method, body) {
   return { ok: r.ok, status: r.status, data };
 }
 
+// Build a `?queue=<name>` query string from the client-side active playlist so
+// queue-scoped requests carry the intended target explicitly rather than relying
+// on the server's in-memory active-playlist state (which resets on restart).
+function queueParam(q = state.activePlaylist) {
+  return q ? `?queue=${encodeURIComponent(q)}` : "";
+}
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -561,7 +568,8 @@ async function activatePlaylist(name, targetView = "now") {
 // Data loading
 // --------------------------------------------------------------------------
 async function loadQueue() {
-  state.queue = await getJSON("/api/queue");
+  const q = await getJSON("/api/queue");
+  state.queue = Array.isArray(q) ? q : [];
   // The sort mode is per-queue (persisted in config.json) and drives both this
   // display and the engine's play order, so load it alongside the queue.
   try {
@@ -606,7 +614,7 @@ async function loadBlocked() {
 // persist it, and reload so the display and the engine's play order agree.
 async function toggleSortMode() {
   const next = state.sortMode === "priority" ? "manual" : "priority";
-  const { ok, data } = await sendJSON("/api/queue/sort", "PUT", { sort: next });
+  const { ok, data } = await sendJSON(`/api/queue/sort${queueParam()}`, "PUT", { sort: next });
   if (!ok) {
     alert((data && data.error) || "could not change sort mode");
     return;
@@ -620,7 +628,7 @@ async function toggleSortMode() {
 // levels; [] clears the filter (play all priorities).
 async function setPlayPriorities(next) {
   const { ok, data } = await sendJSON(
-    "/api/queue/play-priorities", "PUT", { priorities: next });
+    `/api/queue/play-priorities${queueParam()}`, "PUT", { priorities: next });
   if (!ok) {
     alert((data && data.error) || "could not change play filter");
     return;
@@ -670,8 +678,10 @@ async function loadPlaylists() {
   if (state.activePlaylist === null) {
     state.libraryCount = state.queue.length;
   } else {
-    try { state.libraryCount = (await getJSON("/api/main/tasks")).length; }
-    catch { /* keep the last known count on a transient error */ }
+    try {
+      const m = await getJSON("/api/main/tasks");
+      state.libraryCount = Array.isArray(m) ? m.length : 0;
+    } catch { /* keep the last known count on a transient error */ }
   }
   renderPlaylists();
 }
@@ -1590,7 +1600,7 @@ async function rowSetDisabled(targets, disabled) {
   for (const task of targets) {
     if (task === state.player.now_playing) { skipped = true; continue; }
     const { ok, data } = await sendJSON(
-      `/api/tasks/${encodeURIComponent(task)}`, "PATCH", { disabled });
+      `/api/tasks/${encodeURIComponent(task)}${queueParam()}`, "PATCH", { disabled });
     if (!ok) { alert((data && data.error) || "could not update task"); break; }
   }
   if (skipped) alert("The running task can't be changed — stop it first.");
@@ -1605,7 +1615,7 @@ async function rowSetPriority(targets, level) {
   for (const task of targets) {
     if (task === state.player.now_playing) { skipped = true; continue; }
     const { ok, data } = await sendJSON(
-      `/api/tasks/${encodeURIComponent(task)}`, "PATCH", { priority: level });
+      `/api/tasks/${encodeURIComponent(task)}${queueParam()}`, "PATCH", { priority: level });
     if (!ok) { alert((data && data.error) || "could not update task"); break; }
   }
   if (skipped) alert("The running task can't be changed — stop it first.");
@@ -1627,7 +1637,7 @@ async function rowRemove(targets) {
       continue;
     }
     const { ok, data } = await sendJSON(
-      `/api/tasks/${encodeURIComponent(task)}`, "DELETE");
+      `/api/tasks/${encodeURIComponent(task)}${queueParam()}`, "DELETE");
     if (!ok) { alert((data && data.error) || "could not remove task"); break; }
     state.selectedTasks.delete(task);
   }
@@ -1756,7 +1766,7 @@ function moveQueueItem(fromTask, toTask) {
 
 async function persistQueueOrder() {
   const order = state.queue.map((i) => i.task);
-  const { ok, data } = await sendJSON("/api/queue/order", "PUT", { order });
+  const { ok, data } = await sendJSON(`/api/queue/order${queueParam()}`, "PUT", { order });
   if (!ok) {
     alert((data && data.error) || "could not save queue order");
     loadQueue();
@@ -2281,7 +2291,7 @@ function libraryRow() {
   name.append(tag);
   const meta = document.createElement("div");
   meta.className = "pl-meta";
-  const n = state.libraryCount;
+  const n = state.libraryCount || 0;
   const count = `${n} ${n === 1 ? "task" : "tasks"}`;
   meta.textContent = active ? `${count} \u00b7 active queue` : count;
   main.append(name, meta);
@@ -2816,7 +2826,7 @@ async function openTaskDetail(task) {
   }
   let brief;
   try {
-    brief = await getJSON(`/api/tasks/${encodeURIComponent(target)}`);
+    brief = await getJSON(`/api/tasks/${encodeURIComponent(target)}${queueParam()}`);
   } catch {
     brief = null;
   }
@@ -3062,7 +3072,7 @@ async function saveDetail(brief, draft, errEl) {
     return;
   }
   const { ok, data } = await sendJSON(
-    `/api/tasks/${encodeURIComponent(brief.task)}`, "PATCH", payload);
+    `/api/tasks/${encodeURIComponent(brief.task)}${queueParam()}`, "PATCH", payload);
   if (!ok) {
     if (errEl) { errEl.textContent = (data && data.error) || "could not save task"; errEl.hidden = false; }
     return;
@@ -3093,7 +3103,7 @@ async function createDetail(draft, errEl) {
   // Per-task repo override: included only when set (empty ⇒ inherit the queue
   // default). Omitted entirely otherwise, matching the create contract.
   if (draft.repo && draft.repo.trim()) payload.repo = draft.repo.trim();
-  const { ok, data } = await sendJSON("/api/tasks", "POST", payload);
+  const { ok, data } = await sendJSON(`/api/tasks${queueParam()}`, "POST", payload);
   if (!ok) {
     if (errEl) { errEl.textContent = (data && data.error) || "could not create task"; errEl.hidden = false; }
     return;
@@ -3166,7 +3176,7 @@ function renderDetailScreen() {
   const task = state.detailScreenTask;
   const body = $("detail-screen-body");
   if (!task || !body) return;
-  getJSON(`/api/tasks/${encodeURIComponent(task)}`)
+  getJSON(`/api/tasks/${encodeURIComponent(task)}${queueParam()}`)
     .then((brief) => {
       if (state.detailScreenTask !== task) return;
       $("detail-screen-title").textContent = (brief && brief.title) || task;
@@ -3781,22 +3791,25 @@ function renderSettingsFields() {
     pane.append(buildFieldRow(field, tier.surface));
   }
 
-  const rawDetails = document.createElement("details");
-  rawDetails.className = "sf-raw-json";
-  const summary = document.createElement("summary");
-  summary.textContent = "Raw JSON";
-  const textarea = document.createElement("textarea");
-  textarea.rows = 8;
-  textarea.spellcheck = false;
-  const rawData = {};
-  for (const f of cat.fields) {
-    if (!f.secret) rawData[f.key] = f.stored;
+  const allReadonly = cat.fields.every(f => f.type === "readonly");
+  if (!allReadonly) {
+    const rawDetails = document.createElement("details");
+    rawDetails.className = "sf-raw-json";
+    const summary = document.createElement("summary");
+    summary.textContent = "Raw JSON";
+    const textarea = document.createElement("textarea");
+    textarea.rows = 8;
+    textarea.spellcheck = false;
+    const rawData = {};
+    for (const f of cat.fields) {
+      if (!f.secret && f.type !== "readonly") rawData[f.key] = f.stored;
+    }
+    textarea.value = JSON.stringify(rawData, null, 2);
+    textarea.dataset.surface = tier.surface;
+    textarea.dataset.category = cat.name;
+    rawDetails.append(summary, textarea);
+    pane.append(rawDetails);
   }
-  textarea.value = JSON.stringify(rawData, null, 2);
-  textarea.dataset.surface = tier.surface;
-  textarea.dataset.category = cat.name;
-  rawDetails.append(summary, textarea);
-  pane.append(rawDetails);
 }
 
 function renderSearchResults(pane, query) {
@@ -3916,6 +3929,7 @@ function buildControl(field, surface, fullKey) {
     case "int_list":
     case "regex_list": return buildChipEditor(field, surface, fullKey, currentValue);
     case "str_map": return buildMapEditor(field, surface, fullKey, currentValue);
+    case "readonly": return buildReadonly(currentValue);
     default: return buildText(field, surface, fullKey, currentValue);
   }
 }
@@ -4047,6 +4061,13 @@ function buildSecret(field, surface, fullKey) {
   });
   wrap.append(status, input);
   return wrap;
+}
+
+function buildReadonly(value) {
+  const el = document.createElement("code");
+  el.className = "sf-readonly-value";
+  el.textContent = value != null ? String(value) : "—";
+  return el;
 }
 
 function buildChipEditor(field, surface, fullKey, value) {

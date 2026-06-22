@@ -1595,6 +1595,19 @@ body[data-view="detail"] #screen-detail { display: flex; flex: 1; }
 .sf-row.sf-search-hidden { display: none; }
 .sf-highlight { background: rgba(110, 168, 254, 0.2); border-radius: 2px; }
 
+/* Read-only display value (e.g. workspace location) */
+.sf-readonly-value {
+  display: inline-block;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 10px;
+  word-break: break-all;
+}
+
 /* Raw JSON escape hatch */
 .sf-raw-json { margin-top: 16px; color: var(--text-dim); }
 .sf-raw-json summary { cursor: pointer; font-size: 12px; }

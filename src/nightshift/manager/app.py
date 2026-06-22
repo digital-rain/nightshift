@@ -17,6 +17,7 @@ browsers converge as state changes, not on navigation.
 from __future__ import annotations
 
 import contextlib
+import os
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -233,6 +234,40 @@ def _normalize_repo(value: object) -> str | None:
 # --------------------------------------------------------------------------- #
 # App factory
 # --------------------------------------------------------------------------- #
+
+
+def _workspace_tier(workspace: Path) -> dict:
+    """Build a read-only 'Workspace' tier for the /api/settings response."""
+    env_var = "NIGHTSHIFT_WORKSPACE"
+    env_val = os.environ.get(env_var)
+    return {
+        "surface": "workspace",
+        "categories": [
+            {
+                "name": "Workspace",
+                "fields": [
+                    {
+                        "key": "location",
+                        "label": "Location",
+                        "desc": (
+                            "The workspace directory Nightshift reads and writes repos "
+                            "and config from. Set via --workspace flag or "
+                            f"{env_var} env var; resolved at launch."
+                        ),
+                        "type": "readonly",
+                        "apply": "restart",
+                        "store": "—",
+                        "default": None,
+                        "secret": False,
+                        "stored": str(workspace),
+                        "effective": str(workspace),
+                        "env": env_var,
+                        "env_shadowed": bool(env_val),
+                    }
+                ],
+            }
+        ],
+    }
 
 
 def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> FastAPI:
@@ -1277,7 +1312,9 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
 
     @app.get("/api/settings")
     def get_settings() -> JSONResponse:
-        return JSONResponse(build_get_response(workspace, _MANAGER_SURFACES))
+        response = build_get_response(workspace, _MANAGER_SURFACES)
+        response["tiers"].insert(0, _workspace_tier(workspace))
+        return JSONResponse(response)
 
     @app.put("/api/settings")
     async def put_settings(body: dict[str, Any]) -> JSONResponse:
