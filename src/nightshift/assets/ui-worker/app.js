@@ -112,7 +112,7 @@ async function tick() {
 // --------------------------------------------------------------------------
 // Worker Settings (compact renderer over worker surface)
 // --------------------------------------------------------------------------
-const wSettings = { tiers: [], activeSurface: null, activeCategory: null, searchQuery: "", dirty: {}, errors: {} };
+const wSettings = { tiers: [], activeSurface: null, activeCategory: null, searchQuery: "", dirty: {}, errors: {}, restartPending: false };
 
 async function loadWorkerSettings() {
   try {
@@ -253,12 +253,7 @@ function buildWorkerFieldRow(field, surface) {
   key.textContent = field.key;
   const badges = document.createElement("span");
   badges.className = "w-sf-badges";
-  if (field.apply === "restart") {
-    const b = document.createElement("span");
-    b.className = "w-sf-badge w-sf-badge-restart";
-    b.textContent = "restart";
-    badges.appendChild(b);
-  } else if (field.apply === "live") {
+  if (field.apply === "live") {
     const b = document.createElement("span");
     b.className = "w-sf-badge w-sf-badge-live";
     b.textContent = "live";
@@ -538,13 +533,36 @@ function wMarkDirty(field, fullKey, value) {
   updateWorkerSaveBar();
 }
 
+function hasDirtyRestartField() {
+  for (const fullKey of Object.keys(wSettings.dirty)) {
+    const [surface, ...rest] = fullKey.split(".");
+    const key = rest.join(".");
+    const tier = wSettings.tiers.find(t => t.surface === surface);
+    if (!tier) continue;
+    for (const cat of tier.categories) {
+      const field = cat.fields.find(f => f.key === key);
+      if (field && field.apply === "restart") return true;
+    }
+  }
+  return false;
+}
+
+function updateNavRestart() {
+  const btn = document.getElementById("nav-restart");
+  if (!btn) return;
+  const show = wSettings.restartPending || hasDirtyRestartField();
+  btn.hidden = !show;
+  btn.classList.toggle("pending", wSettings.restartPending);
+}
+
 function updateWorkerSaveBar() {
   const bar = document.getElementById("w-settings-savebar");
   const count = Object.keys(wSettings.dirty).length;
-  if (count === 0) { bar.hidden = true; return; }
+  if (count === 0) { bar.hidden = true; updateNavRestart(); return; }
   bar.hidden = false;
   document.getElementById("w-settings-dirty-count").textContent =
     `${count} unsaved change${count === 1 ? "" : "s"}`;
+  updateNavRestart();
 }
 
 async function saveWorkerSettings() {
@@ -571,14 +589,11 @@ async function saveWorkerSettings() {
   wSettings.dirty = {};
   wSettings.errors = {};
   wSettings.tiers = data.tiers || wSettings.tiers;
+  if (data.restart_required && data.restart_required.length) {
+    wSettings.restartPending = true;
+  }
   updateWorkerSaveBar();
   renderWorkerSettings();
-  if (data.restart_required && data.restart_required.length) {
-    const banner = document.getElementById("w-settings-restart-banner");
-    banner.textContent = "Restart this worker to apply: " +
-      data.restart_required.map(k => k.split(".").slice(1).join(".")).join(", ");
-    banner.hidden = false;
-  }
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
