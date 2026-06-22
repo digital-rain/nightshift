@@ -312,6 +312,16 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             return None
         return label
 
+    def _resolve_queue(queue: str | None) -> str | None:
+        """Operator API queue resolution: absent param (None) falls back to the
+        focused queue so ``GET /api/queue`` returns the active playlist's tasks.
+        An empty string targets main explicitly."""
+        if queue is None:
+            return _active_playlist
+        if queue == "":
+            return None
+        return _queue_from_label(queue)
+
     def _queue_exists(queue: str | None) -> bool:
         return queue is None or playlists_mod.exists(tasks_root, queue)
 
@@ -760,14 +770,20 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
 
     @app.get("/api/queue")
     def get_queue(queue: str | None = None) -> JSONResponse:
-        target = _queue_from_label(queue)
+        target = _resolve_queue(queue)
         if not _queue_exists(target):
             return JSONResponse({"error": "queue not found"}, status_code=404)
         return JSONResponse(list_queue(tasks_root, playlists_mod.tasks_rel(target)))
 
+    @app.get("/api/main/tasks")
+    def get_main_tasks() -> JSONResponse:
+        """The main queue's tasks, surfaced in the Playlists screen as the
+        library row count and in the Add-from picker."""
+        return JSONResponse(list_queue(tasks_root, playlists_mod.tasks_rel(None)))
+
     @app.get("/api/tasks/{task}")
     def get_task(task: str, queue: str | None = None) -> JSONResponse:
-        target = _queue_from_label(queue)
+        target = _resolve_queue(queue)
         try:
             return JSONResponse(read_task(tasks_root, task, playlists_mod.tasks_rel(target)))
         except FileNotFoundError:
@@ -775,7 +791,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
 
     @app.post("/api/tasks")
     async def post_task(body: TaskCreate, queue: str | None = None) -> JSONResponse:
-        target = _queue_from_label(queue)
+        target = _resolve_queue(queue)
         target_rel = playlists_mod.tasks_rel(target)
         # Validate the optional repo override *before* writing the brief so a
         # malformed ref is a clean 400 that never orphans a file in the content
@@ -804,7 +820,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
     async def patch_task(
         task: str, body: TaskUpdate, queue: str | None = None
     ) -> JSONResponse:
-        target = _queue_from_label(queue)
+        target = _resolve_queue(queue)
         target_rel = playlists_mod.tasks_rel(target)
         # ``repo`` is the per-task target-repo override (an editable meta key).
         changes = body.model_dump(exclude_unset=True)
@@ -829,7 +845,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
 
     @app.delete("/api/tasks/{task}")
     async def remove_task(task: str, queue: str | None = None) -> JSONResponse:
-        target = _queue_from_label(queue)
+        target = _resolve_queue(queue)
         result = delete_task(tasks_root, task, playlists_mod.tasks_rel(target))
         commit_tasks(tasks_root, f"nightshift: delete task {task}")
         await _emit("queue_changed", queue=target, task=task)
@@ -837,7 +853,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
 
     @app.put("/api/queue/order")
     async def put_queue_order(req: QueueOrder, queue: str | None = None) -> JSONResponse:
-        target = _queue_from_label(queue)
+        target = _resolve_queue(queue)
         if not _queue_exists(target):
             return JSONResponse({"error": "queue not found"}, status_code=404)
         target_rel = playlists_mod.tasks_rel(target)
@@ -848,12 +864,12 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
 
     @app.get("/api/queue/sort")
     def get_queue_sort(queue: str | None = None) -> JSONResponse:
-        target = _queue_from_label(queue)
+        target = _resolve_queue(queue)
         return JSONResponse({"sort": load_sort_mode(tasks_root, playlists_mod.tasks_rel(target))})
 
     @app.put("/api/queue/sort")
     async def put_queue_sort(req: QueueSort, queue: str | None = None) -> JSONResponse:
-        target = _queue_from_label(queue)
+        target = _resolve_queue(queue)
         target_rel = playlists_mod.tasks_rel(target)
         sort = save_sort_mode(tasks_root, req.sort, target_rel)
         commit_tasks(tasks_root, f"nightshift: set sort {queue_label(target)}")
@@ -862,7 +878,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
 
     @app.get("/api/queue/play-priorities")
     def get_play_priorities(queue: str | None = None) -> JSONResponse:
-        target = _queue_from_label(queue)
+        target = _resolve_queue(queue)
         return JSONResponse(
             {"priorities": load_play_priorities(tasks_root, playlists_mod.tasks_rel(target))}
         )
@@ -871,7 +887,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
     async def put_play_priorities(
         req: QueuePlayPriorities, queue: str | None = None
     ) -> JSONResponse:
-        target = _queue_from_label(queue)
+        target = _resolve_queue(queue)
         target_rel = playlists_mod.tasks_rel(target)
         priorities = save_play_priorities(tasks_root, req.priorities, target_rel)
         commit_tasks(tasks_root, f"nightshift: set play-priorities {queue_label(target)}")
@@ -880,7 +896,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
 
     @app.get("/api/queue/config")
     def get_queue_config(queue: str | None = None) -> JSONResponse:
-        target = _queue_from_label(queue)
+        target = _resolve_queue(queue)
         if not _queue_exists(target):
             return JSONResponse({"error": "queue not found"}, status_code=404)
         return JSONResponse({"repo": _queue_repo(target)})
@@ -911,20 +927,20 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
 
     @app.put("/api/queue/config")
     async def put_queue_config(req: QueueConfig, queue: str | None = None) -> JSONResponse:
-        return await _set_queue_repo(_queue_from_label(queue), req)
+        return await _set_queue_repo(_resolve_queue(queue), req)
 
     @app.get("/api/queue/repo")
     def get_queue_repo(queue: str | None = None) -> JSONResponse:
         """The target queue's default repo (mirrors the server's dedicated
         ``/api/queue/repo`` so the shared UI has one binding endpoint)."""
-        target = _queue_from_label(queue)
+        target = _resolve_queue(queue)
         if not _queue_exists(target):
             return JSONResponse({"error": "queue not found"}, status_code=404)
         return JSONResponse({"repo": _queue_repo(target)})
 
     @app.put("/api/queue/repo")
     async def put_queue_repo(req: QueueConfig, queue: str | None = None) -> JSONResponse:
-        return await _set_queue_repo(_queue_from_label(queue), req)
+        return await _set_queue_repo(_resolve_queue(queue), req)
 
     @app.get("/api/queue/dedication")
     async def get_queue_dedication(queue: str | None = None) -> JSONResponse:
