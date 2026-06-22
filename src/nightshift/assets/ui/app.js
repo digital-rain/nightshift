@@ -546,9 +546,16 @@ function applyFocusedState() {
   updatePlayerState(st);
 }
 
+// Sequence counter for activatePlaylist: only the most-recently-started call
+// applies its final setView so that a rapid click→dblclick sequence doesn't
+// leave the UI on the wrong screen (click fires before dblclick, so without
+// the guard the two concurrent activations race and "playlists" often wins).
+let _activationSeq = 0;
+
 // Switch the active queue server-side, then refresh everything and land on a
 // target view (Now by default; selecting a playlist row lands on the Queue).
 async function activatePlaylist(name, targetView = "now") {
+  const seq = ++_activationSeq;
   const { ok, data } = await sendJSON("/api/active", "POST", { playlist: name });
   if (!ok) {
     alert((data && data.error) || "could not switch queue");
@@ -559,6 +566,9 @@ async function activatePlaylist(name, targetView = "now") {
   state.selectedTasks = new Set();
   document.body.classList.remove("has-detail");
   await Promise.all([loadQueue(), loadRuns(), refreshQueues()]);
+  // Abandon if a newer activation started while we were loading (e.g. the
+  // click half of a double-click — the dblclick fires last so its seq wins).
+  if (seq !== _activationSeq) return;
   // Reflect the queue we just focused (it may be idle while another runs).
   applyFocusedState();
   setView(targetView);
@@ -568,18 +578,19 @@ async function activatePlaylist(name, targetView = "now") {
 // Data loading
 // --------------------------------------------------------------------------
 async function loadQueue() {
-  const q = await getJSON("/api/queue");
+  const qp = queueParam();
+  const q = await getJSON(`/api/queue${qp}`);
   state.queue = Array.isArray(q) ? q : [];
   // The sort mode is per-queue (persisted in config.json) and drives both this
   // display and the engine's play order, so load it alongside the queue.
   try {
-    const sort = await getJSON("/api/queue/sort");
+    const sort = await getJSON(`/api/queue/sort${qp}`);
     state.sortMode = (sort && sort.sort) || "manual";
   } catch { state.sortMode = "manual"; }
   // The play-priority filter is also per-queue (persisted in config.json) and
   // restricts which tasks play, so load it alongside the queue.
   try {
-    const pp = await getJSON("/api/queue/play-priorities");
+    const pp = await getJSON(`/api/queue/play-priorities${qp}`);
     state.playPriorities = (pp && Array.isArray(pp.priorities)) ? pp.priorities : [];
   } catch { state.playPriorities = []; }
   // Blocked-task state is needed to display correct status for dispatched tasks.
@@ -664,7 +675,21 @@ function renderPlayFilter() {
 }
 
 async function loadRuns() {
-  state.runs = await getJSON("/api/runs");
+  try {
+    const raw = await getJSON("/api/runs");
+    // The API returns one flat record per task-run. Normalise to the nested
+    // { id, playlist, tasks:[] } shape the rest of the UI expects so that
+    // renderHistory, latestRecordFor, and currentTaskRecord all work.
+    state.runs = Array.isArray(raw) ? raw.map((r) => ({
+      id: r.id,
+      playlist: (r.queue && r.queue !== "main") ? r.queue : null,
+      repo: r.repo,
+      launched_by: r.launched_by || null,
+      started_at: r.started_at,
+      finished_at: r.finished_at,
+      tasks: [r],
+    })) : [];
+  } catch { /* keep last known runs on transient error */ }
   renderHistory();
   if (state.view === "stats") renderStats();
   renderNow();
