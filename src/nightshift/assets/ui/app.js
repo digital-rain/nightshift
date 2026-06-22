@@ -2224,6 +2224,13 @@ function renderPlaylists() {
     hiddenBtn.setAttribute("aria-pressed", state.showHidden ? "true" : "false");
     hiddenBtn.classList.toggle("on", state.showHidden);
   }
+  // A check next to "Hidden" flags that hidden playlists exist but aren't shown
+  // — so it appears only while the toggle is off and disappears once revealed.
+  const indicator = $("hidden-indicator");
+  if (indicator) {
+    const hasHidden = state.playlists.some((pl) => pl.disabled);
+    indicator.hidden = !(hasHidden && !state.showHidden);
+  }
 
   ul.append(libraryRow());
   for (const pl of items) ul.append(playlistRow(pl));

@@ -228,6 +228,9 @@ body {
 .seg-opt:first-child { border-left: none; }
 .seg-opt:hover { color: var(--accent); }
 .seg-opt.on { background: var(--accent-soft); color: var(--accent); }
+/* Indicator that hidden playlists exist but aren't currently shown. */
+.seg-check { margin-left: 5px; color: var(--accent); font-size: 11px; }
+.seg-check[hidden] { display: none; }
 .count { color: var(--text-dim); font-weight: 400; }
 .empty { color: var(--text-dim); font-style: italic; }
 
