@@ -47,11 +47,12 @@ main {
   overflow-y: auto;
   padding: 1rem;
 }
-/* Settings view is full-screen: hide nav, no padding, columns handle overflow */
-body[data-view="settings"] .worker-nav { display: none; }
+/* Settings sits inside <main> alongside the other views; flex layout when visible */
 #view-settings.worker-view {
   padding: 0;
   overflow: hidden;
+}
+#view-settings.worker-view:not([hidden]) {
   display: flex;
   flex-direction: column;
 }
@@ -124,22 +125,6 @@ table.history th, table.history td {
   background: var(--bg-sunken);
   overflow-y: auto;
 }
-.w-settings-back-wrap { padding: 10px 12px 0; }
-.w-settings-back {
-  display: block;
-  width: 100%;
-  text-align: left;
-  background: none;
-  border: none;
-  color: var(--text-dim);
-  font: inherit;
-  font-size: 12px;
-  padding: 4px 8px;
-  border-radius: 6px;
-  cursor: pointer;
-  opacity: 0.7;
-}
-.w-settings-back:hover { opacity: 1; color: var(--accent); background: var(--bg-elev); }
 .w-settings-search-wrap { padding: 12px 12px 8px; }
 .w-settings-search {
   width: 100%;

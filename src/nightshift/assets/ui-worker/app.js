@@ -14,10 +14,7 @@ async function getJSON(path) {
   return resp.json();
 }
 
-let prevView = "now";
 function setView(view) {
-  const current = document.body.dataset.view;
-  if (view === "settings" && current !== "settings") prevView = current || "now";
   document.body.dataset.view = view;
   document.querySelectorAll(".nav-opt").forEach((b) => {
     b.classList.toggle("active", b.dataset.view === view);
@@ -520,7 +517,6 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (b.dataset.view === "settings") loadWorkerSettings();
     });
   });
-  document.getElementById("w-settings-close").addEventListener("click", () => setView(prevView));
   document.getElementById("w-settings-discard").addEventListener("click", () => {
     wSettings.dirty = {};
     wSettings.errors = {};

@@ -1,6 +1,6 @@
 """Launch the Nightshift UI server.
 
-    python -m nightshift.server [--workspace .] [--port 8799] [--host 127.0.0.1]
+    python -m nightshift.server [--workspace .] [--port 8799] [--host 0.0.0.0]
 
 The ``--workspace`` parents every git repo Nightshift may touch; briefs + queue
 config live in its ``<workspace>/<tasks_repo>`` content store (resolved inside
@@ -37,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
     # No flag → fall back to the persisted user-level workspace (set in the
     # Settings UI), then the current directory. An explicit flag always wins.
     parser.add_argument("--workspace", type=Path, default=None)
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=None)
     args = parser.parse_args(argv)
 

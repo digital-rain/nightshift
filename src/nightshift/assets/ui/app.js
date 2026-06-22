@@ -1881,6 +1881,30 @@ function computeStats() {
     if (typeof t.loc === "number" && Number.isFinite(t.loc)) loc += t.loc;
   }
 
+  // Token and cost aggregation across all terminal tasks (including failures).
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  let totalCost = 0;
+  let hasUsage = false;
+  const byModel = {};
+  for (const t of terminal) {
+    const inTok = typeof t.input_tokens === "number" ? t.input_tokens : 0;
+    const outTok = typeof t.output_tokens === "number" ? t.output_tokens : 0;
+    const cost = typeof t.cost_usd === "number" ? t.cost_usd : 0;
+    if (t.input_tokens !== undefined || t.output_tokens !== undefined || t.cost_usd !== undefined) {
+      hasUsage = true;
+    }
+    totalInputTokens += inTok;
+    totalOutputTokens += outTok;
+    totalCost += cost;
+    const model = t.model || "unknown";
+    if (!byModel[model]) byModel[model] = { input: 0, output: 0, cost: 0, runs: 0 };
+    byModel[model].input += inTok;
+    byModel[model].output += outTok;
+    byModel[model].cost += cost;
+    byModel[model].runs++;
+  }
+
   return {
     total: terminal.length,
     completed: completed.length,
@@ -1890,6 +1914,10 @@ function computeStats() {
     failureTotal: terminal.length - completed.length,
     commits,
     loc,
+    totalInputTokens,
+    totalOutputTokens,
+    totalCost,
+    byModel: hasUsage ? Object.entries(byModel).sort((a, b) => b[1].cost - a[1].cost) : null,
   };
 }
 
@@ -1938,6 +1966,13 @@ function renderStats() {
     statCard("Commits", String(s.commits), "landed on main"),
     statCard("Lines of code", formatCount(s.loc), "code churned (ex. comments, build, docs)"),
   );
+  if (s.byModel) {
+    const totalTok = s.totalInputTokens + s.totalOutputTokens;
+    cards.append(
+      statCard("Tokens", formatCount(totalTok), `${formatCount(s.totalInputTokens)} in · ${formatCount(s.totalOutputTokens)} out`),
+      statCard("Cost", `$${s.totalCost.toFixed(2)}`, "USD across all runs"),
+    );
+  }
   body.append(cards);
 
   // Success-rate bar: completed vs failed, as a proportional graph.
@@ -1968,6 +2003,36 @@ function renderStats() {
     breakdown.append(list);
   }
   body.append(breakdown);
+
+  // Usage by model: token consumption and cost per model, sorted by cost.
+  if (s.byModel && s.byModel.length) {
+    const usage = statSection("Usage by model");
+    const list = document.createElement("div");
+    list.className = "stat-bars";
+    const maxCost = s.byModel[0][1].cost;
+    for (const [model, u] of s.byModel) {
+      const row = document.createElement("div");
+      row.className = "stat-bar-row stat-model-row";
+      const lbl = document.createElement("span");
+      lbl.className = "stat-bar-label";
+      lbl.textContent = model;
+      const track = document.createElement("div");
+      track.className = "stat-bar-track";
+      const fill = document.createElement("div");
+      fill.className = "stat-bar-fill stat-fill-ok";
+      fill.style.width = `${maxCost > 0 ? (u.cost / maxCost) * 100 : 0}%`;
+      track.append(fill);
+      const meta = document.createElement("span");
+      meta.className = "stat-bar-value stat-model-meta";
+      const totalTok = u.input + u.output;
+      meta.textContent = `${formatCount(totalTok)} tok · $${u.cost.toFixed(2)}`;
+      meta.title = `${formatCount(u.input)} in · ${formatCount(u.output)} out · ${u.runs} run${u.runs === 1 ? "" : "s"}`;
+      row.append(lbl, track, meta);
+      list.append(row);
+    }
+    usage.append(list);
+    body.append(usage);
+  }
 }
 
 function statCard(label, value, sub) {
@@ -2902,6 +2967,19 @@ function runDetailPairs(run, rec) {
     ],
     ["Launched by", run.launched_by || "—"],
   );
+  // Token usage and cost — only shown when the run carries this data.
+  if (rec.model) pairs.push(["Model", rec.model]);
+  const inTok = typeof rec.input_tokens === "number" ? rec.input_tokens : null;
+  const outTok = typeof rec.output_tokens === "number" ? rec.output_tokens : null;
+  if (inTok !== null || outTok !== null) {
+    const tok = [inTok !== null ? `${formatCount(inTok)} in` : null,
+                 outTok !== null ? `${formatCount(outTok)} out` : null]
+      .filter(Boolean).join(" · ");
+    pairs.push(["Tokens", tok]);
+  }
+  if (typeof rec.cost_usd === "number") {
+    pairs.push(["Cost", `$${rec.cost_usd.toFixed(4)}`]);
+  }
   return pairs;
 }
 
