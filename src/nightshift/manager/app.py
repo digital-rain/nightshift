@@ -1177,6 +1177,15 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
+    # ----- branding -------------------------------------------------------- #
+
+    @app.get("/api/info")
+    def info() -> JSONResponse:
+        # The operator UI is shared with the single-process server; this lets the
+        # frontend retitle itself "Nightshift Manager" when served by the manager
+        # (the single-process server has no /api/info, so it keeps "Nightshift").
+        return JSONResponse({"brand_name": "Nightshift Manager"})
+
     # ----- static UI ------------------------------------------------------- #
 
     if UI_DIR.exists():

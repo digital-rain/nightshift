@@ -4281,8 +4281,23 @@ function startAutoRefresh() {
   }, REFRESH_MS);
 }
 
+// Retitle the shared operator UI when it's served by the manager. The manager
+// exposes /api/info with a brand_name; the single-process server has no such
+// endpoint, so the static "Nightshift" branding stands.
+async function applyBranding() {
+  try {
+    const info = await getJSON("/api/info");
+    if (info && info.brand_name) {
+      const el = $("brand-name") || document.querySelector(".brand-name");
+      if (el) el.textContent = info.brand_name;
+      document.title = info.brand_name;
+    }
+  } catch { /* no /api/info (single-process server): keep static branding */ }
+}
+
 async function init() {
   wire();
+  applyBranding();
   setView("now");
   let defaultTheme = "dark";
   try {
