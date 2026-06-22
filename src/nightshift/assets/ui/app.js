@@ -30,6 +30,7 @@ const state = {
   repos: null,           // /api/repos payload (workspace, known repos, per-queue bindings, warnings)
   playlistInfoName: null, // playlist open in the full-area info pane (view "playlist-info")
   playlistInfoData: null, // loaded {name, repository, task_count} for the info pane
+  blockedTasks: {},      // task id -> blocked_reason string for tasks currently blocked by manager
 };
 
 // Transport glyphs for the Now box (borderless triangle / pause bars).
@@ -113,6 +114,7 @@ function expando(caption, { open = true, subtitle = "", accessory = null } = {})
 // class that colours its pill.
 const STATE_LABELS = {
   pending: "Queued",
+  blocked: "Blocked",
   running: "Running",
   paused: "Paused",
   // A task whose resolved target repo isn't present in the workspace is paused
@@ -130,8 +132,10 @@ function stateLabel(status) {
 // The CSS class that colours a status pill. Most statuses map to a same-named
 // class, but a few synonyms collapse onto a shared visual: `repo_unavailable`
 // (a paused, auto-resumable task) reuses the `.status.paused` warn treatment.
+// `blocked` (needs user action before it can run) reuses the error treatment.
 function statusClass(status) {
   if (status === "repo_unavailable") return "paused";
+  if (status === "blocked") return "error";
   return status || "running";
 }
 function statusPill(status) {
@@ -570,6 +574,8 @@ async function loadQueue() {
     const pp = await getJSON("/api/queue/play-priorities");
     state.playPriorities = (pp && Array.isArray(pp.priorities)) ? pp.priorities : [];
   } catch { state.playPriorities = []; }
+  // Blocked-task state is needed to display correct status for dispatched tasks.
+  await loadBlocked();
   renderPlayFilter();
   // When the main queue is active it *is* the library, so keep that row's count
   // in step with the queue we just loaded.
@@ -579,6 +585,21 @@ async function loadQueue() {
   }
   renderQueue();
   renderNow();
+}
+
+// Load blocked-task state from the manager so queue rows and the detail pane
+// can show "Blocked" instead of "Queued" for tasks the manager can't dispatch.
+async function loadBlocked() {
+  try {
+    const list = await getJSON("/api/blocked");
+    const map = {};
+    for (const b of (list || [])) {
+      if (b.task) map[b.task] = b.blocked_reason || "";
+    }
+    state.blockedTasks = map;
+  } catch {
+    state.blockedTasks = {};
+  }
 }
 
 // Toggle the active queue between manual (drag) order and priority sort,
@@ -1151,6 +1172,7 @@ function queueRowAside(item, isNow) {
   let status;
   if (isNow) status = state.player.state === "paused" ? "paused" : "running";
   else if (rec) status = rec.status;
+  else if (state.blockedTasks && item.task in state.blockedTasks) status = "blocked";
   else status = "pending";
 
   const status_box = document.createElement("div");
@@ -2810,8 +2832,12 @@ async function openTaskDetail(task) {
 // ----- shared detail-pane building blocks (editable + history) -----------
 
 // The FILE / STATUS header that opens both flavours of the detail pane.
-function detailStatusHead(task, status) {
-  return metaGrid([["File", `${task}.md`], ["Status", stateLabel(status)]]);
+// When `blockedReason` is provided a MESSAGE row is appended below STATUS so
+// the reason is visually grouped with FILE & STATUS and separated from TITLE.
+function detailStatusHead(task, status, blockedReason) {
+  const pairs = [["File", `${task}.md`], ["Status", stateLabel(status)]];
+  if (blockedReason) pairs.push(["Message", blockedReason]);
+  return metaGrid(pairs);
 }
 
 // The RUN DETAILS metaGrid pairs for a run + its task record: per-task window,
@@ -2884,9 +2910,14 @@ function taskDetailContent(brief, draft, opts = {}) {
   const run = found ? found.run : null;
   const isNow = locked;
   let status;
+  let blockedReason;
   if (creating) status = "pending";
   else if (isNow) status = state.player.state === "paused" ? "paused" : "running";
   else if (rec) status = rec.status;
+  else if (state.blockedTasks && task in state.blockedTasks) {
+    status = "blocked";
+    blockedReason = state.blockedTasks[task] || undefined;
+  }
   else status = "pending";
 
   // The new-task pane leads with a "new task" line in place of the File/Status
@@ -2894,7 +2925,7 @@ function taskDetailContent(brief, draft, opts = {}) {
   if (creating) {
     frag.append(metaGrid([["File", "new task"], ["Status", "Not yet created"]]));
   } else {
-    frag.append(detailStatusHead(task, status));
+    frag.append(detailStatusHead(task, status, blockedReason));
   }
 
   // TITLE — stands on its own (not inside an expando) and is always editable
