@@ -2243,7 +2243,8 @@ function libraryRow() {
   li.className = "pl-item pl-library";
   const active = state.activePlaylist === null;
   if (active) li.classList.add("active");
-  li.addEventListener("click", () => activatePlaylist(null, "queue"));
+  li.addEventListener("click", () => activatePlaylist(null, "playlists"));
+  li.addEventListener("dblclick", () => activatePlaylist(null, "queue"));
 
   li.append(playlistSpinner(isQueueRunning(null)));
 
@@ -2264,7 +2265,6 @@ function libraryRow() {
   main.append(name, meta);
   li.append(main);
 
-  // The chevron switches to the main queue and drops straight into its Queue.
   const chev = document.createElement("button");
   chev.className = "upnext-chev pl-chev";
   chev.innerHTML = "&#8250;";
@@ -2283,7 +2283,8 @@ function playlistRow(pl) {
   const active = state.activePlaylist === pl.name;
   if (active) li.classList.add("active");
   if (pl.disabled) li.classList.add("pl-hidden");
-  li.addEventListener("click", () => activatePlaylist(pl.name, "queue"));
+  li.addEventListener("click", () => activatePlaylist(pl.name, "playlists"));
+  li.addEventListener("dblclick", () => activatePlaylist(pl.name, "queue"));
 
   li.append(playlistSpinner(isQueueRunning(pl.name)));
 

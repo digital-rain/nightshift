@@ -164,6 +164,10 @@ class QueueConfig(BaseModel):
     repo: str | None = None
 
 
+class ActivePlaylistRequest(BaseModel):
+    playlist: str | None = None
+
+
 class PlaylistCreate(BaseModel):
     name: str
 
@@ -934,6 +938,24 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             "queue_changed", queue=target, payload={"dedication": req.worker_ids}
         )
         return JSONResponse({"worker_ids": req.worker_ids})
+
+    # ----- active playlist (UI focus) ----------------------------------- #
+
+    _active_playlist: str | None = None
+
+    @app.get("/api/active")
+    def get_active() -> dict:
+        return {"active_playlist": _active_playlist}
+
+    @app.post("/api/active")
+    def set_active(req: ActivePlaylistRequest) -> JSONResponse:
+        nonlocal _active_playlist
+        if req.playlist is not None and not playlists_mod.exists(tasks_root, req.playlist):
+            return JSONResponse({"error": "playlist not found"}, status_code=404)
+        _active_playlist = req.playlist
+        return JSONResponse({"active_playlist": _active_playlist})
+
+    # ----- playlists ------------------------------------------------------ #
 
     @app.get("/api/playlists")
     def get_playlists() -> JSONResponse:
