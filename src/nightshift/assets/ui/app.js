@@ -2552,18 +2552,6 @@ function playlistRow(pl) {
   main.append(name, meta);
   li.append(main);
 
-  // Hide / unhide: disabling a playlist hides it from the default view and
-  // parks it (the scheduler skips it). Sits just left of the info button.
-  const hide = document.createElement("button");
-  hide.className = "pl-hide";
-  hide.title = pl.disabled ? "Unhide this playlist" : "Hide and disable this playlist";
-  hide.innerHTML = pl.disabled ? EYE_ICON : EYE_OFF_ICON;
-  hide.addEventListener("click", (e) => {
-    e.stopPropagation();
-    togglePlaylistHidden(pl.name, !pl.disabled);
-  });
-  li.append(hide);
-
   // Info: opens the full-area playlist-info pane (name + repository).
   const info = document.createElement("button");
   info.className = "pl-info";
@@ -2574,6 +2562,18 @@ function playlistRow(pl) {
     openPlaylistInfo(pl.name);
   });
   li.append(info);
+
+  // Hide / unhide: disabling a playlist hides it from the default view and
+  // parks it (the scheduler skips it). Sits just right of the info button.
+  const hide = document.createElement("button");
+  hide.className = "pl-hide";
+  hide.title = pl.disabled ? "Unhide this playlist" : "Hide and disable this playlist";
+  hide.innerHTML = pl.disabled ? EYE_ICON : EYE_OFF_ICON;
+  hide.addEventListener("click", (e) => {
+    e.stopPropagation();
+    togglePlaylistHidden(pl.name, !pl.disabled);
+  });
+  li.append(hide);
 
   const del = document.createElement("button");
   del.className = "pl-del";
