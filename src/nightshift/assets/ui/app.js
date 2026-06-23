@@ -3106,6 +3106,8 @@ function runDetailPairs(run, rec) {
   // on the task record or the run; older runs that predate the column omit it.
   const repo = rec.repo || run.repo;
   if (repo) pairs.push(["Repo", repo]);
+  const validateCmd = rec.validate_cmd ?? run.validate_cmd;
+  pairs.push(["Validate command", validateCmd || "—"]);
   const t = rec.timings;
   if (t && typeof t === "object") {
     for (const [key, label] of [["worker", "Worker"], ["validate", "Validate"], ["commit", "Commit"]]) {
@@ -3319,9 +3321,10 @@ function taskDetailContent(brief, draft, opts = {}) {
   setView(draft.briefView === "preview" ? "preview" : "markdown");
   frag.append(brf.panel);
 
-  // RUN DETAILS / LOG — only when the task has run. A completed record with
-  // timings gets RUN DETAILS; a live or historical record gets a LOG.
-  if (rec && rec.timings) {
+  // RUN DETAILS / LOG — when the task has a run record (live or historical).
+  // RUN DETAILS is shown even before final timings exist so fields like the
+  // validate command are visible while a run is in progress.
+  if (rec) {
     const rd = expando("Run details", { open: false });
     rd.body.append(metaGrid(runDetailPairs(run, rec)));
     frag.append(rd.panel);

@@ -605,6 +605,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             workspace, tasks_root, chosen.task, chosen.queue, repo,
             lease["id"], run_id, base_ref, cfg,
         )
+        planned_validate = order["config"].get("validate_cmd") or None
         await store.create_run(
             run_id,
             task=chosen.task,
@@ -616,6 +617,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             body=order["body"],
             required_mcps=list(chosen.required_mcps),
             repo=repo,
+            validate_cmd=planned_validate or None,
         )
         await store.set_lease_status(lease["id"], "leased", run_id=run_id)
         await _registry().set_busy(

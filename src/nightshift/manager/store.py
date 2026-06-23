@@ -123,6 +123,7 @@ class NightshiftStore(Protocol):
         body: str | None = None,
         required_mcps: list[str] | None = None,
         repo: str | None = None,
+        validate_cmd: str | None = None,
     ) -> dict[str, Any]: ...
     async def update_run(self, run_id: str, **fields: Any) -> None: ...
     async def get_run(self, run_id: str) -> dict[str, Any] | None: ...
@@ -457,6 +458,7 @@ class MemoryStore:
         body: str | None = None,
         required_mcps: list[str] | None = None,
         repo: str | None = None,
+        validate_cmd: str | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             row = {
@@ -481,7 +483,7 @@ class MemoryStore:
                 "cost_usd": None,
                 "failure_kind": None,
                 "failure_reason": None,
-                "validate_cmd": None,
+                "validate_cmd": validate_cmd,
                 "title": title,
                 "body": body,
                 "started_at": _now(),
@@ -933,6 +935,7 @@ class PgStore:
         body: str | None = None,
         required_mcps: list[str] | None = None,
         repo: str | None = None,
+        validate_cmd: str | None = None,
     ) -> dict[str, Any]:
         import json
 
@@ -941,12 +944,13 @@ class PgStore:
                 """
                 INSERT INTO nightshift.runs
                     (id, task, queue, worker_id, backend, model, repo, required_mcps,
-                     status, title, body, started_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'running', $9, $10, now())
+                     validate_cmd, status, title, body, started_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9,
+                        'running', $10, $11, now())
                 RETURNING *
                 """,
                 run_id, task, _qkey(queue), worker_id, backend, model, repo,
-                json.dumps(required_mcps or []), title, body,
+                json.dumps(required_mcps or []), validate_cmd, title, body,
             )
         return _run_row(row)
 

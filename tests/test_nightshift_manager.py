@@ -82,6 +82,9 @@ def test_checkin_poll_handshake(tmp_path: Path) -> None:
         assert order["config"]["validate_cmd"] == "true"
         assert order["base_ref"]  # canonical HEAD pinned
 
+        run = next(x for x in client.get("/api/runs").json() if x["id"] == order["run_id"])
+        assert run["validate_cmd"] == "true"
+
         # The task is now leased — a second worker gets nothing.
         client.post("/api/worker/checkin", json={"worker_id": "w2", "backend": "ollama"})
         r2 = client.post(
