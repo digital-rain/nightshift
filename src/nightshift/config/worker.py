@@ -69,15 +69,15 @@ class WorkerConfig:
         category="Routing", label="Priorities",
         desc="0–5 priority levels this worker accepts (null/empty = any).",
         apply="restart", env="NIGHTSHIFT_WORKER_PRIORITIES", type="int_list"))
-    models: list[str] = field(default_factory=list, metadata=meta(
-        category="Routing", label="Models",
-        desc="Request-facing model ids this worker advertises.",
-        apply="restart", env="NIGHTSHIFT_WORKER_MODELS", type="string_list"))
     mcps: list[str] = field(default_factory=list, metadata=meta(
         category="Routing", label="MCPs",
         desc="MCP connectors wired into this worker's harness.",
         apply="restart", env="NIGHTSHIFT_WORKER_MCPS", type="string_list"))
 
+    models: list[str] = field(default_factory=list, metadata=meta(
+        category="Models", label="Available",
+        desc="Request-facing model ids this worker advertises.",
+        apply="restart", env="NIGHTSHIFT_WORKER_MODELS", type="string_list"))
     model_aliases: dict[str, str] = field(default_factory=dict, metadata=meta(
         category="Models", label="Model aliases",
         desc="Remap {requested: actual} applied at execution.",
