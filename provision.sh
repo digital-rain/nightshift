@@ -108,22 +108,23 @@ if [[ "$DO_DB" -eq 1 ]]; then
       APT_UPDATED=0
     fi
     apt_install "postgresql-${PG_VERSION}" "postgresql-client-${PG_VERSION}"
-    # Bind PostgreSQL to all interfaces so non-localhost DSNs work.
+    # Bind PostgreSQL to this host's IP (plus localhost) so non-loopback DSNs
+    # work. We use the explicit machine address rather than '*' because
+    # localhost is ambiguous across co-located Parallels VMs and the host.
     PG_CONF="/etc/postgresql/${PG_VERSION}/main/postgresql.conf"
     PG_HBA="/etc/postgresql/${PG_VERSION}/main/pg_hba.conf"
     if [[ -f "$PG_CONF" ]]; then
       HOST_IP=$(hostname -I | awk '{print $1}')
-      if grep -q "^#listen_addresses" "$PG_CONF"; then
-        $SUDO sed -i "s/^#listen_addresses.*/listen_addresses = '*'/" "$PG_CONF"
-        note "postgresql.conf: listen_addresses = '*'"
-      elif ! grep -q "listen_addresses.*\*" "$PG_CONF"; then
-        $SUDO sed -i "s/^listen_addresses.*/listen_addresses = '*'/" "$PG_CONF"
-        note "postgresql.conf: listen_addresses = '*'"
-      fi
-      if [[ -n "$HOST_IP" ]] && ! $SUDO grep -q "${HOST_IP%.*}.0/24" "$PG_HBA" 2>/dev/null; then
+      if [[ -n "$HOST_IP" ]]; then
+        $SUDO sed -i "s|^#\?listen_addresses.*|listen_addresses = '${HOST_IP},localhost'|" "$PG_CONF"
+        note "postgresql.conf: listen_addresses = '${HOST_IP},localhost'"
         SUBNET="${HOST_IP%.*}.0/24"
-        $SUDO sed -i "/^host.*all.*all.*127.0.0.1/a host    all             all             ${SUBNET}          scram-sha-256" "$PG_HBA"
-        note "pg_hba.conf: allowed connections from ${SUBNET}"
+        if ! $SUDO grep -q "$SUBNET" "$PG_HBA" 2>/dev/null; then
+          $SUDO sed -i "/^host.*all.*all.*127.0.0.1\/32/a host    all             all             ${SUBNET}            scram-sha-256   # nightshift subnet" "$PG_HBA"
+          note "pg_hba.conf: allowed connections from ${SUBNET}"
+        fi
+      else
+        note "could not determine host IP; left listen_addresses unchanged."
       fi
     fi
 
