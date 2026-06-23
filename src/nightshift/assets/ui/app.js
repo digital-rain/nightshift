@@ -1979,7 +1979,7 @@ function renderStats() {
   const failed = s.total - s.completed;
   const outcome = statSection("Outcomes");
   outcome.append(
-    proportionBar([
+    proportionDonut([
       { label: "Completed", count: s.completed, cls: "stat-fill-ok" },
       { label: "Failed", count: failed, cls: "stat-fill-err" },
     ], s.total),
@@ -2064,20 +2064,65 @@ function statSection(title) {
   return sec;
 }
 
-// A single 100%-wide bar split into proportional, labelled segments.
-function proportionBar(segments, total) {
+// A donut circle chart split into proportional segments.
+function proportionDonut(segments, total) {
+  const R = 38;
+  const STROKE = 12;
+  const C = 2 * Math.PI * R;
+
   const wrap = document.createElement("div");
   wrap.className = "stat-proportion";
-  const track = document.createElement("div");
-  track.className = "stat-proportion-track";
+
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 100 100");
+  svg.setAttribute("width", "100");
+  svg.setAttribute("height", "100");
+  svg.classList.add("stat-donut");
+
+  const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+  g.setAttribute("transform", "rotate(-90 50 50)");
+
+  const track = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  track.setAttribute("cx", "50");
+  track.setAttribute("cy", "50");
+  track.setAttribute("r", String(R));
+  track.setAttribute("fill", "none");
+  track.setAttribute("stroke-width", String(STROKE));
+  track.classList.add("stat-donut-track");
+  g.append(track);
+
+  let offset = 0;
   for (const seg of segments) {
     if (!seg.count) continue;
-    const part = document.createElement("div");
-    part.className = `stat-proportion-part ${seg.cls}`;
-    part.style.flexGrow = String(seg.count);
-    part.title = `${seg.label}: ${seg.count}`;
-    track.append(part);
+    const dash = (seg.count / total) * C;
+    const arc = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    arc.setAttribute("cx", "50");
+    arc.setAttribute("cy", "50");
+    arc.setAttribute("r", String(R));
+    arc.setAttribute("fill", "none");
+    arc.setAttribute("stroke-width", String(STROKE));
+    arc.setAttribute("stroke-dasharray", `${dash} ${C - dash}`);
+    arc.setAttribute("stroke-dashoffset", String(-offset));
+    arc.classList.add("stat-donut-seg", seg.cls);
+    const ttl = document.createElementNS("http://www.w3.org/2000/svg", "title");
+    ttl.textContent = `${seg.label}: ${seg.count}`;
+    arc.append(ttl);
+    g.append(arc);
+    offset += dash;
   }
+  svg.append(g);
+
+  const pct = total ? Math.round((segments[0].count / total) * 100) : 0;
+  const txt = document.createElementNS("http://www.w3.org/2000/svg", "text");
+  txt.setAttribute("x", "50");
+  txt.setAttribute("y", "56");
+  txt.setAttribute("text-anchor", "middle");
+  txt.classList.add("stat-donut-pct");
+  txt.textContent = `${pct}%`;
+  svg.append(txt);
+
+  wrap.append(svg);
+
   const legend = document.createElement("div");
   legend.className = "stat-legend";
   for (const seg of segments) {
@@ -2085,11 +2130,12 @@ function proportionBar(segments, total) {
     item.className = "stat-legend-item";
     const dot = document.createElement("span");
     dot.className = `stat-dot ${seg.cls}`;
-    const pct = total ? Math.round((seg.count / total) * 100) : 0;
-    item.append(dot, document.createTextNode(`${seg.label} ${seg.count} (${pct}%)`));
+    const segPct = total ? Math.round((seg.count / total) * 100) : 0;
+    item.append(dot, document.createTextNode(`${seg.label} ${seg.count} (${segPct}%)`));
     legend.append(item);
   }
-  wrap.append(track, legend);
+  wrap.append(legend);
+
   return wrap;
 }
 

@@ -1278,16 +1278,12 @@ body[data-view="detail"] #screen-detail { display: flex; flex: 1; }
 .stat-section-title { margin: 0 0 10px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim); }
 .stat-none { color: var(--text-dim); font-style: italic; margin: 0; }
 
-/* Proportional outcome bar */
-.stat-proportion-track {
-  display: flex;
-  height: 14px;
-  border-radius: 7px;
-  overflow: hidden;
-  background: var(--bg-sunken);
-  border: 1px solid var(--border);
-}
-.stat-proportion-part { min-width: 2px; }
+/* Proportional outcome donut */
+.stat-donut { display: block; }
+.stat-donut-track { stroke: var(--border); }
+.stat-donut-seg.stat-fill-ok { stroke: var(--ok); }
+.stat-donut-seg.stat-fill-err { stroke: var(--err); }
+.stat-donut-pct { fill: var(--text); font-size: 18px; font-weight: 700; font-family: inherit; }
 .stat-fill-ok { background: var(--ok); }
 .stat-fill-err { background: var(--err); }
 .stat-legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 8px; font-size: 12px; color: var(--text-dim); }
