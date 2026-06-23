@@ -2987,16 +2987,24 @@ function modelSelect(brief, draft, locked) {
 }
 
 // The optional per-task target-repo override, in line with the model dropdown
-// and populated from `/api/repos`. The empty "Inherit" choice clears the
-// override so the task uses its queue's default repo; a value pins this task to
-// that repo regardless of the queue default.
+// and populated from `/api/repos`. The empty choice clears the override so the
+// task uses its queue's default repo; a value pins this task to that repo
+// regardless of the queue default. When the active queue has a configured repo
+// we label the empty option with that name so the user sees what they'd inherit
+// rather than the opaque "Inherit" label.
 function repoOverride(draft, locked) {
   const wrap = document.createElement("label");
   wrap.className = "model-select repo-override";
   const span = document.createElement("span");
   span.className = "model-label";
   span.textContent = "Repo";
-  const select = repoSelect(draft.repo, "Inherit");
+  const queueKey = focusedQueueKey();
+  const queueEntry = (state.repos && Array.isArray(state.repos.queues))
+    ? state.repos.queues.find((q) => q.queue === queueKey)
+    : null;
+  const inheritedRepo = (queueEntry && queueEntry.repo) || null;
+  const emptyLabel = inheritedRepo ? `${inheritedRepo} (inherited)` : "Inherit";
+  const select = repoSelect(draft.repo, emptyLabel);
   select.disabled = locked;
   select.addEventListener("change", () => { draft.repo = select.value; });
   wrap.append(span, select);
