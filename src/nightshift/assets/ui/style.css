@@ -1296,7 +1296,7 @@ body[data-view="detail"] #screen-detail { display: flex; flex: 1; }
 .stat-donut-track { stroke: var(--border); }
 .stat-donut-seg.stat-fill-ok { stroke: var(--ok); }
 .stat-donut-seg.stat-fill-err { stroke: var(--err); }
-.stat-donut-pct { fill: var(--text); font-size: 18px; font-weight: 700; font-family: inherit; }
+.stat-donut-pct { fill: var(--text); font-size: 36px; font-weight: 700; font-family: inherit; }
 .stat-fill-ok { background: var(--ok); }
 .stat-fill-err { background: var(--err); }
 .stat-fill-c0 { background: var(--accent); }

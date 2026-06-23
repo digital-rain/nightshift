@@ -2073,25 +2073,25 @@ function modelCostDonut(byModel) {
 
 // A donut circle chart split into proportional segments.
 function proportionDonut(segments, total) {
-  const R = 38;
-  const STROKE = 12;
+  const R = 76;
+  const STROKE = 24;
   const C = 2 * Math.PI * R;
 
   const wrap = document.createElement("div");
   wrap.className = "stat-proportion";
 
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  svg.setAttribute("viewBox", "0 0 100 100");
-  svg.setAttribute("width", "100");
-  svg.setAttribute("height", "100");
+  svg.setAttribute("viewBox", "0 0 200 200");
+  svg.setAttribute("width", "200");
+  svg.setAttribute("height", "200");
   svg.classList.add("stat-donut");
 
   const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
-  g.setAttribute("transform", "rotate(-90 50 50)");
+  g.setAttribute("transform", "rotate(-90 100 100)");
 
   const track = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-  track.setAttribute("cx", "50");
-  track.setAttribute("cy", "50");
+  track.setAttribute("cx", "100");
+  track.setAttribute("cy", "100");
   track.setAttribute("r", String(R));
   track.setAttribute("fill", "none");
   track.setAttribute("stroke-width", String(STROKE));
@@ -2103,8 +2103,8 @@ function proportionDonut(segments, total) {
     if (!seg.count) continue;
     const dash = (seg.count / total) * C;
     const arc = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-    arc.setAttribute("cx", "50");
-    arc.setAttribute("cy", "50");
+    arc.setAttribute("cx", "100");
+    arc.setAttribute("cy", "100");
     arc.setAttribute("r", String(R));
     arc.setAttribute("fill", "none");
     arc.setAttribute("stroke-width", String(STROKE));
@@ -2121,8 +2121,8 @@ function proportionDonut(segments, total) {
 
   const pct = total ? Math.round((segments[0].count / total) * 100) : 0;
   const txt = document.createElementNS("http://www.w3.org/2000/svg", "text");
-  txt.setAttribute("x", "50");
-  txt.setAttribute("y", "56");
+  txt.setAttribute("x", "100");
+  txt.setAttribute("y", "112");
   txt.setAttribute("text-anchor", "middle");
   txt.classList.add("stat-donut-pct");
   txt.textContent = `${pct}%`;
@@ -2171,13 +2171,13 @@ function failureBar(kind, count, max) {
 // length proportional to cost relative to the highest-cost model. Outermost
 // ring = most expensive, innermost = least.
 function modelRingsChart(byModel) {
-  const STROKE = 12;
-  const GAP = 5;
+  const STROKE = 24;
+  const GAP = 10;
   const STEP = STROKE + GAP;
-  const R0 = 22;
+  const R0 = 44;
   const N = byModel.length;
   const R_max = R0 + (N - 1) * STEP;
-  const PAD = 8;
+  const PAD = 16;
   const HALF = R_max + STROKE / 2 + PAD;
   const SIZE = Math.ceil(HALF * 2);
   const cx = HALF;
