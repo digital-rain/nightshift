@@ -3138,6 +3138,54 @@ function logPre(runId, task, { live = false, logId = "detail-screen-log", isActi
   return log;
 }
 
+// Word-boundary helpers used by wireEditKeydown.
+// "Word" here is a contiguous run of non-whitespace characters, matching the
+// Mac convention for Option+Arrow cursor movement.
+function _wordLeft(val, pos) {
+  let i = pos;
+  while (i > 0 && /\s/.test(val[i - 1])) i--;
+  while (i > 0 && /\S/.test(val[i - 1])) i--;
+  return i;
+}
+
+function _wordRight(val, pos) {
+  let i = pos;
+  while (i < val.length && /\s/.test(val[i])) i++;
+  while (i < val.length && /\S/.test(val[i])) i++;
+  return i;
+}
+
+// Attach a keydown listener that intercepts Alt+ArrowLeft/Right (Option+Arrow on
+// Mac) in editable text elements. Without this, browsers treat those combos as
+// history back/forward, navigating away from the editing pane and losing work.
+// We call preventDefault() to block the navigation and manually move the cursor
+// to the correct word boundary instead.
+function wireEditKeydown(el) {
+  el.addEventListener("keydown", (e) => {
+    if (!e.altKey || (e.key !== "ArrowLeft" && e.key !== "ArrowRight")) return;
+    e.preventDefault();
+    const val = el.value;
+    const { selectionStart, selectionEnd, selectionDirection } = el;
+    const backward = selectionDirection === "backward";
+
+    if (!e.shiftKey) {
+      // Collapse any selection then jump to the word boundary.
+      const from = e.key === "ArrowLeft" ? selectionStart : selectionEnd;
+      const to = e.key === "ArrowLeft" ? _wordLeft(val, from) : _wordRight(val, from);
+      el.setSelectionRange(to, to);
+    } else {
+      // Extend (or shrink) the selection using the focus/anchor model.
+      const focusPos = backward ? selectionStart : selectionEnd;
+      const anchorPos = backward ? selectionEnd : selectionStart;
+      const newFocus = e.key === "ArrowLeft" ? _wordLeft(val, focusPos) : _wordRight(val, focusPos);
+      const newStart = Math.min(anchorPos, newFocus);
+      const newEnd = Math.max(anchorPos, newFocus);
+      const dir = newFocus <= anchorPos ? "backward" : "forward";
+      el.setSelectionRange(newStart, newEnd, dir);
+    }
+  });
+}
+
 // Build the editable task-detail content as a fragment of expando panels: BRIEF
 // (title + spec prose) and SETTINGS (segmented switches + model) are always
 // shown; RUN DETAILS / LOG appear only once the task has run (the now-playing
@@ -3193,6 +3241,7 @@ function taskDetailContent(brief, draft, opts = {}) {
   titleInput.disabled = locked;
   if (creating) titleInput.placeholder = "short descriptive title";
   titleInput.addEventListener("input", () => { draft.title = titleInput.value; });
+  wireEditKeydown(titleInput);
   titleField.append(titleLabel, titleInput);
   frag.append(titleField);
 
@@ -3205,6 +3254,7 @@ function taskDetailContent(brief, draft, opts = {}) {
   briefArea.disabled = locked;
   if (creating) briefArea.placeholder = "what should the worker do?";
   briefArea.addEventListener("input", () => { draft.body = briefArea.value; });
+  wireEditKeydown(briefArea);
   briefArea.className = "detail-brief-edit";
 
   const preview = document.createElement("div");
