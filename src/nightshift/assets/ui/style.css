@@ -1033,6 +1033,23 @@ body[data-view="detail"] #screen-detail { display: flex; flex: 1; }
 #screen-detail .detail-body,
 #screen-playlist-info .detail-body { max-width: 760px; width: 100%; margin: 0 auto; }
 
+/* Add-task shortcut on a playlist row: same reveal-on-hover treatment, sitting
+   just to the left of the info button. */
+.pl-add-task {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 6px;
+  opacity: 0;
+}
+.pl-item:hover .pl-add-task { opacity: 1; }
+.pl-add-task:hover { color: var(--accent); background: var(--bg-sunken); }
+
 /* The info button on a playlist row: mirrors the delete affordance but reveals
    the playlist-info takeover instead. */
 .pl-info {

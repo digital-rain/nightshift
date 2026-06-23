@@ -2552,6 +2552,17 @@ function playlistRow(pl) {
   main.append(name, meta);
   li.append(main);
 
+  // Add task: shortcut to create a new task directly in this queue.
+  const addTask = document.createElement("button");
+  addTask.className = "pl-add-task";
+  addTask.title = "Add a task to this playlist";
+  addTask.innerHTML = "&#43;";
+  addTask.addEventListener("click", (e) => {
+    e.stopPropagation();
+    openCreateTaskForPlaylist(pl.name);
+  });
+  li.append(addTask);
+
   // Info: opens the full-area playlist-info pane (name + repository).
   const info = document.createElement("button");
   info.className = "pl-info";
@@ -3426,6 +3437,21 @@ function openCreateTask() {
   state.detailCreate = true;
   state.detailDraft = null;  // seeded once the defaults load in renderDetailScreen
   state.detailReturn = state.view === "queue" ? "queue" : "now";
+  clearTaskHash();
+  setView("detail");
+}
+
+// Shortcut from the playlists view: activate the given playlist (if not already
+// active) then open the create-task pane, returning to playlists on back/save.
+async function openCreateTaskForPlaylist(name) {
+  if (state.activePlaylist !== name) {
+    await activatePlaylist(name, "playlists");
+  }
+  state.detailScreenTask = null;
+  state.detailHistory = null;
+  state.detailCreate = true;
+  state.detailDraft = null;
+  state.detailReturn = "playlists";
   clearTaskHash();
   setView("detail");
 }
