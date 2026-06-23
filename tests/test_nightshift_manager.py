@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,7 @@ from starlette.testclient import TestClient
 
 from _workspace import build_workspace, make_target_repo
 from nightshift.engine import setup_worktree
-from nightshift.manager.app import _jsonable, create_app
+from nightshift.manager.app import _jsonable, create_app, no_progress_streak
 from nightshift.manager.hub import Hub
 from nightshift.manager.landing import canonical_head
 from nightshift.manager.store import MemoryStore
@@ -236,6 +237,111 @@ def test_submit_records_turns_tokens_for_rollups(tmp_path: Path) -> None:
         by_model = {r["model"]: r for r in stats["by_model"]}
         assert by_model["claude-opus-4-8"]["total_turns"] == 8
         assert round(by_model["claude-opus-4-8"]["total_cost_usd"], 2) == 0.09
+
+
+# --------------------------------------------------------------------------- #
+# Re-execution loop guard (quarantine / dead-letter)
+# --------------------------------------------------------------------------- #
+
+
+def test_no_progress_streak_counts_until_a_landed_commit() -> None:
+    # Newest-first, as list_runs returns. A landed commit resets the count;
+    # aborted/blocked are neutral; no-commit completions and errors count.
+    runs = [
+        {"task": "t", "status": "completed", "commit_sha": None},   # +1
+        {"task": "t", "status": "error", "commit_sha": None},        # +1
+        {"task": "t", "status": "aborted", "commit_sha": None},      # neutral
+        {"task": "other", "status": "completed", "commit_sha": None},  # skipped
+        {"task": "t", "status": "completed", "commit_sha": "abc123"},   # reset/stop
+        {"task": "t", "status": "completed", "commit_sha": None},     # not reached
+    ]
+    assert no_progress_streak(runs, "t") == 2
+    assert no_progress_streak([], "t") == 0
+
+
+def _poll_and_submit_no_change(client: TestClient, task: str) -> dict[str, Any]:
+    """Drive one poll → completed-but-no-commit submit cycle for ``task``."""
+    order = client.post(
+        "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+    ).json()["work"]
+    assert order is not None and order["task"] == task
+    # The worker streams some output before deciding there's nothing to do.
+    client.post(
+        f"/api/worker/runs/{order['run_id']}/events",
+        json={"events": [{"type": "task_log", "task": task, "line": "already done?\n"}]},
+    )
+    resp = client.post(
+        f"/api/worker/runs/{order['run_id']}/submit",
+        json={
+            "worker_id": "w1", "lease_id": order["lease_id"], "task": task,
+            "queue": "main", "title": task, "status": "completed",
+            "landable": False, "backend": "claude-code", "model": "claude-sonnet-4-6",
+        },
+    ).json()
+    return {**resp, "run_id": order["run_id"]}
+
+
+def test_repeated_no_change_quarantines_and_halts_dispatch(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {"10.loop": "Move a setting that's already moved."})
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+
+        # First no-change run: under threshold (default 2), still runnable.
+        first = _poll_and_submit_no_change(client, "10.loop")
+        assert first["quarantined"] is False
+
+        # Second no-change run in a row hits the threshold → quarantined.
+        second = _poll_and_submit_no_change(client, "10.loop")
+        assert second["quarantined"] is True
+
+        # Budget-critical: the worker is now handed nothing for this task.
+        assert client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"] is None
+
+        # The operator can see it, with the quarantine reason.
+        blocked = {b["task"]: b for b in client.get("/api/blocked").json()}
+        assert "10.loop" in blocked
+        assert "quarantined" in blocked["10.loop"]["blocked_reason"]
+
+
+def test_quarantine_threshold_zero_disables_the_guard(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {"10.loop": "Idempotent task."})
+    os.environ["NIGHTSHIFT_QUARANTINE_THRESHOLD"] = "0"
+    try:
+        with _client(root) as client:
+            client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+            for _ in range(3):
+                out = _poll_and_submit_no_change(client, "10.loop")
+                assert out["quarantined"] is False
+            # Never quarantined → still dispatchable.
+            assert client.post(
+                "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+            ).json()["work"] is not None
+    finally:
+        del os.environ["NIGHTSHIFT_QUARANTINE_THRESHOLD"]
+
+
+def test_run_log_reconstructed_from_task_log_events(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {"10.hello": "Do a thing."})
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        order = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        run_id = order["run_id"]
+        client.post(
+            f"/api/worker/runs/{run_id}/events",
+            json={"events": [
+                {"type": "task_log", "task": "10.hello", "line": "line one\n"},
+                {"type": "task_status", "task": "10.hello", "phase": "worker"},
+                {"type": "task_log", "task": "10.hello", "line": "line two\n"},
+            ]},
+        )
+        # The manager rebuilds the log from persisted task_log events so a
+        # finished run's output is viewable after the fact.
+        data = client.get(f"/api/runs/{run_id}/10.hello/log").json()
+        assert data["text"] == "line one\nline two\n"
 
 
 # --------------------------------------------------------------------------- #

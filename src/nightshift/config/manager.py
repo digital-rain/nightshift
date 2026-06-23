@@ -128,6 +128,14 @@ class OperatorConfig:
     max_fix_attempts: int = field(default=6, metadata=meta(
         category="Worker execution policy", label="Max fix attempts",
         desc="Fix retries (dispatch path).", apply="next-task"))
+    quarantine_threshold: int = field(default=2, metadata=meta(
+        category="Worker execution policy", label="Quarantine threshold",
+        desc=(
+            "Consecutive runs of one task that make no progress (no commit "
+            "landed, or a worker error) before it is quarantined: held in the "
+            "queue but skipped by every worker so a confused task cannot burn "
+            "budget in a re-execution loop. 0 disables quarantine."),
+        apply="next-task", env="NIGHTSHIFT_QUARANTINE_THRESHOLD"))
 
     auto_resolve: bool = field(default=True, metadata=meta(
         category="Conflict resolution", label="Auto resolve",
@@ -286,6 +294,10 @@ def load_manager_settings(workspace: Path) -> ManagerSettings:
             data.get("diff_cap_exempt_paths"),
             ("^tests/fixtures/", "^docs/", "\\.md$")),
         max_fix_attempts=_as_int(data.get("max_fix_attempts"), 6),
+        quarantine_threshold=_as_int(
+            os.environ.get("NIGHTSHIFT_QUARANTINE_THRESHOLD")
+            or data.get("quarantine_threshold"),
+            2),
         auto_resolve=bool(data.get("auto_resolve", True)),
         max_resolve_attempts=_as_int(data.get("max_resolve_attempts"), 2),
         resolve_model=data.get("resolve_model"),
@@ -336,6 +348,7 @@ def save_manager_settings(workspace: Path, settings: ManagerSettings) -> None:
         "forbidden_paths": list(settings.operator.forbidden_paths),
         "forbidden_template_paths": list(settings.operator.forbidden_template_paths),
         "max_fix_attempts": settings.operator.max_fix_attempts,
+        "quarantine_threshold": settings.operator.quarantine_threshold,
         "auto_resolve": settings.operator.auto_resolve,
         "max_resolve_attempts": settings.operator.max_resolve_attempts,
         "resolve_model": settings.operator.resolve_model,

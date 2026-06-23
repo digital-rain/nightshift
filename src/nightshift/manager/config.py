@@ -42,6 +42,9 @@ class ManagerConfig:
     tasks_repo: str = "nightshift-tasks"
     rendezvous_remote: str | None = "origin"
     wip_ref_prefix: str = "nightshift-wip"
+    # Consecutive no-progress runs of a task before it is quarantined (held in
+    # the queue but skipped by every worker). 0 disables the guard.
+    quarantine_threshold: int = 2
     cadences: Cadences = field(default_factory=Cadences)
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -63,6 +66,7 @@ def load_manager_config(workspace: Path) -> ManagerConfig:
         tasks_repo=settings.operator.tasks_repo,
         rendezvous_remote=settings.operator.rendezvous_remote,
         wip_ref_prefix=settings.operator.wip_ref_prefix,
+        quarantine_threshold=settings.operator.quarantine_threshold,
         cadences=settings.cadences,
         raw=settings.raw,
     )

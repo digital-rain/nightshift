@@ -334,6 +334,42 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             }
         )
 
+    async def _quarantine_if_looping(
+        queue: str | None, task: str, run_id: str, detail: str
+    ) -> bool:
+        """Quarantine a task that is stuck re-executing without progress.
+
+        Counts the most recent consecutive runs of ``task`` that landed nothing
+        (see :func:`no_progress_streak`); once that streak reaches the configured
+        ``quarantine_threshold`` the task is pinned to the ``quarantined`` state.
+        A quarantined task stays in the queue (so the operator sees it) but is
+        excluded from dispatch by every worker — the budget-protection stop. The
+        offending runs (and their logs, kept as ``task_log`` events) are retained
+        for later analysis. Returns ``True`` when it quarantined the task.
+        """
+        if cfg.quarantine_threshold <= 0:
+            return False
+        runs = await _store().list_runs(queue=queue, limit=50)
+        streak = no_progress_streak(runs, task)
+        if streak < cfg.quarantine_threshold:
+            return False
+        reason = (
+            f"quarantined after {streak} consecutive runs with no progress "
+            f"({detail}); execution halted to protect budget — review the run "
+            f"logs and edit or delete the task to release it"
+        )
+        await _store().set_task_state(
+            queue, task, "quarantined", blocked_reason=reason
+        )
+        await _emit(
+            "task_quarantined",
+            run_id=run_id,
+            queue=queue,
+            task=task,
+            payload={"reason": reason, "streak": streak},
+        )
+        return True
+
     # ----- worker auth (optional shared secret) ---------------------------- #
 
     def _require_secret(x_nightshift_secret: str | None = Header(default=None)) -> None:
@@ -426,6 +462,14 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         # Manager-side queue dedication (queue label -> bound worker ids).
         dedication = await store.queue_dedication()
 
+        # Tasks quarantined for re-execution looping are held: excluded from
+        # dispatch and never re-stated by the overlays below, so a quarantine
+        # reason is never clobbered by a (lower-priority) blocked/repo overlay.
+        quarantined = {
+            (_queue_from_label(row["queue"]), row["task"])
+            for row in await store.tasks_in_state("quarantined")
+        }
+
         # Mark tasks blocked when no live worker can ever currently serve them:
         # an unadvertised pinned model, an unadvertised connector, or a queue
         # dedicated only to offline workers.
@@ -440,6 +484,8 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             dedication=dedication,
             online_workers=online_workers,
         ):
+            if (cand.queue, cand.task) in quarantined:
+                continue
             existing = await store.get_task_state(cand.queue, cand.task)
             if not existing or existing.get("state") != "blocked":
                 await store.set_task_state(
@@ -460,6 +506,8 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         for cands in candidates_by_queue.values():
             for cand in cands:
                 key = (cand.queue, cand.task)
+                if key in quarantined:
+                    continue
                 if cand.repo_error is not None:
                     existing = await store.get_task_state(cand.queue, cand.task)
                     if not existing or existing.get("state") != "blocked":
@@ -494,8 +542,10 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         leased = {(_queue_from_label(le["queue"]), le["task"]) for le in active}
         blocked_rows = await store.list_blocked()
         blocked = {(_queue_from_label(b["queue"]), b["task"]) for b in blocked_rows}
-        # Never dispatch a paused (repo_unavailable) or repo-blocked task.
+        # Never dispatch a paused (repo_unavailable), repo-blocked, or
+        # quarantined (re-execution loop) task.
         blocked |= repo_excluded
+        blocked |= quarantined
 
         worker = WorkerFilter(
             worker_id=body.worker_id,
@@ -668,6 +718,15 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                 **telemetry,
             )
             await store.set_lease_status(body.lease_id, "released")
+            # A worker *error* leaves the brief in the queue with no blocking
+            # overlay, so it re-leases on the next poll. Repeated errors are a
+            # re-execution loop → quarantine. Operator-driven stops (aborted) are
+            # intentional and never quarantine.
+            quarantined = False
+            if body.status == "error":
+                quarantined = await _quarantine_if_looping(
+                    queue, body.task, run_id, "worker error"
+                )
             await _registry().set_idle(body.worker_id)
             await _emit(
                 "task_result",
@@ -676,9 +735,15 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                 task=body.task,
                 payload={"status": body.status, "result_line": body.result_line},
             )
-            return JSONResponse({"landed": False, "status": body.status})
+            return JSONResponse(
+                {"landed": False, "status": body.status, "quarantined": quarantined}
+            )
 
         # Completed but nothing to land (no commit): record success, no git.
+        # The brief is NOT dropped (only a landed task leaves the queue), so a
+        # no-change task re-leases on the next poll. If that has now happened
+        # enough times in a row it is a re-execution loop → quarantine; otherwise
+        # clear any overlay so the (legitimately idempotent) task stays runnable.
         if not body.landable:
             await store.update_run(
                 run_id, status="completed",
@@ -686,14 +751,21 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                 **telemetry,
             )
             await store.set_lease_status(body.lease_id, "released")
-            await store.clear_task_state(queue, body.task)
+            quarantined = await _quarantine_if_looping(
+                queue, body.task, run_id, "no changes produced"
+            )
+            if not quarantined:
+                await store.clear_task_state(queue, body.task)
             await _registry().set_idle(body.worker_id)
             await _emit(
                 "task_result", run_id=run_id, queue=queue, task=body.task,
                 payload={"status": "completed", "result_line": body.result_line or "no changes"},
             )
             await _emit("queue_changed", queue=queue)
-            return JSONResponse({"landed": False, "status": "completed", "no_changes": True})
+            return JSONResponse(
+                {"landed": False, "status": "completed", "no_changes": True,
+                 "quarantined": quarantined}
+            )
 
         tasks_rel = playlists_mod.tasks_rel(queue)
         meta = _task_meta(tasks_root, body.task, queue)
@@ -1348,7 +1420,33 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
 
     @app.get("/api/blocked")
     async def get_blocked() -> JSONResponse:
-        return JSONResponse([_jsonable(b) for b in await _store().list_blocked()])
+        store = _store()
+        # Quarantined tasks are surfaced alongside blocked ones so the operator
+        # sees them in the same "needs attention" surface; each carries its own
+        # ``blocked_reason`` (the quarantine explanation) and a ``state`` tag.
+        rows = [*await store.list_blocked(), *await store.tasks_in_state("quarantined")]
+        return JSONResponse([_jsonable(b) for b in rows])
+
+    @app.get("/api/runs/{run_id}/{task}/log")
+    async def get_run_log(
+        run_id: str, task: str, offset: int = 0, queue: str | None = None
+    ) -> JSONResponse:
+        """Reconstruct a run's log from its persisted ``task_log`` events.
+
+        The worker streams stdout to the manager as ``task_log`` events, which
+        are stored durably (Postgres ``nightshift.events``). This re-assembles
+        them into the plain-text payload the shared UI's log panel expects, so a
+        finished run's output is viewable after the fact (parity with the
+        single-process server's on-disk ``/log`` endpoint)."""
+        events = await _store().run_events(run_id)
+        text = "".join(
+            str((ev.get("payload") or {}).get("line", ""))
+            for ev in events
+            if ev.get("kind") == "task_log"
+        )
+        return JSONResponse(
+            {"text": text[offset:], "offset": len(text), "eof": True}
+        )
 
     _MANAGER_SURFACES = ["manager", "player"]
 
@@ -1385,7 +1483,13 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             "workers": [_jsonable(w) for w in await store.list_workers()],
             "leases": [_jsonable(le) for le in await store.active_leases()],
             "runs": [_jsonable(r) for r in await store.list_runs(limit=50)],
-            "blocked": [_jsonable(b) for b in await store.list_blocked()],
+            "blocked": [
+                _jsonable(b)
+                for b in (
+                    *await store.list_blocked(),
+                    *await store.tasks_in_state("quarantined"),
+                )
+            ],
         }
 
     @app.get("/api/events")
@@ -1450,6 +1554,31 @@ def _jsonable(row: dict[str, Any] | None) -> dict[str, Any]:
         else:
             out[key] = value
     return out
+
+
+def no_progress_streak(runs: list[dict[str, Any]], task: str) -> int:
+    """Most-recent consecutive runs of ``task`` that made no progress.
+
+    ``runs`` is in the order :meth:`NightshiftStore.list_runs` returns them
+    (newest first). The scan stops at the first run that *landed* (a completed
+    run carrying a ``commit_sha``), so real progress resets the count. A
+    completed run with no commit ("worker emitted output only") or a worker
+    ``error`` is a no-progress run and increments the streak. Operator-driven
+    outcomes (``aborted``/``skipped``) and explicit holds (``blocked``) are
+    neutral — they neither count nor reset — so a manual stop in the middle of a
+    loop neither masks nor amplifies it. Pure given its inputs (unit-testable
+    without a store).
+    """
+    streak = 0
+    for run in runs:
+        if run.get("task") != task:
+            continue
+        status = run.get("status")
+        if status == "completed" and run.get("commit_sha"):
+            break
+        if status == "error" or (status == "completed" and not run.get("commit_sha")):
+            streak += 1
+    return streak
 
 
 def _task_meta(tasks_root: Path, task: str, queue: str | None) -> dict[str, Any]:
