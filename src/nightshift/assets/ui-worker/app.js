@@ -60,9 +60,11 @@ async function refreshNow() {
   card.hidden = false;
   document.getElementById("now-task").textContent = now.title || now.task;
   document.getElementById("now-queue").textContent = now.queue || "main";
+  document.getElementById("now-repo").textContent = now.repo || "—";
   document.getElementById("now-phase").textContent = now.phase || "worker";
   document.getElementById("now-model").textContent = `model: ${now.model || "auto"}`;
   document.getElementById("now-started").textContent = `started: ${now.started_at || "—"}`;
+  document.getElementById("now-branch").textContent = now.branch ? `branch: ${now.branch}` : "—";
   const log = document.getElementById("now-log");
   log.textContent = (now.log_tail || []).join("");
   log.scrollTop = log.scrollHeight;

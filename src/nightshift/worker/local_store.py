@@ -34,6 +34,8 @@ class NowPlaying:
     title: str
     model: str
     backend: str
+    repo: str = ""
+    branch: str | None = None
     phase: str = "worker"
     started_at: str = field(default_factory=_now_iso)
     log_tail: deque[str] = field(default_factory=lambda: deque(maxlen=MAX_LOG_TAIL))
@@ -54,10 +56,28 @@ class LocalStore:
 
     # ---- live "now" ------------------------------------------------------- #
 
-    def begin(self, *, run_id: str, task: str, queue: str, title: str, model: str, backend: str) -> None:
+    def begin(
+        self,
+        *,
+        run_id: str,
+        task: str,
+        queue: str,
+        title: str,
+        model: str,
+        backend: str,
+        repo: str = "",
+        branch: str | None = None,
+    ) -> None:
         with self._lock:
             self._now = NowPlaying(
-                run_id=run_id, task=task, queue=queue, title=title, model=model, backend=backend
+                run_id=run_id,
+                task=task,
+                queue=queue,
+                title=title,
+                model=model,
+                backend=backend,
+                repo=repo,
+                branch=branch,
             )
 
     def set_phase(self, phase: str) -> None:

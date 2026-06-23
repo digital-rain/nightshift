@@ -13,7 +13,7 @@ import threading
 from typing import Any
 
 from nightshift import playlists
-from nightshift.engine import teardown_worktree
+from nightshift.engine import teardown_worktree, worktree_branch
 from nightshift.worker.client import ManagerClient
 from nightshift.worker.config import WorkerConfig
 from nightshift.worker.execute import ExecuteOutcome, execute_work_order
@@ -52,7 +52,9 @@ class WorkerLoop:
         )
         cad = resp.get("cadences", {})
         self.poll_seconds = float(cad.get("poll_seconds", self.poll_seconds))
-        self.heartbeat_seconds = float(cad.get("heartbeat_seconds", self.heartbeat_seconds))
+        self.heartbeat_seconds = float(
+            cad.get("heartbeat_seconds", self.heartbeat_seconds)
+        )
         if cad.get("refresh_ms"):
             self.cfg.refresh_ms = int(cad["refresh_ms"])
 
@@ -92,11 +94,18 @@ class WorkerLoop:
         task = order["task"]
         queue = order.get("queue") or "main"
         title = order.get("title", task)
+        repo = order.get("repo") or ""
+        branch = worktree_branch(task, queue)
 
         self.local.begin(
-            run_id=run_id, task=task, queue=queue, title=title,
+            run_id=run_id,
+            task=task,
+            queue=queue,
+            title=title,
             model=str(order.get("config", {}).get("model", "auto")),
             backend=self.cfg.backend,
+            repo=repo,
+            branch=branch,
         )
 
         buffer: list[dict[str, Any]] = []
@@ -108,7 +117,14 @@ class WorkerLoop:
 
         def on_phase(phase: str) -> None:
             self.local.set_phase(phase)
-            buffer.append({"type": "task_status", "task": task, "phase": phase, "status": "running"})
+            buffer.append(
+                {
+                    "type": "task_status",
+                    "task": task,
+                    "phase": phase,
+                    "status": "running",
+                }
+            )
             flush()
 
         def on_log(line: str) -> None:
@@ -126,7 +142,9 @@ class WorkerLoop:
 
         try:
             buffer.append({"type": "task_started", "task": task, "title": title})
-            outcome = execute_work_order(self.cfg, order, on_phase=on_phase, on_log=on_log)
+            outcome = execute_work_order(
+                self.cfg, order, on_phase=on_phase, on_log=on_log
+            )
             flush()
         finally:
             hb_stop.set()
@@ -180,7 +198,9 @@ class WorkerLoop:
         if outcome.branch_ref and result.get("landed"):
             repo = order.get("repo")
             if repo:
-                queue_internal = playlists.queue_from_tasks_rel(order.get("queue") or "main")
+                queue_internal = playlists.queue_from_tasks_rel(
+                    order.get("queue") or "main"
+                )
                 teardown_worktree(self.cfg.workspace, repo, task, queue=queue_internal)
         self.local.finish(
             {
