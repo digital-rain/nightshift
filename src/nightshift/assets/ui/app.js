@@ -2004,33 +2004,10 @@ function renderStats() {
   }
   body.append(breakdown);
 
-  // Usage by model: token consumption and cost per model, sorted by cost.
+  // Usage by model: concentric ring chart, one ring per model, arc = cost proportion.
   if (s.byModel && s.byModel.length) {
     const usage = statSection("Usage by model");
-    const list = document.createElement("div");
-    list.className = "stat-bars";
-    const maxCost = s.byModel[0][1].cost;
-    for (const [model, u] of s.byModel) {
-      const row = document.createElement("div");
-      row.className = "stat-bar-row stat-model-row";
-      const lbl = document.createElement("span");
-      lbl.className = "stat-bar-label";
-      lbl.textContent = model;
-      const track = document.createElement("div");
-      track.className = "stat-bar-track";
-      const fill = document.createElement("div");
-      fill.className = "stat-bar-fill stat-fill-ok";
-      fill.style.width = `${maxCost > 0 ? (u.cost / maxCost) * 100 : 0}%`;
-      track.append(fill);
-      const meta = document.createElement("span");
-      meta.className = "stat-bar-value stat-model-meta";
-      const totalTok = u.input + u.output;
-      meta.textContent = `${formatCount(totalTok)} tok · $${u.cost.toFixed(2)}`;
-      meta.title = `${formatCount(u.input)} in · ${formatCount(u.output)} out · ${u.runs} run${u.runs === 1 ? "" : "s"}`;
-      row.append(lbl, track, meta);
-      list.append(row);
-    }
-    usage.append(list);
+    usage.append(modelRingsChart(s.byModel));
     body.append(usage);
   }
 }
@@ -2157,6 +2134,87 @@ function failureBar(kind, count, max) {
   value.textContent = String(count);
   row.append(label, track, value);
   return row;
+}
+
+// Concentric ring chart for model usage breakdown — one ring per model, arc
+// length proportional to cost relative to the highest-cost model. Outermost
+// ring = most expensive, innermost = least.
+function modelRingsChart(byModel) {
+  const STROKE = 12;
+  const GAP = 5;
+  const STEP = STROKE + GAP;
+  const R0 = 22;
+  const N = byModel.length;
+  const R_max = R0 + (N - 1) * STEP;
+  const PAD = 8;
+  const HALF = R_max + STROKE / 2 + PAD;
+  const SIZE = Math.ceil(HALF * 2);
+  const cx = HALF;
+  const cy = HALF;
+  const maxCost = byModel[0][1].cost;
+
+  const wrap = document.createElement("div");
+  wrap.className = "stat-proportion";
+
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", `0 0 ${SIZE} ${SIZE}`);
+  svg.setAttribute("width", String(SIZE));
+  svg.setAttribute("height", String(SIZE));
+  svg.classList.add("stat-donut");
+
+  const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+  g.setAttribute("transform", `rotate(-90 ${cx} ${cy})`);
+
+  for (let i = 0; i < N; i++) {
+    const [model, u] = byModel[i];
+    const R = R0 + (N - 1 - i) * STEP;
+    const C = 2 * Math.PI * R;
+    const frac = maxCost > 0 ? u.cost / maxCost : 0;
+
+    const track = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    track.setAttribute("cx", String(cx));
+    track.setAttribute("cy", String(cy));
+    track.setAttribute("r", String(R));
+    track.setAttribute("fill", "none");
+    track.setAttribute("stroke-width", String(STROKE));
+    track.classList.add("stat-donut-track");
+    g.append(track);
+
+    if (frac > 0) {
+      const dash = frac * C;
+      const arc = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      arc.setAttribute("cx", String(cx));
+      arc.setAttribute("cy", String(cy));
+      arc.setAttribute("r", String(R));
+      arc.setAttribute("fill", "none");
+      arc.setAttribute("stroke-width", String(STROKE));
+      arc.setAttribute("stroke-dasharray", `${dash} ${C - dash}`);
+      arc.classList.add("stat-rings-arc");
+      const ttl = document.createElementNS("http://www.w3.org/2000/svg", "title");
+      ttl.textContent = `${model}: $${u.cost.toFixed(2)}`;
+      arc.append(ttl);
+      g.append(arc);
+    }
+  }
+
+  svg.append(g);
+  wrap.append(svg);
+
+  const legend = document.createElement("div");
+  legend.className = "stat-legend";
+  for (const [model, u] of byModel) {
+    const item = document.createElement("span");
+    item.className = "stat-legend-item";
+    const dot = document.createElement("span");
+    dot.className = "stat-dot stat-rings-dot";
+    const totalTok = u.input + u.output;
+    item.title = `${formatCount(u.input)} in · ${formatCount(u.output)} out · ${u.runs} run${u.runs === 1 ? "" : "s"}`;
+    item.append(dot, document.createTextNode(`${model}  ${formatCount(totalTok)} tok · $${u.cost.toFixed(2)}`));
+    legend.append(item);
+  }
+  wrap.append(legend);
+
+  return wrap;
 }
 
 function historyRow(run, task) {
