@@ -122,7 +122,7 @@ Secrets (`shared_secret`, `dsn`) are **not** in this file — they live in `.env
 | `cadences.worker_stale_seconds` | `45.0` | Silence after which a worker is marked `offline`. |
 | `cadences.refresh_ms` | `20000` | UI safety-poll fallback (SSE is the primary live channel). |
 | `default_model` | `auto` | Model a brief inherits when it sets no `model:`. |
-| `scheduled_models` | (list) | Pin-only allow-set: an explicit `model:` must be in this list. |
+| `scheduled_models_allow` | (list) | Filter: only auto-schedule tasks pinned to these models. UI model dropdown is populated from live worker registrations. |
 | `max_per_day` | `200` | Dispatch cap (daily-queue path). |
 | `max_concurrent_queues` | `2` | Max queues served concurrently. |
 | `max_nights_before_parking` | `2` | Nights a failing task retries before being parked. |
@@ -289,4 +289,4 @@ Worker-facing (`X-Nightshift-Secret` required when a secret is set):
 - `POST /api/worker/runs/{run_id}/events` — stream logs/phases.
 - `POST /api/worker/runs/{run_id}/submit` — submit the result for landing.
 
-Operator-facing: `/api/queue*`, `/api/tasks*`, `/api/runs`, `/api/workers`, `/api/stats`, `/api/blocked`, `/api/queue/dedication`, `/api/settings`, and the `/api/events` SSE stream (snapshot-on-connect + live deltas).
+Operator-facing: `/api/queue*`, `/api/tasks*`, `/api/runs`, `/api/workers`, `/api/models`, `/api/stats`, `/api/blocked`, `/api/queue/dedication`, `/api/settings`, and the `/api/events` SSE stream (snapshot-on-connect + live deltas).

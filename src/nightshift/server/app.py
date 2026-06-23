@@ -191,9 +191,11 @@ class PlaylistUpdate(BaseModel):
     alias the UI shows for the queue's default ``repo`` binding. Both optional;
     only fields present in the request are applied."""
 
+    model_config = ConfigDict(populate_by_name=True)
+
     name: str | None = None
     repository: str | None = None
-    validate: str | None = None
+    validate_cmd: str | None = Field(default=None, alias="validate")
     # Hide the playlist from the default Playlists view and exclude it from
     # scheduling; ``False`` re-enables it. ``None`` leaves the flag untouched.
     disabled: bool | None = None
@@ -271,11 +273,16 @@ def create_app(workspace: Path) -> FastAPI:
         if not _queue_exists(target):
             return JSONResponse({"error": "queue not found"}, status_code=404)
         try:
-            return JSONResponse(
-                read_task(tasks_root, task, playlists_mod.tasks_rel(target))
-            )
+            info = read_task(tasks_root, task, playlists_mod.tasks_rel(target))
         except FileNotFoundError:
             return JSONResponse({"error": "task not found"}, status_code=404)
+        config = resolve_config(workspace, tasks_root, playlists_mod.tasks_rel(target))
+        info["model_options"] = list(
+            config.get("scheduled_models_allow")
+            or config.get("scheduled_models")
+            or []
+        )
+        return JSONResponse(info)
 
     @app.put("/api/queue/order")
     def put_queue_order(req: QueueOrder, queue: str | None = None) -> JSONResponse:
@@ -606,7 +613,11 @@ def create_app(workspace: Path) -> FastAPI:
                 "frontmatter_raw": {},
                 "evergreen": False,
                 "disabled": False,
-                "model_options": list(config.get("scheduled_models", [])),
+                "model_options": list(
+                    config.get("scheduled_models_allow")
+                    or config.get("scheduled_models")
+                    or []
+                ),
             }
         )
 
@@ -851,8 +862,8 @@ def create_app(workspace: Path) -> FastAPI:
             save_queue_config_value(
                 tasks_root, "repo", repo, playlists_mod.tasks_rel(current)
             )
-        if "validate" in req.model_dump(exclude_unset=True):
-            cmd = normalize_validate_command(str(req.validate or ""))
+        if "validate_cmd" in req.model_dump(exclude_unset=True):
+            cmd = normalize_validate_command(str(req.validate_cmd or ""))
             save_queue_config_value(
                 tasks_root, "validate", cmd, playlists_mod.tasks_rel(current)
             )

@@ -73,6 +73,20 @@ class Registry:
             out.update(str(m) for m in (w.get("models") or []))
         return out
 
+    async def models_for_queue(self, queue_label: str) -> list[str]:
+        """Models advertised by live workers that can serve *queue_label*.
+
+        A worker serves a queue when its ``queues`` is None (any) or the label
+        is in its list. Returns a sorted deduplicated list suitable for the UI
+        model dropdown.
+        """
+        out: set[str] = set()
+        for w in await self._live_workers():
+            wq = w.get("queues")
+            if wq is None or queue_label in wq:
+                out.update(str(m) for m in (w.get("models") or []))
+        return sorted(out)
+
     async def available_mcps(self) -> set[str]:
         """Union of MCP connectors advertised by every non-offline worker."""
         out: set[str] = set()

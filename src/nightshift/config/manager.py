@@ -56,11 +56,11 @@ class OperatorConfig:
         category="Scheduling", label="Max nights before parking",
         desc="Nights a failing task retries before being parked.",
         apply="next-task"))
-    scheduled_models: tuple[str, ...] = field(
+    scheduled_models_allow: tuple[str, ...] = field(
         default=("claude-sonnet-4-6", "claude-opus-4-8"),
         metadata=meta(
-            category="Scheduling", label="Scheduled models",
-            desc="Pin-only allow-set for explicit model: in briefs.",
+            category="Scheduling", label="Scheduled models allow",
+            desc="Filter: only auto-schedule tasks pinned to these models.",
             apply="next-task", type="string_list"))
     default_model: str = field(default="auto", metadata=meta(
         category="Scheduling", label="Default model",
@@ -256,8 +256,8 @@ def load_manager_settings(workspace: Path) -> ManagerSettings:
         max_per_day=_as_int(data.get("max_per_day"), 200),
         max_concurrent_queues=_as_int(data.get("max_concurrent_queues"), 2),
         max_nights_before_parking=_as_int(data.get("max_nights_before_parking"), 2),
-        scheduled_models=_as_tuple(
-            data.get("scheduled_models"),
+        scheduled_models_allow=_as_tuple(
+            data.get("scheduled_models_allow") or data.get("scheduled_models"),
             ("claude-sonnet-4-6", "claude-opus-4-8")),
         default_model=(
             os.environ.get("NIGHTSHIFT_DEFAULT_MODEL")
@@ -324,7 +324,7 @@ def save_manager_settings(workspace: Path, settings: ManagerSettings) -> None:
             "refresh_ms": settings.cadences.refresh_ms,
         },
         "default_model": settings.operator.default_model,
-        "scheduled_models": list(settings.operator.scheduled_models),
+        "scheduled_models_allow": list(settings.operator.scheduled_models_allow),
         "max_per_day": settings.operator.max_per_day,
         "max_concurrent_queues": settings.operator.max_concurrent_queues,
         "max_nights_before_parking": settings.operator.max_nights_before_parking,

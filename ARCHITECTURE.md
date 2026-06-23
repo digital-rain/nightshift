@@ -214,7 +214,7 @@ Precedence (highest wins): environment → `config.json.local` → `config.json`
 
 Key `config.json` blocks:
 - `manager.cadences` — `poll_seconds`, `heartbeat_seconds`, `lease_ttl_seconds`, `refresh_ms`
-- `scheduled_models` — the pin-only allow-set for explicit model ids in briefs
+- `scheduled_models_allow` — filter for auto-scheduled recurring tasks (not the UI dropdown source)
 - `forbidden_paths` / `forbidden_template_paths` — paths workers may not modify
 - `worker_backend`, `default_model` — fallback policy
 

@@ -19,7 +19,7 @@ Parts 2 and 3 depend on this part and add **no** new config knowledge of their o
 
 Configuration today is **modeled in three different ways and stored in three ad-hoc places**:
 
-- The `manager` block + cadences + `tasks_repo`/`wip_ref_prefix` are typed (`ManagerConfig`, `Cadences`), but the **~22 top-level operator/task-policy keys** (`max_per_day`, `automerge`, `forbidden_paths`, `scheduled_models`, …) are **not modeled at all** — they're read ad-hoc via `cfg.get("model", "claude-sonnet-4-6")` scattered across `spawn_daily.py` / `engine.py` / `scheduler.py`, with inline defaults **that already disagree** (e.g. `resolve_frontmatter` defaults `automerge` to `True` while `config.json` ships `false`).
+- The `manager` block + cadences + `tasks_repo`/`wip_ref_prefix` are typed (`ManagerConfig`, `Cadences`), but the **~22 top-level operator/task-policy keys** (`max_per_day`, `automerge`, `forbidden_paths`, `scheduled_models_allow`, …) are **not modeled at all** — they're read ad-hoc via `cfg.get("model", "claude-sonnet-4-6")` scattered across `spawn_daily.py` / `engine.py` / `scheduler.py`, with inline defaults **that already disagree** (e.g. `resolve_frontmatter` defaults `automerge` to `True` while `config.json` ships `false`).
 - The worker config is typed (`WorkerConfig`) and stored in `config.json.local`.
 - The player/UI settings are a **hand-maintained `SCHEMA: list[dict]` + `DEFAULTS: dict` + `validate_settings()`** in `server/settings.py`, stored in `.nightshift/settings.json`.
 
@@ -244,7 +244,7 @@ Source of truth for Parts 2–3. `apply` is the initial classification (verify p
 | `max_per_day` | Scheduling | int | `200` | next-task | |
 | `max_concurrent_queues` | Scheduling | int | `2` | next-task | |
 | `max_nights_before_parking` | Scheduling | int | `2` | next-task | |
-| `scheduled_models` | Scheduling | string_list | (5 ids) | next-task | pin allow-set |
+| `scheduled_models_allow` | Scheduling | string_list | (5 ids) | next-task | scheduling filter |
 | `default_model` | Scheduling | string | `auto` | next-task | env `NIGHTSHIFT_DEFAULT_MODEL` |
 | `model` | Scheduling | string | (file) | next-task | legacy compat path |
 | `cursor_model` | Scheduling | string | (file) | next-task | legacy compat path |
@@ -346,7 +346,7 @@ And a committed **`.env.example`** at the repo root for secrets + launch env.
   "wip_ref_prefix": "nightshift-wip",
   "cadences": { "poll_seconds": 5.0, "heartbeat_seconds": 10.0, "lease_ttl_seconds": 120.0, "worker_stale_seconds": 45.0, "refresh_ms": 20000 },
   "default_model": "auto",
-  "scheduled_models": ["claude-sonnet-4-6", "claude-opus-4-8"],
+  "scheduled_models_allow": ["claude-sonnet-4-6", "claude-opus-4-8"],
   "max_per_day": 200,
   "max_concurrent_queues": 2,
   "max_nights_before_parking": 2,

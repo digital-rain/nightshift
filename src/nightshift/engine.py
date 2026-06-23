@@ -902,8 +902,6 @@ def read_task(tasks_root: Path, task: str, tasks_rel: str = "main") -> dict:
         "frontmatter_raw": dict(meta),
         "evergreen": evergreen,
         "disabled": is_disabled(meta),
-        # Curated model choices for the detail-view dropdown ("default" + these).
-        "model_options": list(config.get("scheduled_models", [])),
     }
 
 

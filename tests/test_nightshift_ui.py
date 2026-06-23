@@ -873,7 +873,7 @@ def test_server_task_defaults_seeds_create_pane(tmp_path: Path) -> None:
             {
                 "model": "claude-sonnet-4-6",
                 "evergreen_tasks": ["00._todo"],
-                "scheduled_models": ["claude-sonnet-4-6", "claude-opus-4-8"],
+                "scheduled_models_allow": ["claude-sonnet-4-6", "claude-opus-4-8"],
             }
         )
     )

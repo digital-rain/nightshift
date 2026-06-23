@@ -39,8 +39,8 @@ split: false
 
 - Omit `model` — the runner falls back to the lane default in
   `tools/nightshift/config.json` → `model`. Only add a `model:` line when the user
-  explicitly asks to override it for this task (and only with a value listed in
-  `scheduled_models`).
+  explicitly asks to override it for this task (and only with a value that a
+  registered worker advertises).
 - `split: true` (with a short body) when the work should be decomposed into subtasks by
   the runner instead of implemented directly.
 

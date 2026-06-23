@@ -105,7 +105,7 @@ class TestRegistryProjection:
         assert by_key[("manager", "automerge")].type == "bool"
         assert by_key[("manager", "landing_mode")].type == "enum"
         assert by_key[("manager", "forbidden_paths")].type == "regex_list"
-        assert by_key[("manager", "scheduled_models")].type == "string_list"
+        assert by_key[("manager", "scheduled_models_allow")].type == "string_list"
         assert by_key[("player", "theme")].type == "enum"
         assert by_key[("player", "repeat_interval")].type == "duration"
         assert by_key[("worker", "model_aliases")].type == "str_map"

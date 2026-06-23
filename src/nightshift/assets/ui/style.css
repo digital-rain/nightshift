@@ -1261,7 +1261,7 @@ body[data-view="detail"] #screen-detail { display: flex; flex: 1; }
 .stats-body { max-width: 760px; width: 100%; margin: 0 auto; }
 .stat-cards {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
   gap: 10px;
   margin-bottom: 22px;
 }

@@ -72,7 +72,7 @@ The worker UI (`ui-worker/`) is currently Now + History with a top nav and no ge
 - **Dirty/delta:** changing two fields and saving sends exactly those two keys; Discard reverts to `stored`.
 - **Error mapping:** a `400` with a per-field message renders inline on the right row and leaves the form dirty.
 - **Restart banner:** a response with `restart_required` shows the banner; `applied_live` (theme) re-skins without reload.
-- **Manual/browser smoke (per `control-ui` skill):** open the manager settings view, exercise a chip editor (`scheduled_models`), a map editor (`model_aliases` on the worker), a secret field (shows set/not-set, never the value), and confirm Save → re-read.
+- **Manual/browser smoke (per `control-ui` skill):** open the manager settings view, exercise a chip editor (`scheduled_models_allow`), a map editor (`model_aliases` on the worker), a secret field (shows set/not-set, never the value), and confirm Save → re-read.
 
 ## 7. Non-goals
 

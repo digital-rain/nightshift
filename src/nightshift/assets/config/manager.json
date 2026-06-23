@@ -13,7 +13,7 @@
     "refresh_ms": 20000
   },
   "default_model": "auto",
-  "scheduled_models": ["claude-sonnet-4-6", "claude-opus-4-8"],
+  "scheduled_models_allow": ["claude-sonnet-4-6", "claude-opus-4-8"],
   "max_per_day": 200,
   "max_concurrent_queues": 2,
   "max_nights_before_parking": 2,

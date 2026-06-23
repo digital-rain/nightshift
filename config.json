@@ -22,7 +22,7 @@
   "default_model": "auto",
   "model": "claude-opus-4-8",
   "cursor_model": "claude-opus-4-8-high",
-  "scheduled_models": [
+  "scheduled_models_allow": [
     "claude-sonnet-4-6",
     "claude-opus-4-6",
     "claude-opus-4-8",

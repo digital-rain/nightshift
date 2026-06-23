@@ -68,6 +68,7 @@ from nightshift.manager.store import NightshiftStore, open_store
 from nightshift.spawn_daily import (
     load_queue_config,
     resolve_config,
+    resolve_frontmatter,
     split_frontmatter,
 )
 
@@ -817,12 +818,43 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         return JSONResponse(list_queue(tasks_root, playlists_mod.tasks_rel(None)))
 
     @app.get("/api/tasks/{task}")
-    def get_task(task: str, queue: str | None = None) -> JSONResponse:
+    async def get_task(task: str, queue: str | None = None) -> JSONResponse:
         target = _resolve_queue(queue)
         try:
-            return JSONResponse(read_task(tasks_root, task, playlists_mod.tasks_rel(target)))
+            info = read_task(tasks_root, task, playlists_mod.tasks_rel(target))
         except FileNotFoundError:
             return JSONResponse({"error": "task not found"}, status_code=404)
+        label = queue_label(target)
+        info["model_options"] = await _registry().models_for_queue(label)
+        return JSONResponse(info)
+
+    @app.get("/api/task-defaults")
+    async def get_task_defaults(queue: str | None = None) -> JSONResponse:
+        """Brief-shaped defaults for a new task: effective model/draft/automerge
+        for the target queue, plus live model choices from registered workers."""
+        target = _resolve_queue(queue)
+        if not _queue_exists(target):
+            return JSONResponse({"error": "queue not found"}, status_code=404)
+        config = resolve_config(workspace, tasks_root, playlists_mod.tasks_rel(target))
+        resolved = resolve_frontmatter({}, config)
+        label = queue_label(target)
+        models = await _registry().models_for_queue(label)
+        return JSONResponse(
+            {
+                "task": None,
+                "title": "",
+                "body": "",
+                "frontmatter": {
+                    "model": resolved["model"],
+                    "draft": resolved["draft"],
+                    "automerge": resolved["automerge"],
+                },
+                "frontmatter_raw": {},
+                "evergreen": False,
+                "disabled": False,
+                "model_options": models,
+            }
+        )
 
     @app.post("/api/tasks")
     async def post_task(body: TaskCreate, queue: str | None = None) -> JSONResponse:
@@ -1286,6 +1318,16 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
     @app.get("/api/workers")
     async def get_workers() -> JSONResponse:
         return JSONResponse([_jsonable(w) for w in await _registry().snapshot()])
+
+    @app.get("/api/models")
+    async def get_models(queue: str | None = None) -> JSONResponse:
+        """Models advertised by live workers that can serve the given queue.
+
+        Used by the task detail dropdown so the operator sees only models
+        actually routable to this queue's workers."""
+        label = queue_label(_resolve_queue(queue) if queue else None)
+        models = await _registry().models_for_queue(label)
+        return JSONResponse({"models": models})
 
     @app.get("/api/stats")
     async def get_stats() -> JSONResponse:

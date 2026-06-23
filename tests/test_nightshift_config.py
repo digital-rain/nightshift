@@ -31,10 +31,10 @@ def test_nightshift_automerge_defaults_off() -> None:
     assert config["automerge"] is False
 
 
-def test_nightshift_scheduled_models_pin_only_allow_set() -> None:
-    # The scheduled_models allow-set survived extraction and still lists the
-    # pinnable model ids the manager may schedule.
+def test_nightshift_scheduled_models_allow_filter() -> None:
+    # The scheduled_models_allow filter lists the model ids the manager may
+    # auto-schedule (UI dropdown is populated from live worker registrations).
     config = json.loads(NIGHTSHIFT_CONFIG.read_text())
-    assert isinstance(config["scheduled_models"], list)
-    assert config["scheduled_models"]
+    assert isinstance(config["scheduled_models_allow"], list)
+    assert config["scheduled_models_allow"]
     assert "diff_cap_lines" in config

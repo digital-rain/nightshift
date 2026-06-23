@@ -412,7 +412,7 @@ def matrix_from_task_names(
     # ``tasks_root`` is ``<workspace>/<tasks_repo>``; resolve the layered queue
     # config (its parent is the workspace by construction).
     config = resolve_config(tasks_root.parent, tasks_root, tasks_rel)
-    scheduled_models = config.get("scheduled_models")
+    allowed = config.get("scheduled_models_allow") or config.get("scheduled_models")
     entries: list[dict] = []
     for name in names:
         path = tasks_root / tasks_rel / f"{name}.md"
@@ -421,10 +421,10 @@ def matrix_from_task_names(
             print(f"skip {name}: disabled", file=sys.stderr)
             continue
         resolved = resolve_frontmatter(meta, config)
-        if scheduled_only and scheduled_models and resolved["model"] not in scheduled_models:
+        if scheduled_only and allowed and resolved["model"] not in allowed:
             print(
                 f"skip {name}: model {resolved['model']} is dispatch-only "
-                "(not in scheduled_models)",
+                "(not in scheduled_models_allow)",
                 file=sys.stderr,
             )
             continue
@@ -495,7 +495,7 @@ def main(argv: list[str] | None = None) -> int:
     matrix_p.add_argument(
         "--scheduled-only",
         action="store_true",
-        help="Drop tasks whose model is not in config scheduled_models",
+        help="Drop tasks whose model is not in config scheduled_models_allow",
     )
 
     recover_p = sub.add_parser(
