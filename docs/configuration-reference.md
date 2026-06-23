@@ -134,6 +134,7 @@ Secrets (`shared_secret`, `dsn`) are **not** in this file — they live in `.env
 | `draft` | `false` | Default draft state for PR-mode landings. |
 | `autostash_operator_work` | `true` | Stash uncommitted operator work before a local landing. |
 | `max_fix_attempts` | `6` | Fix retries (dispatch path). |
+| `validate` | `just validate` | System-wide default validate command run after each task. Per-queue `validate` in queue `config.json` overrides this. Empty string disables validation globally. |
 | `auto_resolve` | `true` | Hand out resolve work-orders on conflict/validation failure. |
 | `max_resolve_attempts` | `2` | Resolve retries before parking. |
 | `resolve_model` / `resolve_backend` | `null` | Optional overrides for resolve runs. |

@@ -128,6 +128,13 @@ class OperatorConfig:
     max_fix_attempts: int = field(default=6, metadata=meta(
         category="Worker execution policy", label="Max fix attempts",
         desc="Fix retries (dispatch path).", apply="next-task"))
+    validate_cmd: str = field(default="just validate", metadata=meta(
+        category="Worker execution policy", label="Validate command",
+        desc=(
+            "System-wide default validate command run after each task. "
+            "Per-queue overrides take precedence. Empty string disables "
+            "validation globally."),
+        apply="next-task", json_key="validate"))
     quarantine_threshold: int = field(default=2, metadata=meta(
         category="Worker execution policy", label="Quarantine threshold",
         desc=(
@@ -294,6 +301,11 @@ def load_manager_settings(workspace: Path) -> ManagerSettings:
             data.get("diff_cap_exempt_paths"),
             ("^tests/fixtures/", "^docs/", "\\.md$")),
         max_fix_attempts=_as_int(data.get("max_fix_attempts"), 6),
+        validate_cmd=str(
+            data.get("validate")
+            if "validate" in data
+            else data.get("validate_cmd", "just validate")
+        ),
         quarantine_threshold=_as_int(
             os.environ.get("NIGHTSHIFT_QUARANTINE_THRESHOLD")
             or data.get("quarantine_threshold"),
@@ -348,6 +360,7 @@ def save_manager_settings(workspace: Path, settings: ManagerSettings) -> None:
         "forbidden_paths": list(settings.operator.forbidden_paths),
         "forbidden_template_paths": list(settings.operator.forbidden_template_paths),
         "max_fix_attempts": settings.operator.max_fix_attempts,
+        "validate": settings.operator.validate_cmd,
         "quarantine_threshold": settings.operator.quarantine_threshold,
         "auto_resolve": settings.operator.auto_resolve,
         "max_resolve_attempts": settings.operator.max_resolve_attempts,

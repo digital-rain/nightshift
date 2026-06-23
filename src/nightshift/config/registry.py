@@ -35,6 +35,7 @@ class FieldSpec:
     options: list[str] | None = None
     secret: bool = False
     env: str | None = None
+    json_key: str | None = None
 
 
 _SURFACE_STORE: dict[str, Store] = {
@@ -135,6 +136,7 @@ def _walk_dataclass(
             options=m.get("options"),
             secret=secret,
             env=m.get("env"),
+            json_key=m.get("json_key"),
         ))
     return specs
 

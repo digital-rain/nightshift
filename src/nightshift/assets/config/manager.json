@@ -25,6 +25,7 @@
   "forbidden_paths": ["^\\.github/workflows/", "^CLAUDE\\.md$", "^AGENTS\\.md$"],
   "forbidden_template_paths": ["^tools/nightshift/templates/"],
   "max_fix_attempts": 6,
+  "validate": "just validate",
   "auto_resolve": true,
   "max_resolve_attempts": 2,
   "resolve_model": null,

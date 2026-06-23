@@ -208,7 +208,8 @@ def write_delta(
                 if spec.env:
                     env_writes.append((spec.env, str(value)))
             else:
-                json_writes.setdefault(spec.store, []).append((key, value))
+                file_key = spec.json_key or key
+                json_writes.setdefault(spec.store, []).append((file_key, value))
 
     for env_key, env_val in env_writes:
         save_dotenv_key(workspace, env_key, env_val)
@@ -239,7 +240,7 @@ def _field_value(
             "env_shadowed": False,
         }
 
-    stored = _get_dotted(file_data, spec.key)
+    stored = _get_dotted(file_data, spec.json_key or spec.key)
     if stored is _MISSING:
         stored = spec.default
 
