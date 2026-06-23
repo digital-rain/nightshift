@@ -1960,11 +1960,6 @@ function renderStats() {
   cards.append(
     statCard("Tasks", String(s.total), "completed runs in history"),
     statCard("Avg time", s.avgSecs !== null ? (formatSecs(s.avgSecs) || "—") : "—", "per task"),
-    statCard(
-      "Success",
-      s.successRate !== null ? `${Math.round(s.successRate * 100)}%` : "—",
-      `${s.completed} of ${s.total}`,
-    ),
     statCard("Commits", String(s.commits), "landed on main"),
     statCard("Lines of code", formatCount(s.loc), "code churned (ex. comments, build, docs)"),
   );
