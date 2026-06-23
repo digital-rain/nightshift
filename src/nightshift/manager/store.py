@@ -473,12 +473,15 @@ class MemoryStore:
                 "result_line": None,
                 "commit_sha": None,
                 "loc": None,
+                "remote": None,
+                "pushed": None,
                 "turns": None,
                 "input_tokens": None,
                 "output_tokens": None,
                 "cost_usd": None,
                 "failure_kind": None,
                 "failure_reason": None,
+                "validate_cmd": None,
                 "title": title,
                 "body": body,
                 "started_at": _now(),
@@ -954,6 +957,7 @@ class PgStore:
             "status", "phase", "result_line", "commit_sha", "loc",
             "failure_kind", "failure_reason", "model", "backend",
             "turns", "input_tokens", "output_tokens", "cost_usd",
+            "remote", "pushed", "validate_cmd",
         }
         sets: list[str] = []
         values: list[Any] = []

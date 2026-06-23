@@ -108,6 +108,32 @@ def resolve_validate_cmd(config: dict) -> list[str] | None:
     return shlex.split(raw)
 
 
+def format_validate_cmd(argv: list[str] | None) -> str:
+    """Shell command string for a work order, or ``""`` when validation is disabled."""
+    if argv is None:
+        return ""
+    return shlex.join(argv)
+
+
+def validate_cmd_from_blob(config: dict) -> tuple[list[str] | None, str | None]:
+    """Resolve validate argv + display string from a work-order ``config`` blob.
+
+    The manager sends an authoritative ``validate_cmd`` string (empty =
+    disabled). Legacy blobs with only ``validate`` fall back to
+    :func:`resolve_validate_cmd`. Returns ``(argv, display)`` where ``display``
+    is the command string actually run, or ``None`` when validation is skipped.
+    """
+    if "validate_cmd" in config:
+        raw = str(config.get("validate_cmd") or "").strip()
+        if not raw:
+            return None, None
+        return shlex.split(raw), raw
+    argv = resolve_validate_cmd(config)
+    if argv is None:
+        return None, None
+    return argv, shlex.join(argv)
+
+
 def _kill_process_group(proc: subprocess.Popen) -> None:
     """Terminate a subprocess and its whole process group, escalating SIGTERM to
     SIGKILL after a short grace so a stubborn child (e.g. pytest workers) dies."""

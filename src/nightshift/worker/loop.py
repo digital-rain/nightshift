@@ -167,6 +167,7 @@ class WorkerLoop:
             "input_tokens": outcome.input_tokens,
             "output_tokens": outcome.output_tokens,
             "cost_usd": outcome.cost_usd,
+            "validate_cmd": outcome.validate_cmd,
         }
         result: dict[str, Any] = {}
         try:

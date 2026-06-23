@@ -17,6 +17,7 @@ from nightshift.manager.landing import (
     base_ref_drifted,
     canonical_head,
     land,
+    main_advanced_sha,
     merge_tree_conflicts,
 )
 
@@ -93,3 +94,55 @@ def test_land_refuses_on_drift_conflict(tmp_path: Path) -> None:
     assert result.conflict is True
     # Branch preserved for resolution.
     assert _git(repo_root, "branch", "--list", worktree_branch("20.edit")).strip() != ""
+
+
+def test_main_advanced_sha_detects_agent_land(tmp_path: Path) -> None:
+    workspace, repo, repo_root = _init_repo(tmp_path)
+    base = canonical_head(repo_root)
+    assert main_advanced_sha(repo_root, base) is None
+    (repo_root / "file.txt").write_text("agent landed\n")
+    _git(repo_root, "commit", "-am", "feat: agent landed on main")
+    assert main_advanced_sha(repo_root, base) == canonical_head(repo_root)
+
+
+def test_adopt_agent_land_on_main_without_branch(tmp_path: Path) -> None:
+    """When an agent squash-merges to main directly, adopt HEAD instead of
+    reporting no changes."""
+    workspace, repo, repo_root = _init_repo(tmp_path)
+    base = canonical_head(repo_root)
+    (repo_root / "file.txt").write_text("agent landed\n")
+    _git(repo_root, "commit", "-am", "feat: agent landed on main")
+    result = land(workspace, repo, "10.adopt", "adopt agent land", queue=None, base_ref=base)
+    assert result.landed is True
+    assert result.sha == canonical_head(repo_root)
+    assert "adopted agent land" in result.detail
+    assert "agent landed" in (repo_root / "file.txt").read_text()
+
+
+def test_adopt_does_not_trigger_when_branch_has_commits(tmp_path: Path) -> None:
+    workspace, repo, repo_root = _init_repo(tmp_path)
+    base = canonical_head(repo_root)
+    _make_branch_commit(workspace, repo, "10.add", path="new.txt", content="branch\n")
+    # main also advanced independently (unrelated to adopt path).
+    (repo_root / "file.txt").write_text("other\n")
+    _git(repo_root, "commit", "-am", "other main commit")
+    result = land(workspace, repo, "10.add", "add new file", queue=None, base_ref=base)
+    assert result.landed is True
+    assert (repo_root / "new.txt").exists()
+
+
+def test_push_mode_records_pushed_on_success(tmp_path: Path) -> None:
+    from _workspace import add_remote, make_bare_remote
+
+    workspace, repo, repo_root = _init_repo(tmp_path)
+    bare = make_bare_remote(tmp_path / "origin.git")
+    add_remote(repo_root, "origin", bare)
+    _make_branch_commit(workspace, repo, "10.add", path="new.txt", content="hello\n")
+    base = canonical_head(repo_root)
+    result = land(
+        workspace, repo, "10.add", "add new file", queue=None, base_ref=base,
+        landing_mode="push",
+    )
+    assert result.landed is True
+    assert result.remote == "push"
+    assert result.pushed is True

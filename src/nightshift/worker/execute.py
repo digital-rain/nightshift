@@ -31,13 +31,14 @@ from nightshift.engine import (
     materialize_brief,
     prepare_worktree_base,
     publish_task_branch,
-    resolve_validate_cmd,
+    validate_cmd_from_blob,
     run_interruptible,
     setup_worktree,
     teardown_worktree,
     worker_env,
 )
 from nightshift.worker.config import WorkerConfig
+from nightshift.manager.landing import main_advanced_sha
 
 
 # Phase callback: (phase) -> None, lets the loop mirror phase into local status.
@@ -65,6 +66,8 @@ class ExecuteOutcome:
     input_tokens: int | None = None
     output_tokens: int | None = None
     cost_usd: float | None = None
+    # Validate command the worker actually ran (None when skipped or not reached).
+    validate_cmd: str | None = None
 
 
 def _finish_landable(
@@ -78,6 +81,7 @@ def _finish_landable(
     tele: dict[str, Any],
     on_log: LogCb,
     wip_ref_prefix: str | None = None,
+    validate_cmd: str | None = None,
 ) -> ExecuteOutcome:
     """Finalize a validated (landable) run.
 
@@ -91,7 +95,7 @@ def _finish_landable(
     if not cfg.rendezvous_remote:
         return ExecuteOutcome(
             status="completed", result_line=result_line, landable=True,
-            resolved_model=model, **tele,
+            resolved_model=model, validate_cmd=validate_cmd, **tele,
         )
     try:
         branch_ref, head_sha = publish_task_branch(
@@ -103,12 +107,13 @@ def _finish_landable(
         return ExecuteOutcome(
             status="error", result_line="publish failed", landable=False,
             resolved_model=model, failure_kind="publish_failed",
-            failure_reason=str(exc), **tele,
+            failure_reason=str(exc), validate_cmd=validate_cmd, **tele,
         )
     on_log(f"  published {branch_ref} ({head_sha[:8]}) to {cfg.rendezvous_remote}\n")
     return ExecuteOutcome(
         status="completed", result_line=result_line, landable=True,
-        resolved_model=model, branch_ref=branch_ref, head_sha=head_sha, **tele,
+        resolved_model=model, branch_ref=branch_ref, head_sha=head_sha,
+        validate_cmd=validate_cmd, **tele,
     )
 
 
@@ -129,6 +134,8 @@ def execute_work_order(
     # worktree/brief helpers take the internal queue arg (main -> None).
     queue = playlists.queue_from_tasks_rel(order.get("queue") or "main")
     config_blob = order.get("config", {})
+    validate_argv, validate_display = validate_cmd_from_blob(config_blob)
+    prompt_validate = validate_display or DEFAULT_VALIDATE_CMD
 
     # Worker-owned model resolution. A vendor mismatch fails the task with a
     # clear reason (surfaced to the operator via the manager).
@@ -188,7 +195,7 @@ def execute_work_order(
         prompt = build_prompt(
             task,
             task_file=str(scratch),
-            validate_cmd=str(config_blob.get("validate") or DEFAULT_VALIDATE_CMD),
+            validate_cmd=prompt_validate,
         )
         env = worker_env()
         max_turns = config_blob.get("max_turns")
@@ -247,8 +254,20 @@ def execute_work_order(
                 **tele,
             )
 
-        # No commits → nothing to land; finish cleanly.
+        # No commits → nothing to land unless the agent landed on main directly
+        # (squash-merge in the worktree). The manager adopts when main advanced
+        # past base_ref; surface a clearer result line than "output only".
         if not has_commits:
+            base_ref = order.get("base_ref")
+            repo_root = workspace / repo
+            if base_ref and main_advanced_sha(repo_root, base_ref):
+                return ExecuteOutcome(
+                    status="completed",
+                    result_line="agent landed on main (awaiting manager adopt)",
+                    landable=False,
+                    resolved_model=model,
+                    **tele,
+                )
             return ExecuteOutcome(
                 status="completed",
                 result_line="no changes produced (worker emitted output only)",
@@ -257,18 +276,20 @@ def execute_work_order(
 
         # Validate in the worktree (the manager re-checks nothing; the worker's
         # gate is the trust boundary for local/push landing).
-        validate_cmd = resolve_validate_cmd(config_blob)
-        if validate_cmd is None:
+        if validate_argv is None:
             preserve = True
             return _finish_landable(
                 cfg, repo, task, queue, model=model,
                 result_line="validation skipped (no validate command)",
                 tele=tele, on_log=on_log,
                 wip_ref_prefix=config_blob.get("wip_ref_prefix"),
+                validate_cmd=None,
             )
         on_phase("validate")
-        on_log(f"  running {' '.join(validate_cmd)}...\n")
-        validate = run_interruptible(validate_cmd, cwd=wt_dir, env=env, should_abort=lambda: None)
+        on_log(f"  running {validate_display}...\n")
+        validate = run_interruptible(
+            validate_argv, cwd=wt_dir, env=env, should_abort=lambda: None,
+        )
         if validate.returncode != 0:
             preserve = True  # keep the branch so the work can be resolved
             tail = (validate.stdout[-1500:] + "\n" + validate.stderr[-500:]).strip()
@@ -277,6 +298,7 @@ def execute_work_order(
                 result_line="validate failed",
                 landable=False, resolved_model=model,
                 failure_kind="validation_error", failure_reason=tail,
+                validate_cmd=validate_display,
                 **tele,
             )
 
@@ -285,6 +307,7 @@ def execute_work_order(
             cfg, repo, task, queue, model=model, result_line="validated",
             tele=tele, on_log=on_log,
             wip_ref_prefix=config_blob.get("wip_ref_prefix"),
+            validate_cmd=validate_display,
         )
     finally:
         if not preserve:

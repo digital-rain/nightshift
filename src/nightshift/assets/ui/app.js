@@ -3114,13 +3114,21 @@ function runDetailPairs(run, rec) {
     }
   }
   const shas = commitShaList(rec.commit_sha);
+  const commitLabel = shas.length
+    ? `landed (${shas.join(", ")})`
+    : (rec.status === "error" ? "not landed" : "—");
   pairs.push(
-    [
-      shas.length > 1 ? "Commits" : "Commit",
-      shas.length ? `landed (${shas.join(", ")})` : (rec.status === "error" ? "not landed" : "—"),
-    ],
-    ["Launched by", run.launched_by || "—"],
+    [shas.length > 1 ? "Commits" : "Commit", commitLabel],
   );
+  if (rec.remote === "push" || rec.remote === "pr") {
+    let pushLabel = "—";
+    if (rec.pushed === true) pushLabel = rec.remote === "pr" ? "PR branch pushed" : "pushed to origin/main";
+    else if (rec.pushed === false) pushLabel = rec.remote === "pr" ? "PR branch push failed" : "push to origin/main failed";
+    pairs.push(["Remote", pushLabel]);
+  } else if (rec.remote === "none" || (rec.commit_sha && rec.pushed == null && rec.remote == null)) {
+    pairs.push(["Remote", "local only"]);
+  }
+  pairs.push(["Launched by", run.launched_by || "—"]);
   // Token usage and cost — only shown when the run carries this data.
   if (rec.model) pairs.push(["Model", rec.model]);
   const inTok = typeof rec.input_tokens === "number" ? rec.input_tokens : null;

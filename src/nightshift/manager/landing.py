@@ -22,6 +22,7 @@ from pathlib import Path
 
 from nightshift.engine import (
     _queue_slug,
+    _worktree_has_commits,
     fetch_rendezvous_branch,
     landing_lock,
     prune_rendezvous_branch,
@@ -42,6 +43,9 @@ class LandingResult:
     conflict: bool = False          # base_ref drift / content conflict → resolve
     remote: str | None = None       # remote action taken: 'push' | 'pr' | None
     pr_url: str | None = None
+    # Whether the configured remote step succeeded. ``None`` when no remote
+    # action was attempted (``landing_mode=none``).
+    pushed: bool | None = None
 
 
 def _rev_parse(repo_root: Path, ref: str) -> str | None:
@@ -83,6 +87,23 @@ def base_ref_drifted(repo_root: Path, base_ref: str | None) -> bool:
         return False
     head = canonical_head(repo_root)
     return head is not None and head != base_ref and _rev_parse(repo_root, base_ref) is not None
+
+
+def main_advanced_sha(repo_root: Path, base_ref: str | None) -> str | None:
+    """Return canonical ``main``'s HEAD when it advanced past ``base_ref``.
+
+    Used to adopt a commit an agent landed directly on ``main`` during its run
+    (squash-merge in the worktree) when the task branch carries no commits for
+    the manager to squash.
+    """
+    if not base_ref:
+        return None
+    head = canonical_head(repo_root)
+    if not head or head == base_ref:
+        return None
+    if _rev_parse(repo_root, base_ref) is None:
+        return None
+    return head
 
 
 def land(
@@ -158,6 +179,13 @@ def land(
     if landing_mode == "pr" and rendezvous_remote:
         sync_main_to_origin(workspace, repo, rendezvous_remote, autostash=autostash)
 
+    adopted = _adopt_agent_land_on_main(
+        workspace, repo, task, title, queue=queue, base_ref=base_ref,
+        landing_mode=landing_mode, automerge=automerge, draft=draft,
+    )
+    if adopted is not None:
+        return adopted
+
     # Pre-check: if main drifted past base_ref and the merge would conflict,
     # refuse cleanly so the caller resolves rather than the squash failing deep.
     if base_ref_drifted(repo_root, base_ref):
@@ -198,6 +226,25 @@ def land(
     if cross_machine and rendezvous_remote and branch_ref:
         prune_rendezvous_branch(workspace, repo, rendezvous_remote, branch_ref)
 
+    _apply_remote_policy(
+        workspace, repo, task, title, queue=queue,
+        landing_mode=landing_mode, automerge=automerge, draft=draft, result=result,
+    )
+    return result
+
+
+def _apply_remote_policy(
+    workspace: Path,
+    repo: str,
+    task: str,
+    title: str,
+    *,
+    queue: str | None,
+    landing_mode: str,
+    automerge: bool,
+    draft: bool,
+    result: LandingResult,
+) -> None:
     if landing_mode == "push":
         result.remote = "push"
         _push_main(workspace, repo, result)
@@ -207,6 +254,39 @@ def land(
             workspace, repo, task, title,
             queue=queue, automerge=automerge, draft=draft, result=result,
         )
+
+
+def _adopt_agent_land_on_main(
+    workspace: Path,
+    repo: str,
+    task: str,
+    title: str,
+    *,
+    queue: str | None,
+    base_ref: str | None,
+    landing_mode: str,
+    automerge: bool,
+    draft: bool,
+) -> LandingResult | None:
+    """When an agent landed on ``main`` during the worker run, adopt HEAD.
+
+    Returns a :class:`LandingResult` when ``main`` advanced past ``base_ref``
+    and the task branch has nothing to squash; otherwise ``None``.
+    """
+    repo_root = workspace / repo
+    sha = main_advanced_sha(repo_root, base_ref)
+    if not sha or _worktree_has_commits(workspace, repo, task, queue=queue):
+        return None
+    teardown_worktree(workspace, repo, task, queue=queue)
+    result = LandingResult(
+        landed=True,
+        sha=sha,
+        detail="adopted agent land on main",
+    )
+    _apply_remote_policy(
+        workspace, repo, task, title, queue=queue,
+        landing_mode=landing_mode, automerge=automerge, draft=draft, result=result,
+    )
     return result
 
 
@@ -223,10 +303,13 @@ def _push_main(workspace: Path, repo: str, result: LandingResult) -> None:
             text=True,
         )
     if res.returncode != 0:
+        result.pushed = False
         result.detail = (
             f"{result.detail}\nlocal land ok ({result.sha}); push to GitHub main failed: "
             f"{(res.stderr or res.stdout).strip()[:300]}"
         ).strip()
+    else:
+        result.pushed = True
 
 
 def _open_pr(
@@ -255,11 +338,13 @@ def _open_pr(
             text=True,
         )
     if push.returncode != 0:
+        result.pushed = False
         result.detail = (
             f"{result.detail}\nlocal land ok ({result.sha}); PR branch push failed: "
             f"{(push.stderr or push.stdout).strip()[:300]}"
         ).strip()
         return
+    result.pushed = True
     argv = [
         "gh", "pr", "create",
         "--head", pr_branch,

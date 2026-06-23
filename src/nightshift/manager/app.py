@@ -32,17 +32,20 @@ from nightshift import repos
 from nightshift._paths import UI_DIR
 from nightshift.config.validate import build_get_response, validate_delta, write_delta
 from nightshift.engine import (
+    _worktree_has_commits,
     commit_tasks,
     compute_code_loc,
     create_task,
     delete_task,
     drop_completed_task,
+    format_validate_cmd,
     list_queue,
     load_play_priorities,
     load_sort_mode,
     read_task,
     reorder_queue,
     resolve_title,
+    resolve_validate_cmd,
     save_play_priorities,
     save_queue_config_value,
     save_sort_mode,
@@ -53,7 +56,7 @@ from nightshift.engine import (
 from nightshift.events import new_run_id
 from nightshift.manager.config import ManagerConfig, load_manager_config
 from nightshift.manager.hub import Hub
-from nightshift.manager.landing import canonical_head, land
+from nightshift.manager.landing import canonical_head, land, main_advanced_sha
 from nightshift.manager.registry import Registry
 from nightshift.manager.scheduler import (
     SchedulerState,
@@ -141,6 +144,9 @@ class SubmitBody(BaseModel):
     input_tokens: int | None = None
     output_tokens: int | None = None
     cost_usd: float | None = None
+    # The validate command the worker actually ran (None when validation was
+    # skipped or never reached).
+    validate_cmd: str | None = None
 
 
 class QueueOrder(BaseModel):
@@ -677,6 +683,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             "input_tokens": body.input_tokens,
             "output_tokens": body.output_tokens,
             "cost_usd": body.cost_usd,
+            "validate_cmd": body.validate_cmd,
         }
 
         # An honest block from the worker (no commits): record the outcome, hold
@@ -740,32 +747,41 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             )
 
         # Completed but nothing to land (no commit): record success, no git.
-        # The brief is NOT dropped (only a landed task leaves the queue), so a
-        # no-change task re-leases on the next poll. If that has now happened
-        # enough times in a row it is a re-execution loop → quarantine; otherwise
-        # clear any overlay so the (legitimately idempotent) task stays runnable.
+        # Unless the agent landed on main directly during the run — main advanced
+        # past the lease's base_ref while the task branch has nothing to squash.
         if not body.landable:
-            await store.update_run(
-                run_id, status="completed",
-                result_line=body.result_line or "no changes", model=body.model,
-                **telemetry,
-            )
-            await store.set_lease_status(body.lease_id, "released")
-            quarantined = await _quarantine_if_looping(
-                queue, body.task, run_id, "no changes produced"
-            )
-            if not quarantined:
-                await store.clear_task_state(queue, body.task)
-            await _registry().set_idle(body.worker_id)
-            await _emit(
-                "task_result", run_id=run_id, queue=queue, task=body.task,
-                payload={"status": "completed", "result_line": body.result_line or "no changes"},
-            )
-            await _emit("queue_changed", queue=queue)
-            return JSONResponse(
-                {"landed": False, "status": "completed", "no_changes": True,
-                 "quarantined": quarantined}
-            )
+            repo_root = workspace / repo
+            if (
+                base_ref
+                and main_advanced_sha(repo_root, base_ref)
+                and not _worktree_has_commits(workspace, repo, body.task, queue=queue)
+            ):
+                body = body.model_copy(update={
+                    "landable": True,
+                    "result_line": "agent landed on main",
+                })
+            else:
+                await store.update_run(
+                    run_id, status="completed",
+                    result_line=body.result_line or "no changes", model=body.model,
+                    **telemetry,
+                )
+                await store.set_lease_status(body.lease_id, "released")
+                quarantined = await _quarantine_if_looping(
+                    queue, body.task, run_id, "no changes produced"
+                )
+                if not quarantined:
+                    await store.clear_task_state(queue, body.task)
+                await _registry().set_idle(body.worker_id)
+                await _emit(
+                    "task_result", run_id=run_id, queue=queue, task=body.task,
+                    payload={"status": "completed", "result_line": body.result_line or "no changes"},
+                )
+                await _emit("queue_changed", queue=queue)
+                return JSONResponse(
+                    {"landed": False, "status": "completed", "no_changes": True,
+                     "quarantined": quarantined}
+                )
 
         tasks_rel = playlists_mod.tasks_rel(queue)
         meta = _task_meta(tasks_root, body.task, queue)
@@ -845,6 +861,8 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             commit_sha=result.sha,
             loc=loc,
             model=body.model,
+            remote=result.remote,
+            pushed=result.pushed,
             **telemetry,
         )
         await store.set_lease_status(body.lease_id, "landed")
@@ -859,6 +877,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                 "status": "completed",
                 "commit_sha": result.sha,
                 "remote": result.remote,
+                "pushed": result.pushed,
                 "pr_url": result.pr_url,
             },
         )
@@ -868,6 +887,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                 "landed": True,
                 "sha": result.sha,
                 "remote": result.remote,
+                "pushed": result.pushed,
                 "pr_url": result.pr_url,
             }
         )
@@ -1619,9 +1639,11 @@ def _build_work_order(
 
     model = meta.get("model") or cfg.default_model
     raw_turns = meta.get("turns", merged.get("max_turns"))
+    validate_argv = resolve_validate_cmd(merged)
     config_blob = {
         "model": str(model).strip() or cfg.default_model,
         "validate": merged.get("validate"),
+        "validate_cmd": format_validate_cmd(validate_argv),
         "diff_cap_lines": merged.get("diff_cap_lines"),
         "forbidden_paths": merged.get("forbidden_paths"),
         "max_turns": int(raw_turns) if raw_turns is not None else None,

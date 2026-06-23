@@ -79,6 +79,7 @@ def test_checkin_poll_handshake(tmp_path: Path) -> None:
         assert order["task"] == "10.hello"
         assert order["queue"] == "main"
         assert order["config"]["model"] == "auto"
+        assert order["config"]["validate_cmd"] == "true"
         assert order["base_ref"]  # canonical HEAD pinned
 
         # The task is now leased — a second worker gets nothing.
@@ -219,6 +220,7 @@ def test_submit_records_turns_tokens_for_rollups(tmp_path: Path) -> None:
                 "queue": "main", "title": "hello", "status": "completed",
                 "landable": False, "backend": "claude-code", "model": "claude-opus-4-8",
                 "turns": 8, "input_tokens": 1500, "output_tokens": 400, "cost_usd": 0.09,
+                "validate_cmd": "just validate",
             },
         )
         assert r.json()["landed"] is False
@@ -227,6 +229,7 @@ def test_submit_records_turns_tokens_for_rollups(tmp_path: Path) -> None:
         run = next(x for x in client.get("/api/runs").json() if x["id"] == run_id)
         assert run["turns"] == 8
         assert run["input_tokens"] == 1500
+        assert run["validate_cmd"] == "just validate"
         assert run["output_tokens"] == 400
 
         # ...and it rolls up per backend and per model.
@@ -484,6 +487,47 @@ def test_blocked_submit_records_reason_without_landing(tmp_path: Path) -> None:
         # is unchanged.
         assert (tasks_root / "main/10.hello.md").exists()
         assert canonical_head(repo_root) == head_before
+
+
+def test_submit_adopts_agent_land_when_main_advanced(tmp_path: Path) -> None:
+    """A worker that reports not-landable but main advanced during the run gets
+    its commit recorded (agent self-landed on main)."""
+    workspace = _seed(tmp_path, {"10.hello": "Do a thing."})
+    tasks_root = workspace / "nightshift-tasks"
+    repo_root = workspace / "longitude"
+    with _client(workspace) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        order = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        run_id, lease_id = order["run_id"], order["lease_id"]
+        base_ref = order["base_ref"]
+
+        # Simulate the agent landing on main directly during the worker run.
+        (repo_root / "README.md").write_text("# agent landed\n")
+        subprocess.run(
+            ["git", "commit", "-am", "feat: agent landed on main"],
+            cwd=repo_root, check=True, capture_output=True,
+        )
+        assert canonical_head(repo_root) != base_ref
+
+        r = client.post(
+            f"/api/worker/runs/{run_id}/submit",
+            json={
+                "worker_id": "w1", "lease_id": lease_id, "task": "10.hello",
+                "queue": "main", "title": "hello", "status": "completed",
+                "result_line": "no changes produced (worker emitted output only)",
+                "landable": False,
+            },
+        )
+        body = r.json()
+        assert body["landed"] is True
+        assert body["sha"] == canonical_head(repo_root)
+
+        run = next(x for x in client.get("/api/runs").json() if x["id"] == run_id)
+        assert run["status"] == "completed"
+        assert run["commit_sha"] == canonical_head(repo_root)
+        assert not (tasks_root / "main/10.hello.md").exists()
 
 
 def test_work_order_shape_carries_repo_task_path_and_base_ref(tmp_path: Path) -> None:

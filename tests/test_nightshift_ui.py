@@ -539,6 +539,24 @@ def test_resolve_validate_cmd_empty_disables_validation(empty: str) -> None:
     assert engine.resolve_validate_cmd({"validate": empty}) is None
 
 
+def test_format_validate_cmd() -> None:
+    assert engine.format_validate_cmd(["just", "validate"]) == "just validate"
+    assert engine.format_validate_cmd(None) == ""
+
+
+def test_validate_cmd_from_blob_authoritative() -> None:
+    argv, display = engine.validate_cmd_from_blob({"validate_cmd": "just check"})
+    assert argv == ["just", "check"]
+    assert display == "just check"
+    assert engine.validate_cmd_from_blob({"validate_cmd": ""}) == (None, None)
+
+
+def test_validate_cmd_from_blob_legacy_validate_key() -> None:
+    argv, display = engine.validate_cmd_from_blob({"validate": "just lint"})
+    assert argv == ["just", "lint"]
+    assert display == "just lint"
+
+
 @pytest.mark.parametrize(
     "raw,expected",
     [
