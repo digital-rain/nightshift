@@ -147,6 +147,8 @@ function statusPill(status) {
 
 // Classified failure reasons (engine `failure_kind`) → short operator-facing
 // labels, so History shows *why* a task failed without opening the log.
+const CHART_PALETTE = ["stat-fill-c0", "stat-fill-c1", "stat-fill-c2", "stat-fill-c3", "stat-fill-c4", "stat-fill-c5"];
+
 const FAILURE_LABELS = {
   merge_conflict: "merge conflict",
   merge_rejected: "merge rejected",
@@ -1975,41 +1977,28 @@ function renderStats() {
   }
   body.append(cards);
 
-  // Success-rate bar: completed vs failed, as a proportional graph.
+  // Ring charts row: outcomes, failure modes, model usage, model cost.
+  const chartsRow = document.createElement("div");
+  chartsRow.className = "stat-charts-row";
+
   const failed = s.total - s.completed;
-  const outcome = statSection("Outcomes");
-  outcome.append(
-    proportionDonut([
-      { label: "Completed", count: s.completed, cls: "stat-fill-ok" },
-      { label: "Failed", count: failed, cls: "stat-fill-err" },
-    ], s.total),
-  );
-  body.append(outcome);
+  chartsRow.append(ringChart("Outcomes", proportionDonut([
+    { label: "Completed", count: s.completed, cls: "stat-fill-ok" },
+    { label: "Failed", count: failed, cls: "stat-fill-err" },
+  ], s.total)));
 
-  // Breakdown by failure mode: one horizontal bar per classified kind.
-  const breakdown = statSection("Failure modes");
-  if (!s.failureRows.length) {
-    const none = document.createElement("p");
-    none.className = "stat-none";
-    none.textContent = "No failures recorded.";
-    breakdown.append(none);
-  } else {
-    const max = Math.max(...s.failureRows.map((r) => r.count));
-    const list = document.createElement("div");
-    list.className = "stat-bars";
-    for (const row of s.failureRows) {
-      list.append(failureBar(row.kind, row.count, max));
-    }
-    breakdown.append(list);
+  if (s.failureRows.length) {
+    chartsRow.append(ringChart("Failure modes", failureModesDonut(s.failureRows)));
   }
-  body.append(breakdown);
 
-  // Usage by model: concentric ring chart, one ring per model, arc = cost proportion.
   if (s.byModel && s.byModel.length) {
-    const usage = statSection("Usage by model");
-    usage.append(modelRingsChart(s.byModel));
-    body.append(usage);
+    chartsRow.append(
+      ringChart("Model usage", modelCallsDonut(s.byModel)),
+      ringChart("Model cost", modelCostDonut(s.byModel)),
+    );
   }
+
+  body.append(chartsRow);
 }
 
 function statCard(label, value, sub) {
@@ -2039,6 +2028,47 @@ function statSection(title) {
   h.textContent = title;
   sec.append(h);
   return sec;
+}
+
+function ringChart(title, content) {
+  const wrap = document.createElement("div");
+  wrap.className = "stat-chart";
+  const h = document.createElement("div");
+  h.className = "stat-chart-title";
+  h.textContent = title;
+  wrap.append(h, content);
+  return wrap;
+}
+
+function failureModesDonut(failureRows) {
+  const total = failureRows.reduce((s, r) => s + r.count, 0);
+  const segments = failureRows.map((r, i) => ({
+    label: FAILURE_LABELS[r.kind] || r.kind,
+    count: r.count,
+    cls: CHART_PALETTE[i % CHART_PALETTE.length],
+  }));
+  return proportionDonut(segments, total);
+}
+
+function modelCallsDonut(byModel) {
+  const total = byModel.reduce((s, [, u]) => s + u.runs, 0);
+  const segments = byModel.map(([model, u], i) => ({
+    label: model,
+    count: u.runs,
+    cls: CHART_PALETTE[i % CHART_PALETTE.length],
+  }));
+  return proportionDonut(segments, total);
+}
+
+function modelCostDonut(byModel) {
+  const total = byModel.reduce((s, [, u]) => s + u.cost, 0);
+  const segments = byModel.map(([model, u], i) => ({
+    label: model,
+    count: u.cost,
+    display: `$${u.cost.toFixed(2)}`,
+    cls: CHART_PALETTE[i % CHART_PALETTE.length],
+  }));
+  return proportionDonut(segments, total);
 }
 
 // A donut circle chart split into proportional segments.
@@ -2108,7 +2138,8 @@ function proportionDonut(segments, total) {
     const dot = document.createElement("span");
     dot.className = `stat-dot ${seg.cls}`;
     const segPct = total ? Math.round((seg.count / total) * 100) : 0;
-    item.append(dot, document.createTextNode(`${seg.label} ${seg.count} (${segPct}%)`));
+    const displayVal = seg.display !== undefined ? seg.display : String(seg.count);
+    item.append(dot, document.createTextNode(`${seg.label} ${displayVal} (${segPct}%)`));
     legend.append(item);
   }
   wrap.append(legend);
