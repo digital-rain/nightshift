@@ -2074,7 +2074,7 @@ function modelCostDonut(byModel) {
 // A donut circle chart split into proportional segments.
 function proportionDonut(segments, total) {
   const R = 76;
-  const STROKE = 24;
+  const STROKE = 12;
   const C = 2 * Math.PI * R;
 
   const wrap = document.createElement("div");
@@ -2171,7 +2171,7 @@ function failureBar(kind, count, max) {
 // length proportional to cost relative to the highest-cost model. Outermost
 // ring = most expensive, innermost = least.
 function modelRingsChart(byModel) {
-  const STROKE = 24;
+  const STROKE = 12;
   const GAP = 10;
   const STEP = STROKE + GAP;
   const R0 = 44;
