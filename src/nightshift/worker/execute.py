@@ -31,14 +31,14 @@ from nightshift.engine import (
     materialize_brief,
     prepare_worktree_base,
     publish_task_branch,
-    validate_cmd_from_blob,
     run_interruptible,
     setup_worktree,
     teardown_worktree,
+    validate_cmd_from_blob,
     worker_env,
 )
-from nightshift.worker.config import WorkerConfig
 from nightshift.manager.landing import main_advanced_sha
+from nightshift.worker.config import WorkerConfig
 
 
 # Phase callback: (phase) -> None, lets the loop mirror phase into local status.
@@ -49,7 +49,7 @@ LogCb = Callable[[str], None]
 
 @dataclass
 class ExecuteOutcome:
-    status: str                 # completed | blocked | error
+    status: str  # completed | blocked | error
     result_line: str
     landable: bool
     resolved_model: str
@@ -94,26 +94,44 @@ def _finish_landable(
     """
     if not cfg.rendezvous_remote:
         return ExecuteOutcome(
-            status="completed", result_line=result_line, landable=True,
-            resolved_model=model, validate_cmd=validate_cmd, **tele,
+            status="completed",
+            result_line=result_line,
+            landable=True,
+            resolved_model=model,
+            validate_cmd=validate_cmd,
+            **tele,
         )
     try:
         branch_ref, head_sha = publish_task_branch(
-            cfg.workspace, repo, task, cfg.rendezvous_remote,
-            queue=queue, prefix=wip_ref_prefix,
+            cfg.workspace,
+            repo,
+            task,
+            cfg.rendezvous_remote,
+            queue=queue,
+            prefix=wip_ref_prefix,
         )
     except RuntimeError as exc:
         on_log(f"  publish to rendezvous remote failed: {exc}\n")
         return ExecuteOutcome(
-            status="error", result_line="publish failed", landable=False,
-            resolved_model=model, failure_kind="publish_failed",
-            failure_reason=str(exc), validate_cmd=validate_cmd, **tele,
+            status="error",
+            result_line="publish failed",
+            landable=False,
+            resolved_model=model,
+            failure_kind="publish_failed",
+            failure_reason=str(exc),
+            validate_cmd=validate_cmd,
+            **tele,
         )
     on_log(f"  published {branch_ref} ({head_sha[:8]}) to {cfg.rendezvous_remote}\n")
     return ExecuteOutcome(
-        status="completed", result_line=result_line, landable=True,
-        resolved_model=model, branch_ref=branch_ref, head_sha=head_sha,
-        validate_cmd=validate_cmd, **tele,
+        status="completed",
+        result_line=result_line,
+        landable=True,
+        resolved_model=model,
+        branch_ref=branch_ref,
+        head_sha=head_sha,
+        validate_cmd=validate_cmd,
+        **tele,
     )
 
 
@@ -157,8 +175,11 @@ def execute_work_order(
     if not repos.repo_available(workspace, repo):
         reason = f"repo '{repo}' is not available in the workspace"
         return ExecuteOutcome(
-            status="error", result_line=reason, landable=False,
-            resolved_model=model, failure_kind="repo_unavailable",
+            status="error",
+            result_line=reason,
+            landable=False,
+            resolved_model=model,
+            failure_kind="repo_unavailable",
             failure_reason=reason,
         )
 
@@ -166,8 +187,11 @@ def execute_work_order(
     if not backend.available(config_blob):
         reason = f"backend '{cfg.backend}' is not available on this worker"
         return ExecuteOutcome(
-            status="error", result_line=reason, landable=False,
-            resolved_model=model, failure_kind="backend_unavailable",
+            status="error",
+            result_line=reason,
+            landable=False,
+            resolved_model=model,
+            failure_kind="backend_unavailable",
             failure_reason=reason,
         )
 
@@ -182,7 +206,9 @@ def execute_work_order(
     # commit the manager will squash onto. Co-located leaves base at HEAD.
     base = "HEAD"
     if cfg.rendezvous_remote:
-        base = prepare_worktree_base(workspace, repo, cfg.rendezvous_remote, order.get("base_ref"))
+        base = prepare_worktree_base(
+            workspace, repo, cfg.rendezvous_remote, order.get("base_ref")
+        )
     wt_dir = setup_worktree(workspace, repo, task, queue=queue, base=base)
     preserve = False
     captured: list[str] = []
@@ -224,8 +250,10 @@ def execute_work_order(
             return ExecuteOutcome(
                 status="error",
                 result_line="worker executable not found",
-                landable=False, resolved_model=model,
-                failure_kind="worker_launch", failure_reason=result.error,
+                landable=False,
+                resolved_model=model,
+                failure_kind="worker_launch",
+                failure_reason=result.error,
                 **tele,
             )
 
@@ -240,17 +268,24 @@ def execute_work_order(
             return ExecuteOutcome(
                 status="blocked",
                 result_line=f"blocked: {blocked_reason}",
-                landable=False, resolved_model=model,
-                failure_kind="blocked", failure_reason=blocked_reason,
+                landable=False,
+                resolved_model=model,
+                failure_kind="blocked",
+                failure_reason=blocked_reason,
                 **tele,
             )
 
         if result.returncode != 0:
-            reason = result.error or f"worker [{cfg.backend}] exited {result.returncode}"
+            reason = (
+                result.error or f"worker [{cfg.backend}] exited {result.returncode}"
+            )
             return ExecuteOutcome(
-                status="error", result_line=reason.splitlines()[0][:120],
-                landable=False, resolved_model=model,
-                failure_kind="worker_error", failure_reason=reason,
+                status="error",
+                result_line=reason.splitlines()[0][:120],
+                landable=False,
+                resolved_model=model,
+                failure_kind="worker_error",
+                failure_reason=reason,
                 **tele,
             )
 
@@ -271,7 +306,9 @@ def execute_work_order(
             return ExecuteOutcome(
                 status="completed",
                 result_line="no changes produced (worker emitted output only)",
-                landable=False, resolved_model=model, **tele,
+                landable=False,
+                resolved_model=model,
+                **tele,
             )
 
         # Validate in the worktree (the manager re-checks nothing; the worker's
@@ -279,16 +316,24 @@ def execute_work_order(
         if validate_argv is None:
             preserve = True
             return _finish_landable(
-                cfg, repo, task, queue, model=model,
+                cfg,
+                repo,
+                task,
+                queue,
+                model=model,
                 result_line="validation skipped (no validate command)",
-                tele=tele, on_log=on_log,
+                tele=tele,
+                on_log=on_log,
                 wip_ref_prefix=config_blob.get("wip_ref_prefix"),
                 validate_cmd=None,
             )
         on_phase("validate")
         on_log(f"  running {validate_display}...\n")
         validate = run_interruptible(
-            validate_argv, cwd=wt_dir, env=env, should_abort=lambda: None,
+            validate_argv,
+            cwd=wt_dir,
+            env=env,
+            should_abort=lambda: None,
         )
         if validate.returncode != 0:
             preserve = True  # keep the branch so the work can be resolved
@@ -296,16 +341,24 @@ def execute_work_order(
             return ExecuteOutcome(
                 status="error",
                 result_line="validate failed",
-                landable=False, resolved_model=model,
-                failure_kind="validation_error", failure_reason=tail,
+                landable=False,
+                resolved_model=model,
+                failure_kind="validation_error",
+                failure_reason=tail,
                 validate_cmd=validate_display,
                 **tele,
             )
 
         preserve = True  # landable branch — the manager squashes it
         return _finish_landable(
-            cfg, repo, task, queue, model=model, result_line="validated",
-            tele=tele, on_log=on_log,
+            cfg,
+            repo,
+            task,
+            queue,
+            model=model,
+            result_line="validated",
+            tele=tele,
+            on_log=on_log,
             wip_ref_prefix=config_blob.get("wip_ref_prefix"),
             validate_cmd=validate_display,
         )

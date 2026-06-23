@@ -100,7 +100,7 @@ main {
 .stat-num { font-size: 1.6rem; font-weight: 700; }
 .stat-label { color: var(--muted, #888); font-size: 0.75rem; text-transform: uppercase; }
 
-table.history { width: 100%; border-collapse: collapse; }
+table.history { display: table; width: 100%; border-collapse: collapse; }
 table.history th, table.history td {
   text-align: left;
   padding: 0.4rem 0.6rem;
