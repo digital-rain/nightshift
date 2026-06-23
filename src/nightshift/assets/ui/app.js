@@ -1989,7 +1989,7 @@ function renderStats() {
   if (s.byModel && s.byModel.length) {
     chartsRow.append(
       ringChart("Model usage", modelCallsDonut(s.byModel)),
-      ringChart("Model cost", modelRingsChart(s.byModel)),
+      ringChart("Model cost", modelCostDonut(s.byModel)),
     );
   }
 
@@ -2063,11 +2063,11 @@ function modelCostDonut(byModel) {
     display: `$${u.cost.toFixed(2)}`,
     cls: CHART_PALETTE[i % CHART_PALETTE.length],
   }));
-  return proportionDonut(segments, total);
+  return proportionDonut(segments, total, `$${total.toFixed(2)}`);
 }
 
 // A donut circle chart split into proportional segments.
-function proportionDonut(segments, total) {
+function proportionDonut(segments, total, centerText) {
   const R = 76;
   const STROKE = 12;
   const C = 2 * Math.PI * R;
@@ -2120,7 +2120,7 @@ function proportionDonut(segments, total) {
   txt.setAttribute("y", "112");
   txt.setAttribute("text-anchor", "middle");
   txt.classList.add("stat-donut-pct");
-  txt.textContent = `${pct}%`;
+  txt.textContent = centerText !== undefined ? centerText : `${pct}%`;
   svg.append(txt);
 
   wrap.append(svg);
