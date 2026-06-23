@@ -904,6 +904,7 @@ def test_server_task_defaults_seeds_create_pane(tmp_path: Path) -> None:
     assert body["title"] == "" and body["body"] == ""
     assert body["frontmatter"]["model"] == "claude-sonnet-4-6"
     assert "draft" in body["frontmatter"] and "automerge" in body["frontmatter"]
+    assert body["frontmatter"]["priority"] == 3
     assert body["model_options"] == ["claude-sonnet-4-6", "claude-opus-4-8"]
     # No file was created by reading defaults.
     assert [q["task"] for q in client.get("/api/queue").json()] == ["alpha"]

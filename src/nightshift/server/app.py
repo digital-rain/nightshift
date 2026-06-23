@@ -609,6 +609,7 @@ def create_app(workspace: Path) -> FastAPI:
                     "model": resolved["model"],
                     "draft": resolved["draft"],
                     "automerge": resolved["automerge"],
+                    "priority": 3,
                 },
                 "frontmatter_raw": {},
                 "evergreen": False,

@@ -942,6 +942,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                     "model": resolved["model"],
                     "draft": resolved["draft"],
                     "automerge": resolved["automerge"],
+                    "priority": 3,
                 },
                 "frontmatter_raw": {},
                 "evergreen": False,
