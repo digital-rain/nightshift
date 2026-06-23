@@ -1989,7 +1989,7 @@ function renderStats() {
   if (s.byModel && s.byModel.length) {
     chartsRow.append(
       ringChart("Model usage", modelCallsDonut(s.byModel)),
-      ringChart("Model cost", modelCostDonut(s.byModel)),
+      ringChart("Model cost", modelRingsChart(s.byModel)),
     );
   }
 
