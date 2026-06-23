@@ -2769,7 +2769,9 @@ function buildPlaylistInfoContent(info) {
     "the playlist's name (also its on-disk queue)");
   const repoField = playlistInfoField("Repository", info.repository || "",
     "playlist-info-repo", "the workspace repo this playlist's tasks target");
-  body.append(nameField, repoField);
+  const validateField = playlistInfoField("Validate command", info.validate || "",
+    "playlist-info-validate", "e.g. just validate");
+  body.append(nameField, repoField, validateField);
 
   const actions = document.createElement("div");
   actions.className = "detail-actions";
@@ -2802,8 +2804,10 @@ function playlistInfoField(label, value, id, placeholder) {
 async function savePlaylistInfo(info, errEl) {
   const nameEl = $("playlist-info-name");
   const repoEl = $("playlist-info-repo");
+  const validateEl = $("playlist-info-validate");
   const newName = (nameEl ? nameEl.value : info.name).trim();
   const newRepo = (repoEl ? repoEl.value : "").trim();
+  const newValidate = validateEl ? validateEl.value : "";
   if (!newName) {
     if (errEl) { errEl.textContent = "name is required"; errEl.hidden = false; }
     return;
@@ -2813,6 +2817,7 @@ async function savePlaylistInfo(info, errEl) {
   const payload = {};
   if (newName !== info.name) payload.name = newName;
   if (newRepo !== (info.repository || "")) payload.repository = newRepo;
+  if (newValidate !== (info.validate || "")) payload.validate = newValidate;
   if (!Object.keys(payload).length) { closePlaylistInfo(); return; }
   const { ok, data } = await sendJSON(
     `/api/playlists/${encodeURIComponent(info.name)}`, "PUT", payload);
