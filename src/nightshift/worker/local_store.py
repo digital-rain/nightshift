@@ -36,6 +36,7 @@ class NowPlaying:
     backend: str
     repo: str = ""
     branch: str | None = None
+    worktree: str | None = None
     phase: str = "worker"
     started_at: str = field(default_factory=_now_iso)
     log_tail: deque[str] = field(default_factory=lambda: deque(maxlen=MAX_LOG_TAIL))
@@ -67,6 +68,7 @@ class LocalStore:
         backend: str,
         repo: str = "",
         branch: str | None = None,
+        worktree: str | None = None,
     ) -> None:
         with self._lock:
             self._now = NowPlaying(
@@ -78,6 +80,7 @@ class LocalStore:
                 backend=backend,
                 repo=repo,
                 branch=branch,
+                worktree=worktree,
             )
 
     def set_phase(self, phase: str) -> None:

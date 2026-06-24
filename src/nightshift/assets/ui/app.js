@@ -3106,6 +3106,8 @@ function runDetailPairs(run, rec) {
   // on the task record or the run; older runs that predate the column omit it.
   const repo = rec.repo || run.repo;
   if (repo) pairs.push(["Repo", repo]);
+  const worktree = rec.worktree;
+  if (worktree) pairs.push(["Worktree", worktree]);
   const validateCmd = rec.validate_cmd ?? run.validate_cmd;
   pairs.push(["Validate command", validateCmd || "—"]);
   const t = rec.timings;

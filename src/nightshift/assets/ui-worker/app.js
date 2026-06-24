@@ -65,6 +65,7 @@ async function refreshNow() {
   document.getElementById("now-model").textContent = `model: ${now.model || "auto"}`;
   document.getElementById("now-started").textContent = `started: ${now.started_at || "—"}`;
   document.getElementById("now-branch").textContent = now.branch ? `branch: ${now.branch}` : "—";
+  document.getElementById("now-worktree").textContent = now.worktree ? `worktree: ${now.worktree}` : "—";
   const log = document.getElementById("now-log");
   log.textContent = (now.log_tail || []).join("");
   log.scrollTop = log.scrollHeight;
@@ -89,7 +90,8 @@ async function refreshHistory() {
         `<td>${escapeHtml(r.queue || "main")}</td>` +
         `<td>${escapeHtml(r.model || "")}</td>` +
         `<td class="status-${escapeHtml(r.status || "")}">${escapeHtml(r.status || "")}</td>` +
-        `<td>${escapeHtml(r.result_line || "")}</td>`;
+        `<td>${escapeHtml(r.result_line || "")}</td>` +
+        `<td title="${escapeHtml(r.worktree || "")}">${escapeHtml(r.worktree ? r.worktree.split("/").pop() : "")}</td>`;
       body.appendChild(tr);
     }
   } catch (_e) {

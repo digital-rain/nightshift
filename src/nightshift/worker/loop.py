@@ -13,7 +13,7 @@ import threading
 from typing import Any
 
 from nightshift import playlists
-from nightshift.engine import teardown_worktree, worktree_branch
+from nightshift.engine import teardown_worktree, worktree_branch, worktree_dir
 from nightshift.worker.client import ManagerClient
 from nightshift.worker.config import WorkerConfig
 from nightshift.worker.execute import ExecuteOutcome, execute_work_order
@@ -96,6 +96,8 @@ class WorkerLoop:
         title = order.get("title", task)
         repo = order.get("repo") or ""
         branch = worktree_branch(task, queue)
+        queue_internal = playlists.queue_from_tasks_rel(queue)
+        wt = str(worktree_dir(self.cfg.workspace, repo, task, queue_internal)) if repo else None
 
         self.local.begin(
             run_id=run_id,
@@ -106,6 +108,7 @@ class WorkerLoop:
             backend=self.cfg.backend,
             repo=repo,
             branch=branch,
+            worktree=wt,
         )
 
         buffer: list[dict[str, Any]] = []
@@ -186,6 +189,7 @@ class WorkerLoop:
             "output_tokens": outcome.output_tokens,
             "cost_usd": outcome.cost_usd,
             "validate_cmd": outcome.validate_cmd,
+            "worktree": outcome.worktree,
         }
         result: dict[str, Any] = {}
         try:
@@ -218,6 +222,7 @@ class WorkerLoop:
                 "input_tokens": outcome.input_tokens,
                 "output_tokens": outcome.output_tokens,
                 "cost_usd": outcome.cost_usd,
+                "worktree": outcome.worktree,
             }
         )
 

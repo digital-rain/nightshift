@@ -147,6 +147,8 @@ class SubmitBody(BaseModel):
     # The validate command the worker actually ran (None when validation was
     # skipped or never reached).
     validate_cmd: str | None = None
+    # The worktree directory the worker used for this task.
+    worktree: str | None = None
 
 
 class QueueOrder(BaseModel):
@@ -686,6 +688,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             "output_tokens": body.output_tokens,
             "cost_usd": body.cost_usd,
             "validate_cmd": body.validate_cmd,
+            "worktree": body.worktree,
         }
 
         # An honest block from the worker (no commits): record the outcome, hold

@@ -68,6 +68,8 @@ class ExecuteOutcome:
     cost_usd: float | None = None
     # Validate command the worker actually ran (None when skipped or not reached).
     validate_cmd: str | None = None
+    # The worktree directory the worker used for this task (str path).
+    worktree: str | None = None
 
 
 def _finish_landable(
@@ -82,6 +84,7 @@ def _finish_landable(
     on_log: LogCb,
     wip_ref_prefix: str | None = None,
     validate_cmd: str | None = None,
+    worktree: str | None = None,
 ) -> ExecuteOutcome:
     """Finalize a validated (landable) run.
 
@@ -99,6 +102,7 @@ def _finish_landable(
             landable=True,
             resolved_model=model,
             validate_cmd=validate_cmd,
+            worktree=worktree,
             **tele,
         )
     try:
@@ -120,6 +124,7 @@ def _finish_landable(
             failure_kind="publish_failed",
             failure_reason=str(exc),
             validate_cmd=validate_cmd,
+            worktree=worktree,
             **tele,
         )
     on_log(f"  published {branch_ref} ({head_sha[:8]}) to {cfg.rendezvous_remote}\n")
@@ -131,6 +136,7 @@ def _finish_landable(
         branch_ref=branch_ref,
         head_sha=head_sha,
         validate_cmd=validate_cmd,
+        worktree=worktree,
         **tele,
     )
 
@@ -144,6 +150,7 @@ def execute_work_order(
 ) -> ExecuteOutcome:
     """Run one work order to a landable (or failed) state. Never touches main."""
     from nightshift.backends import LAUNCH_FAILED, WorkerSpec, get_backend
+    from nightshift.engine import worktree_dir
 
     workspace = cfg.workspace
     task = order["task"]
@@ -154,6 +161,10 @@ def execute_work_order(
     config_blob = order.get("config", {})
     validate_argv, validate_display = validate_cmd_from_blob(config_blob)
     prompt_validate = validate_display or DEFAULT_VALIDATE_CMD
+
+    # Resolve the worktree path early (deterministic from task/queue/repo) so
+    # every outcome carries it — even early failures that never cut the worktree.
+    wt_path = str(worktree_dir(workspace, repo, task, queue))
 
     # Worker-owned model resolution. A vendor mismatch fails the task with a
     # clear reason (surfaced to the operator via the manager).
@@ -166,6 +177,7 @@ def execute_work_order(
             resolved_model=str(config_blob.get("model") or "auto"),
             failure_kind="model_unavailable",
             failure_reason=model_error,
+            worktree=wt_path,
         )
     assert model is not None
 
@@ -181,6 +193,7 @@ def execute_work_order(
             resolved_model=model,
             failure_kind="repo_unavailable",
             failure_reason=reason,
+            worktree=wt_path,
         )
 
     backend = get_backend(cfg.backend)
@@ -193,6 +206,7 @@ def execute_work_order(
             resolved_model=model,
             failure_kind="backend_unavailable",
             failure_reason=reason,
+            worktree=wt_path,
         )
 
     on_phase("worker")
@@ -254,6 +268,7 @@ def execute_work_order(
                 resolved_model=model,
                 failure_kind="worker_launch",
                 failure_reason=result.error,
+                worktree=wt_path,
                 **tele,
             )
 
@@ -272,6 +287,7 @@ def execute_work_order(
                 resolved_model=model,
                 failure_kind="blocked",
                 failure_reason=blocked_reason,
+                worktree=wt_path,
                 **tele,
             )
 
@@ -286,6 +302,7 @@ def execute_work_order(
                 resolved_model=model,
                 failure_kind="worker_error",
                 failure_reason=reason,
+                worktree=wt_path,
                 **tele,
             )
 
@@ -301,6 +318,7 @@ def execute_work_order(
                     result_line="agent landed on main (awaiting manager adopt)",
                     landable=False,
                     resolved_model=model,
+                    worktree=wt_path,
                     **tele,
                 )
             return ExecuteOutcome(
@@ -308,6 +326,7 @@ def execute_work_order(
                 result_line="no changes produced (worker emitted output only)",
                 landable=False,
                 resolved_model=model,
+                worktree=wt_path,
                 **tele,
             )
 
@@ -326,6 +345,7 @@ def execute_work_order(
                 on_log=on_log,
                 wip_ref_prefix=config_blob.get("wip_ref_prefix"),
                 validate_cmd=None,
+                worktree=wt_path,
             )
         on_phase("validate")
         on_log(f"  running {validate_display}...\n")
@@ -346,6 +366,7 @@ def execute_work_order(
                 failure_kind="validation_error",
                 failure_reason=tail,
                 validate_cmd=validate_display,
+                worktree=wt_path,
                 **tele,
             )
 
@@ -361,6 +382,7 @@ def execute_work_order(
             on_log=on_log,
             wip_ref_prefix=config_blob.get("wip_ref_prefix"),
             validate_cmd=validate_display,
+            worktree=wt_path,
         )
     finally:
         if not preserve:
