@@ -1,6 +1,6 @@
 ---
 title: short descriptive title for the PR
-model: claude-sonnet-4-6
+model: auto
 draft: false
 automerge: true
 split: false

@@ -127,9 +127,11 @@ def load_store_config(tasks_root: Path) -> dict:
 def resolve_config(workspace: Path, tasks_root: Path, tasks_rel: str = "main") -> dict:
     """Layered runner config for a queue, rebased onto the two roots.
 
-    Resolution order (later wins): the operator/global ``<workspace>/config.json``,
-    then the optional workspace-level content-store ``<tasks_root>/config.json``
-    (the system-wide layer, formerly ``.tasks/config.json``), then the per-queue
+    Resolution order (later wins): the operator/manager config
+    ``<workspace>/.nightshift/manager.json`` (so global knobs like
+    ``default_model`` flow through to brief defaults), then the optional
+    workspace-level content-store ``<tasks_root>/config.json`` (the system-wide
+    layer, formerly ``.tasks/config.json``), then the per-queue
     ``<tasks_root>/<tasks_rel>/config.json``. A queue therefore inherits every
     setting it does not itself override.
     """
@@ -283,7 +285,7 @@ def resolve_frontmatter(meta: dict, config: dict) -> dict:
     return {
         "model": meta.get(
             "model",
-            config.get("model", config.get("default_model", "claude-sonnet-4-6")),
+            config.get("model", config.get("default_model", "auto")),
         ),
         "max_turns": int(raw_turns) if raw_turns is not None else None,
         "automerge": bool(meta.get("automerge", config.get("automerge", False))),
@@ -300,7 +302,7 @@ def render_spawned_task(
 ) -> str:
     text = template.read_text()
     text = text.replace("title: short descriptive title for the PR", f"title: {title}", 1)
-    text = text.replace("model: claude-sonnet-4-6", f"model: {resolved['model']}", 1)
+    text = text.replace("model: auto", f"model: {resolved['model']}", 1)
     text = text.replace(
         "automerge: true",
         f"automerge: {'true' if resolved['automerge'] else 'false'}",

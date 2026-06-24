@@ -578,8 +578,8 @@ def test_content_store_commits_are_local_and_pushless(tmp_path: Path) -> None:
         assert store_log_subject() == f"nightshift: edit task {task}"
 
         # complete → a real dispatch + land drops the brief as a local commit.
-        # The new brief pins claude-sonnet-4-6 (from the task template), so the
-        # worker advertises that model to be routed the task.
+        # The new brief requests ``auto`` (from the task template); ``auto`` is
+        # always routable, so any advertised model lets the worker pick up the task.
         models = ["claude-sonnet-4-6"]
         client.post(
             "/api/worker/checkin",

@@ -277,11 +277,18 @@ def create_app(workspace: Path) -> FastAPI:
         except FileNotFoundError:
             return JSONResponse({"error": "task not found"}, status_code=404)
         config = resolve_config(workspace, tasks_root, playlists_mod.tasks_rel(target))
-        info["model_options"] = list(
-            config.get("scheduled_models_allow")
-            or config.get("scheduled_models")
-            or []
-        )
+        # Legacy single-box server has no live worker registry, so the dropdown
+        # falls back to the operator's scheduled allow-list; the logical
+        # ``auto``/``max`` selectors always lead (they resolve worker-side).
+        info["model_options"] = [
+            "auto",
+            "max",
+            *(
+                config.get("scheduled_models_allow")
+                or config.get("scheduled_models")
+                or []
+            ),
+        ]
         return JSONResponse(info)
 
     @app.put("/api/queue/order")
@@ -614,11 +621,15 @@ def create_app(workspace: Path) -> FastAPI:
                 "frontmatter_raw": {},
                 "evergreen": False,
                 "disabled": False,
-                "model_options": list(
-                    config.get("scheduled_models_allow")
-                    or config.get("scheduled_models")
-                    or []
-                ),
+                "model_options": [
+                    "auto",
+                    "max",
+                    *(
+                        config.get("scheduled_models_allow")
+                        or config.get("scheduled_models")
+                        or []
+                    ),
+                ],
             }
         )
 
