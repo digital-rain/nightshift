@@ -31,6 +31,8 @@ const state = {
   playlistInfoName: null, // playlist open in the full-area info pane (view "playlist-info")
   playlistInfoData: null, // loaded {name, repository, task_count} for the info pane
   blockedTasks: {},      // task id -> blocked_reason string for tasks currently blocked by manager
+  selectedPlaylist: null,        // playlist-list cursor (name string, null = library)
+  selectedPlaylists: new Set(),  // multi-selected playlist names (shift-click extends)
 };
 
 // Transport glyphs for the Now box (borderless triangle / pause bars).
@@ -1726,10 +1728,25 @@ function onGlobalKeydown(e) {
   if (tag === "input" || tag === "textarea" || tag === "select" ||
       (e.target && e.target.isContentEditable)) return;
   if (anyModalOpen()) return;
+  // Playlists view: arrow keys navigate, Delete removes, Enter opens info.
+  if (state.view === "playlists") {
+    if (isDelete) {
+      const targets = playlistDeleteTargets();
+      if (!targets.length) return;
+      e.preventDefault();
+      bulkDeletePlaylists(targets);
+      return;
+    }
+    if (e.key === "Enter") {
+      if (state.selectedPlaylist) { e.preventDefault(); openPlaylistInfo(state.selectedPlaylist); }
+      return;
+    }
+    e.preventDefault();
+    movePlaylistSelection(e.key === "ArrowDown" ? 1 : -1);
+    return;
+  }
   if (state.view !== "queue" && state.view !== "now") return;
   if (isDelete) {
-    // Delete removes the selected task(s) from the active queue after a
-    // simple ok/cancel confirmation (the row "x" icon is gone).
     const targets = deleteTargets();
     if (!targets.length) return;
     e.preventDefault();
@@ -2459,6 +2476,7 @@ function playlistSpinner(running) {
 function renderPlaylists() {
   const ul = $("playlists");
   if (!ul) return;
+  closeRowMenu();
   ul.innerHTML = "";
   // Disabled playlists are hidden from the default view; the "Hidden" toggle
   // reveals them (rendered muted, with their hide button flipped to "unhide").
@@ -2486,6 +2504,174 @@ function renderPlaylists() {
 
   ul.append(libraryRow());
   for (const pl of items) ul.append(playlistRow(pl));
+}
+
+// Select a playlist row: move the cursor and update the multi-selection.
+// Plain click selects just this playlist; shift-click toggles it into/out of
+// the existing selection. The library row (name === null) is excluded from
+// selection — it can only be activated (click/dblclick).
+function selectPlaylist(name, { extend = false } = {}) {
+  if (extend) {
+    if (state.selectedPlaylists.has(name)) state.selectedPlaylists.delete(name);
+    else state.selectedPlaylists.add(name);
+  } else {
+    state.selectedPlaylists = new Set([name]);
+  }
+  state.selectedPlaylist = name;
+  renderPlaylists();
+}
+
+// The playlists the Delete key acts on: the whole multi-selection in display
+// order, falling back to the single cursor row.
+function playlistDeleteTargets() {
+  if (state.selectedPlaylists.size) {
+    const visible = visiblePlaylists();
+    return visible.map((pl) => pl.name).filter((n) => state.selectedPlaylists.has(n));
+  }
+  return state.selectedPlaylist ? [state.selectedPlaylist] : [];
+}
+
+// The playlists the "…" menu acts on: the whole multi-selection when the
+// clicked row is part of it, otherwise just the clicked row.
+function playlistMenuTargets(name) {
+  if (state.selectedPlaylists.has(name) && state.selectedPlaylists.size > 1) {
+    const visible = visiblePlaylists();
+    return visible.map((pl) => pl.name).filter((n) => state.selectedPlaylists.has(n));
+  }
+  return [name];
+}
+
+// The filtered list of playlists currently shown (respecting showHidden).
+function visiblePlaylists() {
+  return state.showHidden
+    ? state.playlists
+    : state.playlists.filter((pl) => !pl.disabled);
+}
+
+// Arrow-key navigation over the playlist list.
+function movePlaylistSelection(delta) {
+  const names = visiblePlaylists().map((pl) => pl.name);
+  if (!names.length) return;
+  let idx = names.indexOf(state.selectedPlaylist);
+  if (idx === -1) idx = delta > 0 ? -1 : 0;
+  const name = names[Math.max(0, Math.min(names.length - 1, idx + delta))];
+  state.selectedPlaylist = name;
+  state.selectedPlaylists = new Set([name]);
+  renderPlaylists();
+  const row = document.querySelector(`.pl-item[data-playlist="${cssEscape(name)}"]`);
+  if (row && row.scrollIntoView) row.scrollIntoView({ block: "nearest" });
+}
+
+// Build a playlist row's "…" trigger, mirroring the queue row pattern.
+function playlistMenuButton(pl) {
+  const btn = document.createElement("button");
+  btn.className = "pl-menu-btn";
+  btn.title = "Actions";
+  btn.setAttribute("aria-haspopup", "true");
+  btn.setAttribute("aria-label", "Playlist actions");
+  btn.textContent = ELLIPSIS_GLYPH;
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const anchor = btn.getBoundingClientRect();
+    if (!state.selectedPlaylists.has(pl.name)) {
+      selectPlaylist(pl.name);
+    }
+    openPlaylistMenu(anchor, pl);
+  });
+  return btn;
+}
+
+// Open the floating menu for a playlist row, reusing the shared rowMenuEl so
+// outside-click/Escape/scroll dismiss works identically.
+function openPlaylistMenu(anchor, pl) {
+  closeRowMenu();
+  const targets = playlistMenuTargets(pl.name);
+  const many = targets.length > 1;
+  const suffix = many ? ` (${targets.length})` : "";
+
+  const allHidden = targets.every((n) => {
+    const found = state.playlists.find((p) => p.name === n);
+    return found && found.disabled;
+  });
+
+  const menu = document.createElement("div");
+  menu.className = "row-menu";
+  menu.setAttribute("role", "menu");
+
+  const items = [
+    { label: "Get info", act: () => openPlaylistInfo(pl.name), disabled: many },
+    { divider: true },
+    {
+      label: (allHidden ? "Unhide" : "Hide") + suffix,
+      act: () => bulkTogglePlaylistHidden(targets, !allHidden),
+    },
+    { label: "Delete" + suffix, act: () => bulkDeletePlaylists(targets) },
+  ];
+
+  for (const spec of items) {
+    if (spec.divider) {
+      const hr = document.createElement("div");
+      hr.className = "row-menu-sep";
+      menu.append(hr);
+      continue;
+    }
+    const b = document.createElement("button");
+    b.className = "row-menu-item";
+    b.setAttribute("role", "menuitem");
+    if (spec.disabled) {
+      b.textContent = spec.label;
+      b.disabled = true;
+      b.title = "Select a single playlist to view its info";
+    } else {
+      b.textContent = spec.label;
+      b.addEventListener("mouseenter", closeRowSubmenu);
+      b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        closeRowMenu();
+        spec.act();
+      });
+    }
+    menu.append(b);
+  }
+
+  document.body.append(menu);
+  rowMenuEl = menu;
+  positionRowMenu(menu, anchor);
+}
+
+// Bulk hide/unhide playlists.
+async function bulkTogglePlaylistHidden(names, disabled) {
+  for (const name of names) {
+    const { ok, data } = await sendJSON(
+      `/api/playlists/${encodeURIComponent(name)}`, "PUT", { disabled });
+    if (!ok) { alert((data && data.error) || "could not update playlist"); break; }
+  }
+  await loadPlaylists();
+}
+
+// Bulk delete playlists with a single confirmation.
+async function bulkDeletePlaylists(names) {
+  const many = names.length > 1;
+  const msg = many
+    ? `Delete ${names.length} playlists? This removes their .tasks/ directories and all tasks and runs.`
+    : `Delete playlist "${names[0]}"? This removes .tasks/${names[0]}/ and all its tasks and runs.`;
+  if (!confirm(msg)) return;
+  for (const name of names) {
+    const { ok, data } = await sendJSON(`/api/playlists/${encodeURIComponent(name)}`, "DELETE");
+    if (!ok) { alert((data && data.error) || "could not delete playlist"); break; }
+  }
+  state.selectedPlaylist = null;
+  state.selectedPlaylists = new Set();
+  await loadPlaylists();
+  try {
+    const agg = await getJSON("/api/state");
+    if (agg && agg.queues) {
+      for (const [k, st] of Object.entries(agg.queues)) ingestQueueState(k, st);
+    }
+    syncActivePlaylist(agg && agg.active_playlist);
+  } catch { /* keep current focus on a transient error */ }
+  applyFocusedState();
+  if (state.activePlaylist === null) await Promise.all([loadQueue(), loadRuns()]);
 }
 
 // The "library" row: the main `.tasks/` queue, rendered as a playlist. Selecting
@@ -2532,10 +2718,16 @@ function libraryRow() {
 function playlistRow(pl) {
   const li = document.createElement("li");
   li.className = "pl-item";
+  li.dataset.playlist = pl.name;
+  li.title = "Click to select · shift-click to multi-select · double-click to open queue";
   const active = state.activePlaylist === pl.name;
   if (active) li.classList.add("active");
   if (pl.disabled) li.classList.add("pl-hidden");
-  li.addEventListener("click", () => activatePlaylist(pl.name, "playlists"));
+  if (pl.name === state.selectedPlaylist) li.classList.add("cursor");
+  if (state.selectedPlaylists.has(pl.name)) li.classList.add("selected");
+  li.addEventListener("click", (e) => {
+    selectPlaylist(pl.name, { extend: e.shiftKey });
+  });
   li.addEventListener("dblclick", () => activatePlaylist(pl.name, "queue"));
 
   li.append(playlistSpinner(isQueueRunning(pl.name)));
@@ -2563,38 +2755,7 @@ function playlistRow(pl) {
   });
   li.append(addTask);
 
-  // Info: opens the full-area playlist-info pane (name + repository).
-  const info = document.createElement("button");
-  info.className = "pl-info";
-  info.title = "Playlist info";
-  info.innerHTML = "&#9432;";
-  info.addEventListener("click", (e) => {
-    e.stopPropagation();
-    openPlaylistInfo(pl.name);
-  });
-  li.append(info);
-
-  // Hide / unhide: disabling a playlist hides it from the default view and
-  // parks it (the scheduler skips it). Sits just right of the info button.
-  const hide = document.createElement("button");
-  hide.className = "pl-hide";
-  hide.title = pl.disabled ? "Unhide this playlist" : "Hide and disable this playlist";
-  hide.innerHTML = pl.disabled ? EYE_ICON : EYE_OFF_ICON;
-  hide.addEventListener("click", (e) => {
-    e.stopPropagation();
-    togglePlaylistHidden(pl.name, !pl.disabled);
-  });
-  li.append(hide);
-
-  const del = document.createElement("button");
-  del.className = "pl-del";
-  del.title = "Delete this playlist (and its tasks)";
-  del.innerHTML = "&#10005;";
-  del.addEventListener("click", (e) => {
-    e.stopPropagation();
-    deletePlaylist(pl.name);
-  });
-  li.append(del);
+  li.append(playlistMenuButton(pl));
 
   // The chevron switches to this playlist and drops straight into its Queue.
   const chev = document.createElement("button");

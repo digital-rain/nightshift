@@ -1086,6 +1086,24 @@ body[data-view="detail"] #screen-detail { display: flex; flex: 1; }
 .pl-item.pl-hidden { opacity: 0.55; border-style: dashed; }
 .pl-item.pl-hidden:hover { opacity: 0.8; }
 .pl-item.pl-hidden .pl-hide { opacity: 1; color: var(--accent); }
+/* Multi-selected playlist rows: same accent treatment as queue rows. */
+.pl-item.cursor { border-color: var(--accent); }
+.pl-item.selected { background: var(--accent-soft); border-color: var(--accent); }
+/* Per-row "…" actions trigger, mirroring .q-menu-btn. */
+.pl-menu-btn {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 6px;
+  opacity: 0;
+}
+.pl-item:hover .pl-menu-btn,
+.pl-item.selected .pl-menu-btn { opacity: 1; }
+.pl-menu-btn:hover { color: var(--accent); background: var(--bg-sunken); }
 
 /* ---- wide screens: Now grows a right-hand detail column when a task is
    selected (body.has-detail). Narrow widths use the detail modal instead. ---- */
