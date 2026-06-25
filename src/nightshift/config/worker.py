@@ -22,6 +22,7 @@ DEFAULT_AUTO_MODELS: dict[str, str] = {
     "gemini": "gemini-2.5-flash",
     "anthropic": "claude-sonnet-4-6",
     "ollama": "llama3.1",
+    "ollama-cloud": "gpt-oss:120b",
 }
 DEFAULT_MAX_MODELS: dict[str, str] = {
     "claude-code": "claude-opus-4-8",
@@ -29,6 +30,7 @@ DEFAULT_MAX_MODELS: dict[str, str] = {
     "gemini": "gemini-2.5-pro",
     "anthropic": "claude-opus-4-8",
     "ollama": "llama3.1:70b",
+    "ollama-cloud": "deepseek-v3.1:671b",
 }
 
 

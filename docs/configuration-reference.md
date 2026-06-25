@@ -70,7 +70,8 @@ Only `NIGHTSHIFT_WORKSPACE` and `NIGHTSHIFT_MANAGER_URL` are strictly required f
 | `GEMINI_API_KEY` | If using `gemini` backend | — | Gemini API key. |
 | `CLAUDE_CLI_PATH` | No | auto-detect | Path to the `claude` CLI binary. |
 | `CURSOR_CLI_PATH` | No | auto-detect | Path to the `cursor-agent` CLI binary. |
-| `OLLAMA_BASE_URL` | If using `ollama` backend | `http://localhost:11434` | Ollama daemon address. |
+| `OLLAMA_BASE_URL` | If using `ollama` backend | `http://localhost:11434` | Local Ollama daemon address. |
+| `OLLAMA_API_KEY` | If using `ollama-cloud` backend | — | Ollama Cloud API key (create at `https://ollama.com/settings/keys`). Sent as a Bearer token to `https://ollama.com`. |
 
 **Minimal working `.env`** (single box, `claude-code` backend, Postgres):
 
@@ -212,6 +213,7 @@ Overridable via the `auto_model` / `max_model` maps in `worker.json`.
 | `gemini` | `gemini-2.5-flash` | `gemini-2.5-pro` |
 | `anthropic` | `claude-sonnet-4-6` | `claude-opus-4-8` |
 | `ollama` | `llama3.1` | `llama3.1:70b` |
+| `ollama-cloud` | `gpt-oss:120b` | `deepseek-v3.1:671b` |
 
 ## Backends
 
@@ -224,8 +226,9 @@ A worker runs exactly one backend, set by `backend`. Availability is checked at 
 | `gemini` | Agentic CLI | `gemini` on `PATH` (or `gemini_bin`) + authenticated account / `GEMINI_API_KEY` | turns + tokens from end-of-run JSON (no live stream, no cost) |
 | `anthropic` | Single-shot API | `ANTHROPIC_API_KEY` | token counts with `turns=1` |
 | `ollama` | Single-shot API | `ollama` on `PATH` (or `ollama_host`) | token counts with `turns=1`, no dollar cost |
+| `ollama-cloud` | Single-shot API | `OLLAMA_API_KEY` (cloud-hosted on `ollama.com`) | token counts with `turns=1`, no dollar cost |
 
-Optional path overrides (`claude_bin`, `cursor_bin`, `gemini_bin`, `ollama_host`, `cursor_model`) go in `worker.json`.
+Optional path / endpoint overrides (`claude_bin`, `cursor_bin`, `gemini_bin`, `ollama_host`, `cursor_model`) go in `worker.json`. The `ollama-cloud` backend also accepts `ollama_cloud_host` (default `https://ollama.com`), `ollama_cloud_model`, and `ollama_cloud_api_key` (falls back to the `OLLAMA_API_KEY` env var).
 
 ## Task frontmatter
 

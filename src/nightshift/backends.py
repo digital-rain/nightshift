@@ -5,15 +5,19 @@ worktree, streaming output lines through ``emit_log`` and honouring early
 abort (skip / stop). The engine picks one per run by name; this is the single
 seam where Nightshift decides *who* does the work.
 
-Four are registered:
+These are registered:
 
-- ``claude``    — Claude Code CLI (default; fully **agentic**: edits files, runs bash).
-- ``cursor``    — Cursor's headless agent (``cursor-agent``; **agentic**).
-- ``anthropic`` — the Anthropic Messages API directly (**single-shot completion**,
+- ``claude-code``   — Claude Code CLI (default; fully **agentic**: edits files, runs bash).
+- ``cursor``        — Cursor's headless agent (``cursor-agent``; **agentic**).
+- ``gemini``        — Google's Gemini CLI (``gemini``; **agentic**).
+- ``anthropic``     — the Anthropic Messages API directly (**single-shot completion**,
   NOT agentic — it streams a model response but does not edit files).
-- ``ollama``    — a local Ollama model (**single-shot completion**, NOT agentic).
+- ``ollama``        — a local Ollama model (**single-shot completion**, NOT agentic).
+- ``ollama-cloud``  — a cloud-hosted Ollama model on ``ollama.com`` (**single-shot
+  completion**, NOT agentic); same native API as ``ollama`` but reached over HTTPS
+  with a Bearer ``OLLAMA_API_KEY``.
 
-The two API backends exist so we can measure raw model latency/throughput
+The API backends exist so we can measure raw model latency/throughput
 against the agent CLIs and to give a foundation for a future tool loop. Because
 they don't edit files, a run using them finishes as "no changes" (the engine's
 no-commit guard) rather than landing a commit.
@@ -598,6 +602,72 @@ class AnthropicBackend:
         )
 
 
+def _ollama_generate(
+    *,
+    host: str,
+    model: str,
+    prompt: str,
+    emit_log: EmitLog,
+    should_abort: ShouldAbort,
+    label: str,
+    headers: dict[str, str] | None = None,
+    error_hint: str = "",
+) -> WorkerResult:
+    """Stream a single-shot completion from an Ollama ``/api/generate`` endpoint.
+
+    Shared by the local (:class:`OllamaBackend`) and cloud
+    (:class:`OllamaCloudBackend`) backends — the wire protocol is identical; only
+    the ``host`` and (for cloud) the Bearer ``headers`` differ. ``label`` prefixes
+    error messages and ``error_hint`` is appended to transport failures (e.g. a
+    "is `ollama serve` running?" hint for the local daemon).
+    """
+    body = {"model": model, "prompt": prompt, "stream": True}
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    try:
+        with httpx.stream(
+            "POST", f"{host}/api/generate", json=body, headers=headers, timeout=None
+        ) as resp:
+            if resp.status_code >= 400:
+                resp.read()
+                return WorkerResult(
+                    returncode=1, error=f"{label} HTTP {resp.status_code}: {resp.text[:200]}"
+                )
+            for line in resp.iter_lines():
+                reason = should_abort()
+                if reason is not None:
+                    return WorkerResult(returncode=0, aborted=reason)
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                chunk = event.get("response", "")
+                if chunk:
+                    emit_log(chunk)
+                # Ollama reports a per-stream error inline (e.g. unknown model);
+                # surface it rather than finishing as a silent empty success.
+                if event.get("error"):
+                    return WorkerResult(returncode=1, error=f"{label}: {event['error']}")
+                if event.get("done"):
+                    if event.get("prompt_eval_count") is not None:
+                        input_tokens = int(event["prompt_eval_count"])
+                    if event.get("eval_count") is not None:
+                        output_tokens = int(event["eval_count"])
+                    break
+    except httpx.HTTPError as exc:
+        return WorkerResult(
+            returncode=1, error=f"{label} request failed: {exc}{error_hint}"
+        )
+    emit_log("\n")
+    # Token counts but no dollar cost; single-shot → one turn.
+    return WorkerResult(
+        returncode=0, turns=1,
+        input_tokens=input_tokens, output_tokens=output_tokens,
+    )
+
+
 class OllamaBackend:
     name = "ollama"
     agentic = False
@@ -617,47 +687,49 @@ class OllamaBackend:
         on_worker_start: OnWorkerStart | None = None,
     ) -> WorkerResult:
         host = str(spec.config.get("ollama_host", "http://localhost:11434")).rstrip("/")
-        model = spec.config.get("ollama_model", "llama3.1")
+        model = spec.config.get("ollama_model") or spec.model or "llama3.1"
         emit_log(f"  [ollama] {model} @ {host}: single-shot completion (non-agentic)\n")
-        body = {"model": model, "prompt": spec.prompt, "stream": True}
-        input_tokens: int | None = None
-        output_tokens: int | None = None
-        try:
-            with httpx.stream("POST", f"{host}/api/generate", json=body, timeout=None) as resp:
-                if resp.status_code >= 400:
-                    resp.read()
-                    return WorkerResult(
-                        returncode=1, error=f"ollama HTTP {resp.status_code}: {resp.text[:200]}"
-                    )
-                for line in resp.iter_lines():
-                    reason = should_abort()
-                    if reason is not None:
-                        return WorkerResult(returncode=0, aborted=reason)
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    chunk = event.get("response", "")
-                    if chunk:
-                        emit_log(chunk)
-                    if event.get("done"):
-                        if event.get("prompt_eval_count") is not None:
-                            input_tokens = int(event["prompt_eval_count"])
-                        if event.get("eval_count") is not None:
-                            output_tokens = int(event["eval_count"])
-                        break
-        except httpx.HTTPError as exc:
-            return WorkerResult(
-                returncode=1,
-                error=f"ollama request failed: {exc} (is `ollama serve` running?)",
-            )
-        emit_log("\n")
-        # Local model: token counts but no dollar cost; single-shot → one turn.
-        return WorkerResult(
-            returncode=0, turns=1,
-            input_tokens=input_tokens, output_tokens=output_tokens,
+        return _ollama_generate(
+            host=host, model=model, prompt=spec.prompt,
+            emit_log=emit_log, should_abort=should_abort,
+            label="ollama", error_hint=" (is `ollama serve` running?)",
+        )
+
+
+class OllamaCloudBackend:
+    name = "ollama-cloud"
+    agentic = False
+    description = (
+        "Ollama Cloud (ollama.com) — single-shot completion (NOT agentic). "
+        "Hosted models via the native Ollama API over HTTPS; requires OLLAMA_API_KEY."
+    )
+
+    def available(self, config: dict[str, Any] | None = None) -> bool:
+        cfg = config or {}
+        return bool(cfg.get("ollama_cloud_api_key") or os.environ.get("OLLAMA_API_KEY"))
+
+    def run(
+        self,
+        spec: WorkerSpec,
+        emit_log: EmitLog,
+        should_abort: ShouldAbort,
+        on_worker_start: OnWorkerStart | None = None,
+    ) -> WorkerResult:
+        key = (
+            spec.config.get("ollama_cloud_api_key")
+            or spec.env.get("OLLAMA_API_KEY")
+            or os.environ.get("OLLAMA_API_KEY")
+        )
+        if not key:
+            return WorkerResult(returncode=2, error="OLLAMA_API_KEY is not set")
+        host = str(spec.config.get("ollama_cloud_host", "https://ollama.com")).rstrip("/")
+        model = spec.config.get("ollama_cloud_model") or spec.model or "gpt-oss:120b"
+        emit_log(f"  [ollama-cloud] {model} @ {host}: single-shot completion (non-agentic)\n")
+        return _ollama_generate(
+            host=host, model=model, prompt=spec.prompt,
+            emit_log=emit_log, should_abort=should_abort,
+            headers={"Authorization": f"Bearer {key}"},
+            label="ollama-cloud",
         )
 
 
@@ -667,6 +739,7 @@ _BACKENDS: tuple[Any, ...] = (
     GeminiCLIBackend(),
     AnthropicBackend(),
     OllamaBackend(),
+    OllamaCloudBackend(),
 )
 
 DEFAULT_BACKEND = "claude-code"

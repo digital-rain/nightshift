@@ -4,6 +4,7 @@ handshake that actually lands a commit on main via the manager (co-located).
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,7 @@ from starlette.testclient import TestClient
 
 import nightshift.backends as backends_mod
 from _workspace import build_workspace
-from nightshift.backends import WorkerResult
+from nightshift.backends import WorkerResult, WorkerSpec
 from nightshift.manager.app import create_app
 from nightshift.manager.store import MemoryStore
 from nightshift.worker.config import WorkerConfig, load_worker_config
@@ -93,6 +94,130 @@ def test_worker_config_advertises_capabilities(tmp_path: Path, monkeypatch) -> N
     cfg = load_worker_config(tmp_path)
     assert cfg.models == ["claude-opus-4-8", "gpt-5.5"]
     assert cfg.mcps == ["slack", "github"]
+
+
+# --------------------------------------------------------------------------- #
+# ollama-cloud backend
+# --------------------------------------------------------------------------- #
+
+
+class _FakeOllamaResponse:
+    """Minimal stand-in for an ``httpx.stream`` context manager."""
+
+    def __init__(self, lines: list[str], status_code: int = 200, text: str = "") -> None:
+        self.status_code = status_code
+        self.text = text
+        self._lines = lines
+
+    def __enter__(self) -> _FakeOllamaResponse:
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        return False
+
+    def iter_lines(self):
+        yield from self._lines
+
+    def read(self) -> bytes:
+        return b""
+
+
+def test_ollama_cloud_registered() -> None:
+    assert "ollama-cloud" in backends_mod.backend_names()
+    backend = backends_mod.get_backend("ollama-cloud")
+    assert isinstance(backend, backends_mod.OllamaCloudBackend)
+    assert backend.agentic is False
+
+
+def test_ollama_cloud_availability(monkeypatch) -> None:
+    backend = backends_mod.OllamaCloudBackend()
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+    assert backend.available({}) is False
+    # Either the env var or a config override makes it available.
+    assert backend.available({"ollama_cloud_api_key": "k"}) is True
+    monkeypatch.setenv("OLLAMA_API_KEY", "env-key")
+    assert backend.available({}) is True
+
+
+def test_ollama_cloud_model_defaults() -> None:
+    cfg = _cfg("ollama-cloud")
+    assert cfg.resolve_model("auto") == ("gpt-oss:120b", None)
+    assert cfg.resolve_model("max") == ("deepseek-v3.1:671b", None)
+    # explicit ids pass through unchanged.
+    assert cfg.resolve_model("qwen3-coder:480b") == ("qwen3-coder:480b", None)
+
+
+def test_ollama_cloud_missing_key_errors(monkeypatch) -> None:
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+    spec = WorkerSpec(
+        task="t", prompt="hi", model="gpt-oss:120b", max_turns=None,
+        cwd=Path("/tmp"), env={}, config={},
+    )
+    result = backends_mod.OllamaCloudBackend().run(spec, lambda _l: None, lambda: None)
+    assert result.returncode == 2
+    assert result.error is not None and "OLLAMA_API_KEY" in result.error
+
+
+def test_ollama_cloud_sends_bearer_to_cloud(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    lines = [
+        json.dumps({"response": "Hello"}),
+        json.dumps({
+            "response": " world", "done": True,
+            "prompt_eval_count": 5, "eval_count": 7,
+        }),
+    ]
+
+    def fake_stream(method, url, *, json=None, headers=None, timeout=None):
+        captured.update(method=method, url=url, headers=headers, body=json)
+        return _FakeOllamaResponse(lines)
+
+    monkeypatch.setattr(backends_mod.httpx, "stream", fake_stream)
+    monkeypatch.setenv("OLLAMA_API_KEY", "test-key-123")
+    spec = WorkerSpec(
+        task="t", prompt="why is the sky blue?", model="gpt-oss:120b",
+        max_turns=None, cwd=Path("/tmp"), env={}, config={},
+    )
+    logs: list[str] = []
+    result = backends_mod.OllamaCloudBackend().run(spec, logs.append, lambda: None)
+
+    assert result.returncode == 0
+    assert result.turns == 1
+    assert (result.input_tokens, result.output_tokens) == (5, 7)
+    assert captured["url"] == "https://ollama.com/api/generate"
+    assert captured["headers"] == {"Authorization": "Bearer test-key-123"}
+    assert captured["body"]["model"] == "gpt-oss:120b"
+    output = "".join(logs)
+    assert output.startswith("  [ollama-cloud] gpt-oss:120b @ https://ollama.com")
+    assert "Hello world" in output
+
+
+def test_ollama_cloud_config_overrides_host_and_key(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    lines = [json.dumps({"response": "ok", "done": True})]
+
+    def fake_stream(method, url, *, json=None, headers=None, timeout=None):
+        captured.update(url=url, headers=headers, body=json)
+        return _FakeOllamaResponse(lines)
+
+    monkeypatch.setattr(backends_mod.httpx, "stream", fake_stream)
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+    spec = WorkerSpec(
+        task="t", prompt="hi", model="auto", max_turns=None,
+        cwd=Path("/tmp"), env={},
+        config={
+            "ollama_cloud_host": "https://proxy.internal/",
+            "ollama_cloud_model": "qwen3-coder:480b",
+            "ollama_cloud_api_key": "cfg-key",
+        },
+    )
+    result = backends_mod.OllamaCloudBackend().run(spec, lambda _l: None, lambda: None)
+    assert result.returncode == 0
+    assert captured["url"] == "https://proxy.internal/api/generate"
+    assert captured["headers"] == {"Authorization": "Bearer cfg-key"}
+    assert captured["body"]["model"] == "qwen3-coder:480b"
 
 
 # --------------------------------------------------------------------------- #

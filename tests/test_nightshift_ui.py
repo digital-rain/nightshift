@@ -1223,7 +1223,9 @@ def test_backend_registry_and_selection() -> None:
     from nightshift import backends
 
     names = backends.backend_names()
-    assert names == ["claude-code", "cursor", "gemini", "anthropic", "ollama"]
+    assert names == [
+        "claude-code", "cursor", "gemini", "anthropic", "ollama", "ollama-cloud",
+    ]
 
     # Known name resolves; unknown/empty falls back to the default (claude-code).
     assert backends.get_backend("cursor").name == "cursor"
@@ -1236,6 +1238,7 @@ def test_backend_registry_and_selection() -> None:
     assert described["gemini"]["agentic"] is True  # Gemini CLI edits files
     assert described["anthropic"]["agentic"] is False
     assert described["ollama"]["agentic"] is False
+    assert described["ollama-cloud"]["agentic"] is False
     assert set(described["claude-code"]) == {"name", "description", "agentic", "available"}
 
 
@@ -1495,7 +1498,9 @@ def test_server_backends_endpoint(tmp_path: Path) -> None:
     data = resp.json()
     assert data["current"] == "claude-code"
     names = [b["name"] for b in data["backends"]]
-    assert names == ["claude-code", "cursor", "gemini", "anthropic", "ollama"]
+    assert names == [
+        "claude-code", "cursor", "gemini", "anthropic", "ollama", "ollama-cloud",
+    ]
 
 
 def test_worker_backend_is_not_in_player_settings(tmp_path: Path) -> None:
