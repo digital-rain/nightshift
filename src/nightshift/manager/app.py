@@ -16,8 +16,11 @@ browsers converge as state changes, not on navigation.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
+import subprocess
+import sys
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -149,6 +152,30 @@ class SubmitBody(BaseModel):
     validate_cmd: str | None = None
     # The worktree directory the worker used for this task.
     worktree: str | None = None
+
+
+class ResolveResultBody(BaseModel):
+    """Final outcome reported by an out-of-process resolve subprocess (see
+    nightshift.manager.resolve_job)."""
+
+    task: str
+    queue: str | None = None
+    # The original run that conflicted; updated alongside the resolve run so the
+    # task's history reflects the eventual land.
+    origin_run_id: str | None = None
+    status: str = "error"
+    landed: bool = False
+    sha: str | None = None
+    result_line: str | None = None
+    failure_kind: str | None = None
+    failure_reason: str | None = None
+    loc: int | None = None
+    remote: str | None = None
+    pushed: bool | None = None
+    turns: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cost_usd: float | None = None
 
 
 class QueueOrder(BaseModel):
@@ -288,6 +315,39 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
     tasks_repo = cfg.tasks_repo
     tasks_root = workspace / tasks_repo
 
+    async def _origin_sync_loop() -> None:
+        """Periodically fetch origin/main and fast-forward the local clone for
+        every queue's target repo, so dispatched base_refs and merge previews
+        track other actors' pushes even while the manager is idle. Best-effort
+        and bounded by ``cadences.origin_sync_seconds`` (0 disables)."""
+        interval = cfg.cadences.origin_sync_seconds
+        remote = cfg.rendezvous_remote
+        if not interval or interval <= 0 or not remote:
+            return
+        if cfg.landing_mode not in ("push", "pr"):
+            return
+        while True:
+            await asyncio.sleep(interval)
+            seen: set[str] = set()
+            queues: list[str | None] = [None]
+            with contextlib.suppress(Exception):
+                queues += [
+                    p["name"]
+                    for p in playlists_mod.list_playlists(tasks_root)
+                    if not p.get("disabled")
+                ]
+            for q in queues:
+                with contextlib.suppress(Exception):
+                    target = load_queue_config(
+                        tasks_root, playlists_mod.tasks_rel(q)
+                    ).get("repo")
+                    if not target or target in seen:
+                        continue
+                    seen.add(target)
+                    await asyncio.to_thread(
+                        sync_main_to_origin, workspace, target, remote
+                    )
+
     @contextlib.asynccontextmanager
     async def _lifespan(app: FastAPI):
         if app.state.store is None:
@@ -295,9 +355,18 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         app.state.registry = Registry(
             app.state.store, stale_seconds=cfg.cadences.worker_stale_seconds
         )
-        yield
-        with contextlib.suppress(Exception):
-            await app.state.store.close()
+        sync_task = asyncio.create_task(_origin_sync_loop())
+        app.state.origin_sync_task = sync_task
+        try:
+            yield
+        finally:
+            sync_task.cancel()
+            # CancelledError is a BaseException (not Exception), so suppress it
+            # explicitly alongside any teardown error from the sync loop.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await sync_task
+            with contextlib.suppress(Exception):
+                await app.state.store.close()
 
     app = FastAPI(title="Nightshift Manager", lifespan=_lifespan)
 
@@ -310,6 +379,10 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
     # One repo_unavailable warning per queue (deduped by queue key); cleared on
     # rescan so a re-cloned repo re-warns if it disappears again.
     app.state.repo_warnings = set()
+    # Live out-of-process resolve subprocesses, keyed by their (child) run id:
+    # {run_id: {"proc", "repo", "task", "queue", "origin_run_id"}}. Used to cap
+    # concurrency per repo and to reap finished jobs.
+    app.state.resolves = {}
     app.state.store = store  # may be None until lifespan opens one
 
     def _store() -> NightshiftStore:
@@ -422,6 +495,111 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         return load_queue_config(
             tasks_root, playlists_mod.tasks_rel(queue)
         ).get("repo")
+
+    def _reap_resolves() -> None:
+        """Drop bookkeeping for resolve subprocesses that have exited."""
+        for rid in [
+            rid for rid, r in app.state.resolves.items()
+            if r["proc"].poll() is not None
+        ]:
+            app.state.resolves.pop(rid, None)
+
+    def _active_resolves(repo: str) -> int:
+        return sum(
+            1 for r in app.state.resolves.values()
+            if r["repo"] == repo and r["proc"].poll() is None
+        )
+
+    def _spawn_resolve(
+        child_run_id: str,
+        *,
+        task: str,
+        queue: str | None,
+        repo: str,
+        title: str,
+        origin_run_id: str | None,
+    ) -> bool:
+        """Launch the out-of-process resolver. Returns True if it started.
+
+        Stored on ``app.state.spawn_resolve`` so tests can substitute a stub
+        without launching a real subprocess (which can't reach an in-process
+        TestClient anyway)."""
+        argv = [
+            sys.executable, "-m", "nightshift.manager.resolve_job",
+            "--workspace", str(workspace),
+            "--repo", repo,
+            "--task", task,
+            "--title", title,
+            "--tasks-repo", tasks_repo,
+            "--run-id", child_run_id,
+            "--manager-url", f"http://127.0.0.1:{cfg.port}",
+            "--landing-mode", cfg.landing_mode,
+            "--max-push-retries", str(cfg.max_push_retries),
+        ]
+        if queue:
+            argv += ["--queue", queue]
+        if origin_run_id:
+            argv += ["--origin-run-id", origin_run_id]
+        if cfg.rendezvous_remote:
+            argv += ["--rendezvous-remote", cfg.rendezvous_remote]
+        env = dict(os.environ)
+        if cfg.shared_secret:
+            env["NIGHTSHIFT_SHARED_SECRET"] = cfg.shared_secret
+        try:
+            proc = subprocess.Popen(argv, env=env)  # noqa: S603 — fixed argv
+        except OSError:
+            return False
+        app.state.resolves[child_run_id] = {
+            "proc": proc, "repo": repo, "task": task,
+            "queue": queue, "origin_run_id": origin_run_id,
+        }
+        return True
+
+    app.state.spawn_resolve = _spawn_resolve
+
+    async def _start_resolve(
+        origin_run_id: str,
+        *,
+        task: str,
+        queue: str | None,
+        repo: str,
+        title: str,
+    ) -> tuple[bool, str | None, str | None]:
+        """Create a resolve run + spawn the resolver, honoring the per-repo cap.
+
+        Returns ``(started, child_run_id, error)``. Used by both the explicit
+        Resolve endpoint and the auto-escalation path on a landing conflict."""
+        _reap_resolves()
+        if _active_resolves(repo) >= max(1, cfg.max_concurrent_resolves):
+            return False, None, "a resolve is already running for this repo"
+        store = _store()
+        child_run_id = new_run_id()
+        await store.create_run(
+            child_run_id,
+            task=task,
+            queue=queue,
+            worker_id="manager:resolve",
+            backend=cfg.raw.get("resolve_backend"),
+            model=cfg.raw.get("resolve_model"),
+            title=title,
+            repo=repo,
+        )
+        started = app.state.spawn_resolve(
+            child_run_id, task=task, queue=queue, repo=repo,
+            title=title, origin_run_id=origin_run_id,
+        )
+        if not started:
+            await store.update_run(
+                child_run_id, status="error",
+                result_line="failed to launch resolver process",
+                failure_kind="worker_launch",
+            )
+            return False, child_run_id, "failed to launch resolver process"
+        await _emit(
+            "run_started", run_id=child_run_id, queue=queue, task=task,
+            payload={"task": task, "resolve": True},
+        )
+        return True, child_run_id, None
 
     # ===================================================================== #
     # Worker API
@@ -580,15 +758,19 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         prior = await store.get_task_state(chosen.queue, chosen.task)
         if prior and prior.get("state") in ("repo_unavailable", "blocked"):
             await store.clear_task_state(chosen.queue, chosen.task)
-        # PR mode is origin/main-authoritative: resync local main to origin/main
-        # before pinning base_ref, so an orphaned ephemeral pr-mode squash is
-        # dropped and cross-PR divergence cannot accumulate (see remote-landing.md).
+        # Origin-aware dispatch: for any remote-landing mode (push or pr), resync
+        # local main to origin/main before pinning base_ref so the worker starts
+        # from the freshest merged state in a multi-actor repo (and an orphaned
+        # ephemeral pr-mode squash is dropped). Best-effort: a transient fetch
+        # failure must not fail the poll — base_ref then pins the local HEAD and
+        # the land re-syncs anyway. See remote-landing.md.
         poll_meta = _task_meta(tasks_root, chosen.task, chosen.queue)
-        if (
-            ("pr" if poll_meta.get("make_pr") else cfg.landing_mode) == "pr"
-            and cfg.rendezvous_remote
-        ):
-            sync_main_to_origin(workspace, repo, cfg.rendezvous_remote)
+        effective_mode = "pr" if poll_meta.get("make_pr") else cfg.landing_mode
+        if effective_mode in ("push", "pr") and cfg.rendezvous_remote:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(
+                    sync_main_to_origin, workspace, repo, cfg.rendezvous_remote
+                )
         base_ref = canonical_head(workspace / repo)
         lease = await store.acquire_lease(
             task=chosen.task,
@@ -827,24 +1009,44 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             )
             await store.set_lease_status(body.lease_id, "released")
             await _registry().set_idle(body.worker_id)
-            if result.conflict:
-                # Hand the operator/worker a resolve work-order signal: mark the
-                # task so the conflict is visible and the branch (preserved by
-                # squash_to_main) can be resolved.
+            # The branch is preserved (squash_to_main / land only teardown after a
+            # confirmed land), so the conflict or rejection is resolvable. Hold the
+            # task blocked so it doesn't re-lease while a resolve is pending.
+            if result.conflict or result.recoverable:
                 await store.set_task_state(
                     queue, body.task, "blocked",
-                    blocked_reason="needs resolve: " + (result.detail.splitlines()[0] if result.detail else "merge conflict"),
+                    blocked_reason="needs resolve: " + (
+                        result.detail.splitlines()[0] if result.detail
+                        else failure_kind
+                    ),
                 )
                 await _emit(
                     "task_blocked", queue=queue, task=body.task,
-                    payload={"reason": "merge_conflict", "detail": result.detail},
+                    payload={"reason": failure_kind, "detail": result.detail},
                 )
             await _emit(
                 "task_result", run_id=run_id, queue=queue, task=body.task,
                 payload={"status": status, "failure_kind": failure_kind},
             )
+            # Auto-escalate: when enabled, immediately spawn the out-of-process
+            # resolver instead of waiting for an operator to click Resolve. PR
+            # mode lands via GitHub, so it isn't escalated here.
+            resolving = False
+            if (
+                cfg.auto_resolve
+                and (result.conflict or result.recoverable)
+                and effective_mode != "pr"
+            ):
+                resolving, _child, _err = await _start_resolve(
+                    run_id, task=body.task, queue=queue, repo=repo, title=body.title,
+                )
             return JSONResponse(
-                {"landed": False, "conflict": result.conflict, "detail": result.detail}
+                {
+                    "landed": False,
+                    "conflict": result.conflict,
+                    "detail": result.detail,
+                    "resolving": resolving,
+                }
             )
 
         # Backstop the worker's queue removal: a completed regular task must
@@ -897,9 +1099,121 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             }
         )
 
+    @app.post(
+        "/api/worker/runs/{run_id}/resolve-result",
+        dependencies=[Depends(_require_secret)],
+    )
+    async def worker_resolve_result(
+        run_id: str, body: ResolveResultBody
+    ) -> JSONResponse:
+        """Record the outcome of an out-of-process resolve (see resolve_job).
+
+        On a landed resolve: complete the resolve run, reflect the land onto the
+        original run, clear the task overlay, and drop the brief (non-evergreen).
+        Otherwise: re-block the task so it stays resolvable."""
+        store = _store()
+        queue = _queue_from_label(body.queue)
+        telemetry = {
+            "turns": body.turns,
+            "input_tokens": body.input_tokens,
+            "output_tokens": body.output_tokens,
+            "cost_usd": body.cost_usd,
+        }
+        if body.landed and body.status == "completed":
+            await store.update_run(
+                run_id,
+                status="completed",
+                result_line=body.result_line or "resolved: landed",
+                commit_sha=body.sha,
+                loc=body.loc,
+                remote=body.remote,
+                pushed=body.pushed,
+                **telemetry,
+            )
+            if body.origin_run_id:
+                with contextlib.suppress(Exception):
+                    await store.update_run(
+                        body.origin_run_id,
+                        status="completed",
+                        result_line=body.result_line or "resolved",
+                        commit_sha=body.sha,
+                    )
+            await store.clear_task_state(queue, body.task)
+            tasks_rel = playlists_mod.tasks_rel(queue)
+            meta = _task_meta(tasks_root, body.task, queue)
+            if not task_is_evergreen(
+                meta, body.task, resolve_config(workspace, tasks_root, tasks_rel)
+            ):
+                with contextlib.suppress(Exception):
+                    drop_completed_task(tasks_root, body.task, tasks_rel, queue=queue)
+            await _emit(
+                "task_result", run_id=run_id, queue=queue, task=body.task,
+                payload={
+                    "status": "completed", "commit_sha": body.sha,
+                    "remote": body.remote, "pushed": body.pushed,
+                },
+            )
+            await _emit("queue_changed", queue=queue)
+        else:
+            await store.update_run(
+                run_id,
+                status="error",
+                result_line=body.result_line or "resolve failed",
+                failure_kind=body.failure_kind or "merge_conflict",
+                failure_reason=body.failure_reason,
+                **telemetry,
+            )
+            reason = "needs resolve: " + (
+                body.result_line or body.failure_reason or "resolve failed"
+            )
+            await store.set_task_state(
+                queue, body.task, "blocked", blocked_reason=reason,
+            )
+            await _emit(
+                "task_blocked", queue=queue, task=body.task,
+                payload={"reason": body.failure_kind or "merge_conflict"},
+            )
+            await _emit(
+                "task_result", run_id=run_id, queue=queue, task=body.task,
+                payload={"status": "error", "failure_kind": body.failure_kind},
+            )
+        app.state.resolves.pop(run_id, None)
+        return JSONResponse({"ok": True})
+
     # ===================================================================== #
     # Operator API
     # ===================================================================== #
+
+    @app.post("/api/runs/{run_id}/{task}/resolve")
+    @app.post("/api/runs/{run_id}/{task}/recover")
+    async def resolve_run_task(
+        run_id: str, task: str, queue: str | None = None
+    ) -> JSONResponse:
+        """Operator-triggered resolve of a conflicted task. Spawns the resolver
+        out-of-process (non-blocking) so the manager stays responsive and other
+        tasks keep dispatching while the agent works."""
+        store = _store()
+        origin = await store.get_run(run_id)
+        if origin is None:
+            raise HTTPException(status_code=404, detail="unknown run")
+        target_queue = (
+            _queue_from_label(queue) if queue is not None
+            else _queue_from_label(origin.get("queue"))
+        )
+        repo = origin.get("repo") or _queue_repo(target_queue)
+        if not repo:
+            raise HTTPException(
+                status_code=400, detail="no target repo for this task"
+            )
+        title = origin.get("title") or task
+        started, child_run_id, error = await _start_resolve(
+            run_id, task=task, queue=target_queue, repo=repo, title=title,
+        )
+        if not started:
+            return JSONResponse({"ok": False, "error": error}, status_code=409)
+        return JSONResponse(
+            {"ok": True, "run_id": child_run_id, "task": task}, status_code=202
+        )
 
     @app.get("/api/queue")
     def get_queue(queue: str | None = None) -> JSONResponse:

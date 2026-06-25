@@ -24,6 +24,7 @@ from nightshift.engine import (
     _queue_slug,
     _worktree_has_commits,
     fetch_rendezvous_branch,
+    integrate_lock,
     landing_lock,
     prune_rendezvous_branch,
     squash_to_main,
@@ -121,6 +122,7 @@ def land(
     branch_ref: str | None = None,
     head_sha: str | None = None,
     rendezvous_remote: str | None = None,
+    max_push_retries: int = 3,
 ) -> LandingResult:
     """Land a submitted task branch onto canonical ``main`` of the target
     ``repo``, then sync remotely.
@@ -173,12 +175,6 @@ def land(
                 ),
             )
 
-    # PR mode is origin/main-authoritative: resync local main to origin/main so the
-    # ephemeral squash sits on the latest merged state and cannot diverge (the next
-    # dispatch resync replaces it with GitHub's merge commit). See remote-landing.md.
-    if landing_mode == "pr" and rendezvous_remote:
-        sync_main_to_origin(workspace, repo, rendezvous_remote, autostash=autostash)
-
     adopted = _adopt_agent_land_on_main(
         workspace, repo, task, title, queue=queue, base_ref=base_ref,
         landing_mode=landing_mode, automerge=automerge, draft=draft,
@@ -186,35 +182,98 @@ def land(
     if adopted is not None:
         return adopted
 
-    # Pre-check: if main drifted past base_ref and the merge would conflict,
-    # refuse cleanly so the caller resolves rather than the squash failing deep.
-    if base_ref_drifted(repo_root, base_ref):
-        conflicts = merge_tree_conflicts(repo_root, branch)
-        if conflicts:
-            shown = "\n".join(f"    {p}" for p in conflicts[:20])
-            return LandingResult(
-                landed=False,
-                conflict=True,
-                recoverable=False,
-                detail=(
-                    f"canonical main advanced past base_ref {base_ref[:8] if base_ref else '?'}; "
-                    f"squash of '{branch}' conflicts on {len(conflicts)} file(s):\n{shown}"
-                ),
+    # A remote-capable land integrates origin/main into the local clone before
+    # every squash so the result sits on the freshest merged state, and retries
+    # the whole sync->preview->squash->push when origin races us between the
+    # squash and the push. Modes without a remote (or ``none``) land locally.
+    # Sync is gated on an explicitly configured rendezvous remote (a ``none``
+    # mode or an unconfigured remote stays purely local). The push target itself
+    # defaults to ``origin`` so ``push`` mode works without a separate rendezvous
+    # remote, matching the historical direct-push behavior.
+    do_sync = bool(rendezvous_remote) and landing_mode in ("push", "pr")
+    push_remote = rendezvous_remote or "origin"
+
+    with integrate_lock(workspace, repo):
+        for attempt in range(max_push_retries + 1):
+            # 1. Integrate the latest origin/main so the squash replays on top of
+            #    everyone else's merged work (a no-op when already current).
+            if do_sync:
+                sync_main_to_origin(
+                    workspace, repo, rendezvous_remote, autostash=autostash
+                )
+
+            # 2. Preview the squash against the fresh main. A genuine content
+            #    conflict is refused cleanly (branch preserved) so the caller
+            #    issues a resolve work-order instead of squashing deep.
+            conflicts = merge_tree_conflicts(repo_root, branch)
+            if conflicts:
+                shown = "\n".join(f"    {p}" for p in conflicts[:20])
+                return LandingResult(
+                    landed=False,
+                    conflict=True,
+                    recoverable=False,
+                    detail=(
+                        f"squash of '{branch}' conflicts with current main on "
+                        f"{len(conflicts)} file(s):\n{shown}"
+                    ),
+                )
+
+            # 3. Squash the branch onto fresh main (local authority).
+            sha, squash_error, recoverable = squash_to_main(
+                workspace, repo, task, title, queue=queue, autostash=autostash
             )
+            if sha is None:
+                # squash_to_main reports a conflict as recoverable=False.
+                return LandingResult(
+                    landed=False,
+                    detail=squash_error or "squash-merge to main failed",
+                    recoverable=recoverable,
+                    conflict=not recoverable,
+                )
 
-    sha, squash_error, recoverable = squash_to_main(
-        workspace, repo, task, title, queue=queue, autostash=autostash
-    )
-    if sha is None:
-        # squash_to_main reports a conflict as recoverable=False.
-        return LandingResult(
-            landed=False,
-            detail=squash_error or "squash-merge to main failed",
-            recoverable=recoverable,
-            conflict=not recoverable,
-        )
+            result = LandingResult(landed=True, sha=sha, detail=squash_error)
 
-    result = LandingResult(landed=True, sha=sha, detail=squash_error)
+            # 4. Apply the remote policy.
+            if landing_mode == "push":
+                result.remote = "push"
+                pushed, push_detail = _push_head_to_main(
+                    workspace, repo, push_remote
+                )
+                if pushed:
+                    result.pushed = True
+                    break
+                # Non-fast-forward: origin advanced under us. The branch is still
+                # intact (teardown happens only after a confirmed push), so the
+                # next pass re-syncs (resetting local main to origin, which drops
+                # this just-made squash) and re-squashes onto the new tip. Retry
+                # only helps when we actually re-sync; without a rendezvous remote
+                # a rejection is terminal.
+                result.pushed = False
+                if do_sync and attempt < max_push_retries:
+                    continue
+                # Exhausted retries: leave the branch for a resolve and report a
+                # recoverable rejection (NOT a content conflict).
+                return LandingResult(
+                    landed=False,
+                    recoverable=True,
+                    conflict=False,
+                    remote="push",
+                    pushed=False,
+                    detail=(
+                        f"push to origin main rejected after {max_push_retries + 1} "
+                        f"attempt(s) (origin keeps advancing):\n{push_detail}"
+                    ),
+                )
+            elif landing_mode == "pr":
+                result.remote = "pr"
+                _open_pr(
+                    workspace, repo, task, title, queue=queue,
+                    automerge=automerge, draft=draft, result=result,
+                )
+                break
+            else:
+                # landing_mode == "none": the local squash is the whole land.
+                break
 
     # The branch has landed on canonical main; reclaim its worktree + branch
     # (mirrors the engine's post-squash teardown in the single-process path).
@@ -226,10 +285,6 @@ def land(
     if cross_machine and rendezvous_remote and branch_ref:
         prune_rendezvous_branch(workspace, repo, rendezvous_remote, branch_ref)
 
-    _apply_remote_policy(
-        workspace, repo, task, title, queue=queue,
-        landing_mode=landing_mode, automerge=automerge, draft=draft, result=result,
-    )
     return result
 
 
@@ -310,6 +365,93 @@ def _push_main(workspace: Path, repo: str, result: LandingResult) -> None:
         ).strip()
     else:
         result.pushed = True
+
+
+def _push_head_to_main(
+    workspace: Path, repo: str, remote: str
+) -> tuple[bool, str]:
+    """Push local ``HEAD`` to ``<remote>/main`` (non-force) under the landing
+    lock. Returns ``(ok, detail)``; a non-fast-forward rejection is ``ok=False``
+    with the trimmed git stderr so the caller can retry or escalate."""
+    repo_root = workspace / repo
+    with landing_lock(workspace, repo):
+        res = subprocess.run(
+            ["git", "push", remote, "HEAD:main"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+    if res.returncode != 0:
+        return False, (res.stderr or res.stdout).strip()[:300]
+    return True, ""
+
+
+def push_resolved_main(
+    workspace: Path,
+    repo: str,
+    remote: str,
+    sha: str,
+    *,
+    max_retries: int = 3,
+    autostash: bool = True,
+) -> tuple[bool, str]:
+    """Land an already-squashed *resolved* commit (``sha``) on origin ``main``.
+
+    The out-of-process resolve runner produces a single squash commit locally
+    (``engine.resolve_task``); origin may have advanced while its agent worked,
+    so this replays that commit onto the freshest origin/main and pushes,
+    bounded by ``max_retries``. The whole section holds :func:`integrate_lock`
+    so it serializes against every other land on the repo, while the long agent
+    work that produced ``sha`` ran unlocked.
+
+    Returns ``(True, new_sha)`` on a confirmed push, or ``(False, detail)`` when
+    the replay hits a content conflict (re-escalate) or the push keeps being
+    rejected. Operates in ``repo_root`` (clean after the squash), isolated from
+    the resolve worktree.
+    """
+    repo_root = workspace / repo
+    last_detail = ""
+    with integrate_lock(workspace, repo):
+        for _attempt in range(max_retries + 1):
+            # Reset local main to the freshest origin/main. ``sync_main_to_origin``
+            # takes ``landing_lock`` itself, so it must run OUTSIDE the landing_lock
+            # block below (the flock is not reentrant).
+            if remote:
+                sync_main_to_origin(workspace, repo, remote, autostash=autostash)
+            with landing_lock(workspace, repo):
+                # Replay the resolved commit on top of the fresh main (a no-op
+                # fast-forward when main already is ``sha``), then push.
+                head = _rev_parse(repo_root, "HEAD")
+                if head != sha:
+                    cp = subprocess.run(
+                        ["git", "cherry-pick", "--allow-empty", sha],
+                        cwd=repo_root,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if cp.returncode != 0:
+                        subprocess.run(
+                            ["git", "cherry-pick", "--abort"],
+                            cwd=repo_root,
+                            capture_output=True,
+                            text=True,
+                        )
+                        return False, (
+                            f"resolved commit {sha[:8]} conflicts with current "
+                            f"origin/main:\n{(cp.stderr or cp.stdout).strip()[:300]}"
+                        )
+                    head = _rev_parse(repo_root, "HEAD") or sha
+                push = subprocess.run(
+                    ["git", "push", remote or "origin", "HEAD:main"],
+                    cwd=repo_root,
+                    capture_output=True,
+                    text=True,
+                )
+            if push.returncode == 0:
+                return True, head
+            last_detail = (push.stderr or push.stdout).strip()[:300]
+            # Rejected: origin advanced again — re-sync and replay on the next pass.
+    return False, f"push of resolved commit rejected after retries:\n{last_detail}"
 
 
 def _open_pr(

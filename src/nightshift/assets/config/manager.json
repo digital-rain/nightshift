@@ -10,7 +10,8 @@
     "heartbeat_seconds": 10.0,
     "lease_ttl_seconds": 120.0,
     "worker_stale_seconds": 45.0,
-    "refresh_ms": 20000
+    "refresh_ms": 20000,
+    "origin_sync_seconds": 60.0
   },
   "default_model": "auto",
   "scheduled_models_allow": ["claude-sonnet-4-6", "claude-opus-4-8"],
@@ -20,6 +21,8 @@
   "automerge": false,
   "draft": false,
   "autostash_operator_work": true,
+  "max_push_retries": 3,
+  "validate_on_integrate": false,
   "diff_cap_lines": 1500,
   "diff_cap_exempt_paths": ["^tests/fixtures/", "^docs/", "\\.md$"],
   "forbidden_paths": ["^\\.github/workflows/", "^CLAUDE\\.md$", "^AGENTS\\.md$"],
@@ -29,5 +32,6 @@
   "auto_resolve": true,
   "max_resolve_attempts": 2,
   "resolve_model": null,
-  "resolve_backend": null
+  "resolve_backend": null,
+  "max_concurrent_resolves": 1
 }

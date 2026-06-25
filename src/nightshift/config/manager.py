@@ -39,6 +39,13 @@ class Cadences:
         category="Cadences", label="Refresh ms",
         desc="UI safety-poll fallback (SSE is the primary live channel).",
         apply="restart"))
+    origin_sync_seconds: float = field(default=60.0, metadata=meta(
+        category="Cadences", label="Origin sync seconds",
+        desc=(
+            "How often the manager fetches origin/main and fast-forwards its "
+            "local clone so dispatched base_refs stay current while others push. "
+            "0 disables the periodic sync (dispatch/land still sync)."),
+        apply="restart"))
 
 
 @dataclass(frozen=True)
@@ -102,6 +109,19 @@ class OperatorConfig:
         category="Landing & Git", label="Autostash operator work",
         desc="Stash uncommitted operator work before a local landing.",
         apply="next-task"))
+    max_push_retries: int = field(default=3, metadata=meta(
+        category="Landing & Git", label="Max push retries",
+        desc=(
+            "How many times a land re-syncs origin/main and re-squashes when the "
+            "push is rejected because origin advanced (optimistic concurrency)."),
+        apply="next-task"))
+    validate_on_integrate: bool = field(default=False, metadata=meta(
+        category="Landing & Git", label="Validate on integrate",
+        desc=(
+            "Re-run the validate command on the integrated tree before pushing "
+            "when origin drifted but the squash was textually clean (guards "
+            "against semantic conflicts). Off by default."),
+        apply="next-task"))
 
     forbidden_paths: tuple[str, ...] = field(
         default=("^\\.github/workflows/", "^CLAUDE\\.md$", "^AGENTS\\.md$"),
@@ -157,6 +177,13 @@ class OperatorConfig:
     resolve_backend: str | None = field(default=None, metadata=meta(
         category="Conflict resolution", label="Resolve backend",
         desc="Optional backend override for resolve runs.", apply="next-task"))
+    max_concurrent_resolves: int = field(default=1, metadata=meta(
+        category="Conflict resolution", label="Max concurrent resolves",
+        desc=(
+            "Cap on simultaneous out-of-process resolve jobs per repo. Resolve "
+            "agent work runs unlocked and concurrent with normal dispatch; this "
+            "bounds thrash. The final merge is always serialized."),
+        apply="next-task"))
 
 
 @dataclass(frozen=True)
@@ -238,6 +265,7 @@ def load_manager_settings(workspace: Path) -> ManagerSettings:
         lease_ttl_seconds=_as_float(cad_data.get("lease_ttl_seconds"), 120.0),
         worker_stale_seconds=_as_float(cad_data.get("worker_stale_seconds"), 45.0),
         refresh_ms=_as_int(cad_data.get("refresh_ms"), 20000),
+        origin_sync_seconds=_as_float(cad_data.get("origin_sync_seconds"), 60.0),
     )
 
     landing_mode = (
@@ -290,6 +318,8 @@ def load_manager_settings(workspace: Path) -> ManagerSettings:
         automerge=bool(data.get("automerge", False)),
         draft=bool(data.get("draft", False)),
         autostash_operator_work=bool(data.get("autostash_operator_work", True)),
+        max_push_retries=_as_int(data.get("max_push_retries"), 3),
+        validate_on_integrate=bool(data.get("validate_on_integrate", False)),
         forbidden_paths=_as_tuple(
             data.get("forbidden_paths"),
             ("^\\.github/workflows/", "^CLAUDE\\.md$", "^AGENTS\\.md$")),
@@ -314,6 +344,7 @@ def load_manager_settings(workspace: Path) -> ManagerSettings:
         max_resolve_attempts=_as_int(data.get("max_resolve_attempts"), 2),
         resolve_model=data.get("resolve_model"),
         resolve_backend=data.get("resolve_backend"),
+        max_concurrent_resolves=_as_int(data.get("max_concurrent_resolves"), 1),
     )
 
     return ManagerSettings(
@@ -346,6 +377,7 @@ def save_manager_settings(workspace: Path, settings: ManagerSettings) -> None:
             "lease_ttl_seconds": settings.cadences.lease_ttl_seconds,
             "worker_stale_seconds": settings.cadences.worker_stale_seconds,
             "refresh_ms": settings.cadences.refresh_ms,
+            "origin_sync_seconds": settings.cadences.origin_sync_seconds,
         },
         "default_model": settings.operator.default_model,
         "scheduled_models_allow": list(settings.operator.scheduled_models_allow),
@@ -355,6 +387,8 @@ def save_manager_settings(workspace: Path, settings: ManagerSettings) -> None:
         "automerge": settings.operator.automerge,
         "draft": settings.operator.draft,
         "autostash_operator_work": settings.operator.autostash_operator_work,
+        "max_push_retries": settings.operator.max_push_retries,
+        "validate_on_integrate": settings.operator.validate_on_integrate,
         "diff_cap_lines": settings.operator.diff_cap_lines,
         "diff_cap_exempt_paths": list(settings.operator.diff_cap_exempt_paths),
         "forbidden_paths": list(settings.operator.forbidden_paths),
@@ -366,6 +400,7 @@ def save_manager_settings(workspace: Path, settings: ManagerSettings) -> None:
         "max_resolve_attempts": settings.operator.max_resolve_attempts,
         "resolve_model": settings.operator.resolve_model,
         "resolve_backend": settings.operator.resolve_backend,
+        "max_concurrent_resolves": settings.operator.max_concurrent_resolves,
     }
     if settings.operator.model is not None:
         data["model"] = settings.operator.model

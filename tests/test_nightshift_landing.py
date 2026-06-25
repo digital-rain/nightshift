@@ -13,12 +13,14 @@ from pathlib import Path
 
 from _workspace import build_workspace, git_commit_all
 from nightshift.engine import setup_worktree, worktree_branch
+from nightshift.manager import landing as landing_mod
 from nightshift.manager.landing import (
     base_ref_drifted,
     canonical_head,
     land,
     main_advanced_sha,
     merge_tree_conflicts,
+    push_resolved_main,
 )
 
 
@@ -146,3 +148,119 @@ def test_push_mode_records_pushed_on_success(tmp_path: Path) -> None:
     assert result.landed is True
     assert result.remote == "push"
     assert result.pushed is True
+
+
+def _advance_origin(
+    tmp_path: Path, bare: Path, *, path: str, content: str, tag: str
+) -> None:
+    """Push a commit to ``bare``'s main from a throwaway clone, simulating
+    another actor advancing origin/main between our dispatch and our land."""
+    other = tmp_path / f"other-{tag}"
+    subprocess.run(["git", "clone", str(bare), str(other)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(other), "config", "user.email", "o@o"], check=True)
+    subprocess.run(["git", "-C", str(other), "config", "user.name", "o"], check=True)
+    (other / path).write_text(content)
+    subprocess.run(["git", "-C", str(other), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(other), "commit", "-m", f"origin: {tag}"],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(other), "push", "origin", "main"], check=True, capture_output=True
+    )
+
+
+def test_push_mode_integrates_origin_advance(tmp_path: Path) -> None:
+    """Integrate-first: a non-conflicting origin advance is pulled in before the
+    squash, so the land replays on top of it and ships both changes."""
+    from _workspace import add_remote, make_bare_remote
+
+    workspace, repo, repo_root = _init_repo(tmp_path)
+    bare = make_bare_remote(tmp_path / "origin.git")
+    add_remote(repo_root, "origin", bare)
+    base = canonical_head(repo_root)
+    _make_branch_commit(workspace, repo, "10.add", path="new.txt", content="hello\n")
+    # Origin advances (a different file) while local main is untouched.
+    _advance_origin(tmp_path, bare, path="other.txt", content="from origin\n", tag="adv")
+
+    result = land(
+        workspace, repo, "10.add", "add new file", queue=None, base_ref=base,
+        landing_mode="push", rendezvous_remote="origin",
+    )
+    assert result.landed is True
+    assert result.pushed is True
+    # Local main now carries both the origin advance and our squash.
+    assert (repo_root / "other.txt").exists()
+    assert (repo_root / "new.txt").exists()
+
+
+def test_push_retry_after_nonfastforward_rejection(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A rejected push triggers a re-sync + re-squash + re-push under the bounded
+    retry loop; the branch is preserved across the retry so it can re-squash."""
+    from _workspace import add_remote, make_bare_remote
+
+    workspace, repo, repo_root = _init_repo(tmp_path)
+    bare = make_bare_remote(tmp_path / "origin.git")
+    add_remote(repo_root, "origin", bare)
+    base = canonical_head(repo_root)
+    _make_branch_commit(workspace, repo, "10.add", path="new.txt", content="hello\n")
+
+    calls = {"n": 0}
+    real = landing_mod._push_head_to_main
+
+    def flaky(ws: Path, r: str, remote: str):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return False, "non-fast-forward (simulated)"
+        return real(ws, r, remote)
+
+    monkeypatch.setattr(landing_mod, "_push_head_to_main", flaky)
+    result = land(
+        workspace, repo, "10.add", "add new file", queue=None, base_ref=base,
+        landing_mode="push", rendezvous_remote="origin", max_push_retries=3,
+    )
+    assert result.landed is True
+    assert result.pushed is True
+    assert calls["n"] == 2  # one rejection, then success
+    assert (repo_root / "new.txt").exists()
+
+
+def test_push_resolved_main_replays_onto_advanced_origin(tmp_path: Path) -> None:
+    from _workspace import add_remote, make_bare_remote
+
+    workspace, repo, repo_root = _init_repo(tmp_path)
+    bare = make_bare_remote(tmp_path / "origin.git")
+    add_remote(repo_root, "origin", bare)
+    # A resolved squash commit sits on local main but was never pushed.
+    (repo_root / "resolved.txt").write_text("resolved\n")
+    _git(repo_root, "add", "-A")
+    _git(repo_root, "commit", "-m", "resolved squash")
+    sha = canonical_head(repo_root)
+    # Origin advances (non-conflicting) in the meantime.
+    _advance_origin(tmp_path, bare, path="other.txt", content="from origin\n", tag="r")
+
+    ok, new_sha = push_resolved_main(workspace, repo, "origin", sha, max_retries=3)
+    assert ok is True
+    assert new_sha
+    assert (repo_root / "resolved.txt").exists()
+    assert (repo_root / "other.txt").exists()
+
+
+def test_push_resolved_main_reports_conflict(tmp_path: Path) -> None:
+    from _workspace import add_remote, make_bare_remote
+
+    workspace, repo, repo_root = _init_repo(tmp_path)
+    bare = make_bare_remote(tmp_path / "origin.git")
+    add_remote(repo_root, "origin", bare)
+    # Resolved commit edits file.txt one way...
+    (repo_root / "file.txt").write_text("resolved change\n")
+    _git(repo_root, "commit", "-am", "resolved squash")
+    sha = canonical_head(repo_root)
+    # ...origin advances the same line another way → cherry-pick conflicts.
+    _advance_origin(tmp_path, bare, path="file.txt", content="origin change\n", tag="c")
+
+    ok, detail = push_resolved_main(workspace, repo, "origin", sha, max_retries=2)
+    assert ok is False
+    assert "conflict" in detail.lower()

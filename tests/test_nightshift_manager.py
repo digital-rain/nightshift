@@ -614,6 +614,193 @@ def test_content_store_commits_are_local_and_pushless(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Resolve (out-of-process conflict resolution)
+# --------------------------------------------------------------------------- #
+
+
+class _FakeProc:
+    """Stand-in for a live resolve subprocess (always reports running)."""
+
+    def poll(self) -> int | None:
+        return None
+
+
+def _stub_spawn(app) -> list[dict[str, Any]]:
+    """Replace the resolver launcher with a recorder that registers a live fake
+    process (so the per-repo concurrency cap is exercised). Returns the call log.
+    """
+    calls: list[dict[str, Any]] = []
+
+    def fake(child_run_id, *, task, queue, repo, title, origin_run_id):
+        calls.append({
+            "run_id": child_run_id, "task": task, "queue": queue,
+            "repo": repo, "origin_run_id": origin_run_id,
+        })
+        app.state.resolves[child_run_id] = {
+            "proc": _FakeProc(), "repo": repo, "task": task,
+            "queue": queue, "origin_run_id": origin_run_id,
+        }
+        return True
+
+    app.state.spawn_resolve = fake
+    return calls
+
+
+def test_poll_syncs_origin_before_pinning_base_ref(tmp_path: Path) -> None:
+    """In a remote-landing mode the poll integrates origin/main before pinning
+    base_ref, so a dispatched worker starts from the freshest merged state."""
+    from _workspace import add_remote, make_bare_remote
+
+    root = _seed(
+        tmp_path, {"10.x": "do"},
+        config={"landing_mode": "push", "rendezvous_remote": "origin"},
+    )
+    repo_root = root / "longitude"
+    bare = make_bare_remote(tmp_path / "origin.git")
+    add_remote(repo_root, "origin", bare)
+    # Another actor advances origin/main after our local clone was made.
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", str(bare), str(other)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(other), "config", "user.email", "o@o"], check=True)
+    subprocess.run(["git", "-C", str(other), "config", "user.name", "o"], check=True)
+    (other / "origin.txt").write_text("from origin\n")
+    subprocess.run(["git", "-C", str(other), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(other), "commit", "-m", "origin work"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(other), "push", "origin", "main"], check=True, capture_output=True)
+    origin_tip = subprocess.run(
+        ["git", "-C", str(other), "rev-parse", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        order = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        assert order is not None
+        # base_ref tracks the advanced origin tip; the advance is now local too.
+        assert order["base_ref"] == origin_tip
+        assert (repo_root / "origin.txt").exists()
+
+
+def test_resolve_endpoint_spawns_and_caps(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {"10.x": "do a thing"})
+    store = MemoryStore()
+    asyncio.run(store.create_run(
+        "r1", task="10.x", queue="main", worker_id="w1", backend="claude-code",
+        model="auto", title="X", repo="longitude",
+    ))
+    app = create_app(root, store=store)
+    calls = _stub_spawn(app)
+    with TestClient(app) as client:
+        r = client.post("/api/runs/r1/10.x/resolve")
+        assert r.status_code == 202
+        child = r.json()["run_id"]
+        assert child and calls[0]["origin_run_id"] == "r1"
+        assert calls[0]["repo"] == "longitude"
+        # A fresh resolve run was recorded.
+        runs = client.get("/api/runs").json()
+        assert any(run["id"] == child for run in runs)
+        # The per-repo cap (default 1) blocks a second concurrent resolve.
+        r2 = client.post("/api/runs/r1/10.x/resolve")
+        assert r2.status_code == 409
+
+
+def test_resolve_endpoint_unknown_run_404(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {"10.x": "do"})
+    app = create_app(root, store=MemoryStore())
+    _stub_spawn(app)
+    with TestClient(app) as client:
+        assert client.post("/api/runs/nope/10.x/resolve").status_code == 404
+
+
+def test_resolve_result_completes_task(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {"10.x": "do"})
+    store = MemoryStore()
+    asyncio.run(store.create_run(
+        "c1", task="10.x", queue="main", worker_id="manager:resolve",
+        backend="claude-code", model="auto", title="X", repo="longitude",
+    ))
+    app = create_app(root, store=store)
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/worker/runs/c1/resolve-result",
+            json={
+                "task": "10.x", "queue": "main", "status": "completed",
+                "landed": True, "sha": "deadbeef", "result_line": "resolved: landed",
+                "remote": "push", "pushed": True,
+            },
+        )
+        assert r.json()["ok"] is True
+        run = next(x for x in client.get("/api/runs").json() if x["id"] == "c1")
+        assert run["status"] == "completed"
+        assert run["commit_sha"] == "deadbeef"
+
+
+def test_resolve_result_failure_reblocks_task(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {"10.x": "do"})
+    store = MemoryStore()
+    asyncio.run(store.create_run(
+        "c1", task="10.x", queue="main", worker_id="manager:resolve",
+        backend="claude-code", model="auto", title="X", repo="longitude",
+    ))
+    app = create_app(root, store=store)
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/worker/runs/c1/resolve-result",
+            json={
+                "task": "10.x", "queue": "main", "status": "error",
+                "landed": False, "failure_kind": "merge_conflict",
+                "failure_reason": "still conflicts",
+            },
+        )
+        assert r.json()["ok"] is True
+        run = next(x for x in client.get("/api/runs").json() if x["id"] == "c1")
+        assert run["status"] == "error"
+        blocked = client.get("/api/blocked").json()
+        assert any(b["task"] == "10.x" for b in blocked)
+
+
+def test_conflict_auto_escalates_to_resolve(tmp_path: Path) -> None:
+    """A landing conflict on submit (auto_resolve on by default) spawns the
+    out-of-process resolver instead of merely blocking the task."""
+    root = _seed(tmp_path, {"10.edit": "edit the readme"})
+    repo_root = root / "longitude"
+    app = create_app(root, store=MemoryStore())
+    calls = _stub_spawn(app)
+    with TestClient(app) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        order = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        assert order is not None
+
+        # Worker branch edits README one way...
+        wt = setup_worktree(root, order["repo"], "10.edit")
+        (wt / "README.md").write_text("branch change\n")
+        subprocess.run(["git", "add", "-A"], cwd=wt, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "branch"], cwd=wt, check=True, capture_output=True)
+        # ...main advances with a conflicting edit to the same file.
+        (repo_root / "README.md").write_text("main change\n")
+        subprocess.run(
+            ["git", "commit", "-am", "main edit"], cwd=repo_root, check=True, capture_output=True
+        )
+
+        r = client.post(
+            f"/api/worker/runs/{order['run_id']}/submit",
+            json={
+                "worker_id": "w1", "lease_id": order["lease_id"], "task": "10.edit",
+                "queue": "main", "title": order["title"], "status": "completed",
+                "landable": True, "backend": "claude-code",
+            },
+        )
+        body = r.json()
+        assert body["landed"] is False
+        assert body["conflict"] is True
+        assert body["resolving"] is True
+        assert len(calls) == 1 and calls[0]["task"] == "10.edit"
+
+
+# --------------------------------------------------------------------------- #
 # Hub
 # --------------------------------------------------------------------------- #
 

@@ -45,6 +45,12 @@ class ManagerConfig:
     # Consecutive no-progress runs of a task before it is quarantined (held in
     # the queue but skipped by every worker). 0 disables the guard.
     quarantine_threshold: int = 2
+    # Optimistic-concurrency landing knobs (see manager/landing.py).
+    max_push_retries: int = 3
+    validate_on_integrate: bool = False
+    # Conflict-resolution: auto-escalation + out-of-process resolve concurrency.
+    auto_resolve: bool = True
+    max_concurrent_resolves: int = 1
     cadences: Cadences = field(default_factory=Cadences)
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -67,6 +73,10 @@ def load_manager_config(workspace: Path) -> ManagerConfig:
         rendezvous_remote=settings.operator.rendezvous_remote,
         wip_ref_prefix=settings.operator.wip_ref_prefix,
         quarantine_threshold=settings.operator.quarantine_threshold,
+        max_push_retries=settings.operator.max_push_retries,
+        validate_on_integrate=settings.operator.validate_on_integrate,
+        auto_resolve=settings.operator.auto_resolve,
+        max_concurrent_resolves=settings.operator.max_concurrent_resolves,
         cadences=settings.cadences,
         raw=settings.raw,
     )

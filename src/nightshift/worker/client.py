@@ -99,3 +99,16 @@ class ManagerClient:
         resp = self._http.post(f"/api/worker/runs/{run_id}/submit", json=payload)
         resp.raise_for_status()
         return resp.json()
+
+    def resolve_result(self, run_id: str, payload: dict[str, Any]) -> None:
+        """Report an out-of-process resolve's final outcome to the manager.
+
+        Best-effort: the resolve subprocess has already mutated git (the land is
+        durable); a failed report only delays the manager's bookkeeping, which a
+        later operator action or stale-run reconcile can still correct."""
+        try:
+            self._http.post(
+                f"/api/worker/runs/{run_id}/resolve-result", json=payload
+            ).raise_for_status()
+        except httpx.HTTPError:
+            pass
