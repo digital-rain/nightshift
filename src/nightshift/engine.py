@@ -37,6 +37,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from nightshift import playlists, repos
 from nightshift._paths import asset
@@ -51,6 +52,7 @@ from nightshift.events import (
     Event,
     Listener,
 )
+from nightshift.model_id import split_model
 from nightshift.spawn_daily import (
     DEFAULT_PRIORITY,
     MAX_PRIORITY,
@@ -71,6 +73,28 @@ from nightshift.spawn_daily import (
 
 def _noop(_event: Event) -> None:
     return None
+
+
+def select_run_backend(model: str, fallback_backend: str | None) -> tuple[Any, str]:
+    """Pick the backend for a (possibly qualified) model in the legacy run path.
+
+    A ``provider/model`` id dispatches to that provider's backend and the bare
+    model is what reaches the CLI. Agnostic keywords (``auto``/``max``) and bare
+    or unrecognized ids fall back to ``fallback_backend`` (the default backend
+    when ``None``) with the id passed through unchanged.
+
+    Imported lazily to avoid the backends<->engine import cycle (backends reuses
+    engine's claude argv/bin helpers).
+    """
+    from nightshift.backends import get_backend, require_backend
+
+    provider, bare = split_model(model)
+    if provider is not None:
+        try:
+            return require_backend(provider), bare
+        except KeyError:
+            pass
+    return get_backend(fallback_backend), model
 
 
 DEFAULT_VALIDATE_CMD = "just validate"
@@ -2285,7 +2309,7 @@ def _agent_resolve(
     """Rebase the task branch onto the target repo's ``main`` and drive an agent
     to resolve the conflicts / validation failures, then squash. Bounded by
     config ``max_resolve_attempts``."""
-    from nightshift.backends import LAUNCH_FAILED, WorkerSpec, get_backend
+    from nightshift.backends import LAUNCH_FAILED, WorkerSpec
 
     tasks_rel = playlists.tasks_rel(queue)
     repo_root = workspace / repo
@@ -2323,9 +2347,9 @@ def _agent_resolve(
     # never enters the target repo).
     scratch = materialize_brief(workspace, repo, task, body, queue=queue)
     resolved = resolve_frontmatter(meta, config)
-    model = config.get("resolve_model") or resolved["model"]
-    backend = get_backend(
-        config.get("resolve_backend") or backend_name or config.get("worker_backend")
+    backend, model = select_run_backend(
+        config.get("resolve_model") or resolved["model"],
+        config.get("resolve_backend") or backend_name or config.get("worker_backend"),
     )
 
     last_error = conflict_detail or "merge conflict"
@@ -2753,7 +2777,7 @@ def run_task(
 
     # Imported here, not at module top, to avoid a backends<->engine import
     # cycle: backends reuses engine's claude argv/bin helpers.
-    from nightshift.backends import LAUNCH_FAILED, WorkerSpec, get_backend
+    from nightshift.backends import LAUNCH_FAILED, WorkerSpec
 
     try:
         prompt = build_prompt(
@@ -2763,11 +2787,13 @@ def run_task(
         )
         env = worker_env()
         validate_cmd = resolve_validate_cmd(config)
-        backend = get_backend(backend_name or config.get("worker_backend"))
+        backend, run_model = select_run_backend(
+            resolved["model"], backend_name or config.get("worker_backend")
+        )
         spec = WorkerSpec(
             task=task,
             prompt=prompt,
-            model=resolved["model"],
+            model=run_model,
             max_turns=resolved["max_turns"],
             cwd=worktree_dir,
             env=env,
@@ -2789,7 +2815,7 @@ def run_task(
 
         emit(Event(TASK_LOG, {
             "task": task,
-            "line": f"  running worker [{backend.name}] ({resolved['model']})...\n",
+            "line": f"  running worker [{backend.name}] ({run_model})...\n",
         }))
         t_worker = time.monotonic()
         worker = backend.run(spec, _emit_log, _should_abort, on_worker_start=_on_worker_start)
