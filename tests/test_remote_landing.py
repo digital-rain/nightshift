@@ -431,9 +431,9 @@ def test_colocated_land_ignores_rendezvous(tmp_path: Path) -> None:
 
 def test_worker_execute_publishes_when_rendezvous_set(tmp_path: Path, monkeypatch) -> None:
     workspace, repo, repo_root, bare = _setup_manager_repo(tmp_path)
-    monkeypatch.setattr(backends_mod, "get_backend", lambda name: _CommittingBackend())
+    monkeypatch.setattr(backends_mod, "require_backend", lambda name: _CommittingBackend())
     cfg = WorkerConfig(
-        workspace=workspace, worker_id="w", backend="claude-code",
+        workspace=workspace, worker_id="w",
         manager_url="http://x", rendezvous_remote="origin",
     )
     base = canonical_head(repo_root)
@@ -447,9 +447,9 @@ def test_worker_execute_publishes_when_rendezvous_set(tmp_path: Path, monkeypatc
 
 def test_worker_execute_publish_failure_is_publish_failed(tmp_path: Path, monkeypatch) -> None:
     workspace, repo, repo_root, _bare = _setup_manager_repo(tmp_path)
-    monkeypatch.setattr(backends_mod, "get_backend", lambda name: _CommittingBackend())
+    monkeypatch.setattr(backends_mod, "require_backend", lambda name: _CommittingBackend())
     cfg = WorkerConfig(
-        workspace=workspace, worker_id="w", backend="claude-code",
+        workspace=workspace, worker_id="w",
         manager_url="http://x", rendezvous_remote="does-not-exist",
     )
     base = canonical_head(repo_root)
@@ -463,9 +463,9 @@ def test_worker_execute_publish_failure_is_publish_failed(tmp_path: Path, monkey
 
 def test_worker_execute_no_commit_publishes_nothing(tmp_path: Path, monkeypatch) -> None:
     workspace, repo, repo_root, bare = _setup_manager_repo(tmp_path)
-    monkeypatch.setattr(backends_mod, "get_backend", lambda name: _NoopBackend())
+    monkeypatch.setattr(backends_mod, "require_backend", lambda name: _NoopBackend())
     cfg = WorkerConfig(
-        workspace=workspace, worker_id="w", backend="claude-code",
+        workspace=workspace, worker_id="w",
         manager_url="http://x", rendezvous_remote="origin",
     )
     base = canonical_head(repo_root)
@@ -479,9 +479,9 @@ def test_worker_execute_no_commit_publishes_nothing(tmp_path: Path, monkeypatch)
 
 def test_worker_execute_colocated_does_not_publish(tmp_path: Path, monkeypatch) -> None:
     workspace, repo, repo_root, bare = _setup_manager_repo(tmp_path)
-    monkeypatch.setattr(backends_mod, "get_backend", lambda name: _CommittingBackend())
+    monkeypatch.setattr(backends_mod, "require_backend", lambda name: _CommittingBackend())
     cfg = WorkerConfig(  # no rendezvous_remote => co-located
-        workspace=workspace, worker_id="w", backend="claude-code", manager_url="http://x",
+        workspace=workspace, worker_id="w", manager_url="http://x",
     )
     base = canonical_head(repo_root)
     outcome = execute_work_order(
@@ -592,7 +592,7 @@ class _LoopClient:
 def _run_once_capturing_land_mode(tmp_path: Path, monkeypatch, brief: str) -> str | None:
     """Drive one poll->execute->submit and return the landing_mode land() saw."""
     workspace = build_workspace(tmp_path, tasks={"10.do": brief})
-    monkeypatch.setattr(backends_mod, "get_backend", lambda name: _CommittingBackend())
+    monkeypatch.setattr(backends_mod, "require_backend", lambda name: _CommittingBackend())
 
     captured: dict[str, Any] = {}
 
@@ -604,7 +604,7 @@ def _run_once_capturing_land_mode(tmp_path: Path, monkeypatch, brief: str) -> st
 
     with TestClient(create_app(workspace, store=MemoryStore())) as tc:
         cfg = WorkerConfig(
-            workspace=workspace, worker_id="w1", backend="claude-code", manager_url="http://test",
+            workspace=workspace, worker_id="w1", manager_url="http://test",
         )
         loop = WorkerLoop(cfg, _LoopClient(tc), LocalStore(workspace))
         loop.checkin()

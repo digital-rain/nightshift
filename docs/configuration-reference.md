@@ -123,7 +123,7 @@ Secrets (`shared_secret`, `dsn`) are **not** in this file — they live in `.env
 | `cadences.worker_stale_seconds` | `45.0` | Silence after which a worker is marked `offline`. |
 | `cadences.refresh_ms` | `20000` | UI safety-poll fallback (SSE is the primary live channel). |
 | `default_model` | `auto` | Model a brief inherits when it sets no `model:`. |
-| `scheduled_models_allow` | (list) | Filter: only auto-schedule tasks pinned to these models. UI model dropdown is populated from live worker registrations. |
+| `scheduled_models_allow` | (list) | Filter: only auto-schedule tasks pinned to these provider-qualified model ids (e.g. `claude-code/claude-sonnet-4-6`). UI model dropdown is populated from live worker registrations. |
 | `max_per_day` | `200` | Dispatch cap (daily-queue path). |
 | `max_concurrent_queues` | `2` | Max queues served concurrently. |
 | `max_nights_before_parking` | `2` | Nights a failing task retries before being parked. |
@@ -162,32 +162,32 @@ The manager sends them to each worker at checkin, so changing them here changes 
 
 A worker resolves its config in [`config/worker.py`](../src/nightshift/config/worker.py) from built-in defaults, then `<workspace>/.nightshift/worker.json`, then the environment.
 The only strictly required setting is `manager_url`.
-The `backend` field is **the** backend selector (there is no manager-side `worker_backend`).
+Providers are derived automatically from the qualified model ids in `models`/`auto_model`/`max_model`.
 
 ### `worker.json` keys / environment variables
 
 | `worker.json` key | Environment variable | Default | Meaning |
 |---|---|---|---|
 | `worker_id` | `NIGHTSHIFT_WORKER_ID` | `<host>-<pid>` | Stable identity; must be unique per worker. |
-| `backend` | `NIGHTSHIFT_WORKER_BACKEND` | `claude-code` | Which backend this worker runs (see [Backends](#backends)). |
 | `manager_url` | `NIGHTSHIFT_MANAGER_URL` | `http://localhost:8800` | Manager location (required). |
 | `shared_secret` | `NIGHTSHIFT_SHARED_SECRET` | `null` | Must match the manager's secret if one is set. Stored in `.env`, not `worker.json`. |
 | `rendezvous_remote` | `NIGHTSHIFT_RENDEZVOUS_REMOTE` | `null` | Git remote for cross-machine landing. |
 | `queues` | `NIGHTSHIFT_WORKER_QUEUES` | any | Comma-separated queue labels this worker serves. Unset = any queue. |
 | `priorities` | `NIGHTSHIFT_WORKER_PRIORITIES` | any | Comma-separated 0–5 levels this worker accepts. Unset = any. |
-| `models` | `NIGHTSHIFT_WORKER_MODELS` | `[]` | Request-facing model ids this worker advertises. |
+| `models` | `NIGHTSHIFT_WORKER_MODELS` | `[]` | Provider-qualified model ids (`provider/model`) this worker advertises. |
 | `mcps` | `NIGHTSHIFT_WORKER_MCPS` | `[]` | MCP connectors wired into this worker's harness. |
 | `model_aliases` | — | `{}` | `{requested: actual}` remap applied at execution. |
-| `auto_model` | — | per-backend | Map overriding the model `auto` resolves to, per backend. |
-| `max_model` | — | per-backend | Map overriding the model `max` resolves to, per backend. |
+| `auto_model` | — | `claude-code/claude-sonnet-4-6` | Single qualified id that `auto` resolves to. |
+| `max_model` | — | `claude-code/claude-opus-4-8` | Single qualified id that `max` resolves to. |
+| `model_timeout_seconds` | `NIGHTSHIFT_MODEL_TIMEOUT_SECONDS` | `0` (disabled) | Global wall-clock timeout applied to every backend run. `0` means no limit. |
 | `ui_host` | `NIGHTSHIFT_WORKER_UI_HOST` | `0.0.0.0` | Worker UI bind address. |
 | `ui_port` | `NIGHTSHIFT_WORKER_UI_PORT` | `8810` | Worker UI bind port (must differ between co-located workers). |
 
-Comma-separated env lists map to JSON arrays; e.g. `NIGHTSHIFT_WORKER_MODELS=gemini-3-pro,gemini-2.5-flash`.
+Comma-separated env lists map to JSON arrays; e.g. `NIGHTSHIFT_WORKER_MODELS=claude-code/claude-sonnet-4-6,ollama-cloud/gpt-oss:120b`.
 
 ### Capability advertisement and model resolution
 
-The worker advertises `queues`, `priorities`, `models`, and `mcps` on every checkin and poll. The manager returns the first runnable task whose:
+The worker advertises `queues`, `priorities`, `models`, and `mcps` on every checkin and poll. The `models` list contains provider-qualified ids (e.g. `claude-code/claude-sonnet-4-6`); the worker derives its active providers from these ids automatically. The manager returns the first runnable task whose:
 
 - queue is in the worker's `queues` (or worker is queue-agnostic), and is not dedicated to a different worker;
 - priority is in the worker's `priorities` (or worker is priority-agnostic);
@@ -196,28 +196,28 @@ The worker advertises `queues`, `priorities`, `models`, and `mcps` on every chec
 
 At execution the worker resolves the work order's model:
 
-- `auto` (or unset) → the worker's `auto_model` for its backend, else a built-in default.
-- `max` → the worker's `max_model` for its backend, else its auto model.
-- an explicit id → passed through `model_aliases` (identity unless remapped).
+- `auto` (or unset) → the worker's `auto_model` (a single qualified id, default `claude-code/claude-sonnet-4-6`).
+- `max` → the worker's `max_model` (a single qualified id, default `claude-code/claude-opus-4-8`).
+- an explicit qualified id → passed through `model_aliases` (identity unless remapped), then the provider prefix selects the backend.
 
-There is no vendor-mismatch failure: capability routing only ever hands a worker a model it advertised. Use `model_aliases` to absorb upgrades, sunsets, and cross-vendor naming (e.g. `{"gemini-3-pro": "gemini-3-pro-002"}`).
+The provider portion of the resolved model id determines which backend executes the task. A single worker can serve multiple providers simultaneously (e.g. `claude-code` and `ollama-cloud`) by advertising models from each.
 
-### Per-backend `auto` / `max` defaults
+There is no vendor-mismatch failure: capability routing only ever hands a worker a model it advertised. Use `model_aliases` to absorb upgrades, sunsets, and cross-vendor naming (e.g. `{"gemini-3-pro": "gemini/gemini-3-pro-002"}`).
 
-Overridable via the `auto_model` / `max_model` maps in `worker.json`.
+### `auto` / `max` defaults
 
-| Backend | `auto` default | `max` default |
-|---|---|---|
-| `claude-code` | `claude-sonnet-4-6` | `claude-opus-4-8` |
-| `cursor` | `auto` (Cursor's own picker) | `claude-opus-4-8-high` |
-| `gemini` | `gemini-2.5-flash` | `gemini-2.5-pro` |
-| `anthropic` | `claude-sonnet-4-6` | `claude-opus-4-8` |
-| `ollama` | `llama3.1` | `llama3.1:70b` |
-| `ollama-cloud` | `gpt-oss:120b` | `deepseek-v3.1:671b` |
+The `auto_model` and `max_model` settings are single provider-qualified strings. The shipped defaults are:
+
+| Setting | Default |
+|---|---|
+| `auto_model` | `claude-code/claude-sonnet-4-6` |
+| `max_model` | `claude-code/claude-opus-4-8` |
+
+Override in `worker.json` to point at any provider/model combination (e.g. `"auto_model": "ollama-cloud/gpt-oss:120b"`).
 
 ## Backends
 
-A worker runs exactly one backend, set by `backend`. Availability is checked at run time; the relevant tooling/credential must be present on the worker machine.
+A worker can serve multiple providers concurrently. The provider is chosen per task from the resolved model's qualified id (the part before the `/`). Availability is checked at run time; the relevant tooling/credential must be present on the worker machine.
 
 | Backend | Type | Requires | Telemetry |
 |---|---|---|---|

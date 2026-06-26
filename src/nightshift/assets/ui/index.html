@@ -368,6 +368,21 @@
       </div>
     </div>
 
+    <!-- Add-to-playlist picker: copies the selected task(s) into a chosen
+         destination queue (the inverse of the add-from picker). -->
+    <div id="addto-modal" class="modal" hidden>
+      <div class="modal-card">
+        <div class="detail-head">
+          <h3>Add to playlist</h3>
+          <button id="addto-close" class="abtn" title="Close">&#10005;</button>
+        </div>
+        <p id="addto-desc" class="field-desc">Pick a destination queue to copy the selected task(s) into. “library” is the main queue.</p>
+        <p id="addto-status" class="field-desc addfrom-status" hidden></p>
+        <ul id="addto-list" class="addfrom-list"></ul>
+        <p id="addto-empty" class="empty" hidden>No other playlists to add to.</p>
+      </div>
+    </div>
+
     <!-- Create playlist (add queue) modal. Beyond the name, it exposes the
          queue-specific options so a new queue is configured on creation;
          anything left blank inherits the main queue's setting. -->

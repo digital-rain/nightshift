@@ -106,9 +106,9 @@ class TestDefaultsDriftGuard:
         from nightshift.config.manager import Cadences
         assert Cadences().refresh_ms == 20000
 
-    def test_worker_backend(self):
+    def test_worker_auto_model(self):
         from nightshift.config.worker import WorkerConfig
-        assert WorkerConfig(workspace=Path(".")).backend == "claude-code"
+        assert WorkerConfig(workspace=Path(".")).auto_model == "claude-code/claude-sonnet-4-6"
 
     def test_worker_manager_url(self):
         from nightshift.config.worker import WorkerConfig
@@ -235,15 +235,16 @@ class TestRoundTrip:
         original = WorkerConfig(
             workspace=workspace,
             worker_id="test-1",
-            backend="gemini",
-            models=["gemini-2.5-pro"],
+            models=["gemini/gemini-2.5-pro"],
+            auto_model="gemini/gemini-2.5-flash",
+            max_model="gemini/gemini-2.5-pro",
         )
         save_worker_config(workspace, original)
         loaded = load_worker_config(workspace)
 
         assert loaded.worker_id == "test-1"
-        assert loaded.backend == "gemini"
-        assert loaded.models == ["gemini-2.5-pro"]
+        assert loaded.models == ["gemini/gemini-2.5-pro"]
+        assert loaded.auto_model == "gemini/gemini-2.5-flash"
         assert loaded.ui_port == 8810
 
     def test_player_round_trip(self, workspace: Path):
@@ -428,9 +429,9 @@ class TestApplyClassification:
         f = next(f for f in dataclasses.fields(Cadences) if f.name == "poll_seconds")
         assert f.metadata["nightshift"]["apply"] == "restart"
 
-    def test_worker_backend_is_restart(self):
+    def test_worker_model_timeout_is_restart(self):
         from nightshift.config.worker import WorkerConfig
-        f = next(f for f in dataclasses.fields(WorkerConfig) if f.name == "backend")
+        f = next(f for f in dataclasses.fields(WorkerConfig) if f.name == "model_timeout_seconds")
         assert f.metadata["nightshift"]["apply"] == "restart"
 
 

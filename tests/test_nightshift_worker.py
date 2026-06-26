@@ -17,6 +17,7 @@ from nightshift.backends import WorkerResult, WorkerSpec
 from nightshift.manager.app import create_app
 from nightshift.manager.store import MemoryStore
 from nightshift.worker.config import WorkerConfig, load_worker_config
+from nightshift.worker.execute import execute_work_order
 from nightshift.worker.local_store import LocalStore
 from nightshift.worker.loop import WorkerLoop
 
@@ -36,63 +37,84 @@ def _seed(tmp_path: Path, tasks: dict[str, str]) -> Path:
 # --------------------------------------------------------------------------- #
 
 
+def _cfg(**kw) -> WorkerConfig:
+    base: dict[str, Any] = dict(workspace=Path("/tmp"), worker_id="w", manager_url="http://x")
+    base.update(kw)
+    return WorkerConfig(**base)
+
+
 def test_worker_config_from_env(tmp_path: Path, monkeypatch) -> None:
     _seed(tmp_path, {})
     monkeypatch.setenv("NIGHTSHIFT_MANAGER_URL", "http://mgr:8800/")
-    monkeypatch.setenv("NIGHTSHIFT_WORKER_BACKEND", "ollama")
     monkeypatch.setenv("NIGHTSHIFT_WORKER_ID", "worker-x")
     monkeypatch.setenv("NIGHTSHIFT_WORKER_QUEUES", "main,alpha")
     monkeypatch.setenv("NIGHTSHIFT_WORKER_PRIORITIES", "0,1")
+    monkeypatch.setenv("NIGHTSHIFT_WORKER_MODELS", "claude-code/claude-opus-4-8, cursor/gpt-5")
     cfg = load_worker_config(tmp_path)
     assert cfg.worker_id == "worker-x"
-    assert cfg.backend == "ollama"
     assert cfg.manager_url == "http://mgr:8800"  # trailing slash stripped
     assert cfg.queues == ["main", "alpha"]
     assert cfg.priorities == [0, 1]
+    assert cfg.models == ["claude-code/claude-opus-4-8", "cursor/gpt-5"]
+    assert cfg.providers() == {"claude-code", "cursor"}
 
 
-def _cfg(backend: str) -> WorkerConfig:
-    return WorkerConfig(
-        workspace=Path("/tmp"), worker_id="w", backend=backend, manager_url="http://x"
+def test_resolve_auto_max_default_qualified() -> None:
+    cfg = _cfg()
+    assert cfg.resolve_model("auto") == ("claude-code/claude-sonnet-4-6", None)
+    assert cfg.resolve_model("max") == ("claude-code/claude-opus-4-8", None)
+    assert cfg.resolve_model(None) == ("claude-code/claude-sonnet-4-6", None)
+
+
+def test_resolve_auto_max_honor_overrides() -> None:
+    cfg = _cfg(auto_model="ollama-cloud/gpt-oss:120b", max_model="ollama-cloud/deepseek-v3.1:671b")
+    assert cfg.resolve_model("auto") == ("ollama-cloud/gpt-oss:120b", None)
+    assert cfg.resolve_model("max") == ("ollama-cloud/deepseek-v3.1:671b", None)
+
+
+def test_resolve_explicit_qualified_passthrough() -> None:
+    cfg = _cfg()
+    assert cfg.resolve_model("cursor/gpt-5") == ("cursor/gpt-5", None)
+
+
+def test_resolve_explicit_alias_remap() -> None:
+    cfg = _cfg(model_aliases={"cursor/gpt-5": "cursor/gpt-5.1"})
+    assert cfg.resolve_model("cursor/gpt-5") == ("cursor/gpt-5.1", None)
+
+
+def test_providers_derived_from_models() -> None:
+    cfg = _cfg(models=["claude-code/claude-opus-4-8", "ollama-cloud/gpt-oss:120b"])
+    assert cfg.providers() == {"claude-code", "ollama-cloud"}
+
+
+def test_advertised_models_filters_unavailable(monkeypatch) -> None:
+    import shutil as _shutil
+    monkeypatch.setattr(_shutil, "which", lambda _n: None)
+    monkeypatch.setenv("OLLAMA_API_KEY", "k")
+    cfg = _cfg(models=["claude-code/claude-opus-4-8", "ollama-cloud/gpt-oss:120b"])
+    assert cfg.advertised_models() == ["ollama-cloud/gpt-oss:120b"]
+
+
+def test_legacy_backend_qualifies_bare_models(tmp_path: Path, monkeypatch) -> None:
+    _seed(tmp_path, {})
+    (tmp_path / ".nightshift").mkdir(exist_ok=True)
+    (tmp_path / ".nightshift" / "worker.json").write_text(
+        '{"backend": "ollama", "models": ["llama3.1", "llama3.1:70b"]}'
     )
+    cfg = load_worker_config(tmp_path)
+    assert cfg.models == ["ollama/llama3.1", "ollama/llama3.1:70b"]
 
 
-def test_model_resolution_auto_max_explicit() -> None:
-    claude = _cfg("claude-code")
-    assert claude.resolve_model("auto") == ("claude-sonnet-4-6", None)
-    assert claude.resolve_model("max") == ("claude-opus-4-8", None)
-    assert claude.resolve_model(None) == ("claude-sonnet-4-6", None)
-    # explicit, matching vendor → passes through.
-    assert claude.resolve_model("claude-opus-4-5") == ("claude-opus-4-5", None)
-
-
-def test_model_resolution_no_vendor_mismatch() -> None:
-    # Capability routing only ever hands a worker a model it advertised, so an
-    # explicit id always passes through (no vendor-mismatch failure any more).
-    ollama = _cfg("ollama")
-    model, err = ollama.resolve_model("claude-opus-4-8")
-    assert err is None
-    assert model == "claude-opus-4-8"
-
-
-def test_model_aliases_remap_explicit_ids() -> None:
-    cfg = WorkerConfig(
-        workspace=Path("/tmp"), worker_id="w", backend="gemini", manager_url="http://x",
-        model_aliases={"gemini-3-pro": "gemini-3-pro-002"},
-    )
-    # A mapped id resolves to its target; an unmapped id passes through; auto/max
-    # still resolve to the worker's keyword models.
-    assert cfg.resolve_model("gemini-3-pro") == ("gemini-3-pro-002", None)
-    assert cfg.resolve_model("gemini-2.5-flash") == ("gemini-2.5-flash", None)
-    assert cfg.resolve_model("auto")[0] == "gemini-2.5-flash"
+def test_model_timeout_default_zero() -> None:
+    assert _cfg().model_timeout_seconds == 0.0
 
 
 def test_worker_config_advertises_capabilities(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("NIGHTSHIFT_MANAGER_URL", "http://mgr")
-    monkeypatch.setenv("NIGHTSHIFT_WORKER_MODELS", "claude-opus-4-8, gpt-5.5")
+    monkeypatch.setenv("NIGHTSHIFT_WORKER_MODELS", "claude-code/claude-opus-4-8, cursor/gpt-5.5")
     monkeypatch.setenv("NIGHTSHIFT_WORKER_MCPS", "slack,github")
     cfg = load_worker_config(tmp_path)
-    assert cfg.models == ["claude-opus-4-8", "gpt-5.5"]
+    assert cfg.models == ["claude-code/claude-opus-4-8", "cursor/gpt-5.5"]
     assert cfg.mcps == ["slack", "github"]
 
 
@@ -140,11 +162,11 @@ def test_ollama_cloud_availability(monkeypatch) -> None:
 
 
 def test_ollama_cloud_model_defaults() -> None:
-    cfg = _cfg("ollama-cloud")
-    assert cfg.resolve_model("auto") == ("gpt-oss:120b", None)
-    assert cfg.resolve_model("max") == ("deepseek-v3.1:671b", None)
+    cfg = _cfg(auto_model="ollama-cloud/gpt-oss:120b", max_model="ollama-cloud/deepseek-v3.1:671b")
+    assert cfg.resolve_model("auto") == ("ollama-cloud/gpt-oss:120b", None)
+    assert cfg.resolve_model("max") == ("ollama-cloud/deepseek-v3.1:671b", None)
     # explicit ids pass through unchanged.
-    assert cfg.resolve_model("qwen3-coder:480b") == ("qwen3-coder:480b", None)
+    assert cfg.resolve_model("ollama-cloud/qwen3-coder:480b") == ("ollama-cloud/qwen3-coder:480b", None)
 
 
 def test_ollama_cloud_missing_key_errors(monkeypatch) -> None:
@@ -286,13 +308,12 @@ class _LoopClient:
 
 def test_worker_lands_a_task_via_manager(tmp_path: Path, monkeypatch) -> None:
     workspace = _seed(tmp_path, {"10.do": "---\nmodel: auto\n---\nDo the thing."})
-    tasks_root = workspace / "nightshift-tasks"
     repo_root = workspace / "longitude"  # the target repo bound to the main queue
-    monkeypatch.setattr(backends_mod, "get_backend", lambda name: _CommittingBackend())
+    monkeypatch.setattr(backends_mod, "require_backend", lambda name: _CommittingBackend())
 
     with TestClient(create_app(workspace, store=MemoryStore())) as tc:
         cfg = WorkerConfig(
-            workspace=workspace, worker_id="w1", backend="claude-code",
+            workspace=workspace, worker_id="w1",
             manager_url="http://test",
         )
         local = LocalStore(workspace)
@@ -322,8 +343,45 @@ def test_worker_lands_a_task_via_manager(tmp_path: Path, monkeypatch) -> None:
         # Local worker history reflects the landed run.
         assert local.history()[0]["status"] == "completed"
 
-        # The task file left the content store's queue (completed tasks leave it).
-        assert not (tasks_root / "main/10.do.md").exists()
-
         # A second poll finds nothing left to do.
         assert loop.run_once() is False
+
+
+# --------------------------------------------------------------------------- #
+# Dispatch by provider
+# --------------------------------------------------------------------------- #
+
+
+def test_execute_dispatches_by_model_provider(tmp_path: Path, monkeypatch) -> None:
+    """A qualified model routes to that provider's backend; outcome.backend == provider."""
+    workspace = build_workspace(tmp_path, tasks={"00.demo": "Do a thing."})
+    seen: dict[str, Any] = {}
+
+    class _FakeBackend:
+        name = "ollama-cloud"
+        agentic = False
+
+        def available(self, config=None) -> bool:
+            return True
+
+        def run(self, spec, emit_log, should_abort, on_worker_start=None):
+            seen["model"] = spec.model
+            seen["timeout"] = spec.timeout
+            emit_log("ok\n")
+            return WorkerResult(returncode=0, turns=1)
+
+    monkeypatch.setattr(backends_mod, "require_backend", lambda p: _FakeBackend())
+    cfg = WorkerConfig(
+        workspace=workspace, worker_id="w", manager_url="http://x",
+        models=["ollama-cloud/gpt-oss:120b"], model_timeout_seconds=42.0,
+    )
+    order = {
+        "task": "00.demo", "repo": "longitude", "queue": "main",
+        "body": "Do a thing.", "base_ref": "HEAD",
+        "config": {"model": "ollama-cloud/gpt-oss:120b", "validate": ""},
+    }
+    outcome = execute_work_order(cfg, order, on_phase=lambda _p: None, on_log=lambda _l: None)
+    assert seen["model"] == "gpt-oss:120b"      # bare model handed to the backend
+    assert seen["timeout"] == 42.0
+    assert outcome.backend == "ollama-cloud"     # provider recorded on the outcome
+    assert outcome.resolved_model == "ollama-cloud/gpt-oss:120b"

@@ -64,23 +64,15 @@ class OperatorConfig:
         desc="Nights a failing task retries before being parked.",
         apply="next-task"))
     scheduled_models_allow: tuple[str, ...] = field(
-        default=("claude-sonnet-4-6", "claude-opus-4-8"),
+        default=("claude-code/claude-sonnet-4-6", "claude-code/claude-opus-4-8"),
         metadata=meta(
             category="Scheduling", label="Scheduled models allow",
-            desc="Filter: only auto-schedule tasks pinned to these models.",
+            desc="Filter: only auto-schedule tasks pinned to these provider/model ids.",
             apply="next-task", type="string_list"))
     default_model: str = field(default="auto", metadata=meta(
         category="Scheduling", label="Default model",
         desc="Model a brief inherits when it sets no model:.",
         apply="next-task", env="NIGHTSHIFT_DEFAULT_MODEL"))
-    model: str | None = field(default=None, metadata=meta(
-        category="Scheduling", label="Model (legacy)",
-        desc="Legacy compat path for model selection.",
-        apply="next-task"))
-    cursor_model: str | None = field(default=None, metadata=meta(
-        category="Scheduling", label="Cursor model (legacy)",
-        desc="Legacy compat path for cursor model selection.",
-        apply="next-task"))
 
     landing_mode: str = field(default="none", metadata=meta(
         category="Landing & Git", label="Landing mode",
@@ -301,13 +293,11 @@ def load_manager_settings(workspace: Path) -> ManagerSettings:
         max_nights_before_parking=_as_int(data.get("max_nights_before_parking"), 2),
         scheduled_models_allow=_as_tuple(
             data.get("scheduled_models_allow") or data.get("scheduled_models"),
-            ("claude-sonnet-4-6", "claude-opus-4-8")),
+            ("claude-code/claude-sonnet-4-6", "claude-code/claude-opus-4-8")),
         default_model=(
             os.environ.get("NIGHTSHIFT_DEFAULT_MODEL")
             or data.get("default_model")
             or "auto"),
-        model=data.get("model"),
-        cursor_model=data.get("cursor_model"),
         landing_mode=landing_mode,
         rendezvous_remote=rendezvous_remote,
         wip_ref_prefix=wip_ref_prefix,
@@ -402,8 +392,4 @@ def save_manager_settings(workspace: Path, settings: ManagerSettings) -> None:
         "resolve_backend": settings.operator.resolve_backend,
         "max_concurrent_resolves": settings.operator.max_concurrent_resolves,
     }
-    if settings.operator.model is not None:
-        data["model"] = settings.operator.model
-    if settings.operator.cursor_model is not None:
-        data["cursor_model"] = settings.operator.cursor_model
     save_json(manager_json_path(workspace), data)

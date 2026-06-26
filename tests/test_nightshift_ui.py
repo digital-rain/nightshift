@@ -64,7 +64,7 @@ def _seed(workspace: Path, tasks: dict[str, str] | None = None, **kw: object) ->
     ns_dir = workspace / ".nightshift"
     ns_dir.mkdir(parents=True, exist_ok=True)
     (ns_dir / "manager.json").write_text(
-        json.dumps({"model": "claude-sonnet-4-6", "evergreen_tasks": ["00._todo"]})
+        json.dumps({"default_model": "claude-code/claude-sonnet-4-6", "evergreen_tasks": ["00._todo"]})
     )
     return workspace / DEFAULT_TASKS_REPO
 
@@ -371,7 +371,7 @@ def test_read_task_returns_brief_with_resolved_frontmatter(tmp_path: Path) -> No
     assert plain["title"] == "plain"
     assert plain["body"] == "Just a body, no frontmatter."
     # config model default applies when the file has no model.
-    assert plain["frontmatter"]["model"] == "claude-sonnet-4-6"
+    assert plain["frontmatter"]["model"] == "claude-code/claude-sonnet-4-6"
 
     green = read_task(tasks_root, "green")
     assert green["evergreen"] is True
@@ -401,7 +401,7 @@ def test_set_task_meta_edits_toggles_and_model(tmp_path: Path) -> None:
     # model None clears the pin so the task inherits the config default.
     cleared = set_task_meta(tasks_root, "alpha", {"model": None})
     assert "model" not in cleared["frontmatter_raw"]
-    assert cleared["frontmatter"]["model"] == "claude-sonnet-4-6"
+    assert cleared["frontmatter"]["model"] == "claude-code/claude-sonnet-4-6"
     assert "non-editable" not in read_task(tasks_root, "alpha")["body"]
 
 
@@ -889,9 +889,9 @@ def test_server_task_defaults_seeds_create_pane(tmp_path: Path) -> None:
     (tmp_path / ".nightshift" / "manager.json").write_text(
         json.dumps(
             {
-                "model": "claude-sonnet-4-6",
+                "default_model": "claude-code/claude-sonnet-4-6",
                 "evergreen_tasks": ["00._todo"],
-                "scheduled_models_allow": ["claude-sonnet-4-6", "claude-opus-4-8"],
+                "scheduled_models_allow": ["claude-code/claude-sonnet-4-6", "claude-code/claude-opus-4-8"],
             }
         )
     )
@@ -902,7 +902,7 @@ def test_server_task_defaults_seeds_create_pane(tmp_path: Path) -> None:
     body = resp.json()
     assert body["task"] is None
     assert body["title"] == "" and body["body"] == ""
-    assert body["frontmatter"]["model"] == "claude-sonnet-4-6"
+    assert body["frontmatter"]["model"] == "claude-code/claude-sonnet-4-6"
     assert "draft" in body["frontmatter"] and "automerge" in body["frontmatter"]
     assert body["frontmatter"]["priority"] == 3
     # The logical ``auto``/``max`` selectors always lead the dropdown (they
@@ -910,8 +910,8 @@ def test_server_task_defaults_seeds_create_pane(tmp_path: Path) -> None:
     assert body["model_options"] == [
         "auto",
         "max",
-        "claude-sonnet-4-6",
-        "claude-opus-4-8",
+        "claude-code/claude-sonnet-4-6",
+        "claude-code/claude-opus-4-8",
     ]
     # No file was created by reading defaults.
     assert [q["task"] for q in client.get("/api/queue").json()] == ["alpha"]
@@ -951,7 +951,7 @@ def test_server_create_task_applies_detail_frontmatter(tmp_path: Path) -> None:
     assert plain.status_code == 201
     plain_brief = client.get("/api/tasks/plain-task").json()
     assert "model" not in plain_brief["frontmatter_raw"]
-    assert plain_brief["frontmatter"]["model"] == "claude-sonnet-4-6"
+    assert plain_brief["frontmatter"]["model"] == "claude-code/claude-sonnet-4-6"
 
 
 def test_server_get_task_brief(tmp_path: Path) -> None:
@@ -1563,12 +1563,12 @@ def test_resolve_config_layers_shipped_tasks_and_playlist(tmp_path: Path) -> Non
 
     main = resolve_config(tmp_path, tasks_root, "main")
     assert main["validate"] == "just validate"
-    assert main["model"] == "claude-sonnet-4-6"   # from operator defaults
+    assert main["default_model"] == "claude-code/claude-sonnet-4-6"   # from operator defaults
     assert main["automerge"] is True              # from the store layer
 
     pl = resolve_config(tmp_path, tasks_root, "ns")
     assert pl["validate"] == "just validate-nightshift"  # queue override
-    assert pl["model"] == "claude-sonnet-4-6"            # inherited from operator
+    assert pl["default_model"] == "claude-code/claude-sonnet-4-6"            # inherited from operator
     assert pl["automerge"] is True                       # inherited from the store layer
 
 

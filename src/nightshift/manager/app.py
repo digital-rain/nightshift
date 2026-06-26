@@ -71,6 +71,7 @@ from nightshift.manager.scheduler import (
     unroutable,
 )
 from nightshift.manager.store import NightshiftStore, open_store
+from nightshift.model_id import provider_of
 from nightshift.spawn_daily import (
     load_queue_config,
     resolve_config,
@@ -89,7 +90,7 @@ from nightshift.spawn_daily import (
 
 class CheckinBody(BaseModel):
     worker_id: str
-    backend: str
+    backend: str | None = None
     queues: list[str] | None = None
     priorities: list[int] | None = None
     # Advertised capabilities (operator-declared on the worker). ``models`` are
@@ -102,7 +103,7 @@ class CheckinBody(BaseModel):
 
 class PollBody(BaseModel):
     worker_id: str
-    backend: str
+    backend: str | None = None
     queues: list[str] | None = None
     priorities: list[int] | None = None
     # The poll request *is* the routing filter: the manager returns the first
@@ -795,7 +796,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             task=chosen.task,
             queue=chosen.queue,
             worker_id=body.worker_id,
-            backend=body.backend,
+            backend=provider_of(order["config"]["model"]) or body.backend,
             model=order["config"]["model"],
             title=order["title"],
             body=order["body"],

@@ -35,6 +35,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,6 +57,11 @@ OnWorkerStart = Callable[[int], None]
 LAUNCH_FAILED = 127
 
 
+def _httpx_timeout(seconds: float | None) -> Any:
+    """An httpx timeout: a finite per-op bound, or no timeout when unset/<=0."""
+    return httpx.Timeout(seconds) if seconds and seconds > 0 else None
+
+
 @dataclass
 class WorkerSpec:
     """Everything a backend needs to do one task's worth of work."""
@@ -67,6 +73,8 @@ class WorkerSpec:
     cwd: Path
     env: dict[str, str]
     config: dict[str, Any]
+    # Global per-worker wall-clock bound for this run (seconds). None/0 = none.
+    timeout: float | None = None
 
 
 @dataclass
@@ -205,6 +213,7 @@ def _stream_subprocess(
     should_abort: ShouldAbort,
     on_start: OnWorkerStart | None = None,
     parser: AgentStreamParser | None = None,
+    timeout: float | None = None,
 ) -> WorkerResult:
     """Run ``argv``, streaming combined stdout/stderr line-by-line to
     ``emit_log`` and terminating early if ``should_abort`` returns a reason.
@@ -235,15 +244,15 @@ def _stream_subprocess(
     if on_start is not None:
         on_start(proc.pid)
     assert proc.stdout is not None
-    # A worker can stop emitting output while still alive (e.g. blocked on a long
-    # tool call), so streaming alone can't observe a stop. Poll abort on a side
-    # thread and kill the whole process group when it fires.
     aborted: dict[str, str | None] = {"reason": None}
     done = threading.Event()
+    deadline = (time.monotonic() + timeout) if timeout and timeout > 0 else None
 
     def _watch_abort() -> None:
         while not done.wait(0.25):
             reason = should_abort()
+            if reason is None and deadline is not None and time.monotonic() > deadline:
+                reason = "timeout"
             if reason is not None:
                 aborted["reason"] = reason
                 engine._kill_process_group(proc)
@@ -255,6 +264,8 @@ def _stream_subprocess(
         for line in proc.stdout:
             _emit(line)
             reason = should_abort()
+            if reason is None and deadline is not None and time.monotonic() > deadline:
+                reason = "timeout"
             if reason is not None:
                 aborted["reason"] = reason
                 engine._kill_process_group(proc)
@@ -274,6 +285,7 @@ def _run_buffered(
     env: dict[str, str],
     should_abort: ShouldAbort,
     on_start: OnWorkerStart | None = None,
+    timeout: float | None = None,
 ) -> tuple[int, str, str | None, str | None]:
     """Run ``argv`` to completion, **buffering** combined stdout/stderr instead of
     streaming it. Returns ``(returncode, output, aborted_reason, launch_error)``.
@@ -295,10 +307,13 @@ def _run_buffered(
     chunks: list[str] = []
     aborted: dict[str, str | None] = {"reason": None}
     done = threading.Event()
+    deadline = (time.monotonic() + timeout) if timeout and timeout > 0 else None
 
     def _watch_abort() -> None:
         while not done.wait(0.25):
             reason = should_abort()
+            if reason is None and deadline is not None and time.monotonic() > deadline:
+                reason = "timeout"
             if reason is not None:
                 aborted["reason"] = reason
                 engine._kill_process_group(proc)
@@ -310,6 +325,8 @@ def _run_buffered(
         for line in proc.stdout:
             chunks.append(line)
             reason = should_abort()
+            if reason is None and deadline is not None and time.monotonic() > deadline:
+                reason = "timeout"
             if reason is not None:
                 aborted["reason"] = reason
                 engine._kill_process_group(proc)
@@ -431,6 +448,7 @@ class ClaudeCodeBackend:
             argv, cwd=spec.cwd, env=spec.env, emit_log=emit_log,
             should_abort=should_abort, on_start=on_worker_start,
             parser=AgentStreamParser(),
+            timeout=spec.timeout,
         )
 
 
@@ -455,6 +473,7 @@ class CursorAgentBackend:
             argv, cwd=spec.cwd, env=spec.env, emit_log=emit_log,
             should_abort=should_abort, on_start=on_worker_start,
             parser=AgentStreamParser(),
+            timeout=spec.timeout,
         )
 
 
@@ -488,6 +507,7 @@ class GeminiCLIBackend:
         rc, output, aborted, launch_err = _run_buffered(
             argv, cwd=spec.cwd, env=spec.env,
             should_abort=should_abort, on_start=on_worker_start,
+            timeout=spec.timeout,
         )
         if launch_err is not None:
             return WorkerResult(returncode=LAUNCH_FAILED, error=launch_err)
@@ -558,7 +578,7 @@ class AnthropicBackend:
                 "https://api.anthropic.com/v1/messages",
                 json=body,
                 headers=headers,
-                timeout=None,
+                timeout=_httpx_timeout(spec.timeout),
             ) as resp:
                 if resp.status_code >= 400:
                     resp.read()
@@ -612,6 +632,7 @@ def _ollama_generate(
     label: str,
     headers: dict[str, str] | None = None,
     error_hint: str = "",
+    timeout: float | None = None,
 ) -> WorkerResult:
     """Stream a single-shot completion from an Ollama ``/api/generate`` endpoint.
 
@@ -626,7 +647,8 @@ def _ollama_generate(
     output_tokens: int | None = None
     try:
         with httpx.stream(
-            "POST", f"{host}/api/generate", json=body, headers=headers, timeout=None
+            "POST", f"{host}/api/generate", json=body, headers=headers,
+            timeout=_httpx_timeout(timeout),
         ) as resp:
             if resp.status_code >= 400:
                 resp.read()
@@ -693,6 +715,7 @@ class OllamaBackend:
             host=host, model=model, prompt=spec.prompt,
             emit_log=emit_log, should_abort=should_abort,
             label="ollama", error_hint=" (is `ollama serve` running?)",
+            timeout=spec.timeout,
         )
 
 
@@ -730,6 +753,7 @@ class OllamaCloudBackend:
             emit_log=emit_log, should_abort=should_abort,
             headers={"Authorization": f"Bearer {key}"},
             label="ollama-cloud",
+            timeout=spec.timeout,
         )
 
 
@@ -757,6 +781,23 @@ def get_backend(name: str | None) -> Any:
     """Return the backend by ``name``, falling back to the default."""
     registry = _by_name()
     return registry.get(name or DEFAULT_BACKEND) or registry[DEFAULT_BACKEND]
+
+
+def known_providers() -> set[str]:
+    """Set of valid provider tokens (== backend names)."""
+    return {b.name for b in _BACKENDS}
+
+
+def require_backend(provider: str) -> Any:
+    """Return the backend for ``provider`` or raise ``KeyError`` (no fallback).
+
+    Unlike :func:`get_backend`, this never silently falls back to the default —
+    an unknown provider in a qualified model id is an operator error we surface.
+    """
+    registry = _by_name()
+    if provider not in registry:
+        raise KeyError(provider)
+    return registry[provider]
 
 
 def list_backends(config: dict[str, Any] | None = None) -> list[dict[str, Any]]:

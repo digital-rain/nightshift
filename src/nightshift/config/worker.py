@@ -1,6 +1,6 @@
 """Worker configuration model — .nightshift/worker.json.
 
-A worker resolves its identity, backend, routing constraints, and manager
+A worker resolves its identity, routing constraints, and manager
 location from: built-in defaults → .nightshift/worker.json → environment.
 """
 
@@ -12,26 +12,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from nightshift import backends as backends_mod
 from nightshift.config.io import load_dotenv, load_json, save_json, worker_json_path
 from nightshift.config.meta import meta
+from nightshift.model_id import is_qualified, join_model, provider_of
 
 
-DEFAULT_AUTO_MODELS: dict[str, str] = {
-    "claude-code": "claude-sonnet-4-6",
-    "cursor": "auto",
-    "gemini": "gemini-2.5-flash",
-    "anthropic": "claude-sonnet-4-6",
-    "ollama": "llama3.1",
-    "ollama-cloud": "gpt-oss:120b",
-}
-DEFAULT_MAX_MODELS: dict[str, str] = {
-    "claude-code": "claude-opus-4-8",
-    "cursor": "claude-opus-4-8-high",
-    "gemini": "gemini-2.5-pro",
-    "anthropic": "claude-opus-4-8",
-    "ollama": "llama3.1:70b",
-    "ollama-cloud": "deepseek-v3.1:671b",
-}
+DEFAULT_AUTO_MODEL = "claude-code/claude-sonnet-4-6"
+DEFAULT_MAX_MODEL = "claude-code/claude-opus-4-8"
 
 
 @dataclass
@@ -46,10 +34,6 @@ class WorkerConfig:
         category="Identity & connection", label="Worker ID",
         desc="Stable identity; must be unique per worker.",
         apply="restart", env="NIGHTSHIFT_WORKER_ID"))
-    backend: str = field(default="claude-code", metadata=meta(
-        category="Identity & connection", label="Backend",
-        desc="Which backend this worker runs.",
-        apply="restart", env="NIGHTSHIFT_WORKER_BACKEND"))
     manager_url: str = field(default="http://localhost:8800", metadata=meta(
         category="Identity & connection", label="Manager URL",
         desc="Manager location (required).",
@@ -78,20 +62,25 @@ class WorkerConfig:
 
     models: list[str] = field(default_factory=list, metadata=meta(
         category="Models", label="Available",
-        desc="Request-facing model ids this worker advertises.",
+        desc="Qualified model ids this worker advertises, as provider/model "
+             "(e.g. claude-code/claude-opus-4-8, ollama-cloud/gpt-oss:120b).",
         apply="restart", env="NIGHTSHIFT_WORKER_MODELS", type="string_list"))
     model_aliases: dict[str, str] = field(default_factory=dict, metadata=meta(
         category="Models", label="Model aliases",
-        desc="Remap {requested: actual} applied at execution.",
+        desc="Remap {requested: actual} (both provider/model) applied at execution.",
         apply="restart", type="str_map"))
-    auto_model: dict[str, str] = field(default_factory=dict, metadata=meta(
+    auto_model: str = field(default=DEFAULT_AUTO_MODEL, metadata=meta(
         category="Models", label="Auto model",
-        desc="Overrides the model 'auto' resolves to, per backend.",
-        apply="restart", type="str_map"))
-    max_model: dict[str, str] = field(default_factory=dict, metadata=meta(
+        desc="Qualified model 'auto' resolves to (provider/model).",
+        apply="restart"))
+    max_model: str = field(default=DEFAULT_MAX_MODEL, metadata=meta(
         category="Models", label="Max model",
-        desc="Overrides the model 'max' resolves to, per backend.",
-        apply="restart", type="str_map"))
+        desc="Qualified model 'max' resolves to (provider/model).",
+        apply="restart"))
+    model_timeout_seconds: float = field(default=0.0, metadata=meta(
+        category="Models", label="Model timeout seconds",
+        desc="Global wall-clock bound for any backend run. 0 = no timeout.",
+        apply="restart", env="NIGHTSHIFT_MODEL_TIMEOUT_SECONDS"))
 
     ui_host: str = field(default="0.0.0.0", metadata=meta(
         category="UI & Network", label="UI host",
@@ -111,23 +100,41 @@ class WorkerConfig:
         apply="restart", editable=False))
 
     def resolve_model(self, requested: str | None) -> tuple[str | None, str | None]:
-        """Resolve a work-order model to the concrete id this worker runs."""
+        """Resolve a work-order model to a qualified provider/model id.
+
+        ``auto``/``max``/unset resolve to this worker's configured defaults;
+        an explicit id passes through ``model_aliases`` (identity unless mapped).
+        """
         key = (requested or "auto").strip().lower()
         if key in ("", "auto", "default"):
-            return self._auto_model(), None
+            return self.auto_model, None
         if key == "max":
-            return self._max_model(), None
+            return self.max_model, None
         return self.model_aliases.get(requested, requested), None
 
-    def _auto_model(self) -> str:
-        return self.auto_model.get(self.backend) or DEFAULT_AUTO_MODELS.get(
-            self.backend, "auto"
-        )
+    def providers(self) -> set[str]:
+        """Distinct provider tokens across advertised models (+ auto/max)."""
+        out: set[str] = set()
+        for m in [*self.models, self.auto_model, self.max_model]:
+            p = provider_of(m)
+            if p:
+                out.add(p)
+        return out
 
-    def _max_model(self) -> str:
-        return self.max_model.get(self.backend) or DEFAULT_MAX_MODELS.get(
-            self.backend, self._auto_model()
-        )
+    def advertised_models(self, config: dict[str, Any] | None = None) -> list[str]:
+        """Advertised models whose provider backend is available on this host."""
+        out: list[str] = []
+        for m in self.models:
+            provider = provider_of(m)
+            if provider is None:
+                continue
+            try:
+                backend = backends_mod.require_backend(provider)
+            except KeyError:
+                continue
+            if backend.available(config or {}):
+                out.append(m)
+        return out
 
 
 def _csv_list(value: str | None) -> list[str] | None:
@@ -150,17 +157,21 @@ def _int_csv(value: str | None) -> list[int] | None:
     return out or None
 
 
+def _qualify(models: list[str], legacy_backend: str | None) -> list[str]:
+    """Prefix bare ids with a legacy single-backend, leaving qualified ids."""
+    if not legacy_backend:
+        return models
+    return [m if is_qualified(m) else join_model(legacy_backend, m) for m in models]
+
+
 def load_worker_config(workspace: Path) -> WorkerConfig:
     """Resolve worker config from ``.nightshift/worker.json`` + env."""
     workspace = workspace.resolve()
     load_dotenv(workspace)
     local = load_json(worker_json_path(workspace))
 
-    backend = (
-        os.environ.get("NIGHTSHIFT_WORKER_BACKEND")
-        or local.get("backend")
-        or "claude-code"
-    )
+    legacy_backend = local.get("backend")  # back-compat only
+
     worker_id = (
         os.environ.get("NIGHTSHIFT_WORKER_ID")
         or local.get("worker_id")
@@ -182,6 +193,8 @@ def load_worker_config(workspace: Path) -> WorkerConfig:
     models_raw = _csv_list(os.environ.get("NIGHTSHIFT_WORKER_MODELS"))
     if models_raw is None and isinstance(local.get("models"), list):
         models_raw = [str(m) for m in local["models"]]
+    models = _qualify(models_raw or [], legacy_backend)
+
     mcps_raw = _csv_list(os.environ.get("NIGHTSHIFT_WORKER_MCPS"))
     if mcps_raw is None and isinstance(local.get("mcps"), list):
         mcps_raw = [str(m) for m in local["mcps"]]
@@ -192,10 +205,16 @@ def load_worker_config(workspace: Path) -> WorkerConfig:
         else {}
     )
 
+    def _legacy_single(value: Any, default: str) -> str:
+        if isinstance(value, str) and value.strip():
+            return value if is_qualified(value) else _qualify([value], legacy_backend)[0]
+        if isinstance(value, dict) and legacy_backend and value.get(legacy_backend):
+            return join_model(legacy_backend, str(value[legacy_backend]))
+        return default
+
     return WorkerConfig(
         workspace=workspace,
         worker_id=worker_id,
-        backend=backend,
         manager_url=manager_url,
         shared_secret=os.environ.get("NIGHTSHIFT_SHARED_SECRET") or None,
         rendezvous_remote=(
@@ -205,16 +224,15 @@ def load_worker_config(workspace: Path) -> WorkerConfig:
         ),
         queues=queues_raw if queues_raw else None,
         priorities=priorities_raw if priorities_raw else None,
-        models=models_raw or [],
+        models=models,
         mcps=mcps_raw or [],
         model_aliases=model_aliases,
-        auto_model=(
-            dict(local.get("auto_model", {}))
-            if isinstance(local.get("auto_model"), dict) else {}
-        ),
-        max_model=(
-            dict(local.get("max_model", {}))
-            if isinstance(local.get("max_model"), dict) else {}
+        auto_model=_legacy_single(local.get("auto_model"), DEFAULT_AUTO_MODEL),
+        max_model=_legacy_single(local.get("max_model"), DEFAULT_MAX_MODEL),
+        model_timeout_seconds=float(
+            os.environ.get("NIGHTSHIFT_MODEL_TIMEOUT_SECONDS")
+            or local.get("model_timeout_seconds")
+            or 0.0
         ),
         ui_host=os.environ.get("NIGHTSHIFT_WORKER_UI_HOST") or local.get("ui_host") or "0.0.0.0",
         ui_port=int(os.environ.get("NIGHTSHIFT_WORKER_UI_PORT") or local.get("ui_port") or 8810),
@@ -229,7 +247,6 @@ def save_worker_config(workspace: Path, config: WorkerConfig) -> None:
     """
     data: dict[str, Any] = {
         "worker_id": config.worker_id,
-        "backend": config.backend,
         "manager_url": config.manager_url,
         "rendezvous_remote": config.rendezvous_remote,
         "queues": config.queues,
@@ -239,6 +256,7 @@ def save_worker_config(workspace: Path, config: WorkerConfig) -> None:
         "model_aliases": config.model_aliases,
         "auto_model": config.auto_model,
         "max_model": config.max_model,
+        "model_timeout_seconds": config.model_timeout_seconds,
         "ui_host": config.ui_host,
         "ui_port": config.ui_port,
     }

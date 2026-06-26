@@ -283,10 +283,7 @@ def unique_spawn_name(tasks_dir: Path, base: str) -> str:
 def resolve_frontmatter(meta: dict, config: dict) -> dict:
     raw_turns = meta.get("turns", config.get("max_turns"))
     return {
-        "model": meta.get(
-            "model",
-            config.get("model", config.get("default_model", "auto")),
-        ),
+        "model": meta.get("model", config.get("default_model", "auto")),
         "max_turns": int(raw_turns) if raw_turns is not None else None,
         "automerge": bool(meta.get("automerge", config.get("automerge", False))),
         "draft": bool(meta.get("draft", config.get("draft", False))),

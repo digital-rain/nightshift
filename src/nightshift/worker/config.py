@@ -7,8 +7,8 @@ Re-exports from the unified config package. Existing callers import
 from __future__ import annotations
 
 from nightshift.config.worker import (
-    DEFAULT_AUTO_MODELS,
-    DEFAULT_MAX_MODELS,
+    DEFAULT_AUTO_MODEL,
+    DEFAULT_MAX_MODEL,
     WorkerConfig,
     load_worker_config,
     save_worker_config,
@@ -16,8 +16,8 @@ from nightshift.config.worker import (
 
 
 __all__ = [
-    "DEFAULT_AUTO_MODELS",
-    "DEFAULT_MAX_MODELS",
+    "DEFAULT_AUTO_MODEL",
+    "DEFAULT_MAX_MODEL",
     "WorkerConfig",
     "load_worker_config",
     "save_worker_config",

@@ -27,6 +27,7 @@ const state = {
   detailReturn: "now",   // view to return to when the detail pane's back is pressed
   detailDraft: null,     // buffered, unsaved edits for the open detail pane (discarded on back)
   libraryTasks: null,    // cached main-queue tasks for the Add-from "library" source
+  addToTargets: [],      // task ids the Add-to-playlist picker will copy into the chosen queue
   repos: null,           // /api/repos payload (workspace, known repos, per-queue bindings, warnings)
   playlistInfoName: null, // playlist open in the full-area info pane (view "playlist-info")
   playlistInfoData: null, // loaded {name, repository, task_count} for the info pane
@@ -1584,11 +1585,11 @@ function positionRowMenu(menu, r) {
 
 // ----- row-menu actions --------------------------------------------------- #
 
-// Add to playlist → open the same playlist menu the chrome's add surface
-// offers (the Add-from-playlist picker), so playlist membership is managed from
-// one place rather than a second, divergent dialog.
-function rowAddToPlaylist(_targets) {
-  openAddFrom();
+// Add to playlist → open the destination picker so the selected task(s) are
+// copied into another queue. (This is the inverse of the chrome's Add-from
+// surface, which pulls tasks *into* the current queue.)
+function rowAddToPlaylist(targets) {
+  openAddTo(targets);
 }
 
 // Play next → move the target(s) to just after the now-playing track (or to the
@@ -4196,6 +4197,104 @@ async function importFrom(source, tasks) {
   }
 }
 
+// ----- Add to another playlist -------------------------------------------
+// Copy the row-menu's target task(s) from the current queue into a chosen
+// destination queue, reusing the server's `/api/queue/import` endpoint with the
+// current queue as the `source` and the picked queue as the destination.
+async function openAddTo(targets) {
+  state.addToTargets = (targets || []).slice();
+  await loadPlaylists();
+  const n = state.addToTargets.length;
+  const desc = $("addto-desc");
+  if (desc) {
+    desc.textContent =
+      `Pick a destination queue to copy the selected ${n} task${n === 1 ? "" : "s"} into. ` +
+      "“library” is the main queue.";
+  }
+  $("addto-status").hidden = true;
+  renderAddTo();
+  $("addto-modal").hidden = false;
+}
+
+function renderAddTo() {
+  const ul = $("addto-list");
+  if (!ul) return;
+  ul.innerHTML = "";
+
+  // Destinations: every other playlist, plus the special "library" (main queue)
+  // when a playlist is currently active — the active queue itself is excluded
+  // since it's the source.
+  const dests = [];
+  if (state.activePlaylist !== null) {
+    dests.push({ name: "library", library: true });
+  }
+  for (const pl of state.playlists) {
+    if (pl.name !== state.activePlaylist) dests.push(pl);
+  }
+
+  $("addto-empty").hidden = dests.length > 0;
+  for (const d of dests) ul.append(addToDestRow(d));
+}
+
+// A single destination queue. Clicking the row (or its +) copies the selected
+// task(s) into that queue.
+function addToDestRow(d) {
+  const dest = d.library ? null : d.name;
+  const li = document.createElement("li");
+  li.className = "addfrom-item";
+
+  const head = document.createElement("div");
+  head.className = "addfrom-head";
+
+  const add = document.createElement("button");
+  add.className = "addfrom-add";
+  add.innerHTML = "&#43;";
+  add.title = `Add to “${d.name}”`;
+
+  const name = document.createElement("span");
+  name.className = "addfrom-name";
+  name.textContent = d.name;
+  if (d.library) {
+    name.classList.add("addfrom-library");
+    const tag = document.createElement("span");
+    tag.className = "addfrom-tag";
+    tag.textContent = "main queue";
+    name.append(tag);
+  }
+
+  const count = document.createElement("span");
+  count.className = "addfrom-count";
+  if (typeof d.task_count === "number") count.textContent = `${d.task_count}`;
+
+  const go = (e) => { e.stopPropagation(); exportTo(dest, d.name); };
+  add.addEventListener("click", go);
+  head.addEventListener("click", go);
+
+  head.append(add, name, count);
+  li.append(head);
+  return li;
+}
+
+async function exportTo(dest, label) {
+  const tasks = state.addToTargets || [];
+  if (!tasks.length) return;
+  // An explicit empty `queue` param targets the main queue; a name targets that
+  // playlist. The current queue is the source (null = main).
+  const destParam = dest === null ? "?queue=" : `?queue=${encodeURIComponent(dest)}`;
+  const { ok, data } = await sendJSON(
+    `/api/queue/import${destParam}`, "POST",
+    { source: state.activePlaylist, tasks });
+  if (!ok) { alert((data && data.error) || "could not add tasks"); return; }
+  await loadPlaylists();
+  renderAddTo();   // refresh destination counts
+  const n = (data && data.imported && data.imported.length) || 0;
+  const status = $("addto-status");
+  if (status) {
+    status.textContent = `Added ${n} task${n === 1 ? "" : "s"} to ${label}.`;
+    status.hidden = false;
+  }
+}
+
 // --------------------------------------------------------------------------
 // Settings — full-page multi-tier editor
 // --------------------------------------------------------------------------
@@ -4829,6 +4928,10 @@ function wire() {
   $("addfrom-close").addEventListener("click", () => ($("addfrom-modal").hidden = true));
   $("addfrom-modal").addEventListener("click", (e) => {
     if (e.target === $("addfrom-modal")) $("addfrom-modal").hidden = true;
+  });
+  $("addto-close").addEventListener("click", () => ($("addto-modal").hidden = true));
+  $("addto-modal").addEventListener("click", (e) => {
+    if (e.target === $("addto-modal")) $("addto-modal").hidden = true;
   });
   // Gear → popup menu (Settings / Workers / Repos), mirroring the Add dropdown.
   $("btn-settings").addEventListener("click", (e) => {

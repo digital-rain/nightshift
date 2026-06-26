@@ -205,4 +205,4 @@ def test_recover_matrix_from_git_diff(tmp_path: Path) -> None:
     matrix = recover_matrix(tasks_root, base_ref="HEAD^")
     assert len(matrix) == 1
     assert matrix[0]["task"].startswith("00.")
-    assert matrix[0]["model"] == "claude-sonnet-4-6"
+    assert matrix[0]["model"] == "auto"
