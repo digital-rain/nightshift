@@ -1084,7 +1084,10 @@ function executionCard() {
       log.textContent = logTail(text, 12);
     }
   }
-  card.append(log);
+  const { panel: logPanel, body: logBody } = expando("Log", { open: false });
+  logBody.append(log);
+  logPanel.addEventListener("click", (e) => e.stopPropagation());
+  card.append(logPanel);
   return card;
 }
 
