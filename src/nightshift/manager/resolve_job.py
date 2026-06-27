@@ -74,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
     # state, not a stale local main (best-effort: the land re-syncs anyway).
     if remote and landing_mode in ("push", "pr"):
         try:
-            sync_main_to_origin(workspace, repo, remote)
+            sync_main_to_origin(workspace, repo, remote, reset_divergence=False)
         except Exception:  # noqa: BLE001 — a transient fetch failure is non-fatal
             pass
 

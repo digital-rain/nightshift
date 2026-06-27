@@ -260,6 +260,22 @@ def test_sync_main_to_origin_resets_orphan_divergence(tmp_path: Path) -> None:
     assert not (repo_root / "ephemeral.txt").exists()  # orphan dropped, no divergence
 
 
+def test_maybe_sync_preserves_local_cherry_pick(tmp_path: Path) -> None:
+    """Periodic/poll sync must not reset main when it carries unpushed commits."""
+    workspace, repo, repo_root, _bare = _setup_manager_repo(tmp_path)
+    reset_origin_sync_throttle()
+    before = canonical_head(repo_root)
+    (repo_root / "lint.txt").write_text("lint fix\n")
+    git_commit_all(repo_root, "cherry-pick lint fix")
+    local = canonical_head(repo_root)
+    assert local != before
+
+    head = maybe_sync_main_to_origin(workspace, repo, "origin", min_interval_seconds=0)
+    assert head == local
+    assert canonical_head(repo_root) == local
+    assert (repo_root / "lint.txt").exists()
+
+
 def test_sync_main_to_origin_fast_forwards(tmp_path: Path) -> None:
     workspace, repo, repo_root, bare = _setup_manager_repo(tmp_path)
     other = _clone(bare, tmp_path / "other")

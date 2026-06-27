@@ -45,8 +45,9 @@ def main(argv: list[str] | None = None) -> int:
     client = ManagerClient(cfg.manager_url, shared_secret=cfg.shared_secret)
     loop = WorkerLoop(cfg, client, local)
 
+    providers = ",".join(sorted(cfg.providers())) or "?"
     print(
-        f"[nightshift-worker] id={cfg.worker_id} backend={cfg.backend} "
+        f"[nightshift-worker] id={cfg.worker_id} providers={providers} "
         f"manager={cfg.manager_url} queues={cfg.queues} priorities={cfg.priorities}"
     )
 

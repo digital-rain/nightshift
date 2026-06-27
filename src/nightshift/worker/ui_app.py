@@ -64,7 +64,7 @@ def create_worker_app(cfg: WorkerConfig, local: LocalStore) -> FastAPI:
         return JSONResponse(
             {
                 "worker_id": cfg.worker_id,
-                "backend": cfg.backend,
+                "backend": ",".join(sorted(cfg.providers())) or None,
                 "queues": cfg.queues,
                 "priorities": cfg.priorities,
                 "models": cfg.models,

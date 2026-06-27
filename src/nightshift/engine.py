@@ -1886,6 +1886,17 @@ def _rev_parse(repo_root: Path, ref: str) -> str | None:
     return res.stdout.strip() if res.returncode == 0 else None
 
 
+def _is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
+    """True when ``ancestor`` is reachable from ``descendant`` (inclusive)."""
+    res = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    return res.returncode == 0
+
+
 def publish_task_branch(
     workspace: Path,
     repo: str,
@@ -2016,6 +2027,7 @@ def maybe_sync_main_to_origin(
     min_interval_seconds: float = 15.0,
     autostash: bool = True,
     force: bool = False,
+    reset_divergence: bool = False,
 ) -> str | None:
     """Refresh local ``main`` from ``<remote>/main`` when due.
 
@@ -2025,7 +2037,12 @@ def maybe_sync_main_to_origin(
 
     1. ``git fetch <remote> main``
     2. Compare local ``HEAD`` to ``FETCH_HEAD`` (no work when already current)
-    3. Fast-forward local ``main`` with ``reset --hard`` when the remote tip moved
+    3. When local ``main`` is **strictly behind** ``origin/main``, fast-forward
+       with ``reset --hard`` (operator dirty-tree WIP is autostashed when enabled)
+    4. When local ``main`` is **ahead of or diverged from** ``origin/main``,
+       leave it alone unless ``reset_divergence=True`` (land retries / orphan
+       pr-mode cleanup). This preserves operator cherry-picks and other unpushed
+       commits on ``main``.
 
     Returns the local ``HEAD`` after the check, or ``None`` when the remote has
     no ``main`` yet (callers fall back to local ``HEAD``). See
@@ -2043,29 +2060,51 @@ def maybe_sync_main_to_origin(
         return _rev_parse(repo_root, "HEAD")
 
     result = _sync_main_to_origin_impl(
-        workspace, repo, remote, autostash=autostash,
+        workspace,
+        repo,
+        remote,
+        autostash=autostash,
+        reset_divergence=reset_divergence,
     )
     _LAST_ORIGIN_SYNC_CHECK[key] = time.monotonic()
     return result
 
 
 def sync_main_to_origin(
-    workspace: Path, repo: str, remote: str, *, autostash: bool = True
+    workspace: Path,
+    repo: str,
+    remote: str,
+    *,
+    autostash: bool = True,
+    reset_divergence: bool = True,
 ) -> str | None:
     """Force an immediate origin/main refresh (bypasses the git-refresh throttle).
 
     Used when correctness matters more than pacing — e.g. a push-rejected land
-    retry or an out-of-process resolve about to rebase.
+    retry or an out-of-process resolve about to rebase. By default
+    ``reset_divergence=True`` so an orphaned pr-mode squash can be dropped; pass
+    ``reset_divergence=False`` for a fetch + fast-forward-only check.
     """
     return maybe_sync_main_to_origin(
-        workspace, repo, remote, min_interval_seconds=0, autostash=autostash, force=True,
+        workspace,
+        repo,
+        remote,
+        min_interval_seconds=0,
+        autostash=autostash,
+        force=True,
+        reset_divergence=reset_divergence,
     )
 
 
 def _sync_main_to_origin_impl(
-    workspace: Path, repo: str, remote: str, *, autostash: bool = True
+    workspace: Path,
+    repo: str,
+    remote: str,
+    *,
+    autostash: bool = True,
+    reset_divergence: bool = False,
 ) -> str | None:
-    """Fetch ``<remote> main`` and reset local ``main`` when the tip moved."""
+    """Fetch ``<remote> main`` and move local ``main`` when safe."""
     repo_root = workspace / repo
     with landing_lock(workspace, repo):
         fetch = subprocess.run(
@@ -2080,7 +2119,15 @@ def _sync_main_to_origin_impl(
         if target is None:
             return None
         head = _rev_parse(repo_root, "HEAD")
+        if head is None:
+            return None
         if head == target:
+            return head
+
+        behind = _is_ancestor(repo_root, head, target)
+        if not behind and not reset_divergence:
+            # Local main carries unpushed or divergent commits (e.g. a direct
+            # cherry-pick) — periodic/poll sync must not clobber them.
             return head
 
         blockers = _landing_blockers(repo_root)
@@ -2088,8 +2135,6 @@ def _sync_main_to_origin_impl(
         blocker_paths: list[str] = []
         if blockers:
             if not autostash:
-                # Leave local main as-is; it is still a usable base. Callers in
-                # pr mode tolerate a one-dispatch lag rather than clobber WIP.
                 return head
             blocker_paths = [_porcelain_path(line) for line in blockers]
             wip_sha = _stash_operator_work(repo_root, blocker_paths)
