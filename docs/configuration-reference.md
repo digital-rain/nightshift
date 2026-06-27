@@ -101,7 +101,8 @@ Secrets (`shared_secret`, `dsn`) are **not** in this file — they live in `.env
     "heartbeat_seconds": 10.0,
     "lease_ttl_seconds": 120.0,
     "worker_stale_seconds": 45.0,
-    "refresh_ms": 20000
+    "refresh_ms": 20000,
+    "git_refresh_seconds": 15.0
   },
   "default_model": "auto",
   "max_per_day": 200,
@@ -122,6 +123,7 @@ Secrets (`shared_secret`, `dsn`) are **not** in this file — they live in `.env
 | `cadences.lease_ttl_seconds` | `120.0` | Lease lifetime before the manager reclaims it. |
 | `cadences.worker_stale_seconds` | `45.0` | Silence after which a worker is marked `offline`. |
 | `cadences.refresh_ms` | `20000` | UI safety-poll fallback (SSE is the primary live channel). |
+| `cadences.git_refresh_seconds` | `15.0` | Minimum seconds between origin/main fetch checks per target repo. Each check fetches and fast-forwards local `main` only when the remote tip moved; `0` disables throttling. Legacy key `origin_sync_seconds` is still read as a fallback. |
 | `default_model` | `auto` | Model a brief inherits when it sets no `model:`. |
 | `scheduled_models_allow` | (list) | Filter: only auto-schedule tasks pinned to these provider-qualified model ids (e.g. `claude-code/claude-sonnet-4-6`). UI model dropdown is populated from live worker registrations. |
 | `max_per_day` | `200` | Dispatch cap (daily-queue path). |

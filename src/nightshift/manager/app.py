@@ -45,6 +45,7 @@ from nightshift.engine import (
     list_queue,
     load_play_priorities,
     load_sort_mode,
+    maybe_sync_main_to_origin,
     read_task,
     reorder_queue,
     resolve_title,
@@ -53,7 +54,6 @@ from nightshift.engine import (
     save_queue_config_value,
     save_sort_mode,
     set_task_meta,
-    sync_main_to_origin,
     task_is_evergreen,
 )
 from nightshift.events import new_run_id
@@ -317,18 +317,20 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
     tasks_root = workspace / tasks_repo
 
     async def _origin_sync_loop() -> None:
-        """Periodically fetch origin/main and fast-forward the local clone for
-        every queue's target repo, so dispatched base_refs and merge previews
-        track other actors' pushes even while the manager is idle. Best-effort
-        and bounded by ``cadences.origin_sync_seconds`` (0 disables)."""
-        interval = cfg.cadences.origin_sync_seconds
+        """Periodically refresh origin/main for every queue's target repo.
+
+        Each repo is checked at most once per ``cadences.git_refresh_seconds``.
+        A check fetches origin/main and fast-forwards local main only when the
+        remote tip moved; otherwise the repo is left alone until the next
+        interval. ``0`` disables the background loop (dispatch/land still refresh
+        on their own throttle)."""
+        interval = cfg.cadences.git_refresh_seconds
         remote = cfg.rendezvous_remote
         if not interval or interval <= 0 or not remote:
             return
         if cfg.landing_mode not in ("push", "pr"):
             return
         while True:
-            await asyncio.sleep(interval)
             seen: set[str] = set()
             queues: list[str | None] = [None]
             with contextlib.suppress(Exception):
@@ -346,8 +348,13 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                         continue
                     seen.add(target)
                     await asyncio.to_thread(
-                        sync_main_to_origin, workspace, target, remote
+                        maybe_sync_main_to_origin,
+                        workspace,
+                        target,
+                        remote,
+                        min_interval_seconds=interval,
                     )
+            await asyncio.sleep(interval)
 
     @contextlib.asynccontextmanager
     async def _lifespan(app: FastAPI):
@@ -770,7 +777,11 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         if effective_mode in ("push", "pr") and cfg.rendezvous_remote:
             with contextlib.suppress(Exception):
                 await asyncio.to_thread(
-                    sync_main_to_origin, workspace, repo, cfg.rendezvous_remote
+                    maybe_sync_main_to_origin,
+                    workspace,
+                    repo,
+                    cfg.rendezvous_remote,
+                    min_interval_seconds=cfg.cadences.git_refresh_seconds,
                 )
         base_ref = canonical_head(workspace / repo)
         lease = await store.acquire_lease(
@@ -994,6 +1005,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             branch_ref=body.branch_ref,
             head_sha=body.head_sha,
             rendezvous_remote=cfg.rendezvous_remote,
+            git_refresh_seconds=cfg.cadences.git_refresh_seconds,
         )
 
         if not result.landed:

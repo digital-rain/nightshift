@@ -39,12 +39,13 @@ class Cadences:
         category="Cadences", label="Refresh ms",
         desc="UI safety-poll fallback (SSE is the primary live channel).",
         apply="restart"))
-    origin_sync_seconds: float = field(default=60.0, metadata=meta(
-        category="Cadences", label="Origin sync seconds",
+    git_refresh_seconds: float = field(default=15.0, metadata=meta(
+        category="Cadences", label="Git refresh seconds",
         desc=(
-            "How often the manager fetches origin/main and fast-forwards its "
-            "local clone so dispatched base_refs stay current while others push. "
-            "0 disables the periodic sync (dispatch/land still sync)."),
+            "Minimum interval between origin/main fetch checks per target repo. "
+            "Each check fetches origin/main and fast-forwards local main only when "
+            "the remote tip moved; otherwise the manager waits this long before "
+            "checking again. 0 disables throttling (not recommended)."),
         apply="restart"))
 
 
@@ -257,7 +258,10 @@ def load_manager_settings(workspace: Path) -> ManagerSettings:
         lease_ttl_seconds=_as_float(cad_data.get("lease_ttl_seconds"), 120.0),
         worker_stale_seconds=_as_float(cad_data.get("worker_stale_seconds"), 45.0),
         refresh_ms=_as_int(cad_data.get("refresh_ms"), 20000),
-        origin_sync_seconds=_as_float(cad_data.get("origin_sync_seconds"), 60.0),
+        git_refresh_seconds=_as_float(
+            cad_data.get("git_refresh_seconds", cad_data.get("origin_sync_seconds")),
+            15.0,
+        ),
     )
 
     landing_mode = (
@@ -367,7 +371,7 @@ def save_manager_settings(workspace: Path, settings: ManagerSettings) -> None:
             "lease_ttl_seconds": settings.cadences.lease_ttl_seconds,
             "worker_stale_seconds": settings.cadences.worker_stale_seconds,
             "refresh_ms": settings.cadences.refresh_ms,
-            "origin_sync_seconds": settings.cadences.origin_sync_seconds,
+            "git_refresh_seconds": settings.cadences.git_refresh_seconds,
         },
         "default_model": settings.operator.default_model,
         "scheduled_models_allow": list(settings.operator.scheduled_models_allow),

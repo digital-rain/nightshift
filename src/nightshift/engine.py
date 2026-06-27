@@ -1990,19 +1990,82 @@ def prepare_worktree_base(
     return base_ref if _rev_parse(repo_root, base_ref) is not None else "HEAD"
 
 
+# Per-target-repo throttle for origin/main refresh (monotonic timestamps).
+_LAST_ORIGIN_SYNC_CHECK: dict[tuple[str, str], float] = {}
+
+
+def _origin_sync_key(workspace: Path, repo: str) -> tuple[str, str]:
+    return (str(workspace.resolve()), repo)
+
+
+def reset_origin_sync_throttle(workspace: Path | None = None, repo: str | None = None) -> None:
+    """Clear origin-sync throttle state (tests only)."""
+    if workspace is None and repo is None:
+        _LAST_ORIGIN_SYNC_CHECK.clear()
+        return
+    if workspace is None or repo is None:
+        raise ValueError("workspace and repo must both be set or both omitted")
+    _LAST_ORIGIN_SYNC_CHECK.pop(_origin_sync_key(workspace, repo), None)
+
+
+def maybe_sync_main_to_origin(
+    workspace: Path,
+    repo: str,
+    remote: str,
+    *,
+    min_interval_seconds: float = 15.0,
+    autostash: bool = True,
+    force: bool = False,
+) -> str | None:
+    """Refresh local ``main`` from ``<remote>/main`` when due.
+
+    When ``force`` is false and the last fetch for this repo was less than
+    ``min_interval_seconds`` ago, skip the network round-trip and return the
+    current local ``HEAD``. Otherwise:
+
+    1. ``git fetch <remote> main``
+    2. Compare local ``HEAD`` to ``FETCH_HEAD`` (no work when already current)
+    3. Fast-forward local ``main`` with ``reset --hard`` when the remote tip moved
+
+    Returns the local ``HEAD`` after the check, or ``None`` when the remote has
+    no ``main`` yet (callers fall back to local ``HEAD``). See
+    ``docs/spec/remote-landing.md``, Proposal 1.
+    """
+    repo_root = workspace / repo
+    key = _origin_sync_key(workspace, repo)
+    now = time.monotonic()
+    if (
+        not force
+        and min_interval_seconds > 0
+        and key in _LAST_ORIGIN_SYNC_CHECK
+        and (now - _LAST_ORIGIN_SYNC_CHECK[key]) < min_interval_seconds
+    ):
+        return _rev_parse(repo_root, "HEAD")
+
+    result = _sync_main_to_origin_impl(
+        workspace, repo, remote, autostash=autostash,
+    )
+    _LAST_ORIGIN_SYNC_CHECK[key] = time.monotonic()
+    return result
+
+
 def sync_main_to_origin(
     workspace: Path, repo: str, remote: str, *, autostash: bool = True
 ) -> str | None:
-    """Bring local ``main`` to ``<remote>/main`` so PR mode stays
-    ``origin/main``-authoritative (see docs/spec/remote-landing.md, Proposal 1).
+    """Force an immediate origin/main refresh (bypasses the git-refresh throttle).
 
-    Fetches ``<remote> main`` and resets local ``main`` to the fetched tip, so an
-    orphaned ephemeral pr-mode squash (a local commit GitHub re-squashed into a
-    different SHA at merge) is dropped and local/origin ``main`` cannot diverge.
-    Operator code WIP in ``repo_root`` is set aside with the same stash posture
-    :func:`squash_to_main` uses and restored after. Runs under
-    :func:`landing_lock`. Returns the new ``HEAD``, or ``None`` when the remote
-    has no ``main`` yet (the caller falls back to local ``HEAD``)."""
+    Used when correctness matters more than pacing — e.g. a push-rejected land
+    retry or an out-of-process resolve about to rebase.
+    """
+    return maybe_sync_main_to_origin(
+        workspace, repo, remote, min_interval_seconds=0, autostash=autostash, force=True,
+    )
+
+
+def _sync_main_to_origin_impl(
+    workspace: Path, repo: str, remote: str, *, autostash: bool = True
+) -> str | None:
+    """Fetch ``<remote> main`` and reset local ``main`` when the tip moved."""
     repo_root = workspace / repo
     with landing_lock(workspace, repo):
         fetch = subprocess.run(

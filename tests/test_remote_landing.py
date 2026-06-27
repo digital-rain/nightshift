@@ -30,9 +30,11 @@ from _workspace import (
 from nightshift.backends import WorkerResult
 from nightshift.engine import (
     fetch_rendezvous_branch,
+    maybe_sync_main_to_origin,
     normalize_wip_prefix,
     prune_rendezvous_branch,
     publish_task_branch,
+    reset_origin_sync_throttle,
     setup_worktree,
     sync_main_to_origin,
     worktree_branch,
@@ -278,7 +280,55 @@ def test_sync_main_to_origin_none_without_remote_main(tmp_path: Path) -> None:
     repo_root = workspace / "longitude"
     bare = make_bare_remote(tmp_path / "remotes" / "empty.git")
     add_remote(repo_root, "origin", bare, push_main=False)  # remote has no main
+    reset_origin_sync_throttle()
     assert sync_main_to_origin(workspace, "longitude", "origin") is None
+
+
+def test_maybe_sync_main_to_origin_throttles_fetch(tmp_path: Path, monkeypatch) -> None:
+    """Repeated checks within git_refresh_seconds skip the network fetch."""
+    workspace, repo, repo_root, bare = _setup_manager_repo(tmp_path)
+    reset_origin_sync_throttle()
+    other = _clone(bare, tmp_path / "other")
+    (other / "ahead.txt").write_text("ahead\n")
+    git(other, "add", "-A")
+    git(other, "commit", "-m", "advance origin main")
+    git(other, "push", "origin", "HEAD:main")
+    advanced = git(other, "rev-parse", "HEAD")
+
+    fetch_calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def _run(cmd, **kwargs):
+        if cmd[:3] == ["git", "fetch", "origin"]:
+            fetch_calls.append(cmd)
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr("nightshift.engine.subprocess.run", _run)
+
+    assert maybe_sync_main_to_origin(
+        workspace, repo, "origin", min_interval_seconds=60.0,
+    ) == advanced
+    assert fetch_calls == [["git", "fetch", "origin", "main"]]
+
+    fetch_calls.clear()
+    (other / "ahead2.txt").write_text("more\n")
+    git(other, "add", "-A")
+    git(other, "commit", "-m", "advance again")
+    git(other, "push", "origin", "HEAD:main")
+    again = git(other, "rev-parse", "HEAD")
+
+    # Throttled: no second fetch; local main stays on the first advance.
+    assert maybe_sync_main_to_origin(
+        workspace, repo, "origin", min_interval_seconds=60.0,
+    ) == advanced
+    assert fetch_calls == []
+
+    reset_origin_sync_throttle()
+    fetch_calls.clear()
+    assert maybe_sync_main_to_origin(
+        workspace, repo, "origin", min_interval_seconds=60.0, force=True,
+    ) == again
+    assert fetch_calls == [["git", "fetch", "origin", "main"]]
 
 
 # --------------------------------------------------------------------------- #

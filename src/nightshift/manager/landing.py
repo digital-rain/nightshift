@@ -26,6 +26,7 @@ from nightshift.engine import (
     fetch_rendezvous_branch,
     integrate_lock,
     landing_lock,
+    maybe_sync_main_to_origin,
     prune_rendezvous_branch,
     squash_to_main,
     sync_main_to_origin,
@@ -123,6 +124,7 @@ def land(
     head_sha: str | None = None,
     rendezvous_remote: str | None = None,
     max_push_retries: int = 3,
+    git_refresh_seconds: float = 15.0,
 ) -> LandingResult:
     """Land a submitted task branch onto canonical ``main`` of the target
     ``repo``, then sync remotely.
@@ -198,9 +200,18 @@ def land(
             # 1. Integrate the latest origin/main so the squash replays on top of
             #    everyone else's merged work (a no-op when already current).
             if do_sync:
-                sync_main_to_origin(
-                    workspace, repo, rendezvous_remote, autostash=autostash
-                )
+                if attempt == 0:
+                    maybe_sync_main_to_origin(
+                        workspace,
+                        repo,
+                        rendezvous_remote,
+                        min_interval_seconds=git_refresh_seconds,
+                        autostash=autostash,
+                    )
+                else:
+                    sync_main_to_origin(
+                        workspace, repo, rendezvous_remote, autostash=autostash
+                    )
 
             # 2. Preview the squash against the fresh main. A genuine content
             #    conflict is refused cleanly (branch preserved) so the caller

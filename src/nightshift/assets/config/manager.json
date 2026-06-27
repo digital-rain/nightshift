@@ -11,7 +11,7 @@
     "lease_ttl_seconds": 120.0,
     "worker_stale_seconds": 45.0,
     "refresh_ms": 20000,
-    "origin_sync_seconds": 60.0
+    "git_refresh_seconds": 15.0
   },
   "default_model": "auto",
   "scheduled_models_allow": ["claude-code/claude-sonnet-4-6", "claude-code/claude-opus-4-8"],
