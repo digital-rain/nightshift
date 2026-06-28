@@ -100,15 +100,9 @@ main {
 .stat-num { font-size: 1.6rem; font-weight: 700; }
 .stat-label { color: var(--muted, #888); font-size: 0.75rem; text-transform: uppercase; }
 
-table.history { display: table; width: 100%; border-collapse: collapse; }
-table.history th, table.history td {
-  text-align: left;
-  padding: 0.4rem 0.6rem;
-  border-bottom: 1px solid var(--border, #2a2a2a);
-  font-size: 0.85rem;
+.history .hrow {
+  cursor: default;
 }
-.status-completed { color: #4ade80; }
-.status-error { color: #f87171; }
 
 /* ---- Worker Settings: full-screen two-pane layout (mirrors manager) ---- */
 .w-settings-layout {

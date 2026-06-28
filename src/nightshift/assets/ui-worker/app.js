@@ -71,6 +71,128 @@ async function refreshNow() {
   log.scrollTop = log.scrollHeight;
 }
 
+const STATE_LABELS = {
+  pending: "Queued",
+  blocked: "Blocked",
+  running: "Running",
+  paused: "Paused",
+  repo_unavailable: "Paused",
+  completed: "Completed",
+  error: "Failed",
+  stopped: "Cancelled",
+  skipped: "Skipped",
+  aborted: "Aborted",
+};
+
+const FAILURE_LABELS = {
+  merge_conflict: "merge conflict",
+  merge_rejected: "merge rejected",
+  validation_error: "validation",
+  worker_error: "worker error",
+  worker_launch: "worker launch",
+  timeout: "timeout",
+  aborted: "aborted",
+  no_changes: "no changes",
+};
+
+function stateLabel(status) {
+  return STATE_LABELS[status] || (status ? status[0].toUpperCase() + status.slice(1) : "—");
+}
+
+function statusClass(status) {
+  if (status === "repo_unavailable") return "paused";
+  if (status === "blocked") return "error";
+  return status || "running";
+}
+
+function statusPill(status) {
+  const span = document.createElement("span");
+  span.className = "status " + statusClass(status);
+  span.textContent = stateLabel(status);
+  return span;
+}
+
+function failureBadge(kind) {
+  const label = FAILURE_LABELS[kind];
+  if (!label) return null;
+  const span = document.createElement("span");
+  span.className = "fail-badge fail-" + kind;
+  span.textContent = label;
+  return span;
+}
+
+function formatElapsed(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${String(s % 60).padStart(2, "0")}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${String(m % 60).padStart(2, "0")}m`;
+}
+
+function formatDuration(start, end) {
+  if (!start || !end) return "";
+  const ms = Date.parse(end) - Date.parse(start);
+  if (!(ms >= 0)) return "";
+  return formatElapsed(ms);
+}
+
+function formatWhen(iso) {
+  if (!iso) return "";
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return "";
+  const diff = Date.now() - t;
+  const min = Math.round(diff / 60000);
+  if (min < 1) return "just now";
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  return new Date(t).toLocaleDateString();
+}
+
+function historyRow(r) {
+  const row = document.createElement("div");
+  row.className = "hrow";
+
+  const pill = statusPill(r.status || "running");
+  pill.classList.add("hrow-pill");
+
+  const main = document.createElement("div");
+  main.className = "hrow-main";
+  const title = document.createElement("div");
+  title.className = "hrow-title";
+  title.textContent = r.title || r.task;
+  if (r.repo) {
+    const rtag = document.createElement("span");
+    rtag.className = "hrow-tag hrow-repo";
+    rtag.textContent = r.repo;
+    rtag.title = `Target repo: ${r.repo}`;
+    title.append(rtag);
+  }
+  const meta = document.createElement("div");
+  meta.className = "hrow-meta";
+  const badge = r.status === "error" ? failureBadge(r.failure_kind) : null;
+  if (badge) meta.append(badge);
+  const metaText = document.createElement("span");
+  metaText.className = "hrow-meta-text";
+  metaText.textContent = r.result_line || `${r.task}.md`;
+  meta.append(metaText);
+  main.append(title, meta);
+
+  const aside = document.createElement("div");
+  aside.className = "hrow-aside";
+  const dur = document.createElement("div");
+  dur.className = "hrow-dur";
+  dur.textContent = formatDuration(r.started_at, r.finished_at);
+  const when = document.createElement("div");
+  when.className = "hrow-when";
+  when.textContent = formatWhen(r.finished_at || r.started_at);
+  aside.append(dur, when);
+
+  row.append(pill, main, aside);
+  return row;
+}
+
 async function refreshHistory() {
   try {
     const [rows, stats] = await Promise.all([
@@ -81,18 +203,12 @@ async function refreshHistory() {
     document.getElementById("st-done").textContent = stats.completed || 0;
     document.getElementById("st-err").textContent = stats.errored || 0;
     document.getElementById("st-loc").textContent = stats.total_loc || 0;
-    const body = document.getElementById("history-body");
-    body.innerHTML = "";
-    for (const r of rows) {
-      const tr = document.createElement("tr");
-      tr.innerHTML =
-        `<td>${escapeHtml(r.title || r.task)}</td>` +
-        `<td>${escapeHtml(r.queue || "main")}</td>` +
-        `<td>${escapeHtml(r.model || "")}</td>` +
-        `<td class="status-${escapeHtml(r.status || "")}">${escapeHtml(r.status || "")}</td>` +
-        `<td>${escapeHtml(r.result_line || "")}</td>` +
-        `<td title="${escapeHtml(r.worktree || "")}">${escapeHtml(r.worktree ? r.worktree.split("/").pop() : "")}</td>`;
-      body.appendChild(tr);
+    const list = document.getElementById("history-list");
+    list.innerHTML = "";
+    const empty = document.getElementById("history-empty");
+    empty.hidden = rows.length > 0;
+    for (const r of rows.slice(0, 200)) {
+      list.append(historyRow(r));
     }
   } catch (_e) {
     /* ignore transient errors */

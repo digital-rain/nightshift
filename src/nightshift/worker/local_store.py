@@ -99,7 +99,10 @@ class LocalStore:
 
     def finish(self, record: dict[str, Any]) -> None:
         with self._lock:
-            record = {**record, "finished_at": _now_iso()}
+            extras: dict[str, Any] = {"finished_at": _now_iso()}
+            if self._now is not None:
+                extras["started_at"] = self._now.started_at
+            record = {**record, **extras}
             with self._path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record) + "\n")
             self._now = None

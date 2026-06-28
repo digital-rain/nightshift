@@ -61,12 +61,8 @@
           <div class="stat"><span class="stat-num" id="st-err">0</span><span class="stat-label">errored</span></div>
           <div class="stat"><span class="stat-num" id="st-loc">0</span><span class="stat-label">LOC</span></div>
         </div>
-        <table class="history">
-          <thead>
-            <tr><th>Task</th><th>Queue</th><th>Model</th><th>Status</th><th>Result</th><th>Worktree</th></tr>
-          </thead>
-          <tbody id="history-body"></tbody>
-        </table>
+        <div id="history-list" class="history"></div>
+        <p id="history-empty" class="empty" hidden>No runs yet.</p>
       </section>
 
       <section id="view-settings" class="worker-view" hidden>
