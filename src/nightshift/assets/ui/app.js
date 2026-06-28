@@ -2,6 +2,51 @@
 
 const $ = (id) => document.getElementById(id);
 
+// --------------------------------------------------------------------------
+// Render guard: keep live-refresh from eating in-progress clicks
+// --------------------------------------------------------------------------
+// The list renderers rebuild their rows from scratch (innerHTML = ""), and they
+// run both on the periodic poll and on every manager SSE lifecycle event. While
+// a task is running those events arrive often, so a rebuild can swap a row's DOM
+// node out from under the pointer between mousedown and mouseup — the browser
+// only fires `click` when both land on the same element, so the click is
+// silently dropped and the controls (change queue, the row "+"/"…"/chevron,
+// add-task) feel unresponsive.
+//
+// While the pointer is held down inside an interactive list we defer any
+// requested rebuild of that list until the gesture finishes, so the click can
+// complete on a live node. Renders triggered by the user's own action (a real
+// view switch, a selection change) still run immediately because they happen on
+// pointerup/click, not during the press.
+const guardedRenderers = new Map();   // container id -> render fn to replay on release
+let pointerDownInList = false;
+let pendingRenderReplay = false;
+
+document.addEventListener("pointerdown", (e) => {
+  pointerDownInList = !!(e.target && e.target.closest &&
+    e.target.closest("#queue, #playlists, #now-body"));
+}, true);
+
+function releasePointerHold() {
+  if (!pointerDownInList) return;
+  pointerDownInList = false;
+  if (!pendingRenderReplay) return;
+  pendingRenderReplay = false;
+  // Replay any rebuilds that were deferred during the gesture so the lists pick
+  // up whatever changed while the pointer was held.
+  for (const replay of guardedRenderers.values()) replay();
+}
+document.addEventListener("pointerup", releasePointerHold, true);
+document.addEventListener("pointercancel", releasePointerHold, true);
+
+// Run `build` to (re)render `container`, unless the user is mid-click inside an
+// interactive list — in which case defer it to the next pointer release.
+function renderList(containerId, build) {
+  guardedRenderers.set(containerId, build);
+  if (pointerDownInList) { pendingRenderReplay = true; return; }
+  build();
+}
+
 const state = {
   view: "now",
   queue: [],
@@ -978,6 +1023,9 @@ function upNextItems() {
 }
 
 function renderNow() {
+  renderList("now-body", renderNowInner);
+}
+function renderNowInner() {
   const wrap = $("now-body");
   if (!wrap) return;
   wrap.innerHTML = "";
@@ -1170,6 +1218,9 @@ function logTail(text, n) {
 // Queue screen
 // --------------------------------------------------------------------------
 function renderQueue() {
+  renderList("queue", renderQueueNow);
+}
+function renderQueueNow() {
   const ul = $("queue");
   if (!ul) return;
   // A re-render replaces the row buttons the floating menu is anchored to, so
@@ -2478,6 +2529,9 @@ function playlistSpinner(running) {
 }
 
 function renderPlaylists() {
+  renderList("playlists", renderPlaylistsNow);
+}
+function renderPlaylistsNow() {
   const ul = $("playlists");
   if (!ul) return;
   closeRowMenu();
