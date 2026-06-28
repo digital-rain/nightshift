@@ -95,7 +95,8 @@ main {
 
 .empty { padding: 2rem; text-align: center; color: var(--muted, #888); }
 
-.stats-row { display: flex; gap: 1.5rem; margin-bottom: 1rem; }
+.history-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
+.stats-row { display: flex; gap: 1.5rem; }
 .stat { display: flex; flex-direction: column; align-items: center; }
 .stat-num { font-size: 1.6rem; font-weight: 700; }
 .stat-label { color: var(--muted, #888); font-size: 0.75rem; text-transform: uppercase; }

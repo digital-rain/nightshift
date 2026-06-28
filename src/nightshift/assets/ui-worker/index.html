@@ -55,14 +55,31 @@
       </section>
 
       <section id="view-history" class="worker-view" hidden>
-        <div class="stats-row">
-          <div class="stat"><span class="stat-num" id="st-total">0</span><span class="stat-label">runs</span></div>
-          <div class="stat"><span class="stat-num" id="st-done">0</span><span class="stat-label">completed</span></div>
-          <div class="stat"><span class="stat-num" id="st-err">0</span><span class="stat-label">errored</span></div>
-          <div class="stat"><span class="stat-num" id="st-loc">0</span><span class="stat-label">LOC</span></div>
+        <div class="history-head">
+          <div class="stats-row">
+            <div class="stat"><span class="stat-num" id="st-total">0</span><span class="stat-label">runs</span></div>
+            <div class="stat"><span class="stat-num" id="st-done">0</span><span class="stat-label">completed</span></div>
+            <div class="stat"><span class="stat-num" id="st-err">0</span><span class="stat-label">errored</span></div>
+            <div class="stat"><span class="stat-num" id="st-loc">0</span><span class="stat-label">LOC</span></div>
+          </div>
+          <button id="btn-stats" type="button" class="ghost-btn" title="Run statistics">Stats</button>
         </div>
         <div id="history-list" class="history"></div>
         <p id="history-empty" class="empty" hidden>No runs yet.</p>
+      </section>
+
+      <section id="view-stats" class="worker-view" hidden>
+        <div class="detail-takeover-head">
+          <button id="stats-back" class="detail-back" title="Back to History" aria-label="Back to History">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M15 5l-7 7 7 7" />
+            </svg>
+          </button>
+          <h2 id="stats-title">Statistics</h2>
+        </div>
+        <div id="stats-body" class="stats-body"></div>
+        <p id="stats-empty" class="empty" hidden>No runs yet.</p>
       </section>
 
       <section id="view-detail" class="worker-view" hidden>

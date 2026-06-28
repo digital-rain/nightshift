@@ -16,19 +16,23 @@ async function getJSON(path) {
 
 let currentView = "now";
 let detailRecord = null;
+let historyRows = [];
 
 function setView(view) {
   currentView = view;
   document.body.dataset.view = view;
+  const historyGroup = view === "detail" || view === "stats";
   document.querySelectorAll(".nav-opt").forEach((b) => {
     const navView = b.dataset.view;
-    b.classList.toggle("active", navView === view || (navView === "history" && view === "detail"));
+    b.classList.toggle("active", navView === view || (navView === "history" && historyGroup));
   });
   document.getElementById("view-now").hidden = view !== "now";
   document.getElementById("view-history").hidden = view !== "history";
   document.getElementById("view-detail").hidden = view !== "detail";
+  document.getElementById("view-stats").hidden = view !== "stats";
   document.getElementById("view-settings").hidden = view !== "settings";
   if (view === "detail") renderHistoryDetail();
+  if (view === "stats") renderStats();
 }
 
 async function loadInfo() {
@@ -208,6 +212,7 @@ async function refreshHistory() {
       getJSON("/api/history"),
       getJSON("/api/stats"),
     ]);
+    historyRows = rows;
     document.getElementById("st-total").textContent = stats.total_runs || 0;
     document.getElementById("st-done").textContent = stats.completed || 0;
     document.getElementById("st-err").textContent = stats.errored || 0;
@@ -372,6 +377,288 @@ async function tick() {
     await refreshHistory();
   }
   timer = setTimeout(tick, refreshMs);
+}
+
+// --------------------------------------------------------------------------
+// Statistics — graphical summary of the worker's run history.
+// --------------------------------------------------------------------------
+
+const CHART_PALETTE = ["stat-fill-c0", "stat-fill-c1", "stat-fill-c2", "stat-fill-c3", "stat-fill-c4", "stat-fill-c5"];
+
+function openStats() {
+  setView("stats");
+}
+
+function closeStats() {
+  setView("history");
+}
+
+function taskDurationSecs(rec) {
+  if (rec.timings && rec.timings.total !== null && rec.timings.total !== undefined && !Number.isNaN(Number(rec.timings.total))) {
+    return Number(rec.timings.total);
+  }
+  if (rec.started_at && rec.finished_at) {
+    const ms = Date.parse(rec.finished_at) - Date.parse(rec.started_at);
+    if (ms >= 0) return ms / 1000;
+  }
+  return null;
+}
+
+function commitShaList(commitSha) {
+  if (!commitSha) return [];
+  return String(commitSha).split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+function computeStats() {
+  const terminal = historyRows.filter((t) => t.status && t.status !== "running");
+  const completed = terminal.filter((t) => t.status === "completed");
+
+  const durations = [];
+  for (const t of terminal) {
+    const secs = taskDurationSecs(t);
+    if (secs !== null) durations.push(secs);
+  }
+  const avgSecs = durations.length
+    ? durations.reduce((a, b) => a + b, 0) / durations.length
+    : null;
+
+  const failures = {};
+  for (const t of terminal) {
+    if (t.status === "completed") continue;
+    const kind = t.failure_kind || (t.status === "stopped" ? "stopped" : "unknown");
+    failures[kind] = (failures[kind] || 0) + 1;
+  }
+  const failureRows = Object.entries(failures)
+    .map(([kind, count]) => ({ kind, count }))
+    .sort((a, b) => b.count - a.count);
+
+  let commits = 0;
+  let loc = 0;
+  for (const t of completed) {
+    commits += commitShaList(t.commit_sha).length;
+    if (typeof t.loc === "number" && Number.isFinite(t.loc)) loc += t.loc;
+  }
+
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  let totalCost = 0;
+  let hasUsage = false;
+  const byModel = {};
+  for (const t of terminal) {
+    const inTok = typeof t.input_tokens === "number" ? t.input_tokens : 0;
+    const outTok = typeof t.output_tokens === "number" ? t.output_tokens : 0;
+    const cost = typeof t.cost_usd === "number" ? t.cost_usd : 0;
+    if (t.input_tokens !== undefined || t.output_tokens !== undefined || t.cost_usd !== undefined) {
+      hasUsage = true;
+    }
+    totalInputTokens += inTok;
+    totalOutputTokens += outTok;
+    totalCost += cost;
+    const model = t.model || "unknown";
+    if (!byModel[model]) byModel[model] = { input: 0, output: 0, cost: 0, runs: 0 };
+    byModel[model].input += inTok;
+    byModel[model].output += outTok;
+    byModel[model].cost += cost;
+    byModel[model].runs++;
+  }
+
+  return {
+    total: terminal.length,
+    completed: completed.length,
+    avgSecs,
+    failureRows,
+    commits,
+    loc,
+    totalInputTokens,
+    totalOutputTokens,
+    totalCost,
+    byModel: hasUsage ? Object.entries(byModel).sort((a, b) => b[1].cost - a[1].cost) : null,
+  };
+}
+
+function renderStats() {
+  const body = document.getElementById("stats-body");
+  if (!body) return;
+  body.innerHTML = "";
+
+  const s = computeStats();
+  const empty = document.getElementById("stats-empty");
+  if (empty) empty.hidden = s.total > 0;
+  if (!s.total) return;
+
+  const cards = document.createElement("div");
+  cards.className = "stat-cards";
+  cards.append(
+    statCard("Tasks", String(s.total), "completed runs in history"),
+    statCard("Avg time", s.avgSecs !== null ? (formatSecs(s.avgSecs) || "—") : "—", "per task"),
+    statCard("Commits", String(s.commits), "landed on main"),
+    statCard("Lines of code", formatCount(s.loc), "code churned"),
+  );
+  if (s.byModel) {
+    const totalTok = s.totalInputTokens + s.totalOutputTokens;
+    cards.append(
+      statCard("Tokens", formatCount(totalTok), `${formatCount(s.totalInputTokens)} in · ${formatCount(s.totalOutputTokens)} out`),
+      statCard("Cost", `$${s.totalCost.toFixed(2)}`, "USD across all runs"),
+    );
+  }
+  body.append(cards);
+
+  const chartsRow = document.createElement("div");
+  chartsRow.className = "stat-charts-row";
+
+  const failed = s.total - s.completed;
+  chartsRow.append(ringChart("Outcomes", proportionDonut([
+    { label: "Completed", count: s.completed, cls: "stat-fill-ok" },
+    { label: "Failed", count: failed, cls: "stat-fill-err" },
+  ], s.total)));
+
+  if (s.failureRows.length) {
+    chartsRow.append(ringChart("Failure modes", failureModesDonut(s.failureRows)));
+  }
+
+  if (s.byModel && s.byModel.length) {
+    chartsRow.append(
+      ringChart("Model usage", modelCallsDonut(s.byModel)),
+      ringChart("Model cost", modelCostDonut(s.byModel)),
+    );
+  }
+
+  body.append(chartsRow);
+}
+
+function statCard(label, value, sub) {
+  const card = document.createElement("div");
+  card.className = "stat-card";
+  const v = document.createElement("div");
+  v.className = "stat-card-value";
+  v.textContent = value;
+  const l = document.createElement("div");
+  l.className = "stat-card-label";
+  l.textContent = label;
+  card.append(v, l);
+  if (sub) {
+    const s = document.createElement("div");
+    s.className = "stat-card-sub";
+    s.textContent = sub;
+    card.append(s);
+  }
+  return card;
+}
+
+function ringChart(title, content) {
+  const wrap = document.createElement("div");
+  wrap.className = "stat-chart";
+  const h = document.createElement("div");
+  h.className = "stat-chart-title";
+  h.textContent = title;
+  wrap.append(h, content);
+  return wrap;
+}
+
+function failureModesDonut(rows) {
+  const total = rows.reduce((s, r) => s + r.count, 0);
+  const segments = rows.map((r, i) => ({
+    label: FAILURE_LABELS[r.kind] || r.kind,
+    count: r.count,
+    cls: CHART_PALETTE[i % CHART_PALETTE.length],
+  }));
+  return proportionDonut(segments, total);
+}
+
+function modelCallsDonut(byModel) {
+  const total = byModel.reduce((s, [, u]) => s + u.runs, 0);
+  const segments = byModel.map(([model, u], i) => ({
+    label: model,
+    count: u.runs,
+    cls: CHART_PALETTE[i % CHART_PALETTE.length],
+  }));
+  return proportionDonut(segments, total);
+}
+
+function modelCostDonut(byModel) {
+  const total = byModel.reduce((s, [, u]) => s + u.cost, 0);
+  const segments = byModel.map(([model, u], i) => ({
+    label: model,
+    count: u.cost,
+    display: `$${u.cost.toFixed(2)}`,
+    cls: CHART_PALETTE[i % CHART_PALETTE.length],
+  }));
+  return proportionDonut(segments, total, `$${total.toFixed(2)}`);
+}
+
+function proportionDonut(segments, total, centerText) {
+  const R = 76;
+  const STROKE = 10.8;
+  const C = 2 * Math.PI * R;
+
+  const wrap = document.createElement("div");
+  wrap.className = "stat-proportion";
+
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 200 200");
+  svg.setAttribute("width", "200");
+  svg.setAttribute("height", "200");
+  svg.classList.add("stat-donut");
+
+  const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+  g.setAttribute("transform", "rotate(-90 100 100)");
+
+  const track = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  track.setAttribute("cx", "100");
+  track.setAttribute("cy", "100");
+  track.setAttribute("r", String(R));
+  track.setAttribute("fill", "none");
+  track.setAttribute("stroke-width", String(STROKE));
+  track.classList.add("stat-donut-track");
+  g.append(track);
+
+  let offset = 0;
+  for (const seg of segments) {
+    if (!seg.count) continue;
+    const dash = (seg.count / total) * C;
+    const arc = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    arc.setAttribute("cx", "100");
+    arc.setAttribute("cy", "100");
+    arc.setAttribute("r", String(R));
+    arc.setAttribute("fill", "none");
+    arc.setAttribute("stroke-width", String(STROKE));
+    arc.setAttribute("stroke-dasharray", `${dash} ${C - dash}`);
+    arc.setAttribute("stroke-dashoffset", String(-offset));
+    arc.classList.add("stat-donut-seg", seg.cls);
+    const ttl = document.createElementNS("http://www.w3.org/2000/svg", "title");
+    ttl.textContent = `${seg.label}: ${seg.count}`;
+    arc.append(ttl);
+    g.append(arc);
+    offset += dash;
+  }
+  svg.append(g);
+
+  const pct = total ? Math.round((segments[0].count / total) * 100) : 0;
+  const txt = document.createElementNS("http://www.w3.org/2000/svg", "text");
+  txt.setAttribute("x", "100");
+  txt.setAttribute("y", "112");
+  txt.setAttribute("text-anchor", "middle");
+  txt.classList.add("stat-donut-pct");
+  txt.textContent = centerText !== undefined ? centerText : `${pct}%`;
+  svg.append(txt);
+
+  wrap.append(svg);
+
+  const legend = document.createElement("div");
+  legend.className = "stat-legend";
+  for (const seg of segments) {
+    const item = document.createElement("span");
+    item.className = "stat-legend-item";
+    const dot = document.createElement("span");
+    dot.className = `stat-dot ${seg.cls}`;
+    const segPct = total ? Math.round((seg.count / total) * 100) : 0;
+    const displayVal = seg.display !== undefined ? seg.display : String(seg.count);
+    item.append(dot, document.createTextNode(`${seg.label} ${displayVal} (${segPct}%)`));
+    legend.append(item);
+  }
+  wrap.append(legend);
+
+  return wrap;
 }
 
 // --------------------------------------------------------------------------
@@ -876,6 +1163,10 @@ document.addEventListener("DOMContentLoaded", async () => {
     });
   });
   document.getElementById("detail-back").addEventListener("click", closeDetailScreen);
+  document.getElementById("btn-stats").addEventListener("click", () => {
+    refreshHistory().then(openStats);
+  });
+  document.getElementById("stats-back").addEventListener("click", closeStats);
   document.getElementById("w-settings-discard").addEventListener("click", () => {
     wSettings.dirty = {};
     wSettings.errors = {};
