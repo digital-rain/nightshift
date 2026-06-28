@@ -14,14 +14,21 @@ async function getJSON(path) {
   return resp.json();
 }
 
+let currentView = "now";
+let detailRecord = null;
+
 function setView(view) {
+  currentView = view;
   document.body.dataset.view = view;
   document.querySelectorAll(".nav-opt").forEach((b) => {
-    b.classList.toggle("active", b.dataset.view === view);
+    const navView = b.dataset.view;
+    b.classList.toggle("active", navView === view || (navView === "history" && view === "detail"));
   });
   document.getElementById("view-now").hidden = view !== "now";
   document.getElementById("view-history").hidden = view !== "history";
+  document.getElementById("view-detail").hidden = view !== "detail";
   document.getElementById("view-settings").hidden = view !== "settings";
+  if (view === "detail") renderHistoryDetail();
 }
 
 async function loadInfo() {
@@ -151,8 +158,10 @@ function formatWhen(iso) {
 }
 
 function historyRow(r) {
-  const row = document.createElement("div");
+  const row = document.createElement("button");
   row.className = "hrow";
+  row.type = "button";
+  row.addEventListener("click", () => openHistoryDetail(r));
 
   const pill = statusPill(r.status || "running");
   pill.classList.add("hrow-pill");
@@ -213,6 +222,142 @@ async function refreshHistory() {
   } catch (_e) {
     /* ignore transient errors */
   }
+}
+
+// --------------------------------------------------------------------------
+// History detail view (mirrors the manager's read-only history detail)
+// --------------------------------------------------------------------------
+
+const CHEVRON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>';
+
+function formatSecs(value) {
+  if (value === null || value === undefined) return null;
+  const n = Number(value);
+  if (Number.isNaN(n)) return null;
+  if (n < 60) return `${n.toFixed(n < 10 ? 1 : 0)}s`;
+  return formatElapsed(n * 1000);
+}
+
+function formatCount(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "0";
+  return Math.round(n).toLocaleString("en-US");
+}
+
+function expando(caption, { open = true } = {}) {
+  const panel = document.createElement("section");
+  panel.className = "xpanel" + (open ? " open" : "");
+  const head = document.createElement("button");
+  head.type = "button";
+  head.className = "xpanel-head";
+  head.setAttribute("aria-expanded", open ? "true" : "false");
+  const chev = document.createElement("span");
+  chev.className = "xpanel-chev";
+  chev.innerHTML = CHEVRON_SVG;
+  const cap = document.createElement("span");
+  cap.className = "xpanel-cap";
+  cap.textContent = caption;
+  head.append(chev, cap);
+  const body = document.createElement("div");
+  body.className = "xpanel-body";
+  body.hidden = !open;
+  head.addEventListener("click", () => {
+    const isOpen = panel.classList.toggle("open");
+    head.setAttribute("aria-expanded", isOpen ? "true" : "false");
+    body.hidden = !isOpen;
+  });
+  panel.append(head, body);
+  return { panel, body };
+}
+
+function metaGrid(pairs) {
+  const grid = document.createElement("div");
+  grid.className = "detail-meta";
+  for (const [k, v] of pairs) {
+    const key = document.createElement("div");
+    key.className = "meta-k";
+    key.textContent = k;
+    const val = document.createElement("div");
+    val.className = "meta-v";
+    val.textContent = v;
+    grid.append(key, val);
+  }
+  return grid;
+}
+
+function detailStatusHead(task, status) {
+  return metaGrid([["File", `${task}.md`], ["Status", stateLabel(status)]]);
+}
+
+function runDetailPairs(rec) {
+  const pairs = [
+    ["Started", rec.started_at ? new Date(rec.started_at).toLocaleString() : "—"],
+    ["Finished", rec.finished_at ? new Date(rec.finished_at).toLocaleString() : "—"],
+    ["Duration", formatDuration(rec.started_at, rec.finished_at) || "—"],
+  ];
+  if (rec.repo) pairs.push(["Repo", rec.repo]);
+  if (rec.worktree) pairs.push(["Worktree", rec.worktree]);
+  if (rec.commit_sha) {
+    const shas = String(rec.commit_sha).split(",").map(s => s.trim()).filter(Boolean);
+    pairs.push([shas.length > 1 ? "Commits" : "Commit", `landed (${shas.join(", ")})`]);
+  } else {
+    pairs.push(["Commit", rec.status === "error" ? "not landed" : "—"]);
+  }
+  if (rec.model) pairs.push(["Model", rec.model]);
+  if (rec.backend) pairs.push(["Backend", rec.backend]);
+  if (typeof rec.turns === "number") pairs.push(["Turns", String(rec.turns)]);
+  const inTok = typeof rec.input_tokens === "number" ? rec.input_tokens : null;
+  const outTok = typeof rec.output_tokens === "number" ? rec.output_tokens : null;
+  if (inTok !== null || outTok !== null) {
+    const tok = [inTok !== null ? `${formatCount(inTok)} in` : null,
+                 outTok !== null ? `${formatCount(outTok)} out` : null]
+      .filter(Boolean).join(" · ");
+    pairs.push(["Tokens", tok]);
+  }
+  if (typeof rec.cost_usd === "number") {
+    pairs.push(["Cost", `$${rec.cost_usd.toFixed(4)}`]);
+  }
+  return pairs;
+}
+
+function openHistoryDetail(rec) {
+  detailRecord = rec;
+  setView("detail");
+}
+
+function closeDetailScreen() {
+  detailRecord = null;
+  setView("history");
+}
+
+function renderHistoryDetail() {
+  const rec = detailRecord;
+  const body = document.getElementById("detail-screen-body");
+  if (!rec || !body) return;
+  document.getElementById("detail-screen-title").textContent = rec.title || rec.task;
+  body.innerHTML = "";
+
+  body.append(detailStatusHead(rec.task, rec.status));
+
+  if (rec.result_line) {
+    const res = document.createElement("div");
+    res.className = "detail-result";
+    res.textContent = rec.result_line;
+    const badge = rec.status === "error" ? failureBadge(rec.failure_kind) : null;
+    if (badge) res.append(badge);
+    body.append(res);
+  }
+
+  if (rec.error && (rec.status === "error" || rec.status === "aborted")) {
+    const err = document.createElement("pre");
+    err.className = "detail-error";
+    err.textContent = rec.error;
+    body.append(err);
+  }
+
+  const rd = expando("Run details", { open: true });
+  rd.body.append(metaGrid(runDetailPairs(rec)));
+  body.append(rd.panel);
 }
 
 function escapeHtml(s) {
@@ -730,6 +875,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (b.dataset.view === "settings") loadWorkerSettings();
     });
   });
+  document.getElementById("detail-back").addEventListener("click", closeDetailScreen);
   document.getElementById("w-settings-discard").addEventListener("click", () => {
     wSettings.dirty = {};
     wSettings.errors = {};
