@@ -50,12 +50,14 @@ Every one of those inflates input tokens for output we did not ask for — **tok
 Owning the harness turns the token budget into an owned, testable property:
 
 - **Deterministic context assembly** — send spans (grep / retrieval), not whole files; nothing is re-read unless the loop chose to.
-- **Explicit cache breakpoints** — the stable prefix (charter + tool spec) is marked `cache_control` so it is charged at cache-read rates, not re-prefilled every turn.
+- **Explicit cache breakpoints (Anthropic path only)** — the stable prefix (charter + tool spec) is marked `cache_control` so it is charged at cache-read rates (~0.1× base input), not re-prefilled every turn. This lever exists **only** on the Anthropic vendor path: `cache_control` is an Anthropic Messages API feature, and `ollama-cloud`/`ollama` have no equivalent — for those vendors the cost win rests entirely on deterministic context assembly + cheap-tier offload, not caching. Caching is governed by hard rules the harness must respect or the win silently evaporates (see invariant 6 and §5.4): it is a **strict prefix match** (any byte change before the breakpoint invalidates everything after, in render order `tools → system → messages`); the cached prefix must clear a **per-model minimum** (4096 tokens on Opus/Haiku, 2048 on Sonnet 4.6) or it does not cache at all, with no error; and the `tools` array renders first, so any mid-run change to the tool set invalidates the **entire** cache.
+- **Rate-limit headroom** — cache reads are not deducted against the per-minute token limit, a real secondary win for an overnight batch worker that would otherwise hit TPM caps.
 - **Bounded, inspectable retries** — no hidden re-asks.
 - **A pinned, version-controlled system prompt** — drift becomes a reviewed diff, not a silent vendor change.
 - **Cheap-tier offload** — route mechanical sub-tasks (file selection, classification) to `ollama-cloud`/local at ~zero marginal cost, reserving the frontier model for reasoning.
 
 Token usage per task becomes something we **assert in tests** (§10) and watch in the existing per-model/backend rollups — the lever this driver is about.
+The §10 budget test must assert a **real cache hit** (`cache_read_input_tokens > 0` on the second of two consecutive turns), not merely that a breakpoint is present in the request — a breakpoint on a sub-minimum prefix passes the shape check while caching nothing.
 
 ---
 
@@ -169,14 +171,18 @@ replacement lines
 
 Every knob a closed CLI hides becomes explicit backend config (read from `worker.json`, overridable per queue), all defaulting to conservative values:
 
-- `thinking_budget` (Anthropic extended thinking tokens), `max_tokens`, `temperature`.
-- `cache_breakpoints` — where `cache_control: {"type": "ephemeral"}` is placed (default: after the charter + tool spec, and after large pinned file context).
+- `thinking_budget` (Anthropic extended thinking) and `max_tokens`, `temperature`. **Vendor/model note:** the fixed `budget_tokens` form is deprecated on current Anthropic models (Opus 4.6+/Sonnet 4.6+) in favour of adaptive thinking + an `effort` parameter; `transport.py` maps `thinking_budget` to the token form only for older models and to `effort`/adaptive otherwise, recording which form was sent.
+- `cache_breakpoints` — where `cache_control: {"type": "ephemeral"}` is placed. **Default: two breakpoints** — one on the stable prefix (after charter + tool spec, and after large pinned file context) and a rolling one on the last block of the most recent turn, so a growing tool loop keeps hitting cache. Up to 4 are available. Default TTL is **5 minutes** (refreshed free on every hit) — correct for an overnight loop whose turns are seconds apart; the 1-hour TTL (2× write cost) is an escape hatch only for runs that can stall past 5 minutes between Anthropic calls (e.g. a slow side-agent or validate step).
 - `max_turns` / `timeout` — already in `WorkerSpec`; the loop honours both.
 - `max_retries` and which HTTP statuses retry (bounded, logged).
-- `tools_enabled` — the allow-list of tools exposed this run (e.g. disable `run_bash` for a read-only queue).
+- `tools_enabled` — the allow-list of tools exposed this run (e.g. disable `run_bash` for a read-only queue). **Resolved once at loop start and never mutated mid-run:** the `tools` array renders at prefix position 0, so adding/removing/reordering a tool mid-run invalidates the entire cache. The §6 `semantic_search` tool, when present, is likewise added at loop start, not lazily on first index hit.
 - `context_policy` — `spans` (default) vs `whole_file`, so whole-file reads are an opt-in, not a silent default.
 
-These map cleanly onto the Anthropic request body; for `ollama-cloud`/`ollama` the unsupported knobs are no-ops, and the harness records which were honoured.
+These map cleanly onto the Anthropic request body; for `ollama-cloud`/`ollama` the unsupported knobs (cache breakpoints, thinking budget) are no-ops, and the harness records which were honoured.
+**Caching mechanics the loop must respect:**
+- The charter + tool spec must be **byte-identical** across turns and across tasks sharing a cache — no interpolated timestamps, per-task ids, or repo slug in the cached prefix, and tool-definition JSON serialized with deterministic key ordering (sort by name).
+- Each breakpoint walks back at most **20 content blocks** to find a prior cache entry. A single agentic turn can emit more than 20 `tool_use`/`tool_result` blocks (read + grep + search, repeated); the rolling breakpoint on the latest turn keeps the lookback in range.
+- **Thinking blocks cannot carry `cache_control`** but are cached as part of prior assistant turns and **count as input tokens when read from cache** (they show up in `input_tokens` via `_usage_tokens` folding `cache_read_input_tokens` — the §10 budget must account for them). On Opus 4.5+/Sonnet 4.6+ thinking blocks survive across `tool_result` turns by default, so the tool-loop path keeps the cache valid; on older models a non-tool-result user turn strips them and invalidates downstream cache.
 
 ### 5.5 Abort, telemetry, failure
 
@@ -244,7 +250,7 @@ The retrieval index (§6) is worth building regardless — the CLIs cannot expos
 - **Tools (`tools.py`):** path-traversal rejection keeps every op inside `spec.cwd`; `grep`/span behaviour.
 - **Transport (`transport.py`):** vendor token selects the right API (Anthropic vs Ollama); knob mapping onto the request body; unsupported knobs no-op for Ollama.
 - **Loop (`loop.py`):** a fake transport (canned tool-call → tool-result → final text) makes the loop deterministic offline (mirroring the existing `use_fake` pattern); assert `max_turns` and `timeout` are honoured and telemetry is summed.
-- **Token budget (the §1.3 lever):** with the fake transport recording every request, assert the stable prefix carries a cache breakpoint and that tokens-per-task for a fixture stay within a pinned budget — a regression test against harness drift.
+- **Token budget (the §1.3 lever):** with the fake transport recording every request *and* returning fake `usage` (including `cache_creation`/`cache_read` splits), assert (a) the stable prefix carries a cache breakpoint, (b) across two consecutive turns the second reports `cache_read_input_tokens > 0` — a real hit, not just a breakpoint on a sub-minimum prefix — (c) `_usage_tokens` folds the cache splits into `input_tokens` correctly, and (d) tokens-per-task for a fixture stay within a pinned budget. A regression test against harness drift.
 - **Backend integration:** a fake-backed `nightshift` run in a temp worktree lands a squash commit (proving `agentic=True` + real writes flow through `engine.squash_to_main`); an API-error run records an honest failure with no commit; `select_run_backend("nightshift/anthropic/claude-sonnet-4-6", ...)` resolves to this backend with the model half intact.
 - **Retrieval:** chunk/embed round-trip against a fake embedder; `semantic_search` ranking on a fixture corpus; graceful degradation to grep when the index is absent.
 
@@ -258,9 +264,10 @@ The retrieval index (§6) is worth building regardless — the CLIs cannot expos
 4. **One harness, many vendors.** The loop is vendor-agnostic; the model half names the upstream API. Adding a vendor adds a transport adapter, not a new loop.
 5. **The request is owned.** Context assembly, thinking budget, `max_tokens`, cache breakpoints, retries, and the tool allow-list are explicit, version-controlled config — never a hidden vendor default.
 6. **The token budget is owned and tested.** Per-task token usage is a measured, regression-tested property; nothing is re-read or re-sent unless the loop chose to.
-7. **No cross-repo or new heavy dependency.** Nightshift does not import `longitude` code and adds no `litellm`; it reaches model APIs over the existing `httpx` paths.
-8. **Reuse the engine, don't fork it.** Worktree setup, validate/repair, the landing lock, and squash come from `engine.py` unchanged.
-9. **Retrieval is additive and degradable.** Absent index → grep + span reads; the index lives in nightshift's own Postgres.
+7. **Caching obeys the prefix-match contract (Anthropic path only).** Prompt caching is an Anthropic-only lever; on `ollama-cloud`/`ollama` it is a no-op. Where it applies: caching is a strict prefix match in render order `tools → system → messages` — any byte change before a breakpoint invalidates everything after it. Therefore (a) the cached prefix (charter + tool spec) is byte-identical across turns, with no interpolated timestamps/ids/slugs and deterministic tool-definition serialization; (b) the tool allow-list is fixed at loop start and never mutated mid-run (the `tools` array renders at position 0); (c) the cached prefix must clear the per-model minimum (4096 tokens on Opus/Haiku, 2048 on Sonnet 4.6) or it silently does not cache; (d) a cache *hit* — not merely a breakpoint in the request — is what the §10 budget test asserts.
+8. **No cross-repo or new heavy dependency.** Nightshift does not import `longitude` code and adds no `litellm`; it reaches model APIs over the existing `httpx` paths.
+9. **Reuse the engine, don't fork it.** Worktree setup, validate/repair, the landing lock, and squash come from `engine.py` unchanged.
+10. **Retrieval is additive and degradable.** Absent index → grep + span reads; the index lives in nightshift's own Postgres.
 
 ---
 
