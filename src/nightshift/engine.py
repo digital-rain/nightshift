@@ -2028,6 +2028,7 @@ def maybe_sync_main_to_origin(
     autostash: bool = True,
     force: bool = False,
     reset_divergence: bool = False,
+    drop_shas: frozenset[str] | None = None,
 ) -> str | None:
     """Refresh local ``main`` from ``<remote>/main`` when due.
 
@@ -2041,8 +2042,10 @@ def maybe_sync_main_to_origin(
        with ``reset --hard`` (operator dirty-tree WIP is autostashed when enabled)
     4. When local ``main`` is **ahead of or diverged from** ``origin/main``,
        leave it alone unless ``reset_divergence=True`` (land retries / orphan
-       pr-mode cleanup). This preserves operator cherry-picks and other unpushed
-       commits on ``main``.
+       pr-mode cleanup). Even then the reset is surgical: unpushed commits are
+       replayed onto the fresh ``origin/main`` afterwards, so operator
+       cherry-picks survive. ``drop_shas`` names commits the caller deliberately
+       discards (its own orphan squash) so they are *not* replayed.
 
     Returns the local ``HEAD`` after the check, or ``None`` when the remote has
     no ``main`` yet (callers fall back to local ``HEAD``). See
@@ -2065,6 +2068,7 @@ def maybe_sync_main_to_origin(
         remote,
         autostash=autostash,
         reset_divergence=reset_divergence,
+        drop_shas=drop_shas,
     )
     _LAST_ORIGIN_SYNC_CHECK[key] = time.monotonic()
     return result
@@ -2077,6 +2081,7 @@ def sync_main_to_origin(
     *,
     autostash: bool = True,
     reset_divergence: bool = True,
+    drop_shas: frozenset[str] | None = None,
 ) -> str | None:
     """Force an immediate origin/main refresh (bypasses the git-refresh throttle).
 
@@ -2084,6 +2089,10 @@ def sync_main_to_origin(
     retry or an out-of-process resolve about to rebase. By default
     ``reset_divergence=True`` so an orphaned pr-mode squash can be dropped; pass
     ``reset_divergence=False`` for a fetch + fast-forward-only check.
+
+    ``drop_shas`` names commits the caller deliberately discards (its own orphan
+    squash). Any *other* unpushed commit on local ``main`` (e.g. an operator
+    cherry-pick) is replayed onto the fresh ``origin/main`` and preserved.
     """
     return maybe_sync_main_to_origin(
         workspace,
@@ -2093,7 +2102,61 @@ def sync_main_to_origin(
         autostash=autostash,
         force=True,
         reset_divergence=reset_divergence,
+        drop_shas=drop_shas,
     )
+
+
+def _unpushed_commits(repo_root: Path, target: str, head: str) -> list[str]:
+    """Commits on local ``head`` not reachable from ``target``, oldest-first.
+
+    These are the commits a ``reset --hard target`` over a divergence would drop
+    (e.g. an operator cherry-pick on ``main`` plus the manager's own orphan
+    squash). Returned oldest-first so a replay re-applies them in order."""
+    res = subprocess.run(
+        ["git", "rev-list", "--reverse", f"{target}..{head}"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        return []
+    return [line.strip() for line in res.stdout.splitlines() if line.strip()]
+
+
+def _replay_commits(repo_root: Path, shas: list[str]) -> None:
+    """Cherry-pick ``shas`` (oldest-first) onto the current ``HEAD``.
+
+    Each commit is replayed individually so a redundant one (its content already
+    present on the new base — e.g. the manager's own squash that origin already
+    carries) collapses to an empty cherry-pick and is skipped rather than
+    re-introduced. A commit that genuinely conflicts with the new base is skipped
+    too (best-effort rescue): its content is preserved unreachable in the reflog
+    for manual recovery rather than left as a half-applied conflict on ``main``.
+    """
+    for sha in shas:
+        cp = subprocess.run(
+            ["git", "cherry-pick", sha],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        if cp.returncode == 0:
+            continue
+        # Empty (already-applied) or conflicted: abort this pick and move on.
+        # ``--skip`` advances past an empty pick; ``--abort`` unwinds a conflict.
+        # Try skip first (the common, redundant-squash case), then abort.
+        if subprocess.run(
+            ["git", "cherry-pick", "--skip"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        ).returncode != 0:
+            subprocess.run(
+                ["git", "cherry-pick", "--abort"],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+            )
 
 
 def _sync_main_to_origin_impl(
@@ -2103,8 +2166,20 @@ def _sync_main_to_origin_impl(
     *,
     autostash: bool = True,
     reset_divergence: bool = False,
+    drop_shas: frozenset[str] | None = None,
 ) -> str | None:
-    """Fetch ``<remote> main`` and move local ``main`` when safe."""
+    """Fetch ``<remote> main`` and move local ``main`` when safe.
+
+    When ``reset_divergence`` is set and local ``main`` has diverged (carries
+    unpushed commits), the reset to ``origin/main`` is *surgical*: any unpushed
+    commit is rescued and replayed on top of the fresh tip afterwards, so an
+    operator cherry-pick sitting on ``main`` survives a land retry instead of
+    being silently dropped. ``drop_shas`` names commits the caller intends to
+    discard (the manager's own orphan squash from a rejected push), which are
+    excluded from the replay; redundant picks (content already on the new base)
+    collapse to empty and are skipped automatically.
+    """
+    drop = drop_shas or frozenset()
     repo_root = workspace / repo
     with landing_lock(workspace, repo):
         fetch = subprocess.run(
@@ -2130,6 +2205,16 @@ def _sync_main_to_origin_impl(
             # cherry-pick) — periodic/poll sync must not clobber them.
             return head
 
+        # Over a divergence, capture the unpushed commits so we can replay the
+        # ones the caller did not ask to drop after fast-forwarding to origin.
+        rescue: list[str] = []
+        if not behind:
+            rescue = [
+                sha
+                for sha in _unpushed_commits(repo_root, target, head)
+                if sha not in drop
+            ]
+
         blockers = _landing_blockers(repo_root)
         wip_sha: str | None = None
         blocker_paths: list[str] = []
@@ -2146,13 +2231,15 @@ def _sync_main_to_origin_impl(
                 capture_output=True,
                 text=True,
             )
+            if reset.returncode == 0 and rescue:
+                _replay_commits(repo_root, rescue)
         finally:
             if wip_sha:
                 _restore_operator_work(repo_root, wip_sha, blocker_paths)
 
         if reset.returncode != 0:
             return _rev_parse(repo_root, "HEAD")
-        return target
+        return _rev_parse(repo_root, "HEAD")
 
 
 def recover_task(

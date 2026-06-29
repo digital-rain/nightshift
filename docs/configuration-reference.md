@@ -123,7 +123,7 @@ Secrets (`shared_secret`, `dsn`) are **not** in this file — they live in `.env
 | `cadences.lease_ttl_seconds` | `120.0` | Lease lifetime before the manager reclaims it. |
 | `cadences.worker_stale_seconds` | `45.0` | Silence after which a worker is marked `offline`. |
 | `cadences.refresh_ms` | `20000` | UI safety-poll fallback (SSE is the primary live channel). |
-| `cadences.git_refresh_seconds` | `15.0` | Minimum seconds between origin/main fetch checks per target repo. Each check fetches and fast-forwards local `main` **only when it is strictly behind** `origin/main`; unpushed or divergent local commits (e.g. a direct cherry-pick on `main`) are left alone. Hard reset over divergence happens only on forced land retries. `0` disables throttling. Legacy key `origin_sync_seconds` is still read as a fallback. |
+| `cadences.git_refresh_seconds` | `15.0` | Minimum seconds between origin/main fetch checks per target repo. Each check fetches and fast-forwards local `main` **only when it is strictly behind** `origin/main`; unpushed or divergent local commits (e.g. a direct cherry-pick on `main`) are left alone. A forced land retry may reset over divergence, but it does so **surgically** — it drops only the manager's own orphan squash and replays any other unpushed commit (operator cherry-picks survive). `0` disables throttling. Legacy key `origin_sync_seconds` is still read as a fallback. |
 | `default_model` | `auto` | Model a brief inherits when it sets no `model:`. |
 | `scheduled_models_allow` | (list) | Filter: only auto-schedule tasks pinned to these provider-qualified model ids (e.g. `claude-code/claude-sonnet-4-6`). UI model dropdown is populated from live worker registrations. |
 | `max_per_day` | `200` | Dispatch cap (daily-queue path). |

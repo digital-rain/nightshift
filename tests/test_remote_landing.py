@@ -29,6 +29,7 @@ from _workspace import (
 )
 from nightshift.backends import WorkerResult
 from nightshift.engine import (
+    _is_ancestor,
     fetch_rendezvous_branch,
     maybe_sync_main_to_origin,
     normalize_wip_prefix,
@@ -253,11 +254,76 @@ def test_sync_main_to_origin_resets_orphan_divergence(tmp_path: Path) -> None:
     merged = git(other, "rev-parse", "HEAD")
     assert merged not in (m0, local)
 
-    new_head = sync_main_to_origin(workspace, repo, "origin")
+    # The orphan is dropped only because the caller names it explicitly; an
+    # unnamed divergent commit would be rescued + replayed (see the operator
+    # cherry-pick tests below).
+    new_head = sync_main_to_origin(
+        workspace, repo, "origin", drop_shas=frozenset({local})
+    )
     assert new_head == merged
     assert canonical_head(repo_root) == merged
     assert (repo_root / "merged.txt").exists()
     assert not (repo_root / "ephemeral.txt").exists()  # orphan dropped, no divergence
+
+
+def test_sync_main_to_origin_rescues_operator_commit_over_divergence(
+    tmp_path: Path,
+) -> None:
+    """A forced reset_divergence sync must replay an unpushed operator commit
+    (e.g. a hand cherry-pick) onto the fresh origin/main, never drop it."""
+    workspace, repo, repo_root, bare = _setup_manager_repo(tmp_path)
+
+    # Operator commits a lint fix directly on local main (unpushed).
+    (repo_root / "lint.txt").write_text("lint fix\n")
+    git_commit_all(repo_root, "operator cherry-pick lint fix")
+
+    # origin/main advances independently on another clone.
+    other = _clone(bare, tmp_path / "other")
+    (other / "feature.txt").write_text("origin feature\n")
+    git(other, "add", "-A")
+    git(other, "commit", "-m", "advance origin main")
+    git(other, "push", "origin", "HEAD:main")
+    advanced = git(other, "rev-parse", "HEAD")
+
+    # Forced divergence reset (the land-retry posture) with NO drop set: the
+    # operator commit is rescued and replayed on top of origin's advance.
+    new_head = sync_main_to_origin(workspace, repo, "origin")
+    assert new_head is not None
+    assert _is_ancestor(repo_root, advanced, new_head)  # origin's work integrated
+    assert (repo_root / "feature.txt").exists()
+    assert (repo_root / "lint.txt").exists()  # operator commit survived
+    # The operator commit now sits on top of origin's advance, not lost.
+    log = git(repo_root, "log", "--format=%s", f"{advanced}..{new_head}")
+    assert "operator cherry-pick lint fix" in log
+
+
+def test_sync_drops_orphan_but_keeps_operator_commit(tmp_path: Path) -> None:
+    """When main carries both the manager's orphan squash AND an operator
+    commit, naming only the orphan drops it while the operator commit replays."""
+    workspace, repo, repo_root, bare = _setup_manager_repo(tmp_path)
+
+    # Operator commit first, then the manager's orphan squash on top.
+    (repo_root / "lint.txt").write_text("lint fix\n")
+    git_commit_all(repo_root, "operator cherry-pick")
+    (repo_root / "ephemeral.txt").write_text("orphan squash\n")
+    git_commit_all(repo_root, "ephemeral pr squash")
+    orphan = canonical_head(repo_root)
+
+    other = _clone(bare, tmp_path / "github")
+    (other / "merged.txt").write_text("github merge\n")
+    git(other, "add", "-A")
+    git(other, "commit", "-m", "squash-merge of PR")
+    git(other, "push", "origin", "HEAD:main")
+    merged = git(other, "rev-parse", "HEAD")
+
+    new_head = sync_main_to_origin(
+        workspace, repo, "origin", drop_shas=frozenset({orphan})
+    )
+    assert new_head is not None
+    assert _is_ancestor(repo_root, merged, new_head)
+    assert (repo_root / "merged.txt").exists()
+    assert (repo_root / "lint.txt").exists()  # operator commit replayed
+    assert not (repo_root / "ephemeral.txt").exists()  # named orphan dropped
 
 
 def test_maybe_sync_preserves_local_cherry_pick(tmp_path: Path) -> None:

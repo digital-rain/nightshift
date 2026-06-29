@@ -195,11 +195,17 @@ def land(
     do_sync = bool(rendezvous_remote) and landing_mode in ("push", "pr")
     push_remote = rendezvous_remote or "origin"
 
+    # The squash commit a rejected push leaves on local main: the next re-sync
+    # must drop exactly this (and nothing else, so an operator commit on main is
+    # preserved). Captured as a full SHA after each squash attempt.
+    orphan_squash: str | None = None
+
     with integrate_lock(workspace, repo):
         for attempt in range(max_push_retries + 1):
             # 1. Integrate the latest origin/main so the squash replays on top of
             #    everyone else's merged work (a no-op when already current).
             if do_sync:
+                drop = frozenset({orphan_squash}) if orphan_squash else None
                 if attempt == 0:
                     maybe_sync_main_to_origin(
                         workspace,
@@ -207,10 +213,15 @@ def land(
                         rendezvous_remote,
                         min_interval_seconds=git_refresh_seconds,
                         autostash=autostash,
+                        drop_shas=drop,
                     )
                 else:
                     sync_main_to_origin(
-                        workspace, repo, rendezvous_remote, autostash=autostash
+                        workspace,
+                        repo,
+                        rendezvous_remote,
+                        autostash=autostash,
+                        drop_shas=drop,
                     )
 
             # 2. Preview the squash against the fresh main. A genuine content
@@ -242,6 +253,11 @@ def land(
                     conflict=not recoverable,
                 )
 
+            # Record the full SHA of the squash we just made; if the push below
+            # is rejected, the next re-sync drops exactly this commit (the next
+            # iteration re-squashes onto the freshly advanced origin) while any
+            # operator commit on main is rescued + replayed.
+            orphan_squash = _rev_parse(repo_root, "HEAD")
             result = LandingResult(landed=True, sha=sha, detail=squash_error)
 
             # 4. Apply the remote policy.
@@ -426,9 +442,15 @@ def push_resolved_main(
         for _attempt in range(max_retries + 1):
             # Reset local main to the freshest origin/main. ``sync_main_to_origin``
             # takes ``landing_lock`` itself, so it must run OUTSIDE the landing_lock
-            # block below (the flock is not reentrant).
+            # block below (the flock is not reentrant). Drop our own resolved
+            # commit on the re-sync — it is re-applied by the explicit cherry-pick
+            # below — so the rescue does not double-apply it; any *operator* commit
+            # on main is still rescued + replayed.
             if remote:
-                sync_main_to_origin(workspace, repo, remote, autostash=autostash)
+                drop = frozenset({sha}) if sha else None
+                sync_main_to_origin(
+                    workspace, repo, remote, autostash=autostash, drop_shas=drop
+                )
             with landing_lock(workspace, repo):
                 # Replay the resolved commit on top of the fresh main (a no-op
                 # fast-forward when main already is ``sha``), then push.
