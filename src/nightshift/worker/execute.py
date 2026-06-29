@@ -259,6 +259,8 @@ def execute_work_order(
             task,
             task_file=str(scratch),
             validate_cmd=prompt_validate,
+            loop=bool(config_blob.get("loop", False)),
+            loop_max_iterations=int(config_blob.get("loop_max_iterations", 0)),
         )
         env = worker_env()
         max_turns = config_blob.get("max_turns")

@@ -241,12 +241,16 @@ class TaskCreate(BaseModel):
     # Optional per-task repo override (defaults to the queue's repo). Written as
     # an editable frontmatter meta key on the new brief.
     repo: str | None = None
+    loop: bool | None = None
+    loop_max_iterations: int | None = None
 
 
 class TaskUpdate(BaseModel):
     # Partial edit; unset fields are left untouched. ``repo`` is an editable
     # frontmatter meta key (the per-task target-repo override).
     repo: str | None = None
+    loop: bool | None = None
+    loop_max_iterations: int | None = None
 
 
 def _normalize_repo(value: object) -> str | None:
@@ -1338,11 +1342,19 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             return JSONResponse({"error": str(exc)}, status_code=400)
         except FileExistsError as exc:
             return JSONResponse({"error": f"task already exists: {exc}"}, status_code=409)
-        # Optional per-task repo override is written as an editable meta key.
+        # Apply optional frontmatter fields from the create pane (repo
+        # override, loop mode) to the freshly created file.
+        meta_changes: dict[str, object | None] = {}
         if repo_override is not None:
+            meta_changes["repo"] = repo_override
+        if body.loop is not None:
+            meta_changes["loop"] = body.loop
+        if body.loop_max_iterations is not None:
+            meta_changes["loop_max_iterations"] = body.loop_max_iterations
+        if meta_changes:
             with contextlib.suppress(FileNotFoundError, ValueError):
                 set_task_meta(
-                    tasks_root, created["task"], {"repo": repo_override}, target_rel
+                    tasks_root, created["task"], meta_changes, target_rel
                 )
         commit_tasks(tasks_root, f"nightshift: create task {created['task']}")
         await _emit("queue_changed", queue=target, task=created.get("task"))
@@ -2027,6 +2039,10 @@ def _build_work_order(
         # worker never reads the centralized config, so the manager hands it the
         # operator-configured prefix here (co-located workers ignore it).
         "wip_ref_prefix": cfg.wip_ref_prefix,
+        # Ralph-loop mode: when true, the worker uses the iterative ralph-loop
+        # prompt instead of the standard single-pass nightshift-local prompt.
+        "loop": bool(meta.get("loop", False)),
+        "loop_max_iterations": int(meta.get("loop_max_iterations", 0)),
     }
     return {
         "lease_id": lease_id,

@@ -3117,6 +3117,7 @@ function settingsControls(brief, draft, rerender, locked) {
     ["Evergreen", () => !!draft.evergreen, (on) => { draft.evergreen = on; }],
     ["Auto-merge", () => !!draft.automerge, (on) => { draft.automerge = on; }],
     ["Draft", () => !!draft.draft, (on) => { draft.draft = on; }],
+    ["Loop", () => !!draft.loop, (on) => { draft.loop = on; }],
   ];
   for (const [label, getOn, setOn] of switches) {
     const seg_btn = document.createElement("button");
@@ -3141,6 +3142,10 @@ function settingsControls(brief, draft, rerender, locked) {
   );
   wrap.append(row);
 
+  if (draft.loop) {
+    wrap.append(loopSettings(draft, rerender, locked));
+  }
+
   if (locked) {
     const note = document.createElement("div");
     note.className = "ctl-note";
@@ -3148,6 +3153,64 @@ function settingsControls(brief, draft, rerender, locked) {
     wrap.append(note);
   }
   return wrap;
+}
+
+function loopSettings(draft, rerender, locked) {
+  const row = document.createElement("div");
+  row.className = "settings-row loop-settings";
+
+  const label = document.createElement("span");
+  label.className = "model-label";
+  label.textContent = "Turns limit";
+
+  const hasLimit = draft.loop_max_iterations > 0;
+
+  const seg = document.createElement("div");
+  seg.className = "segmented";
+  seg.setAttribute("role", "group");
+  seg.setAttribute("aria-label", "Turns limit");
+  for (const [text, val] of [["Off", false], ["On", true]]) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "seg-opt";
+    b.textContent = text;
+    const on = val === hasLimit;
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+    b.disabled = locked;
+    b.addEventListener("click", () => {
+      if (val) {
+        if (draft.loop_max_iterations <= 0) draft.loop_max_iterations = 10;
+      } else {
+        draft.loop_max_iterations = 0;
+      }
+      if (typeof rerender === "function") rerender();
+    });
+    seg.append(b);
+  }
+
+  row.append(label, seg);
+
+  if (hasLimit) {
+    const numLabel = document.createElement("span");
+    numLabel.className = "model-label";
+    numLabel.textContent = "Max iterations";
+    const input = document.createElement("input");
+    input.type = "number";
+    input.className = "ctl-select loop-max-input";
+    input.min = "1";
+    input.max = "1000";
+    input.value = String(draft.loop_max_iterations);
+    input.disabled = locked;
+    input.addEventListener("change", () => {
+      const v = parseInt(input.value, 10);
+      draft.loop_max_iterations = (isNaN(v) || v < 1) ? 1 : v;
+      input.value = String(draft.loop_max_iterations);
+    });
+    row.append(numLabel, input);
+  }
+
+  return row;
 }
 
 // Priority picker: a P0–P5 segmented control (P0 = highest, P5 = lowest) reusing
@@ -3258,6 +3321,10 @@ function draftFromBrief(brief) {
     // The per-task target-repo override, file-only (empty = inherit the queue
     // default). Read from the raw frontmatter so an inheriting task stays empty.
     repo: raw.repo || "",
+    // Ralph-loop mode: when on, the worker runs iterative self-referential
+    // development instead of a single pass.
+    loop: !!(raw.loop),
+    loop_max_iterations: typeof raw.loop_max_iterations === "number" ? raw.loop_max_iterations : 0,
   };
 }
 
@@ -3605,6 +3672,8 @@ async function saveDetail(brief, draft, errEl) {
     draft: !!draft.draft,
     model: draft.model || "default",
     priority: typeof draft.priority === "number" ? draft.priority : 5,
+    loop: !!draft.loop,
+    loop_max_iterations: draft.loop ? (draft.loop_max_iterations || 0) : 0,
   };
   // The per-task repo override is only sent when the user actually changed it
   // (PATCH semantics — unsent fields are left untouched). A new value pins the
@@ -3645,6 +3714,8 @@ async function createDetail(draft, errEl) {
     draft: !!draft.draft,
     model: draft.model || "default",
     priority: typeof draft.priority === "number" ? draft.priority : 5,
+    loop: !!draft.loop,
+    loop_max_iterations: draft.loop ? (draft.loop_max_iterations || 0) : 0,
   };
   // Per-task repo override: included only when set (empty ⇒ inherit the queue
   // default). Omitted entirely otherwise, matching the create contract.

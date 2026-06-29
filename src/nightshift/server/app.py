@@ -125,6 +125,8 @@ class TaskCreate(BaseModel):
     # Optional per-task target-repo override (a bare workspace-child name);
     # defaults to the queue's ``repo`` when "", "default", or unset.
     repo: str | None = None
+    loop: bool | None = None
+    loop_max_iterations: int | None = None
 
 
 class TaskUpdate(BaseModel):
@@ -143,6 +145,8 @@ class TaskUpdate(BaseModel):
     body: str | None = None
     # Per-task target-repo override; "" / "default" clears it (inherit queue).
     repo: str | None = None
+    loop: bool | None = None
+    loop_max_iterations: int | None = None
 
 
 class QueueOrder(BaseModel):
@@ -661,7 +665,7 @@ def create_app(workspace: Path) -> FastAPI:
             exclude_unset=True,
             include={
                 "disabled", "evergreen", "automerge", "draft", "model",
-                "priority", "repo",
+                "priority", "repo", "loop", "loop_max_iterations",
             },
         )
         changes: dict[str, object | None] = {}

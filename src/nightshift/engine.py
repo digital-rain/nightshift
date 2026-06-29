@@ -963,6 +963,7 @@ def read_task(tasks_root: Path, task: str, tasks_rel: str = "main") -> dict:
 # (``repo: None``) falls the task back to the queue's default ``repo``.
 _EDITABLE_META_KEYS = {
     "disabled", "evergreen", "automerge", "draft", "model", "priority", "repo",
+    "loop", "loop_max_iterations",
 }
 
 # The detail-view editor may also rewrite the spec prose (``body``) and the
@@ -1113,7 +1114,14 @@ def list_queue(tasks_root: Path, tasks_rel: str = "main") -> list[dict]:
 # --------------------------------------------------------------------------- #
 
 
-def build_prompt(task: str, *, task_file: str, validate_cmd: str) -> str:
+def build_prompt(
+    task: str,
+    *,
+    task_file: str,
+    validate_cmd: str,
+    loop: bool = False,
+    loop_max_iterations: int = 0,
+) -> str:
     """Build the worker prompt matching CI injection format.
 
     ``task_file`` is the path to the **already-materialised** run-scratch brief
@@ -1123,7 +1131,22 @@ def build_prompt(task: str, *, task_file: str, validate_cmd: str) -> str:
     ``$VALIDATE`` so the worker runs the queue's own gate — matching the command
     the engine later enforces. The caller (engine or worker) resolves both from
     the queue config before calling, so this helper needs neither root.
+
+    When ``loop`` is True, use the ralph-loop prompt instead of the standard
+    nightshift-local prompt. ``loop_max_iterations`` (0 = unlimited) is
+    injected as ``$MAX_ITERATIONS``.
     """
+    if loop:
+        prompt_file = asset("prompts", "nightshift-ralph-loop.md")
+        prompt_body = prompt_file.read_text()
+        return (
+            f"Your task file is: {task_file}\n"
+            f"The TASK variable is: {task}\n"
+            f"The TASK_FILE variable is: {task_file}\n"
+            f"The VALIDATE command is: {validate_cmd}\n"
+            f"The MAX_ITERATIONS variable is: {loop_max_iterations}\n\n"
+            f"{prompt_body}"
+        )
     prompt_file = asset("prompts", "nightshift-local.md")
     prompt_body = prompt_file.read_text()
     return (
@@ -2982,6 +3005,8 @@ def run_task(
             task,
             task_file=str(scratch),
             validate_cmd=str(config.get("validate") or DEFAULT_VALIDATE_CMD),
+            loop=bool(meta.get("loop", False)),
+            loop_max_iterations=int(meta.get("loop_max_iterations", 0)),
         )
         env = worker_env()
         validate_cmd = resolve_validate_cmd(config)
