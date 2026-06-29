@@ -64,19 +64,20 @@ class WorkerConfig:
         category="Models", label="Available",
         desc="Qualified model ids this worker advertises, as provider/model "
              "(e.g. claude-code/claude-opus-4-8, ollama-cloud/gpt-oss:120b).",
-        apply="restart", env="NIGHTSHIFT_WORKER_MODELS", type="string_list"))
+        apply="restart", env="NIGHTSHIFT_WORKER_MODELS", type="string_list",
+        validate="model_id_list"))
     model_aliases: dict[str, str] = field(default_factory=dict, metadata=meta(
         category="Models", label="Model aliases",
         desc="Remap {requested: actual} (both provider/model) applied at execution.",
-        apply="restart", type="str_map"))
+        apply="restart", type="str_map", validate="model_id_map"))
     auto_model: str = field(default=DEFAULT_AUTO_MODEL, metadata=meta(
         category="Models", label="Auto model",
         desc="Qualified model 'auto' resolves to (provider/model).",
-        apply="restart"))
+        apply="restart", validate="model_id"))
     max_model: str = field(default=DEFAULT_MAX_MODEL, metadata=meta(
         category="Models", label="Max model",
         desc="Qualified model 'max' resolves to (provider/model).",
-        apply="restart"))
+        apply="restart", validate="model_id"))
     model_timeout_seconds: float = field(default=0.0, metadata=meta(
         category="Models", label="Model timeout seconds",
         desc="Global wall-clock bound for any backend run. 0 = no timeout.",

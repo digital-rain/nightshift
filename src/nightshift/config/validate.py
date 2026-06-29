@@ -28,6 +28,7 @@ from nightshift.config.registry import (
     specs_for_surface,
 )
 from nightshift.engine import normalize_wip_prefix
+from nightshift.model_id import AGNOSTIC, is_qualified
 
 
 def _validate_field(spec: FieldSpec, value: Any) -> str | None:
@@ -91,6 +92,59 @@ def _validate_field(spec: FieldSpec, value: Any) -> str | None:
     return None
 
 
+def _validate_model_id(value: str, allow_keywords: bool = False) -> str | None:
+    """Check a single model id is provider-qualified (provider/model).
+
+    If *allow_keywords* is True, agnostic keywords (auto/max/default/"") pass.
+    """
+    stripped = value.strip()
+    if not stripped:
+        return None if allow_keywords else "model id must not be empty"
+    if stripped.lower() in AGNOSTIC:
+        if allow_keywords:
+            return None
+        return f"'{stripped}' is a keyword, not a qualified model id — use provider/model"
+    if not is_qualified(stripped):
+        return f"'{stripped}' requires a provider/ prefix (e.g. claude-code/{stripped})"
+    return None
+
+
+def _validate_semantic(spec: FieldSpec, value: Any) -> str | None:
+    """Semantic validation beyond type checks, driven by spec.validate."""
+    if not spec.validate:
+        return None
+
+    match spec.validate:
+        case "model_id":
+            if isinstance(value, str):
+                return _validate_model_id(value)
+            if value is None:
+                return None
+        case "model_id_or_keyword":
+            if isinstance(value, str):
+                return _validate_model_id(value, allow_keywords=True)
+            if value is None:
+                return None
+        case "model_id_list":
+            if isinstance(value, list):
+                for i, item in enumerate(value):
+                    if not isinstance(item, str):
+                        continue
+                    err = _validate_model_id(item)
+                    if err:
+                        return f"item {i}: {err}"
+        case "model_id_map":
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    err = _validate_model_id(k)
+                    if err:
+                        return f"key '{k}': {err}"
+                    err = _validate_model_id(v)
+                    if err:
+                        return f"value for '{k}': {err}"
+    return None
+
+
 def _normalize_field(spec: FieldSpec, value: Any) -> Any:
     """Apply field-specific normalization after validation passes."""
     if spec.key == "wip_ref_prefix" and isinstance(value, str):
@@ -126,6 +180,10 @@ def validate_delta(
                 errors[full] = "unknown field"
                 continue
             err = _validate_field(spec, value)
+            if err:
+                errors[full] = err
+                continue
+            err = _validate_semantic(spec, value)
             if err:
                 errors[full] = err
             else:
@@ -322,6 +380,8 @@ def build_get_response(
             }
             if spec.options:
                 field_payload["options"] = spec.options
+            if spec.validate:
+                field_payload["validate"] = spec.validate
 
             if cat_name not in seen_cats:
                 cat_fields: list[dict[str, Any]] = []

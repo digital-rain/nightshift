@@ -924,6 +924,7 @@ function buildWorkerControl(field, surface, fullKey) {
       const items = Array.isArray(value) ? [...value] : [];
       const wrap = document.createElement("div");
       wrap.className = "w-sf-chips";
+      wrap.dataset.wsfKey = fullKey;
       const rerender = () => {
         wrap.innerHTML = "";
         items.forEach((item, i) => {
@@ -936,6 +937,9 @@ function buildWorkerControl(field, surface, fullKey) {
             items[i] = field.type === "int_list" ? parseInt(input.value, 10) : input.value;
             wMarkDirty(field, fullKey, [...items]);
           });
+          if (field.validate) {
+            input.addEventListener("blur", () => wOnFieldBlur(field, fullKey));
+          }
           const del = document.createElement("button");
           del.type = "button";
           del.className = "w-sf-chip-del";
@@ -966,6 +970,7 @@ function buildWorkerControl(field, surface, fullKey) {
       const entries = Object.entries(value || {}).map(([k, v]) => ({ k, v }));
       const wrap = document.createElement("div");
       wrap.className = "w-sf-map";
+      wrap.dataset.wsfKey = fullKey;
       const collectMap = () => {
         const obj = {};
         for (const e of entries) { if (e.k) obj[e.k] = e.v; }
@@ -979,9 +984,15 @@ function buildWorkerControl(field, surface, fullKey) {
           const ki = document.createElement("input");
           ki.placeholder = "key"; ki.value = entry.k;
           ki.addEventListener("input", () => { entries[i].k = ki.value; wMarkDirty(field, fullKey, collectMap()); });
+          if (field.validate) {
+            ki.addEventListener("blur", () => wOnFieldBlur(field, fullKey));
+          }
           const vi = document.createElement("input");
           vi.placeholder = "value"; vi.value = entry.v;
           vi.addEventListener("input", () => { entries[i].v = vi.value; wMarkDirty(field, fullKey, collectMap()); });
+          if (field.validate) {
+            vi.addEventListener("blur", () => wOnFieldBlur(field, fullKey));
+          }
           const del = document.createElement("button");
           del.type = "button"; del.className = "w-sf-chip-del"; del.textContent = "\u00d7";
           del.addEventListener("click", () => { entries.splice(i, 1); wMarkDirty(field, fullKey, collectMap()); rerender(); });
@@ -1006,7 +1017,11 @@ function buildWorkerControl(field, surface, fullKey) {
       const input = document.createElement("input");
       input.type = "text";
       input.value = value != null ? value : "";
+      input.dataset.wsfKey = fullKey;
       input.addEventListener("input", () => wMarkDirty(field, fullKey, input.value || null));
+      if (field.validate) {
+        input.addEventListener("blur", () => wOnFieldBlur(field, fullKey));
+      }
       return input;
     }
   }
@@ -1089,6 +1104,101 @@ function wMarkDirty(field, fullKey, value) {
   }
   delete wSettings.errors[fullKey];
   updateWorkerSaveBar();
+  const row = document.querySelector(`[data-wsf-key="${fullKey}"]`)?.closest(".w-sf-row");
+  if (row) {
+    row.classList.remove("w-sf-error");
+    const errEl = row.querySelector(".w-sf-error-msg");
+    if (errEl) errEl.remove();
+  }
+}
+
+const W_MODEL_ID_KEYWORDS = new Set(["auto", "max", "default", ""]);
+
+function wValidateModelId(value, allowKeywords) {
+  if (value == null) return null;
+  const v = String(value).trim();
+  if (!v) return allowKeywords ? null : "model id must not be empty";
+  if (W_MODEL_ID_KEYWORDS.has(v.toLowerCase())) {
+    return allowKeywords ? null : `'${v}' is a keyword, not a qualified model id \u2014 use provider/model`;
+  }
+  if (!v.includes("/")) return `'${v}' requires a provider/ prefix (e.g. claude-code/${v})`;
+  return null;
+}
+
+function wRunFieldValidation(field, fullKey, value) {
+  const hint = field.validate || null;
+  if (!hint) return null;
+  switch (hint) {
+    case "model_id":
+      return (value != null) ? wValidateModelId(value, false) : null;
+    case "model_id_or_keyword":
+      return (value != null) ? wValidateModelId(value, true) : null;
+    case "model_id_list":
+      if (!Array.isArray(value)) return null;
+      for (let i = 0; i < value.length; i++) {
+        const err = wValidateModelId(value[i], false);
+        if (err) return `item ${i + 1}: ${err}`;
+      }
+      return null;
+    case "model_id_map":
+      if (!value || typeof value !== "object") return null;
+      for (const [k, v] of Object.entries(value)) {
+        let err = wValidateModelId(k, false);
+        if (err) return `key '${k}': ${err}`;
+        err = wValidateModelId(v, false);
+        if (err) return `value for '${k}': ${err}`;
+      }
+      return null;
+  }
+  return null;
+}
+
+function wShowFieldError(fullKey, msg) {
+  wSettings.errors[fullKey] = msg;
+  const row = document.querySelector(`[data-wsf-key="${fullKey}"]`)?.closest(".w-sf-row");
+  if (row) {
+    row.classList.add("w-sf-error");
+    let errEl = row.querySelector(".w-sf-error-msg");
+    if (!errEl) {
+      errEl = document.createElement("div");
+      errEl.className = "w-sf-error-msg";
+      row.append(errEl);
+    }
+    errEl.textContent = msg;
+  }
+}
+
+function wClearFieldError(fullKey) {
+  delete wSettings.errors[fullKey];
+  const row = document.querySelector(`[data-wsf-key="${fullKey}"]`)?.closest(".w-sf-row");
+  if (row) {
+    row.classList.remove("w-sf-error");
+    const errEl = row.querySelector(".w-sf-error-msg");
+    if (errEl) errEl.remove();
+  }
+}
+
+function wOnFieldBlur(field, fullKey) {
+  const value = fullKey in wSettings.dirty ? wSettings.dirty[fullKey] : field.stored;
+  const err = wRunFieldValidation(field, fullKey, value);
+  if (err) {
+    wShowFieldError(fullKey, err);
+  } else {
+    wClearFieldError(fullKey);
+  }
+}
+
+function wFindFieldByFullKey(fullKey) {
+  const [surface, ...rest] = fullKey.split(".");
+  const key = rest.join(".");
+  for (const tier of wSettings.tiers) {
+    if (tier.surface !== surface) continue;
+    for (const cat of tier.categories) {
+      const field = cat.fields.find(f => f.key === key);
+      if (field) return field;
+    }
+  }
+  return null;
 }
 
 function hasDirtyRestartField() {
@@ -1131,6 +1241,21 @@ async function saveWorkerSettings() {
     if (!delta[surface]) delta[surface] = {};
     delta[surface][key] = value;
   }
+
+  // Client-side validation before save.
+  const clientErrors = {};
+  for (const [fullKey, value] of Object.entries(wSettings.dirty)) {
+    const field = wFindFieldByFullKey(fullKey);
+    if (!field) continue;
+    const err = wRunFieldValidation(field, fullKey, value);
+    if (err) clientErrors[fullKey] = err;
+  }
+  if (Object.keys(clientErrors).length) {
+    wSettings.errors = clientErrors;
+    renderWorkerSettings();
+    return;
+  }
+
   const resp = await fetch("/api/settings", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },

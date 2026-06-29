@@ -4604,6 +4604,99 @@ function markDirty(surface, field, fullKey, value) {
   }
 }
 
+const MODEL_ID_KEYWORDS = new Set(["auto", "max", "default", ""]);
+
+function validateModelId(value, allowKeywords) {
+  if (value == null) return null;
+  const v = String(value).trim();
+  if (!v) return allowKeywords ? null : "model id must not be empty";
+  if (MODEL_ID_KEYWORDS.has(v.toLowerCase())) {
+    return allowKeywords ? null : `'${v}' is a keyword, not a qualified model id \u2014 use provider/model`;
+  }
+  if (!v.includes("/")) return `'${v}' requires a provider/ prefix (e.g. claude-code/${v})`;
+  return null;
+}
+
+function fieldValidateHint(field) {
+  return field.validate || null;
+}
+
+function runFieldValidation(field, fullKey, value) {
+  const hint = fieldValidateHint(field);
+  if (!hint) return null;
+  switch (hint) {
+    case "model_id":
+      return (value != null) ? validateModelId(value, false) : null;
+    case "model_id_or_keyword":
+      return (value != null) ? validateModelId(value, true) : null;
+    case "model_id_list":
+      if (!Array.isArray(value)) return null;
+      for (let i = 0; i < value.length; i++) {
+        const err = validateModelId(value[i], false);
+        if (err) return `item ${i + 1}: ${err}`;
+      }
+      return null;
+    case "model_id_map":
+      if (!value || typeof value !== "object") return null;
+      for (const [k, v] of Object.entries(value)) {
+        let err = validateModelId(k, false);
+        if (err) return `key '${k}': ${err}`;
+        err = validateModelId(v, false);
+        if (err) return `value for '${k}': ${err}`;
+      }
+      return null;
+  }
+  return null;
+}
+
+function showFieldError(fullKey, msg) {
+  settingsState.errors[fullKey] = msg;
+  const row = document.querySelector(`[data-sf-key="${fullKey}"]`)?.closest(".sf-row");
+  if (row) {
+    row.classList.add("sf-error");
+    let errEl = row.querySelector(".sf-error-msg");
+    if (!errEl) {
+      errEl = document.createElement("div");
+      errEl.className = "sf-error-msg";
+      row.append(errEl);
+    }
+    errEl.textContent = msg;
+  }
+}
+
+function clearFieldError(fullKey) {
+  delete settingsState.errors[fullKey];
+  const row = document.querySelector(`[data-sf-key="${fullKey}"]`)?.closest(".sf-row");
+  if (row) {
+    row.classList.remove("sf-error");
+    const errEl = row.querySelector(".sf-error-msg");
+    if (errEl) errEl.remove();
+  }
+}
+
+function onFieldBlur(field, fullKey) {
+  const value = fullKey in settingsState.dirty ? settingsState.dirty[fullKey] : field.stored;
+  const err = runFieldValidation(field, fullKey, value);
+  if (err) {
+    showFieldError(fullKey, err);
+  } else {
+    clearFieldError(fullKey);
+  }
+}
+
+function findFieldByFullKey(fullKey) {
+  const [surface, ...rest] = fullKey.split(".");
+  const key = rest.join(".");
+  for (const tier of settingsState.tiers) {
+    if (tier.surface !== surface) continue;
+    for (const cat of tier.categories) {
+      const field = cat.fields.find(f => f.key === key);
+      if (field) return field;
+    }
+  }
+  return null;
+}
+
 function buildToggle(field, surface, fullKey, value) {
   const wrap = document.createElement("div");
   wrap.className = "sf-toggle";
@@ -4691,6 +4784,9 @@ function buildText(field, surface, fullKey, value) {
     const v = input.value;
     markDirty(surface, field, fullKey, v || null);
   });
+  if (fieldValidateHint(field)) {
+    input.addEventListener("blur", () => onFieldBlur(field, fullKey));
+  }
   return input;
 }
 
@@ -4749,6 +4845,9 @@ function buildChipEditor(field, surface, fullKey, value) {
       if (field.type === "regex_list") {
         try { new RegExp(item); } catch { input.classList.add("invalid"); }
       }
+      if (fieldValidateHint(field)) {
+        input.addEventListener("blur", () => onFieldBlur(field, fullKey));
+      }
       const del = document.createElement("button");
       del.type = "button";
       del.className = "sf-chip-del";
@@ -4801,6 +4900,9 @@ function buildMapEditor(field, surface, fullKey, value) {
         entries[i].k = ki.value;
         markDirty(surface, field, fullKey, collectMap());
       });
+      if (fieldValidateHint(field)) {
+        ki.addEventListener("blur", () => onFieldBlur(field, fullKey));
+      }
       const sep = document.createElement("span");
       sep.className = "sf-map-sep";
       sep.textContent = "\u2192";
@@ -4812,6 +4914,9 @@ function buildMapEditor(field, surface, fullKey, value) {
         entries[i].v = vi.value;
         markDirty(surface, field, fullKey, collectMap());
       });
+      if (fieldValidateHint(field)) {
+        vi.addEventListener("blur", () => onFieldBlur(field, fullKey));
+      }
       const del = document.createElement("button");
       del.type = "button";
       del.className = "sf-chip-del";
@@ -4864,6 +4969,20 @@ async function saveSettings() {
     const key = rest.join(".");
     if (!delta[surface]) delta[surface] = {};
     delta[surface][key] = value;
+  }
+
+  // Client-side validation before save.
+  const clientErrors = {};
+  for (const [fullKey, value] of Object.entries(settingsState.dirty)) {
+    const field = findFieldByFullKey(fullKey);
+    if (!field) continue;
+    const err = runFieldValidation(field, fullKey, value);
+    if (err) clientErrors[fullKey] = err;
+  }
+  if (Object.keys(clientErrors).length) {
+    settingsState.errors = clientErrors;
+    renderSettingsFields();
+    return;
   }
 
   const { ok, data } = await sendJSON("/api/settings", "PUT", delta);

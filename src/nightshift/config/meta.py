@@ -23,6 +23,7 @@ class FieldMeta(TypedDict, total=False):
     editable: bool
     flatten: bool
     json_key: str
+    validate: str
 
 
 _REQUIRED = ("category", "label", "desc", "apply")

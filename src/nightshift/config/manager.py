@@ -69,11 +69,12 @@ class OperatorConfig:
         metadata=meta(
             category="Scheduling", label="Scheduled models allow",
             desc="Filter: only auto-schedule tasks pinned to these provider/model ids.",
-            apply="next-task", type="string_list"))
+            apply="next-task", type="string_list", validate="model_id_list"))
     default_model: str = field(default="auto", metadata=meta(
         category="Scheduling", label="Default model",
         desc="Model a brief inherits when it sets no model:.",
-        apply="next-task", env="NIGHTSHIFT_DEFAULT_MODEL"))
+        apply="next-task", env="NIGHTSHIFT_DEFAULT_MODEL",
+        validate="model_id_or_keyword"))
 
     landing_mode: str = field(default="none", metadata=meta(
         category="Landing & Git", label="Landing mode",
@@ -166,7 +167,8 @@ class OperatorConfig:
         desc="Resolve retries before parking.", apply="next-task"))
     resolve_model: str | None = field(default=None, metadata=meta(
         category="Conflict resolution", label="Resolve model",
-        desc="Optional model override for resolve runs.", apply="next-task"))
+        desc="Optional model override for resolve runs.", apply="next-task",
+        validate="model_id"))
     resolve_backend: str | None = field(default=None, metadata=meta(
         category="Conflict resolution", label="Resolve backend",
         desc="Optional backend override for resolve runs.", apply="next-task"))
