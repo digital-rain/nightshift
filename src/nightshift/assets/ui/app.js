@@ -1268,6 +1268,7 @@ function queueRowAside(item, isNow) {
   const rec = found ? found.rec : null;
   let status;
   if (isNow) status = state.player.state === "paused" ? "paused" : "running";
+  else if (item.completed) status = "completed";
   else if (item.quarantined) status = "quarantined";
   else if (rec) status = rec.status;
   else if (state.blockedTasks && item.task in state.blockedTasks) {
@@ -1304,7 +1305,7 @@ function queueItemRow(item) {
   if (state.selectedTasks.has(item.task)) li.classList.add("selected");
   // Dim rows the active play-priority filter excludes: they stay visible (and
   // editable) but won't run until ALL or their level is reselected.
-  if (!item.disabled && !isNow && !playPriorityAllows(item.priority)) {
+  if (!item.disabled && !item.completed && !isNow && !playPriorityAllows(item.priority)) {
     li.classList.add("out-of-scope");
   }
 
@@ -1363,6 +1364,12 @@ function queueItemRow(item) {
     const badge = document.createElement("span");
     badge.className = "badge quarantined";
     badge.textContent = "quarantined";
+    li.append(badge);
+  }
+  if (item.completed) {
+    const badge = document.createElement("span");
+    badge.className = "badge completed";
+    badge.textContent = "completed";
     li.append(badge);
   }
   // Per-row "…" menu: the row's actions (add to playlist, get info, play
@@ -3115,35 +3122,26 @@ function settingsControls(brief, draft, rerender, locked) {
   const row = document.createElement("div");
   row.className = "settings-row";
 
-  const seg = document.createElement("div");
-  seg.className = "segmented";
-  seg.setAttribute("role", "group");
-  seg.setAttribute("aria-label", "Task switches");
-  const switches = [
-    ["Enabled", () => !draft.disabled, (on) => { draft.disabled = !on; }],
-    ["Quarantine", () => !!draft.quarantined, (on) => { draft.quarantined = on; }],
+  // STATUS — mutually exclusive: Ready, Disabled, Quarantine, Completed
+  const statusSeg = labeledSegment("Status", "Task status", locked, rerender,
+    statusOptions(draft));
+
+  // ATTRIBUTES — independent toggles: Evergreen, Loop
+  const attrSeg = labeledSegment("Attributes", "Task attributes", locked, rerender, [
     ["Evergreen", () => !!draft.evergreen, (on) => { draft.evergreen = on; }],
-    ["Auto-merge", () => !!draft.automerge, (on) => { draft.automerge = on; }],
-    ["Draft", () => !!draft.draft, (on) => { draft.draft = on; }],
     ["Loop", () => !!draft.loop, (on) => { draft.loop = on; }],
-  ];
-  for (const [label, getOn, setOn] of switches) {
-    const seg_btn = document.createElement("button");
-    seg_btn.type = "button";
-    seg_btn.className = "seg-opt";
-    seg_btn.textContent = label;
-    const on = getOn();
-    seg_btn.classList.toggle("on", on);
-    seg_btn.setAttribute("aria-pressed", on ? "true" : "false");
-    seg_btn.disabled = locked;
-    seg_btn.addEventListener("click", () => {
-      setOn(!getOn());
-      if (typeof rerender === "function") rerender();
-    });
-    seg.append(seg_btn);
-  }
+  ]);
+
+  // PR — independent toggles: Draft, Auto-merge
+  const prSeg = labeledSegment("PR", "Pull request settings", locked, rerender, [
+    ["Draft", () => !!draft.draft, (on) => { draft.draft = on; }],
+    ["Auto-merge", () => !!draft.automerge, (on) => { draft.automerge = on; }],
+  ]);
+
   row.append(
-    seg,
+    statusSeg,
+    attrSeg,
+    prSeg,
     modelSelect(brief, draft, locked),
     prioritySegment(draft, rerender, locked),
     repoOverride(draft, locked),
@@ -3161,6 +3159,50 @@ function settingsControls(brief, draft, rerender, locked) {
     wrap.append(note);
   }
   return wrap;
+}
+
+function statusOptions(draft) {
+  const statuses = [
+    ["Ready",      () => !draft.disabled && !draft.quarantined && !draft.completed],
+    ["Disabled",   () => !!draft.disabled],
+    ["Quarantine", () => !!draft.quarantined],
+    ["Completed",  () => !!draft.completed],
+  ];
+  return statuses.map(([label, isOn]) => [label, isOn, (on) => {
+    if (!on) return;
+    draft.disabled = label === "Disabled";
+    draft.quarantined = label === "Quarantine";
+    draft.completed = label === "Completed";
+  }]);
+}
+
+function labeledSegment(label, ariaLabel, locked, rerender, switches) {
+  const group = document.createElement("div");
+  group.className = "seg-group";
+  const lbl = document.createElement("span");
+  lbl.className = "seg-group-label";
+  lbl.textContent = label;
+  const seg = document.createElement("div");
+  seg.className = "segmented";
+  seg.setAttribute("role", "group");
+  seg.setAttribute("aria-label", ariaLabel);
+  for (const [text, getOn, setOn] of switches) {
+    const seg_btn = document.createElement("button");
+    seg_btn.type = "button";
+    seg_btn.className = "seg-opt";
+    seg_btn.textContent = text;
+    const on = getOn();
+    seg_btn.classList.toggle("on", on);
+    seg_btn.setAttribute("aria-pressed", on ? "true" : "false");
+    seg_btn.disabled = locked;
+    seg_btn.addEventListener("click", () => {
+      setOn(!getOn());
+      if (typeof rerender === "function") rerender();
+    });
+    seg.append(seg_btn);
+  }
+  group.append(lbl, seg);
+  return group;
 }
 
 function loopSettings(draft, rerender, locked) {
@@ -3320,6 +3362,7 @@ function draftFromBrief(brief) {
     body: brief.body || "",
     disabled: !!brief.disabled,
     quarantined: !!brief.quarantined,
+    completed: !!brief.completed,
     evergreen: !!brief.evergreen,
     automerge: !!(brief.frontmatter && brief.frontmatter.automerge),
     draft: !!(brief.frontmatter && brief.frontmatter.draft),
@@ -3541,6 +3584,7 @@ function taskDetailContent(brief, draft, opts = {}) {
   let blockedReason;
   if (creating) status = "pending";
   else if (isNow) status = state.player.state === "paused" ? "paused" : "running";
+  else if (brief.completed) status = "completed";
   else if (brief.quarantined) status = "quarantined";
   else if (rec) status = rec.status;
   else if (state.blockedTasks && task in state.blockedTasks) {
@@ -3678,6 +3722,7 @@ async function saveDetail(brief, draft, errEl) {
     body: draft.body,
     disabled: !!draft.disabled,
     quarantined: !!draft.quarantined,
+    completed: !!draft.completed,
     evergreen: !!draft.evergreen,
     automerge: !!draft.automerge,
     draft: !!draft.draft,
@@ -3721,6 +3766,7 @@ async function createDetail(draft, errEl) {
     text: draft.body,
     disabled: !!draft.disabled,
     quarantined: !!draft.quarantined,
+    completed: !!draft.completed,
     evergreen: !!draft.evergreen,
     automerge: !!draft.automerge,
     draft: !!draft.draft,

@@ -260,6 +260,7 @@ class TaskUpdate(BaseModel):
 
     disabled: bool | None = None
     quarantined: bool | None = None
+    completed: bool | None = None
     evergreen: bool | None = None
     automerge: bool | None = None
     draft: bool | None = None
