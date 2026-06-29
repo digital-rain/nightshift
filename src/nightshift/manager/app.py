@@ -1428,6 +1428,25 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         commit_tasks(tasks_root, f"nightshift: edit task {task}")
+        # When the operator sets the task back to "ready" (not disabled,
+        # not quarantined, not completed), clear the manager's state
+        # overlay so it is no longer excluded from dispatch.
+        now_ready = (
+            not updated.get("disabled")
+            and not updated.get("quarantined")
+            and not updated.get("completed")
+        )
+        if now_ready:
+            store = _store()
+            prior = await store.get_task_state(target, task)
+            if prior and prior.get("state") in ("quarantined", "blocked"):
+                await store.clear_task_state(target, task)
+                await _emit(
+                    "task_released",
+                    queue=target,
+                    task=task,
+                    payload={"prior_state": prior.get("state")},
+                )
         await _emit("queue_changed", queue=target, task=task)
         return JSONResponse(updated)
 

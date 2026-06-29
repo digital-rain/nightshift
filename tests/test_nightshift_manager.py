@@ -311,6 +311,39 @@ def test_repeated_no_change_quarantines_and_halts_dispatch(tmp_path: Path) -> No
         assert "quarantined" in blocked["10.loop"]["blocked_reason"]
 
 
+def test_patch_quarantined_false_releases_task_for_dispatch(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {"10.loop": "Move a setting that's already moved."})
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+
+        # Drive two no-change runs to trigger quarantine (threshold=2).
+        _poll_and_submit_no_change(client, "10.loop")
+        second = _poll_and_submit_no_change(client, "10.loop")
+        assert second["quarantined"] is True
+
+        # Task is blocked — poll returns nothing.
+        assert client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"] is None
+
+        # Operator sets the task back to "ready" via the detail pane.
+        r = client.patch(
+            "/api/tasks/10.loop",
+            json={"quarantined": False, "disabled": False, "completed": False},
+        )
+        assert r.status_code == 200
+        assert r.json()["quarantined"] is False
+
+        # The store overlay is cleared — task is dispatchable again.
+        blocked = {b["task"]: b for b in client.get("/api/blocked").json()}
+        assert "10.loop" not in blocked
+        work = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        assert work is not None
+        assert work["task"] == "10.loop"
+
+
 def test_quarantine_threshold_zero_disables_the_guard(tmp_path: Path) -> None:
     root = _seed(tmp_path, {"10.loop": "Idempotent task."})
     os.environ["NIGHTSHIFT_QUARANTINE_THRESHOLD"] = "0"
