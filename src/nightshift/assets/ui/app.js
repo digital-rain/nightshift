@@ -2097,6 +2097,10 @@ function renderStats() {
     );
   }
 
+  if (s.byModel && s.total) {
+    chartsRow.append(ringChart("Average tokens", avgTokensDonut(s)));
+  }
+
   body.append(chartsRow);
 }
 
@@ -2168,6 +2172,17 @@ function modelCostDonut(byModel) {
     cls: CHART_PALETTE[i % CHART_PALETTE.length],
   }));
   return proportionDonut(segments, total, `$${total.toFixed(2)}`);
+}
+
+function avgTokensDonut(s) {
+  const totalTok = s.totalInputTokens + s.totalOutputTokens;
+  const avg = Math.round(totalTok / s.total);
+  const avgIn = Math.round(s.totalInputTokens / s.total);
+  const avgOut = Math.round(s.totalOutputTokens / s.total);
+  return proportionDonut([
+    { label: "Input", count: avgIn, display: formatCount(avgIn), cls: CHART_PALETTE[0] },
+    { label: "Output", count: avgOut, display: formatCount(avgOut), cls: CHART_PALETTE[1] },
+  ], avgIn + avgOut, formatCount(avg));
 }
 
 // A donut circle chart split into proportional segments.
