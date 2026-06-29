@@ -1699,6 +1699,17 @@ body[data-view="detail"] #screen-detail { display: flex; flex: 1; }
   font-style: italic;
 }
 
+/* ---- button wink: momentary fill inversion on press ---- */
+button.wink:not(.seg-opt):not(.mode-opt):not(.pf-opt):not(.navbtn) {
+  background: var(--accent) !important;
+  color: #fff !important;
+  border-color: var(--accent) !important;
+}
+button.btn.primary.wink {
+  background: var(--bg-sunken) !important;
+  color: var(--accent) !important;
+}
+
 @media (max-width: 600px) {
   .settings-sidebar { flex: 0 0 180px; }
   .settings-main { padding: 14px 12px 80px; }

@@ -39,6 +39,18 @@ function releasePointerHold() {
 document.addEventListener("pointerup", releasePointerHold, true);
 document.addEventListener("pointercancel", releasePointerHold, true);
 
+// --------------------------------------------------------------------------
+// Button wink: brief fill inversion on press for non-segmented buttons
+// --------------------------------------------------------------------------
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest("button");
+  if (!btn || btn.disabled) return;
+  if (btn.matches(".seg-opt, .mode-opt, .pf-opt, .navbtn")) return;
+  if (btn.classList.contains("wink")) return;
+  btn.classList.add("wink");
+  setTimeout(() => btn.classList.remove("wink"), 300);
+}, true);
+
 // Run `build` to (re)render `container`, unless the user is mid-click inside an
 // interactive list — in which case defer it to the next pointer release.
 function renderList(containerId, build) {
