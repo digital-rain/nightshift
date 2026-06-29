@@ -83,6 +83,15 @@ class WorkerConfig:
         desc="Global wall-clock bound for any backend run. 0 = no timeout.",
         apply="restart", env="NIGHTSHIFT_MODEL_TIMEOUT_SECONDS"))
 
+    quarantine: bool = field(default=False, metadata=meta(
+        category="Execution policy", label="Quarantine mode",
+        desc=(
+            "When enabled, any task that fails is immediately quarantined: "
+            "held in the queue but skipped by every worker until an operator "
+            "reviews and releases it. Prevents a broken task from burning "
+            "budget on repeated retries."),
+        apply="restart", env="NIGHTSHIFT_WORKER_QUARANTINE"))
+
     ui_host: str = field(default="0.0.0.0", metadata=meta(
         category="UI & Network", label="UI host",
         desc="Worker UI bind address.",
@@ -136,6 +145,12 @@ class WorkerConfig:
             if backend.available(config or {}):
                 out.append(m)
         return out
+
+
+def _parse_bool(env_val: str | None, fallback: Any) -> bool:
+    if env_val is not None:
+        return env_val.lower() in ("1", "true", "yes")
+    return bool(fallback)
 
 
 def _csv_list(value: str | None) -> list[str] | None:
@@ -235,6 +250,10 @@ def load_worker_config(workspace: Path) -> WorkerConfig:
             or local.get("model_timeout_seconds")
             or 0.0
         ),
+        quarantine=_parse_bool(
+            os.environ.get("NIGHTSHIFT_WORKER_QUARANTINE"),
+            local.get("quarantine", False),
+        ),
         ui_host=os.environ.get("NIGHTSHIFT_WORKER_UI_HOST") or local.get("ui_host") or "0.0.0.0",
         ui_port=int(os.environ.get("NIGHTSHIFT_WORKER_UI_PORT") or local.get("ui_port") or 8810),
         raw=local,
@@ -258,6 +277,7 @@ def save_worker_config(workspace: Path, config: WorkerConfig) -> None:
         "auto_model": config.auto_model,
         "max_model": config.max_model,
         "model_timeout_seconds": config.model_timeout_seconds,
+        "quarantine": config.quarantine,
         "ui_host": config.ui_host,
         "ui_port": config.ui_port,
     }

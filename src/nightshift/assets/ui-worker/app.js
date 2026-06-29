@@ -85,6 +85,7 @@ async function refreshNow() {
 const STATE_LABELS = {
   pending: "Queued",
   blocked: "Blocked",
+  quarantined: "Quarantined",
   running: "Running",
   paused: "Paused",
   repo_unavailable: "Paused",
@@ -113,6 +114,7 @@ function stateLabel(status) {
 function statusClass(status) {
   if (status === "repo_unavailable") return "paused";
   if (status === "blocked") return "error";
+  if (status === "quarantined") return "quarantined";
   return status || "running";
 }
 
@@ -186,6 +188,14 @@ function historyRow(r) {
   meta.className = "hrow-meta";
   const badge = r.status === "error" ? failureBadge(r.failure_kind) : null;
   if (badge) meta.append(badge);
+  if (r.quarantined) {
+    const qbadge = document.createElement("span");
+    qbadge.className = "status quarantined";
+    qbadge.style.fontSize = "10px";
+    qbadge.style.padding = "1px 6px";
+    qbadge.textContent = "Quarantined";
+    meta.append(qbadge);
+  }
   const metaText = document.createElement("span");
   metaText.className = "hrow-meta-text";
   metaText.textContent = r.result_line || `${r.task}.md`;
@@ -342,7 +352,7 @@ function renderHistoryDetail() {
   document.getElementById("detail-screen-title").textContent = rec.title || rec.task;
   body.innerHTML = "";
 
-  body.append(detailStatusHead(rec.task, rec.status));
+  body.append(detailStatusHead(rec.task, rec.quarantined ? "quarantined" : rec.status));
 
   if (rec.result_line) {
     const res = document.createElement("div");

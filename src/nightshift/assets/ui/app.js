@@ -76,7 +76,7 @@ const state = {
   repos: null,           // /api/repos payload (workspace, known repos, per-queue bindings, warnings)
   playlistInfoName: null, // playlist open in the full-area info pane (view "playlist-info")
   playlistInfoData: null, // loaded {name, repository, task_count} for the info pane
-  blockedTasks: {},      // task id -> blocked_reason string for tasks currently blocked by manager
+  blockedTasks: {},      // task id -> {reason, state} for tasks blocked or quarantined by manager
   selectedPlaylist: null,        // playlist-list cursor (name string, null = library)
   selectedPlaylists: new Set(),  // multi-selected playlist names (shift-click extends)
 };
@@ -163,6 +163,7 @@ function expando(caption, { open = true, subtitle = "", accessory = null } = {})
 const STATE_LABELS = {
   pending: "Queued",
   blocked: "Blocked",
+  quarantined: "Quarantined",
   running: "Running",
   paused: "Paused",
   // A task whose resolved target repo isn't present in the workspace is paused
@@ -184,6 +185,7 @@ function stateLabel(status) {
 function statusClass(status) {
   if (status === "repo_unavailable") return "paused";
   if (status === "blocked") return "error";
+  if (status === "quarantined") return "quarantined";
   return status || "running";
 }
 function statusPill(status) {
@@ -656,14 +658,15 @@ async function loadQueue() {
   renderNow();
 }
 
-// Load blocked-task state from the manager so queue rows and the detail pane
-// can show "Blocked" instead of "Queued" for tasks the manager can't dispatch.
+// Load blocked/quarantined task state from the manager so queue rows and the
+// detail pane can distinguish "Blocked" vs "Quarantined" for tasks the manager
+// can't dispatch.
 async function loadBlocked() {
   try {
     const list = await getJSON("/api/blocked");
     const map = {};
     for (const b of (list || [])) {
-      if (b.task) map[b.task] = b.blocked_reason || "";
+      if (b.task) map[b.task] = { reason: b.blocked_reason || "", state: b.state || "blocked" };
     }
     state.blockedTasks = map;
   } catch {
@@ -1266,7 +1269,10 @@ function queueRowAside(item, isNow) {
   let status;
   if (isNow) status = state.player.state === "paused" ? "paused" : "running";
   else if (rec) status = rec.status;
-  else if (state.blockedTasks && item.task in state.blockedTasks) status = "blocked";
+  else if (state.blockedTasks && item.task in state.blockedTasks) {
+    const overlay = state.blockedTasks[item.task];
+    status = (overlay && overlay.state) || "blocked";
+  }
   else status = "pending";
 
   const status_box = document.createElement("div");
@@ -3461,8 +3467,9 @@ function taskDetailContent(brief, draft, opts = {}) {
   else if (isNow) status = state.player.state === "paused" ? "paused" : "running";
   else if (rec) status = rec.status;
   else if (state.blockedTasks && task in state.blockedTasks) {
-    status = "blocked";
-    blockedReason = state.blockedTasks[task] || undefined;
+    const overlay = state.blockedTasks[task];
+    status = (overlay && overlay.state) || "blocked";
+    blockedReason = (overlay && overlay.reason) || undefined;
   }
   else status = "pending";
 

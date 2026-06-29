@@ -153,6 +153,10 @@ class SubmitBody(BaseModel):
     validate_cmd: str | None = None
     # The worktree directory the worker used for this task.
     worktree: str | None = None
+    # Worker-side quarantine flag: when the worker has quarantine mode enabled,
+    # it sets this to True so the manager quarantines on the first failure
+    # instead of waiting for the streak threshold.
+    quarantine: bool = False
 
 
 class ResolveResultBody(BaseModel):
@@ -456,6 +460,31 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             queue=queue,
             task=task,
             payload={"reason": reason, "streak": streak},
+        )
+        return True
+
+    async def _quarantine_immediate(
+        queue: str | None, task: str, run_id: str, detail: str
+    ) -> bool:
+        """Quarantine a task on the first failure (worker quarantine mode).
+
+        Unlike :func:`_quarantine_if_looping` which waits for a streak to
+        reach the configured threshold, this quarantines unconditionally —
+        called when the submitting worker has quarantine mode enabled.
+        """
+        reason = (
+            f"quarantined by worker on first failure ({detail}); "
+            f"review the run logs and edit or delete the task to release it"
+        )
+        await _store().set_task_state(
+            queue, task, "quarantined", blocked_reason=reason
+        )
+        await _emit(
+            "task_quarantined",
+            run_id=run_id,
+            queue=queue,
+            task=task,
+            payload={"reason": reason, "streak": 1},
         )
         return True
 
@@ -927,12 +956,18 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             # A worker *error* leaves the brief in the queue with no blocking
             # overlay, so it re-leases on the next poll. Repeated errors are a
             # re-execution loop → quarantine. Operator-driven stops (aborted) are
-            # intentional and never quarantine.
+            # intentional and never quarantine. When the worker has quarantine
+            # mode enabled it requests immediate quarantine on the first failure.
             quarantined = False
             if body.status == "error":
-                quarantined = await _quarantine_if_looping(
-                    queue, body.task, run_id, "worker error"
-                )
+                if body.quarantine:
+                    quarantined = await _quarantine_immediate(
+                        queue, body.task, run_id, "worker error"
+                    )
+                else:
+                    quarantined = await _quarantine_if_looping(
+                        queue, body.task, run_id, "worker error"
+                    )
             await _registry().set_idle(body.worker_id)
             await _emit(
                 "task_result",
@@ -966,9 +1001,14 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                     **telemetry,
                 )
                 await store.set_lease_status(body.lease_id, "released")
-                quarantined = await _quarantine_if_looping(
-                    queue, body.task, run_id, "no changes produced"
-                )
+                if body.quarantine:
+                    quarantined = await _quarantine_immediate(
+                        queue, body.task, run_id, "no changes produced"
+                    )
+                else:
+                    quarantined = await _quarantine_if_looping(
+                        queue, body.task, run_id, "no changes produced"
+                    )
                 if not quarantined:
                     await store.clear_task_state(queue, body.task)
                 await _registry().set_idle(body.worker_id)

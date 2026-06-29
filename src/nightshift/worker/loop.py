@@ -186,6 +186,7 @@ class WorkerLoop:
             "cost_usd": outcome.cost_usd,
             "validate_cmd": outcome.validate_cmd,
             "worktree": outcome.worktree,
+            "quarantine": self.cfg.quarantine,
         }
         result: dict[str, Any] = {}
         try:
@@ -213,6 +214,7 @@ class WorkerLoop:
                 "result_line": outcome.result_line,
                 "commit_sha": result.get("sha"),
                 "landed": bool(result.get("landed")),
+                "quarantined": bool(result.get("quarantined")),
                 "turns": outcome.turns,
                 "input_tokens": outcome.input_tokens,
                 "output_tokens": outcome.output_tokens,

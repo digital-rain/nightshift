@@ -648,6 +648,7 @@ body {
 .status.skipped, .status.stopped { background: var(--bg-sunken); color: var(--text-dim); }
 .status.paused { background: rgba(230, 192, 104, 0.16); color: var(--warn); }
 .status.aborted { background: rgba(230, 192, 104, 0.16); color: var(--warn); }
+.status.quarantined { background: rgba(200, 130, 220, 0.16); color: #c882dc; }
 
 /* ---- classified failure badges ---- */
 .fail-badge {

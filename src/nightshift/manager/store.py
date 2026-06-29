@@ -391,6 +391,7 @@ class MemoryStore:
                 {
                     "queue": r["queue"],
                     "task": r["task"],
+                    "state": r["state"],
                     "repo": r.get("repo"),
                     "blocked_reason": r.get("blocked_reason"),
                 }
@@ -868,7 +869,7 @@ class PgStore:
     async def tasks_in_state(self, state: str) -> list[dict[str, Any]]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT queue, task, repo, blocked_reason FROM nightshift.tasks WHERE state = $1",
+                "SELECT queue, task, state, repo, blocked_reason FROM nightshift.tasks WHERE state = $1",
                 state,
             )
         return [dict(r) for r in rows]
