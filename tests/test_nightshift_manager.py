@@ -426,6 +426,50 @@ def test_malformed_task_repo_ref_blocks_not_dispatched(tmp_path: Path) -> None:
         assert client.get("/api/runs").json() == []
 
 
+def test_patch_task_saves_detail_pane_fields(tmp_path: Path) -> None:
+    # Regression: the manager's ``TaskUpdate`` once declared only repo/loop, so
+    # the detail pane's other fields (disabled, priority, model, title, body…)
+    # were silently dropped by ``model_dump(exclude_unset=True)`` and every save
+    # of those toggles failed with "no fields to update". Every editable field
+    # the pane sends must round-trip, and model/priority must normalise like the
+    # legacy server.
+    workspace = _seed(tmp_path, {"10.hello": "Do a thing."})
+    main_dir = workspace / "nightshift-tasks" / "main"
+    with _client(workspace) as client:
+        # The toggle the user reported: flipping ``enabled`` (→ disabled) saves.
+        r = client.patch("/api/tasks/10.hello", json={"disabled": True})
+        assert r.status_code == 200
+        assert r.json()["disabled"] is True
+        assert "disabled: true" in (main_dir / "10.hello.md").read_text()
+
+        # And changing priority saves (and is range-validated).
+        assert client.patch("/api/tasks/10.hello", json={"priority": 1}).status_code == 200
+        assert "priority: 1" in (main_dir / "10.hello.md").read_text()
+        assert client.patch("/api/tasks/10.hello", json={"priority": 9}).status_code == 400
+
+        # The full detail-pane payload (title, body, toggles, model) round-trips,
+        # and a "default" model pin clears the key (inherit the config default).
+        full = client.patch(
+            "/api/tasks/10.hello",
+            json={
+                "title": "Hello v2",
+                "body": "Reworked.",
+                "evergreen": True,
+                "draft": True,
+                "model": "default",
+                "priority": 2,
+            },
+        )
+        assert full.status_code == 200
+        text = (main_dir / "10.hello.md").read_text()
+        assert "title: Hello v2" in text
+        assert "Reworked." in text
+        assert "model:" not in text  # "default" cleared the pin
+
+        # A genuinely empty PATCH is still a 400 (the guard still fires).
+        assert client.patch("/api/tasks/10.hello", json={}).status_code == 400
+
+
 def test_create_and_edit_reject_malformed_repo_without_orphan(tmp_path: Path) -> None:
     # A malformed per-task repo override is an edit-time 400 on both create and
     # edit (matching the legacy server), and a rejected create must never orphan

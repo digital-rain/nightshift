@@ -73,6 +73,8 @@ from nightshift.manager.scheduler import (
 from nightshift.manager.store import NightshiftStore, open_store
 from nightshift.model_id import provider_of
 from nightshift.spawn_daily import (
+    MAX_PRIORITY,
+    MIN_PRIORITY,
     load_queue_config,
     resolve_config,
     resolve_frontmatter,
@@ -246,8 +248,24 @@ class TaskCreate(BaseModel):
 
 
 class TaskUpdate(BaseModel):
-    # Partial edit; unset fields are left untouched. ``repo`` is an editable
-    # frontmatter meta key (the per-task target-repo override).
+    """Partial edit from the detail-view pane. Unset fields are left untouched;
+    ``model`` set to "" or "default" clears the field so the task inherits the
+    config default. ``title`` (headline) and ``body`` (spec prose) are content
+    edits saved alongside the frontmatter toggles in one PATCH. The accepted keys
+    mirror :data:`engine._EDITABLE_META_KEYS` ∪ :data:`engine._EDITABLE_CONTENT_KEYS`
+    — any field declared here but absent from the model is silently dropped by
+    ``model_dump(exclude_unset=True)`` and yields a spurious "no fields to update".
+    """
+
+    disabled: bool | None = None
+    evergreen: bool | None = None
+    automerge: bool | None = None
+    draft: bool | None = None
+    model: str | None = None
+    priority: int | None = None
+    title: str | None = None
+    body: str | None = None
+    # Per-task target-repo override; "" / "default" clears it (inherit queue).
     repo: str | None = None
     loop: bool | None = None
     loop_max_iterations: int | None = None
@@ -274,6 +292,18 @@ def _normalize_repo(value: object) -> str | None:
             "absolute paths)"
         )
     return repo
+
+
+def _validate_priority(value: object) -> int:
+    """Coerce a request's priority to an int in ``[MIN_PRIORITY, MAX_PRIORITY]``,
+    raising ``ValueError`` (surfaced as a 400) for out-of-range/non-int input."""
+    try:
+        priority = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise ValueError("priority must be an integer 0-5")
+    if not (MIN_PRIORITY <= priority <= MAX_PRIORITY):
+        raise ValueError(f"priority must be between {MIN_PRIORITY} and {MAX_PRIORITY}")
+    return priority
 
 
 # --------------------------------------------------------------------------- #
@@ -1366,17 +1396,28 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
     ) -> JSONResponse:
         target = _resolve_queue(queue)
         target_rel = playlists_mod.tasks_rel(target)
-        # ``repo`` is the per-task target-repo override (an editable meta key).
-        changes = body.model_dump(exclude_unset=True)
-        if not changes:
+        # Partial edit: only the fields the detail pane actually sent reach the
+        # frontmatter writer. ``model``/``priority``/``repo`` are normalised the
+        # same way as the legacy server so the two backends behave identically.
+        fields = body.model_dump(exclude_unset=True)
+        if not fields:
             return JSONResponse({"error": "no fields to update"}, status_code=400)
-        # A malformed override is a 400 here (edit-time guard); a sent ``null``
-        # clears it so the task falls back to the queue default.
-        if "repo" in changes:
-            try:
-                changes["repo"] = _normalize_repo(changes["repo"])
-            except ValueError as exc:
-                return JSONResponse({"error": str(exc)}, status_code=400)
+        changes: dict[str, object | None] = {}
+        try:
+            for key, value in fields.items():
+                if key == "model":
+                    # "" / "default" clears the key so the task inherits the default.
+                    changes["model"] = None if value in (None, "", "default") else value
+                elif key == "priority":
+                    if value is not None:
+                        changes["priority"] = _validate_priority(value)
+                elif key == "repo":
+                    # "" / "default" clears the override → inherit the queue repo.
+                    changes["repo"] = _normalize_repo(value)
+                else:
+                    changes[key] = value
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
         try:
             updated = set_task_meta(tasks_root, task, changes, target_rel)
         except FileNotFoundError:
