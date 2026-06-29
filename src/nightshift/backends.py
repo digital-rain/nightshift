@@ -757,6 +757,111 @@ class OllamaCloudBackend:
         )
 
 
+class NightshiftAgentBackend:
+    """In-process agentic harness (the ``nightshift`` provider).
+
+    The bare model half is ``<vendor>/<upstream-model>`` (e.g.
+    ``anthropic/claude-sonnet-4-6``); ``select_run_backend`` strips the
+    ``nightshift/`` prefix, so ``spec.model`` already carries the vendor half.
+    The harness runs an owned tool loop and applies edits with a deterministic
+    SEARCH/REPLACE applier — no apply-model round-trip. Heavy code lives in
+    :mod:`nightshift.agent`; this class is the thin backend-contract wiring and
+    imports it lazily to stay clear of the ``backends``↔``agent`` cycle (agent
+    imports ``_usage_tokens``/``_httpx_timeout`` from here).
+    """
+
+    name = "nightshift"
+    agentic = True
+    description = (
+        "In-process agentic harness (owned tool loop + deterministic "
+        "SEARCH/REPLACE; vendor in the model half, e.g. "
+        "nightshift/anthropic/claude-sonnet-4-6)."
+    )
+
+    def available(self, config: dict[str, Any] | None = None) -> bool:
+        """Available if any supported vendor's credentials are present.
+
+        The precise per-vendor error (which vendor, which key) is raised at
+        ``run`` time; this mirrors ``OllamaCloudBackend.available``.
+        """
+        cfg = config or {}
+        if cfg.get("ollama_cloud_api_key") or os.environ.get("OLLAMA_API_KEY"):
+            return True
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            return True
+        return bool(shutil.which("ollama"))
+
+    def run(
+        self,
+        spec: WorkerSpec,
+        emit_log: EmitLog,
+        should_abort: ShouldAbort,
+        on_worker_start: OnWorkerStart | None = None,
+    ) -> WorkerResult:
+        from nightshift.agent.loop import (
+            DEFAULT_MAX_TOKENS,
+            DEFAULT_MAX_TURNS,
+            load_charter,
+            run_loop,
+        )
+        from nightshift.agent.tools import build_registry
+        from nightshift.agent.transport import TransportError, complete, split_vendor
+
+        vendor, upstream = split_vendor(spec.model)
+        if not vendor or not upstream:
+            return WorkerResult(
+                returncode=2,
+                error=f"nightshift model must be <vendor>/<model>, got {spec.model!r}",
+            )
+
+        knobs = dict(spec.config.get("nightshift", {})) if isinstance(
+            spec.config.get("nightshift"), dict
+        ) else {}
+        knobs.setdefault("max_tokens", DEFAULT_MAX_TOKENS)
+        tools_enabled = knobs.get("tools_enabled") or None
+        context_policy = str(knobs.get("context_policy", "spans"))
+
+        emit_log(f"  [nightshift] {vendor}/{upstream}: agentic loop\n")
+        registry = build_registry(
+            spec.cwd,
+            timeout=spec.timeout,
+            tools_enabled=tools_enabled,
+            context_policy=context_policy,
+            should_abort=lambda: should_abort(),
+        )
+
+        def _complete(messages, tools, knobs_, **kw):
+            return complete(messages, tools, knobs_, env=spec.env, **kw)
+
+        try:
+            loop = run_loop(
+                transport_complete=_complete,
+                registry=registry,
+                charter=load_charter(),
+                brief=spec.prompt,
+                model=spec.model,
+                knobs=knobs,
+                max_turns=spec.max_turns if spec.max_turns is not None else DEFAULT_MAX_TURNS,
+                timeout=spec.timeout,
+                should_abort=should_abort,
+                emit_log=emit_log,
+            )
+        except TransportError as exc:
+            return WorkerResult(returncode=1, error=str(exc))
+
+        if loop.error is not None:
+            return WorkerResult(returncode=1, error=loop.error, turns=loop.turns)
+        input_tokens, output_tokens = _usage_tokens(loop.usage)
+        return WorkerResult(
+            returncode=0,
+            aborted=loop.aborted,
+            turns=loop.turns,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=None,
+        )
+
+
 _BACKENDS: tuple[Any, ...] = (
     ClaudeCodeBackend(),
     CursorAgentBackend(),
@@ -764,6 +869,7 @@ _BACKENDS: tuple[Any, ...] = (
     AnthropicBackend(),
     OllamaBackend(),
     OllamaCloudBackend(),
+    NightshiftAgentBackend(),
 )
 
 DEFAULT_BACKEND = "claude-code"

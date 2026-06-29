@@ -104,6 +104,6 @@ A worker uses exactly one backend; install the tooling for the ones you intend t
 
 Nightshift was extracted from a larger monorepo. A few defaults still assume that repo's layout and are worth tuning for your target project:
 
-- `engine._attempt_repair` runs `ruff` against `lib/python/long_*`, `services/`, `tools/long_cli` during a post-failure repair pass. Adjust these for the repository your workers operate on.
+- `engine._attempt_repair` runs `.venv/bin/ruff check --fix` and `ruff format` over the worktree during a post-failure repair pass. This assumes the target repo uses `ruff` (from a `.venv`) and carries its own `ruff` config; drop or adjust the repair pass if that doesn't match your project.
 - The default validate command is `just validate`; the queue's `config.json` (`validate`) overrides it per queue.
 - `config.json` `forbidden_paths` / `forbidden_template_paths` ship with the original project's protected paths; edit them to match your repo.

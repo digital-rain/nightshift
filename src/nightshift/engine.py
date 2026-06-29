@@ -2712,16 +2712,19 @@ def _attempt_repair(
     env: dict[str, str] | None = None,
     should_abort=None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run deterministic auto-fixes and retry validate once (interruptibly)."""
+    """Run deterministic auto-fixes and retry validate once (interruptibly).
+
+    Ruff is run over the whole worktree (``.``); it honors the target repo's own
+    ``pyproject.toml`` / ``ruff.toml`` (selected rules, ``exclude`` globs), so the
+    repair pass stays correct without the engine knowing the repo's layout.
+    """
     subprocess.run(
-        [".venv/bin/ruff", "check", "--fix", "--unsafe-fixes",
-         "lib/python/long_*", "services/", "tools/long_cli"],
+        [".venv/bin/ruff", "check", "--fix", "--unsafe-fixes", "."],
         cwd=worktree_dir,
         capture_output=True,
     )
     subprocess.run(
-        [".venv/bin/ruff", "format",
-         "lib/python/long_*", "services/", "tools/long_cli"],
+        [".venv/bin/ruff", "format", "."],
         cwd=worktree_dir,
         capture_output=True,
     )

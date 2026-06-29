@@ -56,24 +56,24 @@ class OperatorConfig:
     max_per_day: int = field(default=200, metadata=meta(
         category="Scheduling", label="Max per day",
         desc="Dispatch cap for the daily-queue path.",
-        apply="next-task", env="NIGHTSHIFT_MAX_PER_DAY"))
+        env="NIGHTSHIFT_MAX_PER_DAY"))
     max_concurrent_queues: int = field(default=2, metadata=meta(
         category="Scheduling", label="Max concurrent queues",
-        desc="Max queues served concurrently.", apply="next-task"))
+        desc="Max queues served concurrently."))
     max_nights_before_parking: int = field(default=2, metadata=meta(
         category="Scheduling", label="Max nights before parking",
         desc="Nights a failing task retries before being parked.",
-        apply="next-task"))
+        ))
     scheduled_models_allow: tuple[str, ...] = field(
         default=("claude-code/claude-sonnet-4-6", "claude-code/claude-opus-4-8"),
         metadata=meta(
             category="Scheduling", label="Scheduled models allow",
             desc="Filter: only auto-schedule tasks pinned to these provider/model ids.",
-            apply="next-task", type="string_list", validate="model_id_list"))
+            type="string_list", validate="model_id_list"))
     default_model: str = field(default="auto", metadata=meta(
         category="Scheduling", label="Default model",
         desc="Model a brief inherits when it sets no model:.",
-        apply="next-task", env="NIGHTSHIFT_DEFAULT_MODEL",
+        env="NIGHTSHIFT_DEFAULT_MODEL",
         validate="model_id_or_keyword"))
 
     landing_mode: str = field(default="none", metadata=meta(
@@ -95,60 +95,60 @@ class OperatorConfig:
         apply="restart", env="NIGHTSHIFT_TASKS_REPO"))
     automerge: bool = field(default=False, metadata=meta(
         category="Landing & Git", label="Automerge",
-        desc="Default automerge for PR-mode landings.", apply="next-task"))
+        desc="Default automerge for PR-mode landings."))
     draft: bool = field(default=False, metadata=meta(
         category="Landing & Git", label="Draft",
-        desc="Default draft state for PR-mode landings.", apply="next-task"))
+        desc="Default draft state for PR-mode landings."))
     autostash_operator_work: bool = field(default=True, metadata=meta(
         category="Landing & Git", label="Autostash operator work",
         desc="Stash uncommitted operator work before a local landing.",
-        apply="next-task"))
+        ))
     max_push_retries: int = field(default=3, metadata=meta(
         category="Landing & Git", label="Max push retries",
         desc=(
             "How many times a land re-syncs origin/main and re-squashes when the "
             "push is rejected because origin advanced (optimistic concurrency)."),
-        apply="next-task"))
+        ))
     validate_on_integrate: bool = field(default=False, metadata=meta(
         category="Landing & Git", label="Validate on integrate",
         desc=(
             "Re-run the validate command on the integrated tree before pushing "
             "when origin drifted but the squash was textually clean (guards "
             "against semantic conflicts). Off by default."),
-        apply="next-task"))
+        ))
 
     forbidden_paths: tuple[str, ...] = field(
         default=("^\\.github/workflows/", "^CLAUDE\\.md$", "^AGENTS\\.md$"),
         metadata=meta(
             category="Worker execution policy", label="Forbidden paths",
             desc="Regex paths a worker may never modify.",
-            apply="next-task", type="regex_list"))
+            type="regex_list"))
     forbidden_template_paths: tuple[str, ...] = field(
         default=("^tools/nightshift/templates/",),
         metadata=meta(
             category="Worker execution policy", label="Forbidden template paths",
             desc="Paths forbidden specifically in template/decomposition runs.",
-            apply="next-task", type="regex_list"))
+            type="regex_list"))
     diff_cap_lines: int = field(default=1500, metadata=meta(
         category="Worker execution policy", label="Diff cap lines",
         desc="Default max changed lines for a task's result.",
-        apply="next-task"))
+        ))
     diff_cap_exempt_paths: tuple[str, ...] = field(
         default=("^tests/fixtures/", "^docs/", "\\.md$"),
         metadata=meta(
             category="Worker execution policy", label="Diff cap exempt paths",
             desc="Paths excluded from the diff cap.",
-            apply="next-task", type="regex_list"))
+            type="regex_list"))
     max_fix_attempts: int = field(default=6, metadata=meta(
         category="Worker execution policy", label="Max fix attempts",
-        desc="Fix retries (dispatch path).", apply="next-task"))
+        desc="Fix retries (dispatch path)."))
     validate_cmd: str = field(default="just validate", metadata=meta(
         category="Worker execution policy", label="Validate command",
         desc=(
             "System-wide default validate command run after each task. "
             "Per-queue overrides take precedence. Empty string disables "
             "validation globally."),
-        apply="next-task", json_key="validate"))
+        json_key="validate"))
     quarantine_threshold: int = field(default=2, metadata=meta(
         category="Worker execution policy", label="Quarantine threshold",
         desc=(
@@ -156,29 +156,29 @@ class OperatorConfig:
             "landed, or a worker error) before it is quarantined: held in the "
             "queue but skipped by every worker so a confused task cannot burn "
             "budget in a re-execution loop. 0 disables quarantine."),
-        apply="next-task", env="NIGHTSHIFT_QUARANTINE_THRESHOLD"))
+        env="NIGHTSHIFT_QUARANTINE_THRESHOLD"))
 
     auto_resolve: bool = field(default=True, metadata=meta(
         category="Conflict resolution", label="Auto resolve",
         desc="Hand out resolve work-orders on conflict/validation failure.",
-        apply="next-task"))
+        ))
     max_resolve_attempts: int = field(default=2, metadata=meta(
         category="Conflict resolution", label="Max resolve attempts",
-        desc="Resolve retries before parking.", apply="next-task"))
+        desc="Resolve retries before parking."))
     resolve_model: str | None = field(default=None, metadata=meta(
         category="Conflict resolution", label="Resolve model",
-        desc="Optional model override for resolve runs.", apply="next-task",
+        desc="Optional model override for resolve runs.",
         validate="model_id"))
     resolve_backend: str | None = field(default=None, metadata=meta(
         category="Conflict resolution", label="Resolve backend",
-        desc="Optional backend override for resolve runs.", apply="next-task"))
+        desc="Optional backend override for resolve runs."))
     max_concurrent_resolves: int = field(default=1, metadata=meta(
         category="Conflict resolution", label="Max concurrent resolves",
         desc=(
             "Cap on simultaneous out-of-process resolve jobs per repo. Resolve "
             "agent work runs unlocked and concurrent with normal dispatch; this "
             "bounds thrash. The final merge is always serialized."),
-        apply="next-task"))
+        ))
 
 
 @dataclass(frozen=True)
@@ -215,7 +215,7 @@ class ManagerSettings:
     # as a nested object for code ergonomics, serialized flat.
     operator: OperatorConfig = field(default_factory=OperatorConfig, metadata=meta(
         category="Scheduling", label="Operator config",
-        desc="Task-policy keys.", apply="next-task", editable=False, flatten=True))
+        desc="Task-policy keys.", editable=False, flatten=True))
 
     # Internal: the raw dict from disk for pass-through access by legacy readers.
     raw: dict[str, Any] = field(default_factory=dict, metadata=meta(

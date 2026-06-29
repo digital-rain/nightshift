@@ -22,6 +22,64 @@ DEFAULT_AUTO_MODEL = "claude-code/claude-sonnet-4-6"
 DEFAULT_MAX_MODEL = "claude-code/claude-opus-4-8"
 
 
+# Agentic-CLI providers whose runs the harness re-routes when the toggle is on
+# (Phase 8). Non-agentic API providers (anthropic/ollama/ollama-cloud single-shot)
+# and an already-nightshift id are never rewritten.
+_AGENTIC_CLI_PROVIDERS = frozenset({"claude-code", "cursor", "gemini"})
+
+
+@dataclass
+class NightshiftBackendConfig:
+    """Owned-harness knobs (spec §5.4) + the opt-in switch.
+
+    Surfaces in the settings UI automatically: the registry walks this nested
+    dataclass under the ``nightshift.`` dotted prefix and the UI renders each
+    field by type (``enabled`` → a labeled toggle). Defaults here must agree with
+    the module constants in :mod:`nightshift.agent.loop` / ``agent.transport``.
+    """
+
+    enabled: bool = field(default=False, metadata=meta(
+        category="Nightshift harness", label="Use in-house agentic harness",
+        desc="Route this worker's agentic runs through the owned nightshift "
+             "harness (using the vendor/model below) instead of the CLI backend. "
+             "Needs the chosen vendor's API key configured.",
+        ))
+    vendor: str = field(default="anthropic", metadata=meta(
+        category="Nightshift harness", label="Vendor",
+        desc="Upstream API the harness drives when enabled.",
+        options=["anthropic", "ollama-cloud", "ollama"]))
+    model: str = field(default="claude-sonnet-4-6", metadata=meta(
+        category="Nightshift harness", label="Model",
+        desc="Upstream model id the harness uses when enabled.",
+        ))
+    max_tokens: int = field(default=4096, metadata=meta(
+        category="Nightshift harness", label="Max output tokens",
+        desc="Per-request output cap."))
+    effort: str = field(default="off", metadata=meta(
+        category="Nightshift harness", label="Thinking effort",
+        desc="Extended-thinking effort (off disables thinking).",
+        options=["off", "low", "medium", "high", "xhigh", "max"]))
+    enable_cache: bool = field(default=True, metadata=meta(
+        category="Nightshift harness", label="Prompt caching",
+        desc="Place Anthropic cache breakpoints (Anthropic vendor only).",
+        ))
+    cache_ttl: str = field(default="5m", metadata=meta(
+        category="Nightshift harness", label="Cache TTL",
+        desc="Prompt-cache lifetime.", options=["5m", "1h"]))
+    max_retries: int = field(default=2, metadata=meta(
+        category="Nightshift harness", label="Max retries",
+        desc="Bounded transport retries on transient upstream failures.",
+        ))
+    tools_enabled: list[str] = field(default_factory=list, metadata=meta(
+        category="Nightshift harness", label="Tools enabled",
+        desc="Allow-list of tool names (empty = all tools).",
+        type="string_list"))
+    context_policy: str = field(default="spans", metadata=meta(
+        category="Nightshift harness", label="Context policy",
+        desc="read_file gating: spans (nudge to ranges) or whole_file.",
+        options=["spans", "whole_file"]))
+
+
 @dataclass
 class WorkerConfig:
     """Resolved worker settings from .nightshift/worker.json + env."""
@@ -111,6 +169,12 @@ class WorkerConfig:
         category="UI & Network", label="Refresh ms",
         desc="UI poll cadence; set from the manager at checkin.",
         apply="restart", editable=False))
+    nightshift: NightshiftBackendConfig = field(
+        default_factory=NightshiftBackendConfig,
+        metadata=meta(
+            category="Nightshift harness", label="Nightshift harness",
+            desc="In-house agentic harness settings.",
+            editable=False))
     raw: dict[str, Any] = field(default_factory=dict, metadata=meta(
         category="Internal", label="Raw", desc="Raw dict.",
         apply="restart", editable=False))
@@ -120,13 +184,38 @@ class WorkerConfig:
 
         ``auto``/``max``/unset resolve to this worker's configured defaults;
         an explicit id passes through ``model_aliases`` (identity unless mapped).
+        When the nightshift harness toggle is on, the resolved id is re-routed to
+        the harness (see :meth:`_maybe_route_to_harness`).
         """
         key = (requested or "auto").strip().lower()
         if key in ("", "auto", "default"):
-            return self.auto_model, None
+            return self._maybe_route_to_harness(self.auto_model), None
         if key == "max":
-            return self.max_model, None
-        return self.model_aliases.get(requested, requested), None
+            return self._maybe_route_to_harness(self.max_model), None
+        resolved = self.model_aliases.get(requested, requested)
+        return self._maybe_route_to_harness(resolved), None
+
+    def _maybe_route_to_harness(self, qualified: str | None) -> str | None:
+        """Re-route an agentic-CLI model to the harness when the toggle is on.
+
+        The single Phase 8 routing seam. When ``nightshift.enabled`` is true and
+        ``qualified`` names an agentic-CLI provider (claude-code/cursor/gemini),
+        rewrite it to ``nightshift/<vendor>/<model>``. Off (the default) it is a
+        byte-identical no-op; non-agentic-CLI and already-``nightshift/`` ids pass
+        through untouched. If the harness vendor backend is unavailable, the
+        original id is returned so the toggle never silently breaks routing.
+        """
+        if not self.nightshift.enabled or not qualified:
+            return qualified
+        if provider_of(qualified) not in _AGENTIC_CLI_PROVIDERS:
+            return qualified
+        try:
+            backend = backends_mod.require_backend("nightshift")
+        except KeyError:
+            return qualified
+        if not backend.available({}):
+            return qualified
+        return f"nightshift/{self.nightshift.vendor}/{self.nightshift.model}"
 
     def providers(self) -> set[str]:
         """Distinct provider tokens across advertised models (+ auto/max)."""
@@ -267,7 +356,34 @@ def load_worker_config(workspace: Path) -> WorkerConfig:
         ),
         ui_host=os.environ.get("NIGHTSHIFT_WORKER_UI_HOST") or local.get("ui_host") or "0.0.0.0",
         ui_port=int(os.environ.get("NIGHTSHIFT_WORKER_UI_PORT") or local.get("ui_port") or 8810),
+        nightshift=_load_nightshift(local.get("nightshift")),
         raw=local,
+    )
+
+
+def _load_nightshift(data: Any) -> NightshiftBackendConfig:
+    """Build the nested harness config from the ``nightshift`` worker.json key.
+
+    Missing/invalid → all defaults (the toggle stays off). Unknown keys are
+    ignored; known keys fall back to the dataclass default when absent.
+    """
+    d = data if isinstance(data, dict) else {}
+    defaults = NightshiftBackendConfig()
+    return NightshiftBackendConfig(
+        enabled=_parse_bool(None, d.get("enabled", defaults.enabled)),
+        vendor=str(d.get("vendor", defaults.vendor)),
+        model=str(d.get("model", defaults.model)),
+        max_tokens=int(d.get("max_tokens", defaults.max_tokens)),
+        effort=str(d.get("effort", defaults.effort)),
+        enable_cache=_parse_bool(None, d.get("enable_cache", defaults.enable_cache)),
+        cache_ttl=str(d.get("cache_ttl", defaults.cache_ttl)),
+        max_retries=int(d.get("max_retries", defaults.max_retries)),
+        tools_enabled=(
+            [str(t) for t in d["tools_enabled"]]
+            if isinstance(d.get("tools_enabled"), list)
+            else list(defaults.tools_enabled)
+        ),
+        context_policy=str(d.get("context_policy", defaults.context_policy)),
     )
 
 
@@ -292,5 +408,17 @@ def save_worker_config(workspace: Path, config: WorkerConfig) -> None:
         "worker_url": config.worker_url,
         "ui_host": config.ui_host,
         "ui_port": config.ui_port,
+        "nightshift": {
+            "enabled": config.nightshift.enabled,
+            "vendor": config.nightshift.vendor,
+            "model": config.nightshift.model,
+            "max_tokens": config.nightshift.max_tokens,
+            "effort": config.nightshift.effort,
+            "enable_cache": config.nightshift.enable_cache,
+            "cache_ttl": config.nightshift.cache_ttl,
+            "max_retries": config.nightshift.max_retries,
+            "tools_enabled": list(config.nightshift.tools_enabled),
+            "context_policy": config.nightshift.context_policy,
+        },
     }
     save_json(worker_json_path(workspace), data)

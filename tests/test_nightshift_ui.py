@@ -1225,6 +1225,7 @@ def test_backend_registry_and_selection() -> None:
     names = backends.backend_names()
     assert names == [
         "claude-code", "cursor", "gemini", "anthropic", "ollama", "ollama-cloud",
+        "nightshift",
     ]
 
     # Known name resolves; unknown/empty falls back to the default (claude-code).
@@ -1232,6 +1233,8 @@ def test_backend_registry_and_selection() -> None:
     assert backends.get_backend("gemini").name == "gemini"
     assert backends.get_backend(None).name == "claude-code"
     assert backends.get_backend("nope").name == "claude-code"
+    assert backends.get_backend("nightshift").name == "nightshift"
+    assert backends.list_backends({})  # smoke: nightshift describes cleanly
 
     described = {b["name"]: b for b in backends.list_backends({})}
     assert described["claude-code"]["agentic"] is True
@@ -1500,6 +1503,7 @@ def test_server_backends_endpoint(tmp_path: Path) -> None:
     names = [b["name"] for b in data["backends"]]
     assert names == [
         "claude-code", "cursor", "gemini", "anthropic", "ollama", "ollama-cloud",
+        "nightshift",
     ]
 
 

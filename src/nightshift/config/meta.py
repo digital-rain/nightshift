@@ -26,11 +26,18 @@ class FieldMeta(TypedDict, total=False):
     validate: str
 
 
-_REQUIRED = ("category", "label", "desc", "apply")
+# ``apply`` is intentionally not required: it defaults to ``"next-task"`` (the
+# common case), so only fields that need a restart or apply live carry the tag.
+_REQUIRED = ("category", "label", "desc")
 
 
 def meta(**kw: Any) -> dict[str, Any]:
-    """Build a validated metadata mapping for ``dataclasses.field(metadata=…)``."""
+    """Build a validated metadata mapping for ``dataclasses.field(metadata=…)``.
+
+    ``apply`` defaults to ``"next-task"`` when omitted — label a field's apply
+    mode only when it differs (``"restart"`` / ``"live"``).
+    """
+    kw.setdefault("apply", "next-task")
     return {"nightshift": FieldMeta(**kw)}
 
 
