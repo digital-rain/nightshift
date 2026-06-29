@@ -46,9 +46,11 @@ def main(argv: list[str] | None = None) -> int:
     loop = WorkerLoop(cfg, client, local)
 
     providers = ",".join(sorted(cfg.providers())) or "?"
+    url_tag = f" worker_url={cfg.worker_url}" if cfg.worker_url else ""
     print(
         f"[nightshift-worker] id={cfg.worker_id} providers={providers} "
         f"manager={cfg.manager_url} queues={cfg.queues} priorities={cfg.priorities}"
+        f"{url_tag}"
     )
 
     loop_thread = threading.Thread(target=loop.run_forever, daemon=True)

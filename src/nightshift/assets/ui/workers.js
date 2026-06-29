@@ -65,7 +65,16 @@
 
     const head = document.createElement("div");
     head.className = "worker-card-head";
-    const id = document.createElement("span");
+    const workerUrl = (w.meta || {}).worker_url;
+    let id;
+    if (workerUrl) {
+      id = document.createElement("a");
+      id.href = workerUrl;
+      id.target = "_blank";
+      id.rel = "noopener";
+    } else {
+      id = document.createElement("span");
+    }
     id.className = "worker-id";
     id.textContent = w.id;
     const backend = document.createElement("span");

@@ -70,6 +70,7 @@ def create_worker_app(cfg: WorkerConfig, local: LocalStore) -> FastAPI:
                 "models": cfg.models,
                 "mcps": cfg.mcps,
                 "manager_url": cfg.manager_url,
+                "worker_url": cfg.worker_url,
                 "brand_tag": "Nightshift Worker",
                 "refresh_ms": cfg.refresh_ms,
             }

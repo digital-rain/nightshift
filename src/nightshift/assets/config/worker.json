@@ -9,6 +9,7 @@
   "auto_model": "claude-code/claude-sonnet-4-6",
   "max_model": "claude-code/claude-opus-4-8",
   "model_timeout_seconds": 0,
+  "worker_url": null,
   "ui_host": "0.0.0.0",
   "ui_port": 8810
 }

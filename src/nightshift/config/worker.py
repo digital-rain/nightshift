@@ -92,6 +92,12 @@ class WorkerConfig:
             "budget on repeated retries."),
         apply="restart", env="NIGHTSHIFT_WORKER_QUARANTINE"))
 
+    worker_url: str | None = field(default=None, metadata=meta(
+        category="UI & Network", label="Worker URL",
+        desc="Externally reachable URL for this worker's UI. "
+             "Sent to the manager at checkin so the operator can click through. "
+             "When unset, the manager UI shows no link.",
+        apply="restart", env="NIGHTSHIFT_WORKER_URL"))
     ui_host: str = field(default="0.0.0.0", metadata=meta(
         category="UI & Network", label="UI host",
         desc="Worker UI bind address.",
@@ -254,6 +260,11 @@ def load_worker_config(workspace: Path) -> WorkerConfig:
             os.environ.get("NIGHTSHIFT_WORKER_QUARANTINE"),
             local.get("quarantine", False),
         ),
+        worker_url=(
+            os.environ.get("NIGHTSHIFT_WORKER_URL")
+            or local.get("worker_url")
+            or None
+        ),
         ui_host=os.environ.get("NIGHTSHIFT_WORKER_UI_HOST") or local.get("ui_host") or "0.0.0.0",
         ui_port=int(os.environ.get("NIGHTSHIFT_WORKER_UI_PORT") or local.get("ui_port") or 8810),
         raw=local,
@@ -278,6 +289,7 @@ def save_worker_config(workspace: Path, config: WorkerConfig) -> None:
         "max_model": config.max_model,
         "model_timeout_seconds": config.model_timeout_seconds,
         "quarantine": config.quarantine,
+        "worker_url": config.worker_url,
         "ui_host": config.ui_host,
         "ui_port": config.ui_port,
     }

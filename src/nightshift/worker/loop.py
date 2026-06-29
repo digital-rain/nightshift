@@ -42,6 +42,9 @@ class WorkerLoop:
         self._stop = threading.Event()
 
     def checkin(self) -> None:
+        checkin_meta: dict[str, Any] = {"pid": _safe_pid()}
+        if self.cfg.worker_url:
+            checkin_meta["worker_url"] = self.cfg.worker_url
         resp = self.client.checkin(
             self.cfg.worker_id,
             backend=",".join(sorted(self.cfg.providers())) or None,
@@ -49,7 +52,7 @@ class WorkerLoop:
             priorities=self.cfg.priorities,
             models=self.cfg.advertised_models(),
             mcps=self.cfg.mcps,
-            meta={"pid": _safe_pid()},
+            meta=checkin_meta,
         )
         cad = resp.get("cadences", {})
         self.poll_seconds = float(cad.get("poll_seconds", self.poll_seconds))
