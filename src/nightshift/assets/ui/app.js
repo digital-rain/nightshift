@@ -1268,6 +1268,7 @@ function queueRowAside(item, isNow) {
   const rec = found ? found.rec : null;
   let status;
   if (isNow) status = state.player.state === "paused" ? "paused" : "running";
+  else if (item.quarantined) status = "quarantined";
   else if (rec) status = rec.status;
   else if (state.blockedTasks && item.task in state.blockedTasks) {
     const overlay = state.blockedTasks[item.task];
@@ -1356,6 +1357,12 @@ function queueItemRow(item) {
     const badge = document.createElement("span");
     badge.className = "badge";
     badge.textContent = "disabled";
+    li.append(badge);
+  }
+  if (item.quarantined) {
+    const badge = document.createElement("span");
+    badge.className = "badge quarantined";
+    badge.textContent = "quarantined";
     li.append(badge);
   }
   // Per-row "…" menu: the row's actions (add to playlist, get info, play
@@ -3114,6 +3121,7 @@ function settingsControls(brief, draft, rerender, locked) {
   seg.setAttribute("aria-label", "Task switches");
   const switches = [
     ["Enabled", () => !draft.disabled, (on) => { draft.disabled = !on; }],
+    ["Quarantine", () => !!draft.quarantined, (on) => { draft.quarantined = on; }],
     ["Evergreen", () => !!draft.evergreen, (on) => { draft.evergreen = on; }],
     ["Auto-merge", () => !!draft.automerge, (on) => { draft.automerge = on; }],
     ["Draft", () => !!draft.draft, (on) => { draft.draft = on; }],
@@ -3311,6 +3319,7 @@ function draftFromBrief(brief) {
     title: brief.title || brief.task || "",
     body: brief.body || "",
     disabled: !!brief.disabled,
+    quarantined: !!brief.quarantined,
     evergreen: !!brief.evergreen,
     automerge: !!(brief.frontmatter && brief.frontmatter.automerge),
     draft: !!(brief.frontmatter && brief.frontmatter.draft),
@@ -3532,6 +3541,7 @@ function taskDetailContent(brief, draft, opts = {}) {
   let blockedReason;
   if (creating) status = "pending";
   else if (isNow) status = state.player.state === "paused" ? "paused" : "running";
+  else if (brief.quarantined) status = "quarantined";
   else if (rec) status = rec.status;
   else if (state.blockedTasks && task in state.blockedTasks) {
     const overlay = state.blockedTasks[task];
@@ -3667,6 +3677,7 @@ async function saveDetail(brief, draft, errEl) {
     title: draft.title.trim(),
     body: draft.body,
     disabled: !!draft.disabled,
+    quarantined: !!draft.quarantined,
     evergreen: !!draft.evergreen,
     automerge: !!draft.automerge,
     draft: !!draft.draft,
@@ -3709,6 +3720,7 @@ async function createDetail(draft, errEl) {
     title,
     text: draft.body,
     disabled: !!draft.disabled,
+    quarantined: !!draft.quarantined,
     evergreen: !!draft.evergreen,
     automerge: !!draft.automerge,
     draft: !!draft.draft,

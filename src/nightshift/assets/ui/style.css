@@ -536,6 +536,7 @@ body {
   color: var(--text-dim);
 }
 .badge.evergreen { color: var(--ok); border-color: var(--ok); }
+.badge.quarantined { color: #e6ac40; border-color: #e6ac40; }
 .badge.now { color: var(--accent); border-color: var(--accent); }
 /* Priority chip (P0..P5): a monospace-ish pill whose tint runs from urgent
    (P0, error/red) through warn to muted (P5), so urgency reads at a glance. */
@@ -648,7 +649,7 @@ body {
 .status.skipped, .status.stopped { background: var(--bg-sunken); color: var(--text-dim); }
 .status.paused { background: rgba(230, 192, 104, 0.16); color: var(--warn); }
 .status.aborted { background: rgba(230, 192, 104, 0.16); color: var(--warn); }
-.status.quarantined { background: rgba(200, 130, 220, 0.16); color: #c882dc; }
+.status.quarantined { background: rgba(230, 172, 64, 0.16); color: #e6ac40; }
 
 /* ---- classified failure badges ---- */
 .fail-badge {

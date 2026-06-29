@@ -59,6 +59,7 @@ from nightshift.spawn_daily import (
     MIN_PRIORITY,
     find_autosplit_sources,
     is_disabled,
+    is_quarantined,
     load_config,
     load_queue_config,
     resolve_config,
@@ -683,7 +684,7 @@ def live_ordered_queue(tasks_root: Path, tasks_rel: str = "main") -> list[str]:
             continue
         text = p.read_text(errors="replace")
         meta = split_frontmatter(text)[0] if text.startswith("---") else {}
-        if is_disabled(meta):
+        if is_disabled(meta) or is_quarantined(meta):
             continue
         queue_names.append(p.stem)
         priorities[p.stem] = task_priority(meta)
@@ -952,6 +953,7 @@ def read_task(tasks_root: Path, task: str, tasks_rel: str = "main") -> dict:
         "frontmatter_raw": dict(meta),
         "evergreen": evergreen,
         "disabled": is_disabled(meta),
+        "quarantined": is_quarantined(meta),
     }
 
 
@@ -962,8 +964,8 @@ def read_task(tasks_root: Path, task: str, tasks_rel: str = "main") -> dict:
 # the per-task target-repo override (a bare workspace-child name); clearing it
 # (``repo: None``) falls the task back to the queue's default ``repo``.
 _EDITABLE_META_KEYS = {
-    "disabled", "evergreen", "automerge", "draft", "model", "priority", "repo",
-    "loop", "loop_max_iterations",
+    "disabled", "quarantined", "evergreen", "automerge", "draft", "model",
+    "priority", "repo", "loop", "loop_max_iterations",
 }
 
 # The detail-view editor may also rewrite the spec prose (``body``) and the
@@ -1103,6 +1105,7 @@ def list_queue(tasks_root: Path, tasks_rel: str = "main") -> list[dict]:
             "title": resolve_title(p.stem, meta),
             "evergreen": evergreen,
             "disabled": is_disabled(meta),
+            "quarantined": is_quarantined(meta),
             "priority": priorities[p.stem],
         }
     ordered = order_stems(tasks_root, list(by_stem), tasks_rel, priorities=priorities)
@@ -2941,6 +2944,17 @@ def run_task(
         return TaskResult(
             task=task, title=title, success=False, status="skipped",
             result_line="skipped: task is disabled",
+        )
+
+    if is_quarantined(meta):
+        emit(Event(TASK_RESULT, {
+            "task": task,
+            "status": "skipped",
+            "result_line": "skipped: task is quarantined",
+        }))
+        return TaskResult(
+            task=task, title=title, success=False, status="skipped",
+            result_line="skipped: task is quarantined",
         )
 
     # Resolve the target repo (task frontmatter override → queue default). A

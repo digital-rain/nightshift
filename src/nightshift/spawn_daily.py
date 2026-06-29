@@ -214,6 +214,11 @@ def is_disabled(meta: dict) -> bool:
     return bool(meta.get("disabled", False))
 
 
+def is_quarantined(meta: dict) -> bool:
+    """Return True when frontmatter marks a task as quarantined."""
+    return bool(meta.get("quarantined", False))
+
+
 # Priority scale: 0 = highest, 5 = lowest. A task that doesn't set ``priority``
 # sorts as the lowest (5) so explicitly-prioritised tasks float to the top.
 MIN_PRIORITY = 0

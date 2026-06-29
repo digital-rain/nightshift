@@ -240,6 +240,7 @@ class PlaylistUpdate(BaseModel):
 class TaskCreate(BaseModel):
     title: str
     text: str
+    quarantined: bool | None = None
     # Optional per-task repo override (defaults to the queue's repo). Written as
     # an editable frontmatter meta key on the new brief.
     repo: str | None = None
@@ -258,6 +259,7 @@ class TaskUpdate(BaseModel):
     """
 
     disabled: bool | None = None
+    quarantined: bool | None = None
     evergreen: bool | None = None
     automerge: bool | None = None
     draft: bool | None = None

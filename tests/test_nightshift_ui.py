@@ -275,7 +275,7 @@ def test_run_task_missing_claude_errors_gracefully(
     tasks_root = _seed(tmp_path, tasks={"10.x": "do x"})
     monkeypatch.setattr(engine, "setup_worktree", lambda ws, repo, task, *, queue=None: tmp_path)
     monkeypatch.setattr(engine, "teardown_worktree", lambda ws, repo, task, *, queue=None: None)
-    monkeypatch.setattr(engine, "build_prompt", lambda task, *, task_file=None, validate_cmd=None: "p")
+    monkeypatch.setattr(engine, "build_prompt", lambda task, *, task_file=None, validate_cmd=None, loop=False, loop_max_iterations=0: "p")
     monkeypatch.setattr(engine, "_write_failure_log", lambda *a, **k: None)
     monkeypatch.setattr(engine, "resolve_claude_bin", lambda config=None: "no-such-bin-xyz")
 
@@ -1436,7 +1436,7 @@ def test_run_task_no_changes_completes_cleanly(
     tasks_root = _seed(tmp_path, tasks={"10.x": "do x"})
     monkeypatch.setattr(engine, "setup_worktree", lambda ws, repo, task, *, queue=None: tmp_path)
     monkeypatch.setattr(engine, "teardown_worktree", lambda ws, repo, task, *, queue=None: None)
-    monkeypatch.setattr(engine, "build_prompt", lambda task, *, task_file=None, validate_cmd=None: "p")
+    monkeypatch.setattr(engine, "build_prompt", lambda task, *, task_file=None, validate_cmd=None, loop=False, loop_max_iterations=0: "p")
     monkeypatch.setattr(engine, "_worktree_has_commits", lambda ws, repo, task, *, queue=None: False)
 
     class _NoopBackend:

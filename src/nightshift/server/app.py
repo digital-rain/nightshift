@@ -117,6 +117,7 @@ class TaskCreate(BaseModel):
     title: str
     text: str = ""
     disabled: bool | None = None
+    quarantined: bool | None = None
     evergreen: bool | None = None
     automerge: bool | None = None
     draft: bool | None = None
@@ -136,6 +137,7 @@ class TaskUpdate(BaseModel):
     edits saved alongside the frontmatter toggles in one PATCH."""
 
     disabled: bool | None = None
+    quarantined: bool | None = None
     evergreen: bool | None = None
     automerge: bool | None = None
     draft: bool | None = None
