@@ -30,7 +30,7 @@ flowchart LR
   - `gemini` — the `gemini` CLI on `PATH`, with an authenticated account or `GEMINI_API_KEY`.
   - `anthropic` — `ANTHROPIC_API_KEY` set (single-shot API backend, no CLI).
   - `ollama` — the `ollama` CLI on `PATH` (or an `ollama_host`).
-- **Postgres is recommended but optional.** With a DSN (`NIGHTSHIFT_PG_DSN`) the manager persists state durably and every browser converges on the same source of truth. Without one it falls back to an in-memory store — fine for a quick try, but state is lost on restart and there is no cross-restart history. Nightshift owns its own DSN; it never reuses longitude's `LONG_PG_DSN`, so a clean Nightshift-only database on a separate host is the default posture (point `NIGHTSHIFT_PG_DSN` at the longitude DB explicitly if you want them to share one).
+- **Postgres is recommended but optional.** With a DSN (`NIGHTSHIFT_PG_DSN`) the manager persists state durably and every browser converges on the same source of truth. Without one it falls back to an in-memory store — fine for a quick try, but state is lost on restart and there is no cross-restart history. The store is configured solely from `NIGHTSHIFT_PG_DSN`; a clean Nightshift-only database is the default posture (point `NIGHTSHIFT_PG_DSN` at an existing database if you want to share one).
 
 ## The workspace
 
@@ -72,7 +72,7 @@ NIGHTSHIFT_WORKSPACE=$HOME/workspaces
 NIGHTSHIFT_MANAGER_URL=http://localhost:8800
 
 # Durable state (recommended). Nightshift's own DSN — a clean, dedicated DB.
-# Omit to use the in-memory fallback. This is never inherited from LONG_PG_DSN.
+# Omit to use the in-memory fallback.
 NIGHTSHIFT_PG_DSN=postgresql://nightshift@localhost:5432/nightshift
 
 # A backend credential — whichever backend this worker will use.

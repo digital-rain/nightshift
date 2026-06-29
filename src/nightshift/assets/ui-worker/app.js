@@ -815,15 +815,18 @@ function buildWorkerFieldRow(field, surface) {
   key.textContent = field.key;
   const badges = document.createElement("span");
   badges.className = "w-sf-badges";
-  if (field.apply === "live") {
+  // Only badge an apply mode that differs from the default (next-task): a
+  // restart requirement is the consequential one to surface; "live" is a nicety.
+  // next-task is the common case and gets no badge — it would just be noise.
+  if (field.apply === "restart") {
+    const b = document.createElement("span");
+    b.className = "w-sf-badge w-sf-badge-restart";
+    b.textContent = "restart";
+    badges.appendChild(b);
+  } else if (field.apply === "live") {
     const b = document.createElement("span");
     b.className = "w-sf-badge w-sf-badge-live";
     b.textContent = "live";
-    badges.appendChild(b);
-  } else if (field.apply === "next-task") {
-    const b = document.createElement("span");
-    b.className = "w-sf-badge w-sf-badge-next-task";
-    b.textContent = "next-task";
     badges.appendChild(b);
   }
   if (field.secret) {

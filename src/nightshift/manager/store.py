@@ -1128,10 +1128,8 @@ async def open_store(dsn: str | None = None) -> NightshiftStore:
 
     Uses Postgres (``PgStore``) when a DSN is available (``dsn`` arg, else
     ``NIGHTSHIFT_PG_DSN``), else an in-memory store so a co-located
-    single-machine run needs no DB. Nightshift owns its own DSN and does **not**
-    fall back to longitude's ``LONG_PG_DSN`` — pass the same value explicitly to
-    share a database. The asyncpg import is local to this factory so the module
-    never imports a PG client at top level.
+    single-machine run needs no DB. The asyncpg import is local to this factory
+    so the module never imports a PG client at top level.
     """
     dsn = dsn or os.environ.get("NIGHTSHIFT_PG_DSN")
     if not dsn:

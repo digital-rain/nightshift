@@ -264,7 +264,7 @@ A queue is a top-level directory of the `nightshift-tasks` content store. Per-qu
 
 ## Database / state store
 
-Nightshift owns its own DSN. The store is selected from `NIGHTSHIFT_PG_DSN` (env/.env); it deliberately does **not** fall back to longitude's `LONG_PG_DSN`.
+The store is selected from `NIGHTSHIFT_PG_DSN` (env/.env).
 
 | Setting | Effect |
 |---|---|

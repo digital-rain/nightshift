@@ -902,23 +902,18 @@ def test_dsn_env_overrides_block(tmp_path: Path, monkeypatch) -> None:
     assert load_manager_config(root).dsn == "postgresql://env-host/nightshift"
 
 
-def test_dsn_does_not_recycle_long_pg_dsn(tmp_path: Path, monkeypatch) -> None:
-    # The whole point: longitude's DSN must never silently become Nightshift's.
+def test_dsn_absent_is_none(tmp_path: Path, monkeypatch) -> None:
     from nightshift.manager.config import load_manager_config
 
     monkeypatch.delenv("NIGHTSHIFT_PG_DSN", raising=False)
-    monkeypatch.setenv("LONG_PG_DSN", "postgresql://longitude/longitude")
-    monkeypatch.setenv("DATABASE_URL", "postgresql://longitude/other")
     root = _write_manager_block(tmp_path, {})
     assert load_manager_config(root).dsn is None
 
 
 def test_open_store_no_dsn_is_memory(monkeypatch) -> None:
-    # open_store with no arg + no NIGHTSHIFT_PG_DSN must fall back to MemoryStore
-    # and must not consult LONG_PG_DSN.
+    # open_store with no arg + no NIGHTSHIFT_PG_DSN falls back to MemoryStore.
     from nightshift.manager.store import MemoryStore, open_store
 
     monkeypatch.delenv("NIGHTSHIFT_PG_DSN", raising=False)
-    monkeypatch.setenv("LONG_PG_DSN", "postgresql://longitude/longitude")
     store = asyncio.run(open_store())
     assert isinstance(store, MemoryStore)

@@ -52,7 +52,7 @@ The manager reads `tools/nightshift/config.json`. Service-level settings live un
 | `landing_mode` | `none` | Remote policy applied *after* the always-on local fast-forward of canonical `main`: `none` (local only), `push` (push `main` to origin), `pr` (open a PR). |
 | `rendezvous_remote` | `origin` | Git remote `land()` fetches a worker's cross-machine task branch from and prunes after landing; consulted only when a submit carries a `branch_ref` (co-located submits land the local branch directly). |
 | `shared_secret` | `null` | If set, every worker call must send a matching `X-Nightshift-Secret` header. |
-| `dsn` | `null` | Nightshift's own Postgres DSN. Set → durable `PgStore`; unset → in-memory store. Never inherited from longitude's `LONG_PG_DSN` (see [Database](#database--state-store)). |
+| `dsn` | `null` | Nightshift's own Postgres DSN. Set → durable `PgStore`; unset → in-memory store (see [Database](#database--state-store)). |
 | `cadences.poll_seconds` | `5.0` | Worker idle poll interval (sent to workers at checkin). |
 | `cadences.heartbeat_seconds` | `10.0` | Worker→manager heartbeat interval that keeps a lease alive. |
 | `cadences.lease_ttl_seconds` | `120.0` | Lease lifetime before the manager reclaims it. |
@@ -202,7 +202,7 @@ Queue dedication is manager-side: a dedicated queue's tasks are offered only to 
 
 ## Database / state store
 
-Nightshift owns its own DSN. The store is selected from `NIGHTSHIFT_PG_DSN` (env) or `manager.dsn` (config block); it deliberately does **not** fall back to longitude's `LONG_PG_DSN` or `DATABASE_URL`, so Nightshift never silently rides on the longitude database. To share one database, point `NIGHTSHIFT_PG_DSN` at the same DSN explicitly.
+The store is selected from `NIGHTSHIFT_PG_DSN` (env) or `manager.dsn` (config block). To share a database with another application, point `NIGHTSHIFT_PG_DSN` at the same DSN explicitly.
 
 | Setting | Effect |
 |---|---|

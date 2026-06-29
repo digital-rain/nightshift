@@ -77,9 +77,9 @@ What we cannot beat is the frontier model emitting fewer tokens than a Claude mo
 
 ## 3. Review against the current standalone repo
 
-The original analysis assumed the `longitude` monorepo, where `long_llm`, `long_intel_tools`, the `long_metrics_narrative` orchestrator loop, and pgvector were siblings to reuse "for free."
+The original analysis assumed a monorepo where an LLM gateway, a tool seam, an orchestrator loop, and pgvector were siblings to reuse "for free."
 **That premise does not hold.**
-Nightshift is a standalone repo whose full dependency set is `fastapi`, `uvicorn`, `httpx`, `pydantic`, `asyncpg`, `python-dotenv` — no `litellm`, no `long_llm`, no pgvector — and its DB is separate from longitude's (`docs/configuration-reference.md`).
+Nightshift is a standalone repo whose full dependency set is `fastapi`, `uvicorn`, `httpx`, `pydantic`, `asyncpg`, `python-dotenv` — no `litellm`, no external gateway, no pgvector — and it owns its own database (`docs/configuration-reference.md`).
 
 Since that first review the repo has also moved decisively toward the freedom this spec wants:
 
@@ -92,11 +92,11 @@ Corrected reuse map:
 
 | Component | Original claim | Reality now |
 |---|---|---|
-| Tool-call agent loop | "Have it (orchestrator)" | **In `longitude`, not a dependency, and `litellm`-based.** Build it in nightshift over the existing `httpx` API path — no new dependency. |
+| Tool-call agent loop | "Have it (orchestrator)" | **Not a dependency, and `litellm`-based where it exists.** Build it in nightshift over the existing `httpx` API path — no new dependency. |
 | Direct model streaming | "Have it (AnthropicBackend), needs tool support" | **Correct and in-repo.** `AnthropicBackend` and `_ollama_generate` already stream over `httpx`. These are the transports the harness wraps. |
-| Provider routing / budgets / cache | "Have it for free (`long_llm`)" | **Don't import a sibling repo.** Nightshift already has its own routing (provider-qualified ids, `model_aliases`, `auto`/`max`) and per-model/backend token rollups via `WorkerResult`. Prompt caching is an Anthropic **API request feature** (`cache_control`), not a gateway. |
+| Provider routing / budgets / cache | "Have it for free (external gateway)" | **Don't import a sibling repo.** Nightshift already has its own routing (provider-qualified ids, `model_aliases`, `auto`/`max`) and per-model/backend token rollups via `WorkerResult`. Prompt caching is an Anthropic **API request feature** (`cache_control`), not a gateway. |
 | Worktree isolation / squash | "Have it" | **Correct and in-repo — the biggest reuse.** `setup_worktree`, `squash_to_main`, the landing lock, validate/repair: reused unchanged. |
-| Tool seam | "Have it (`long_intel_tools`)" | **In `longitude`, a reference pattern only.** Nightshift needs its own small tool registry (§5.2). |
+| Tool seam | "Have it (external tool package)" | **A reference pattern only, not a dependency.** Nightshift needs its own small tool registry (§5.2). |
 | Embedding index / pgvector | "Substrate already installed" | **Not in nightshift's DB.** Requires a real Postgres with the `vector` extension + a nightshift-owned migration (§6). |
 | Cursor as the thing to replace | (not in scope then) | **Now the explicit target.** Provider-qualified ids make the swap a config change: stop advertising `cursor/...`, advertise `nightshift/...`. |
 
@@ -226,7 +226,7 @@ Index the target repo lazily on first `nightshift` run against it (or via a mana
 
 ## 8. Build vs adopt
 
-The new drivers tilt the decision toward **build**, and the venue is this repo, not longitude's `04-build-vs-adopt-analysis.md` (a different project).
+The new drivers tilt the decision toward **build**, and the venue is this repo.
 
 - **Adopt (aider / OpenHands)** is still the cheapest *benchmark*: in nightshift it is just one more subprocess backend (`build_aider_argv`, mirroring `build_cursor_argv`), reusing `_stream_subprocess` + `AgentStreamParser`. Worth adding to measure against.
 - **But adopting re-introduces a harness we do not control** — its own context policy, token economics, and version drift — which is exactly what drivers §1.2 and §1.3 are trying to escape. Feature control and an owned token budget are build arguments.
@@ -265,7 +265,7 @@ The retrieval index (§6) is worth building regardless — the CLIs cannot expos
 5. **The request is owned.** Context assembly, thinking budget, `max_tokens`, cache breakpoints, retries, and the tool allow-list are explicit, version-controlled config — never a hidden vendor default.
 6. **The token budget is owned and tested.** Per-task token usage is a measured, regression-tested property; nothing is re-read or re-sent unless the loop chose to.
 7. **Caching obeys the prefix-match contract (Anthropic path only).** Prompt caching is an Anthropic-only lever; on `ollama-cloud`/`ollama` it is a no-op. Where it applies: caching is a strict prefix match in render order `tools → system → messages` — any byte change before a breakpoint invalidates everything after it. Therefore (a) the cached prefix (charter + tool spec) is byte-identical across turns, with no interpolated timestamps/ids/slugs and deterministic tool-definition serialization; (b) the tool allow-list is fixed at loop start and never mutated mid-run (the `tools` array renders at position 0); (c) the cached prefix must clear the per-model minimum (4096 tokens on Opus/Haiku, 2048 on Sonnet 4.6) or it silently does not cache; (d) a cache *hit* — not merely a breakpoint in the request — is what the §10 budget test asserts.
-8. **No cross-repo or new heavy dependency.** Nightshift does not import `longitude` code and adds no `litellm`; it reaches model APIs over the existing `httpx` paths.
+8. **No cross-repo or new heavy dependency.** Nightshift imports no external sibling-repo code and adds no `litellm`; it reaches model APIs over the existing `httpx` paths.
 9. **Reuse the engine, don't fork it.** Worktree setup, validate/repair, the landing lock, and squash come from `engine.py` unchanged.
 10. **Retrieval is additive and degradable.** Absent index → grep + span reads; the index lives in nightshift's own Postgres.
 
@@ -274,8 +274,8 @@ The retrieval index (§6) is worth building regardless — the CLIs cannot expos
 ## 12. Out of scope / non-goals
 
 - **No fast-apply model** — the deterministic applier is the deliberate substitute.
-- **No new heavy dependencies** — no `litellm`, no `long_llm`; APIs reached via existing `httpx` paths.
-- **No borrowing longitude's database** — the retrieval phase adds a nightshift-owned migration + extension, or it does not ship.
+- **No new heavy dependencies** — no `litellm`, no external LLM gateway; APIs reached via existing `httpx` paths.
+- **No borrowing another application's database** — the retrieval phase adds a nightshift-owned migration + extension, or it does not ship.
 - **No removal of existing backends in this work** — `cursor` is retired from advertised models only after the harness wins on measured latency and cost; the backend stays registered as a benchmark.
 - **No matching Cursor's serving latency or speculative-edit infra** — the target is "faster than `claude-code`, with an owned token budget," not parity with Cursor's infrastructure.
 

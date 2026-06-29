@@ -91,7 +91,7 @@ Most of a harness already exists, just wired for single-shot or for CLI subproce
 | **Deterministic edit applier (`SEARCH`/`REPLACE`)** | **Missing** | — |
 | **Embedding index / span retrieval** | **Missing** | — |
 
-The middle-layer option: a provider-routing layer (e.g. longitude's `long_llm` gateway — LiteLLM-backed router with budgets, response cache, and a local-first fallback, or any equivalent) can sit under the harness so the same loop runs against Anthropic, a local Ollama model, or others without per-provider branching.
+The middle-layer option: a provider-routing layer (e.g. a LiteLLM-backed router with budgets, response cache, and a local-first fallback, or any equivalent gateway) can sit under the harness so the same loop runs against Anthropic, a local Ollama model, or others without per-provider branching.
 That also inherits cost ledgers and caching for free.
 It is optional for Phase 0 (the existing `httpx` Anthropic client is enough) and becomes attractive once we want routing and budgets.
 
@@ -173,7 +173,7 @@ Do not invest in the index before the Phase 0 benchmark exists.
 
 - **Edit reliability.** `SEARCH`/`REPLACE` fails when the model's anchor text is not unique or drifts from disk. Needs a strict, loud applier and a retry/repair turn — this is the main correctness risk and the main thing `aider`-style projects have already tuned.
 - **Where does the residual gap land?** After §5 the remaining latency is mostly the frontier model's own output-token rate and serving latency — unfixable from our side. The benchmark must isolate this so we do not chase it.
-- **Middle layer now or later?** Phase 0 can use the existing `httpx` client; introducing a routing/budget layer (e.g. `long_llm`) is an independent decision driven by whether we want tiered models and cost caps.
+- **Middle layer now or later?** Phase 0 can use the existing `httpx` client; introducing a routing/budget layer (a LiteLLM-style gateway) is an independent decision driven by whether we want tiered models and cost caps.
 - **Index scope and freshness.** Per-repo index, incremental re-embed on change, and where embeddings run (local vs. paid) — all open, and all part of Phase 1, not Phase 0.
 - **Charter alignment.** The agentic loop must honor the same forbidden-paths, diff-cap, and validate gates the CLI backends already obey; `run_bash` is the sharp edge there.
 

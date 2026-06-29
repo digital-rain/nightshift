@@ -4587,6 +4587,8 @@ function buildFieldRow(field, surface) {
 
   const badges = document.createElement("span");
   badges.className = "sf-badges";
+  // Badge only a non-default apply mode (restart / live); next-task is the
+  // common case and gets no badge — it would just be noise.
   if (field.apply === "restart") {
     const b = document.createElement("span");
     b.className = "sf-badge sf-badge-restart";
@@ -4596,11 +4598,6 @@ function buildFieldRow(field, surface) {
     const b = document.createElement("span");
     b.className = "sf-badge sf-badge-live";
     b.textContent = "live";
-    badges.append(b);
-  } else if (field.apply === "next-task") {
-    const b = document.createElement("span");
-    b.className = "sf-badge sf-badge-next-task";
-    b.textContent = "next-task";
     badges.append(b);
   }
   if (field.secret) {
