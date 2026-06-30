@@ -23,7 +23,9 @@ export default defineConfig({
     host: true,
     port: 5273,
     proxy: {
-      '/api': { target: 'http://localhost:8810', changeOrigin: true },
+      // 127.0.0.1, not localhost — the worker UI binds 0.0.0.0 (IPv4) but
+      // localhost resolves to ::1 (IPv6) first on many hosts → ECONNREFUSED.
+      '/api': { target: 'http://127.0.0.1:8810', changeOrigin: true },
     },
   },
 })

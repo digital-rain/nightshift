@@ -27,7 +27,11 @@ export default defineConfig({
     host: true,
     port: 5173,
     proxy: {
-      '/api': { target: 'http://localhost:8800', changeOrigin: true },
+      // Target 127.0.0.1, NOT localhost: the manager binds 0.0.0.0 (IPv4 only),
+      // but `localhost` resolves to ::1 (IPv6) first on many hosts, so a
+      // localhost target makes the proxy hit [::1]:8800 where nothing listens
+      // → ECONNREFUSED. The literal v4 address sidesteps DNS ordering entirely.
+      '/api': { target: 'http://127.0.0.1:8800', changeOrigin: true },
     },
   },
 })
