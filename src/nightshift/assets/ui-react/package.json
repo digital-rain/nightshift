@@ -1,0 +1,31 @@
+{
+  "name": "nightshift-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Nightshift operator + worker UIs (React 19 / Vite / TypeScript / Tailwind 4).",
+  "scripts": {
+    "dev": "vite",
+    "dev:worker": "vite --config vite.worker.config.ts",
+    "build": "tsc -b && vite build && vite build --config vite.worker.config.ts",
+    "build:manager": "tsc -b && vite build",
+    "build:worker": "tsc -b && vite build --config vite.worker.config.ts",
+    "preview": "vite preview",
+    "typecheck": "tsc -b --noEmit"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.101.2",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.2",
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^6.0.3",
+    "tailwindcss": "^4.3.2",
+    "typescript": "^5.9.0",
+    "vite": "^8.1.0"
+  }
+}
