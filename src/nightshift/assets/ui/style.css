@@ -1001,6 +1001,7 @@ body {
 #screen-detail .detail-field-label,
 #screen-detail .detail-h,
 #screen-detail .model-label,
+#screen-detail .seg-group-label,
 #screen-playlist-info .detail-field-label { text-transform: uppercase; letter-spacing: 0.05em; font-size: 11px; }
 
 /* A read-only segmented control: it *displays* recorded flags (history detail),
