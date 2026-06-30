@@ -24,14 +24,14 @@ export function AppShell({
   return (
     <>
       <header className="flex items-center justify-between gap-4 border-b border-border bg-bg-elev px-4 py-2.5 shadow-[var(--shadow-ns)]">
-        <div className="flex min-w-0 items-center gap-2.5">
+        <div className="flex min-w-0 items-center gap-3">
           {logoSrc && (
-            <img src={logoSrc} alt={brandName} className="block h-8 w-auto" />
+            <img src={logoSrc} alt={brandName} className="block h-11 w-auto shrink-0" />
           )}
-          <div className="flex min-w-0 flex-col leading-tight">
-            <span className="text-[15px] font-bold text-text">{brandName}</span>
+          <div className="flex min-w-0 flex-col leading-none">
+            <span className="text-[19px] font-bold tracking-tight text-text">{brandName}</span>
             {brandTag != null && (
-              <span className="truncate text-[10px] uppercase tracking-wider text-text-dim">
+              <span className="mt-1 truncate text-[10px] uppercase tracking-wider text-text-dim">
                 {brandTag}
               </span>
             )}

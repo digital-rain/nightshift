@@ -20,6 +20,7 @@ import {
   Spinner,
 } from '../../src/components/primitives'
 import { EyeIcon, EyeOffIcon } from '../../src/components/icons'
+import { RescanButton } from '../../src/components/RescanButton'
 import { DetailTakeover } from '../../src/components/DetailTakeover'
 import { cn } from '../../src/lib/cn'
 import {
@@ -64,9 +65,10 @@ export function PlaylistsScreen() {
           >
             Hidden {showHidden ? '✓' : ''}
           </GhostButton>
-          <GhostButton onClick={() => rescan.mutate()} title="Scan the workspace for git repos">
-            Rescan
-          </GhostButton>
+          <RescanButton
+            onRescan={() => rescan.mutateAsync()}
+            title="Re-scan the workspace for playlists"
+          />
           <PrimaryButton onClick={() => setCreating(true)}>+ New</PrimaryButton>
         </div>
       </div>

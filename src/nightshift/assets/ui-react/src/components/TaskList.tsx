@@ -59,7 +59,7 @@ export function TaskList({
         ) : rows.length === 0 ? (
           <EmptyState>{emptyMessage}</EmptyState>
         ) : (
-          <ul className="list-none">
+          <ul className="flex list-none flex-col gap-1.5 px-4 py-3">
             {rows.map((m) => (
               <TaskListItem
                 key={m.id}

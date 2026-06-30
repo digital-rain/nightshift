@@ -250,33 +250,35 @@ function MiniPlayer() {
   const playing = state?.state === 'playing'
   const idle = state?.state === 'idle'
   return (
-    <div className="mx-auto flex w-full max-w-[920px] items-center justify-center gap-5 border-b border-border py-3.5">
-      <button
-        type="button"
-        title={playing ? 'Pause' : 'Play'}
-        onClick={() => transport.mutate({ action: playing ? 'pause' : 'play' })}
-        className="flex h-14 w-14 items-center justify-center text-accent hover:text-text"
-      >
-        {playing ? <PauseIcon className="h-7 w-7" /> : <PlayIcon className="h-7 w-7" />}
-      </button>
-      <button
-        type="button"
-        title="Skip current task"
-        onClick={() => transport.mutate({ action: 'skip' })}
-        className="flex h-14 w-14 items-center justify-center text-text hover:text-accent disabled:opacity-35"
-        disabled={idle}
-      >
-        <SkipIcon className="h-6 w-6" />
-      </button>
-      <button
-        type="button"
-        title="Stop"
-        onClick={() => transport.mutate({ action: 'stop' })}
-        className="flex h-14 w-14 items-center justify-center text-text hover:text-accent disabled:opacity-35"
-        disabled={idle}
-      >
-        <StopIcon className="h-6 w-6" />
-      </button>
+    <div className="mx-auto grid w-full max-w-[920px] grid-cols-[1fr_auto_1fr] items-center border-b border-border py-3.5">
+      <div className="col-start-2 flex items-center justify-center gap-5">
+        <button
+          type="button"
+          title={playing ? 'Pause' : 'Play'}
+          onClick={() => transport.mutate({ action: playing ? 'pause' : 'play' })}
+          className="flex h-14 w-14 items-center justify-center text-accent hover:text-text"
+        >
+          {playing ? <PauseIcon className="h-7 w-7" /> : <PlayIcon className="h-7 w-7" />}
+        </button>
+        <button
+          type="button"
+          title="Skip current task"
+          onClick={() => transport.mutate({ action: 'skip' })}
+          className="flex h-14 w-14 items-center justify-center text-text hover:text-accent disabled:opacity-35"
+          disabled={idle}
+        >
+          <SkipIcon className="h-6 w-6" />
+        </button>
+        <button
+          type="button"
+          title="Stop"
+          onClick={() => transport.mutate({ action: 'stop' })}
+          className="flex h-14 w-14 items-center justify-center text-text hover:text-accent disabled:opacity-35"
+          disabled={idle}
+        >
+          <StopIcon className="h-6 w-6" />
+        </button>
+      </div>
     </div>
   )
 }
@@ -351,11 +353,11 @@ export function ManagerApp() {
         </>
       }
       nav={
-        <div className="flex flex-col pb-[env(safe-area-inset-bottom)]">
+        <div className="flex flex-col px-3 pb-[env(safe-area-inset-bottom)]">
           <MiniPlayer />
-          <div className="flex items-stretch">
+          <div className="mx-auto flex w-full max-w-[920px] items-stretch pt-2">
             <NavTab label="Now" active={view === 'now'} onClick={() => setView('now')} icon={<NowIcon className="h-[22px] w-[22px]" />} />
-            <NavTab label="Queue" active={view === 'queue'} onClick={() => setView('queue')} icon={<QueueIcon className="h-[22px] w-[22px]" />} />
+            <NavTab label="Up Next" active={view === 'queue'} onClick={() => setView('queue')} icon={<QueueIcon className="h-[22px] w-[22px]" />} />
             <NavTab label="Playlists" active={view === 'playlists'} onClick={() => setView('playlists')} icon={<PlaylistsIcon className="h-[22px] w-[22px]" />} />
             <NavTab label="History" active={view === 'history' || view === 'stats'} onClick={() => setView('history')} icon={<HistoryIcon className="h-[22px] w-[22px]" />} />
           </div>

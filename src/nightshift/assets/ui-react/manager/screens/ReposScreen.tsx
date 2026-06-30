@@ -9,10 +9,10 @@ import type { RepoQueueBinding } from '../../src/api/types'
 import {
   Count,
   ErrorState,
-  GhostButton,
   Pill,
   Spinner,
 } from '../../src/components/primitives'
+import { RescanButton } from '../../src/components/RescanButton'
 import { useRepos, useRescanRepos, useSetQueueRepo } from '../../src/hooks/managerQueries'
 
 export function ReposScreen() {
@@ -28,9 +28,10 @@ export function ReposScreen() {
         <h2 className="text-sm font-semibold uppercase tracking-wide text-text-dim">
           Repos
         </h2>
-        <GhostButton onClick={() => rescan.mutate()} title="Re-scan the workspace (resumes paused tasks)">
-          Rescan
-        </GhostButton>
+        <RescanButton
+          onRescan={() => rescan.mutateAsync()}
+          title="Re-scan the workspace (resumes paused tasks)"
+        />
       </div>
 
       {data.warnings.length > 0 && (

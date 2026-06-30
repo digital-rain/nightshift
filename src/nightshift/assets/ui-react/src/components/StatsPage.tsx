@@ -139,10 +139,10 @@ export function DonutChart({
         </g>
         <text
           x="100"
-          y="112"
+          y="113"
           textAnchor="middle"
-          className="fill-text font-bold"
-          style={{ fontSize: 36 }}
+          className="font-bold tnum"
+          style={{ fontSize: 34, fill: 'var(--color-text)' }}
         >
           {centerText ?? `${pct}%`}
         </text>
@@ -364,11 +364,12 @@ export function ManagerStatsView({
   runs?: Run[]
 }) {
   if (stats.overall.total_runs === 0) return <EmptyState>No runs yet.</EmptyState>
+  // Cards + donut charts only — the per-dimension comparison tables live on the
+  // Workers screen (ComparisonTables), matching the legacy Stats screen.
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
       <StatTiles tiles={overallTiles(stats.overall)} />
       <StatCharts overall={stats.overall} byModel={stats.by_model} runs={runs} />
-      <ComparisonTables stats={stats} />
     </div>
   )
 }

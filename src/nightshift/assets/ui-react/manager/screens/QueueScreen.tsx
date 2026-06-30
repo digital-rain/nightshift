@@ -109,7 +109,7 @@ export function QueueScreen({
         ) : ordered.length === 0 ? (
           <EmptyState>No pending tasks.</EmptyState>
         ) : (
-          <ul className="list-none">
+          <ul className="flex list-none flex-col gap-1.5 px-4 py-3">
             {ordered.map((item) => {
               const h = handlers(item.task)
               const row = queueItemToRow(item)
@@ -122,8 +122,9 @@ export function QueueScreen({
                   onDrop={h.onDrop}
                   onDragEnd={h.onDragEnd}
                   className={cn(
+                    'rounded-[10px] transition-opacity',
                     h.isDragging && 'opacity-40',
-                    h.isOver && 'border-t-2 border-accent',
+                    h.isOver && 'ring-2 ring-accent ring-offset-2 ring-offset-bg',
                   )}
                 >
                   <TaskListItem

@@ -50,9 +50,13 @@ export function Segmented<T extends string | number>({
             aria-pressed={on}
             onClick={() => onSelect(opt.value)}
             className={cn(
-              'inline-flex h-full items-center justify-center border-l border-border bg-bg-sunken first:border-l-0',
-              size === 'md' ? 'w-9' : 'min-w-[30px] px-[7px] text-[11px] font-semibold tnum tracking-[0.02em]',
-              on ? 'bg-accent-soft text-accent' : 'text-text-dim hover:text-text',
+              'inline-flex h-full items-center justify-center border-l border-border bg-bg-sunken transition-colors first:border-l-0',
+              size === 'md'
+                ? 'w-9'
+                : 'min-w-[28px] px-2 text-[11px] font-semibold leading-none tnum tracking-[0.04em]',
+              on
+                ? 'bg-accent-soft font-bold text-accent'
+                : 'text-text-dim hover:bg-bg-elev hover:text-text',
             )}
           >
             {opt.content}

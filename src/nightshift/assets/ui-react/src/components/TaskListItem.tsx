@@ -51,9 +51,9 @@ export function TaskListItem({
   return (
     <li
       className={cn(
-        'flex items-start gap-3 border-b border-border px-4 py-3',
-        clickable && 'cursor-pointer hover:bg-bg-elev',
-        selected && 'bg-bg-elev',
+        'flex items-start gap-3 rounded-[10px] border border-border bg-bg-elev px-3 py-2.5',
+        clickable && 'cursor-pointer hover:border-accent',
+        selected && 'border-accent bg-accent-soft',
         model.muted && 'opacity-55',
       )}
       onClick={clickable ? () => onClick!(model.id) : undefined}
