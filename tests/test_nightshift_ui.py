@@ -269,6 +269,33 @@ def test_resolve_claude_bin(monkeypatch: pytest.MonkeyPatch) -> None:
     assert str(Path.home() / ".local/bin") in path_parts
 
 
+def test_worker_env_pythonpath_points_at_worktree_src(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worktree's own ``src`` is prepended to PYTHONPATH so ``import nightshift``
+    resolves to the branch under test, not the symlinked ``.venv``'s editable
+    install (which points at the main checkout's src). See worker_env()."""
+    from nightshift.engine import worker_env
+
+    wt = tmp_path / "wt"
+    (wt / "src").mkdir(parents=True)
+
+    # No arg → no PYTHONPATH override (unchanged behavior for other callers).
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    assert "PYTHONPATH" not in worker_env()
+
+    # Worktree given → its src is first on PYTHONPATH, ahead of any inherited
+    # entries (so it shadows the editable .pth from the symlinked venv).
+    monkeypatch.setenv("PYTHONPATH", f"/main/src{os.pathsep}/other")
+    parts = worker_env(wt)["PYTHONPATH"].split(os.pathsep)
+    assert parts[0] == str(wt / "src")
+    assert parts[1:] == ["/main/src", "/other"]
+
+    # A worktree without a src dir is a no-op (PYTHONPATH untouched).
+    monkeypatch.setenv("PYTHONPATH", "/main/src")
+    assert worker_env(tmp_path / "no-src")["PYTHONPATH"] == "/main/src"
+
+
 def test_run_task_missing_claude_errors_gracefully(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

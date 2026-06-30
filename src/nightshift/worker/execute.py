@@ -262,7 +262,7 @@ def execute_work_order(
             loop=bool(config_blob.get("loop", False)),
             loop_max_iterations=int(config_blob.get("loop_max_iterations", 0)),
         )
-        env = worker_env()
+        env = worker_env(wt_dir)
         max_turns = config_blob.get("max_turns")
         spec = WorkerSpec(
             task=task,

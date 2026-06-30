@@ -1219,16 +1219,34 @@ def resolve_claude_bin(config: dict | None = None) -> str:
     return "claude"
 
 
-def worker_env() -> dict[str, str]:
+def worker_env(worktree: Path | str | None = None) -> dict[str, str]:
     """A child-process environment with the common bin dirs on PATH, so the
     worker (and the tools it shells out to) resolve even when the server was
-    launched from a non-login shell."""
+    launched from a non-login shell.
+
+    ``worktree`` (a task worktree dir): when given, ``<worktree>/src`` is
+    prepended to ``PYTHONPATH`` so ``import nightshift`` resolves to the
+    worktree's own source. Worktrees symlink the target repo's ``.venv``
+    (:data:`SYMLINK_TARGETS`), whose editable install points at the *main*
+    checkout's ``src`` — without this override, ``just validate`` (and the
+    agent's own ``python`` runs) would exercise main's code instead of the
+    branch under test, failing any task that adds code + a test for it.
+    """
     env = os.environ.copy()
     parts = env.get("PATH", "").split(os.pathsep)
     for d in _EXTRA_BIN_DIRS:
         if d not in parts:
             parts.append(d)
     env["PATH"] = os.pathsep.join(p for p in parts if p)
+    if worktree is not None:
+        wt_src = str(Path(worktree) / "src")
+        if Path(wt_src).is_dir():
+            existing = [
+                p
+                for p in env.get("PYTHONPATH", "").split(os.pathsep)
+                if p and p != wt_src
+            ]
+            env["PYTHONPATH"] = os.pathsep.join([wt_src, *existing])
     return env
 
 
@@ -2561,7 +2579,7 @@ def _agent_resolve(
 
     max_attempts = int(config.get("max_resolve_attempts", DEFAULT_MAX_RESOLVE_ATTEMPTS))
     validate_cmd = resolve_validate_cmd(config)
-    env = worker_env()
+    env = worker_env(worktree_dir)
     task_file = tasks_root / tasks_rel / f"{task}.md"
     meta: dict = {}
     body = ""
@@ -3036,7 +3054,7 @@ def run_task(
             loop=bool(meta.get("loop", False)),
             loop_max_iterations=int(meta.get("loop_max_iterations", 0)),
         )
-        env = worker_env()
+        env = worker_env(worktree_dir)
         validate_cmd = resolve_validate_cmd(config)
         backend, run_model = select_run_backend(
             resolved["model"], backend_name or config.get("worker_backend")
