@@ -2860,6 +2860,16 @@ function playlistRow(pl) {
   });
   li.append(addTask);
 
+  const info = document.createElement("button");
+  info.className = "pl-info";
+  info.title = "Get info";
+  info.innerHTML = "&#9432;";
+  info.addEventListener("click", (e) => {
+    e.stopPropagation();
+    openPlaylistInfo(pl.name);
+  });
+  li.append(info);
+
   li.append(playlistMenuButton(pl));
 
   // The chevron switches to this playlist and drops straight into its Queue.
