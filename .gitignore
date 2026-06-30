@@ -224,6 +224,8 @@ __marimo__/
 .tasks/*/runs/
 # Manager/worker landing worktrees and locks.
 .worktrees/
+.claude/worktrees/
+
 # Worker local run history / status.
 .nightshift-worker/
 # Nightshift config dir: runtime state stays ignored, but committed config files do not.
