@@ -64,11 +64,28 @@ Worker screens: Now / History / Stats / Settings are wired. Still:
 
 Cross-cutting:
 
-- [ ] Settings `PUT` delta shaping — the editor currently forwards a flat
-      `{key: value}` working delta; map it to the nested
-      surface→category→field body the backend expects, and surface
-      `applied_live` / `restart_required` from the response.
+- [x] Settings `PUT` delta shaping — `useSettingsSave` now maps the editor's
+      path-keyed delta to the nested surface→category→field body and surfaces
+      save errors. Still TODO: display `applied_live` / `restart_required`
+      from the response (e.g. a restart banner).
 - [ ] Light-theme toggle wiring (`data-theme` attribute switch is already
       supported by the token CSS; just needs a control).
 - [ ] Tests (Longitude's UI has none; consider vitest + testing-library here).
 - [ ] Cutover: repoint `outDir` (or the FastAPI mount) once at parity.
+
+## Review pass (this branch)
+
+A code + screenshot review ran on the foundation. Resolved on the branch:
+
+- Tailwind 4 wasn't scanning the `manager/`/`worker/` entry roots, so classes
+  used only there were dropped from the build (the worker logo rendered at full
+  size). Fixed with `@source` directives. (commit "fix Tailwind 4 content scan")
+- worker `refresh_ms: 0` disabled polling; SSE reconnect left runs/queue/active
+  stale; `TaskDetail` could show stale state if reused without a key;
+  `SettingsEditor` delta collided on duplicate field keys and could strand its
+  tier/category selection after a refetch; settings save swallowed errors.
+  All fixed (commit "address review findings") — see `useSettingsSave`,
+  `useSse` snapshot handling, `SettingsEditor` path-keying + index clamp, and
+  the `key={openTask}` at the manager task-detail call site.
+
+Known remaining (latent, documented): none from the review are open.
