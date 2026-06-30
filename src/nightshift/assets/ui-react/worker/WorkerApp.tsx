@@ -227,7 +227,7 @@ export function WorkerApp() {
         </div>
       }
       nav={
-        <>
+        <div className="mx-auto flex w-full max-w-[920px] items-stretch px-3 pb-[env(safe-area-inset-bottom)]">
           <NavTab label="Now" active={view === 'now'} onClick={() => setView('now')} icon={<NowIcon className="h-[22px] w-[22px]" />} />
           <NavTab
             label="History"
@@ -241,7 +241,7 @@ export function WorkerApp() {
             onClick={() => setView('settings')}
             icon={<GearIcon className="h-[22px] w-[22px]" />}
           />
-        </>
+        </div>
       }
     >
       {view === 'now' && <NowView />}

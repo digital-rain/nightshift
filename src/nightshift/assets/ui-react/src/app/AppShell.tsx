@@ -45,7 +45,7 @@ export function AppShell({
       <main className="flex min-h-0 flex-1 flex-col">{children}</main>
 
       {nav != null && (
-        <nav className="flex items-stretch border-t border-border bg-bg-elev">
+        <nav className="block w-full border-t border-border bg-bg-elev">
           {nav}
         </nav>
       )}
