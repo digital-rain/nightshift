@@ -70,14 +70,25 @@ react_dir := justfile_directory() / "src/nightshift/assets/ui-react"
 react-install:
     cd "{{react_dir}}" && npm install
 
+# Install npm deps only if node_modules is absent (e.g. fresh checkout, or after
+# a worktree was removed). The run/build recipes depend on this so they never
+# fail with `vite: not found`.
+_react-deps:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -d "{{react_dir}}/node_modules" ]; then
+        echo "react: node_modules missing — installing deps…"
+        cd "{{react_dir}}" && npm install
+    fi
+
 # Build both React bundles → dist-manager / dist-worker (side-by-side; leaves the
 # legacy assets/ui + assets/ui-worker untouched).
-react-build:
+react-build: _react-deps
     cd "{{react_dir}}" && npm run build
 
 # Dev: Vite dev server for the operator UI with HMR, proxying /api to a running
 # manager (start `just manager` in another terminal first). Opens on :5173.
-manager-react port="":
+manager-react port="": _react-deps
     #!/usr/bin/env bash
     set -euo pipefail
     cd "{{react_dir}}"
@@ -87,7 +98,7 @@ manager-react port="":
 
 # Dev: Vite dev server for the worker UI with HMR, proxying /api to a running
 # worker UI backend (start `just worker` first). Opens on :5273.
-worker-react port="":
+worker-react port="": _react-deps
     #!/usr/bin/env bash
     set -euo pipefail
     cd "{{react_dir}}"
@@ -98,7 +109,7 @@ worker-react port="":
 # Production: build the React operator UI, then launch the real manager backend
 # serving that bundle (via NIGHTSHIFT_UI_DIR) instead of the legacy UI. Same
 # backend, same API — the React build is just the static surface. Default :8800.
-manager-react-prod port="":
+manager-react-prod port="": _react-deps
     #!/usr/bin/env bash
     set -euo pipefail
     cd "{{react_dir}}" && npm run build:manager
@@ -112,7 +123,7 @@ manager-react-prod port="":
 # Production: build the React worker UI, then launch the real worker backend
 # serving that bundle (via NIGHTSHIFT_WORKER_UI_DIR). /shared still resolves from
 # the legacy operator assets (NIGHTSHIFT_UI_DIR is left unset). Worker UI :8810.
-worker-react-prod port="":
+worker-react-prod port="": _react-deps
     #!/usr/bin/env bash
     set -euo pipefail
     cd "{{react_dir}}" && npm run build:worker
