@@ -22,6 +22,8 @@ import { useState } from 'react'
 import type { TaskDetail as TaskDetailModel, TaskUpdate } from '../api/types'
 import { DetailTakeover } from './DetailTakeover'
 import { PrimaryButton, GhostButton } from './primitives'
+import { Segmented } from './Segmented'
+import { Markdown } from '../lib/markdown'
 import {
   CheckboxField,
   NumberField,
@@ -54,6 +56,8 @@ export function TaskDetail({
   const [draft, setDraft] = useState(fm.draft)
   const [automerge, setAutomerge] = useState(fm.automerge)
   const [evergreen, setEvergreen] = useState(detail.evergreen)
+  // Brief Markdown | Preview toggle, mirroring the legacy detail-brief.
+  const [briefMode, setBriefMode] = useState<'edit' | 'preview'>('edit')
 
   const isNew = detail.task == null
   const editable = !readOnly
@@ -99,14 +103,40 @@ export function TaskDetail({
         value={title}
         onChange={editable ? setTitle : () => {}}
       />
-      <TextAreaField
-        id="task-body"
-        label="Body"
-        desc="The task prompt handed to the agent."
-        value={body}
-        onChange={editable ? setBody : () => {}}
-        rows={14}
-      />
+      <div className="flex flex-col gap-1.5">
+        <div className="flex items-center justify-between">
+          <label htmlFor="task-body" className="text-sm font-semibold text-text">
+            Body
+          </label>
+          <Segmented
+            size="sm"
+            options={[
+              { value: 'edit', content: 'Markdown' },
+              { value: 'preview', content: 'Preview' },
+            ]}
+            isActive={(v) => v === briefMode}
+            onSelect={setBriefMode}
+          />
+        </div>
+        <p className="text-xs text-text-dim">The task prompt handed to the agent.</p>
+        {briefMode === 'preview' ? (
+          <div className="min-h-[8rem] rounded-md border border-border bg-bg-sunken px-3 py-2">
+            {body.trim() ? (
+              <Markdown source={body} />
+            ) : (
+              <span className="text-sm text-text-dim">Nothing to preview.</span>
+            )}
+          </div>
+        ) : (
+          <TextAreaField
+            id="task-body"
+            label=""
+            value={body}
+            onChange={editable ? setBody : () => {}}
+            rows={14}
+          />
+        )}
+      </div>
 
       <div className="grid grid-cols-1 gap-x-6 sm:grid-cols-2">
         <SelectField

@@ -57,7 +57,20 @@ in `src/components` and generalise across both:
 - **TaskDetail** + **DetailTakeover** + **fields** — the read/edit task surface.
 - **SettingsEditor** — the tier/category/field editor; both backends return the
   same settings shape, so one editor drives both.
-- **primitives** — Pill, StatusBadge, buttons, EmptyState, Spinner, ErrorState.
+- **primitives** — Pill, StatusBadge (full legacy status vocabulary), buttons,
+  EmptyState, Spinner, ErrorState.
+- **icons** — the legacy 24×24 SVG set (transport, chevrons, nav glyphs, the
+  three transport-mode glyphs, eye/eye-off, grip, gear, plus, sort) as components.
+- **PhaseStepper** — Worker → Validate → Commit progression (active dot pulses).
+  `stepsFromPhase(phase, status)` derives the model from a run.
+- **DonutChart / StatCharts** — dependency-free SVG donuts (outcomes, failure
+  modes, model usage, model cost) for both stats surfaces.
+- **Segmented** — the transport-mode selector + priority-filter shell.
+- **Modal / Expando / RowMenu / SpinRing** — dialog, collapsible panel, popup
+  actions menu, now-playing spinner.
+- **lib/markdown.tsx** — the brief Markdown|Preview renderer (ported from app.js).
+- **hooks** — `useTheme` (data-theme dark/light), `useDragOrder` (native queue
+  reorder).
 
 ## Run it (justfile recipes)
 
@@ -121,11 +134,34 @@ Until then this is a fully isolated, reviewable surface.
 
 ## Scope of this pass
 
-This is the **foundation + shared component kit**, not a 1:1 port of all ~18k
-lines of the legacy UIs. The two app shells wire the shared kit to real data and
-demonstrate every shared piece end-to-end (Queue, History, Stats, Workers,
-Settings, task edit, SSE convergence, transport). Legacy chrome still to port on
-top of these same pieces: the playlists/repos screens, the add-from/add-to and
-new-playlist modals, drag-to-reorder, the priority-filter + transport-mode
-groups, deep-linking, and log streaming. See `docs/REACT_UI.md`.
+This pass completes the **music-metaphor port** to near-parity with the legacy
+manager + worker UIs, all composed from the shared kit above.
+
+**Manager** — the iPhone-Music shell: top-bar transport-mode segmented control
+(oneshot/auto/repeat), P0–P5 play-priority filter, + Add, theme toggle, and a
+gear menu (Settings / Workers / Repos); a bottom mini-player (play/pause · skip ·
+stop) over the tab strip (Now / Queue / Playlists / History). Screens: **Now**
+(running card with model badge, 1s elapsed ticker, PhaseStepper, live log tail —
+or an idle hero), **Queue** (drag-to-reorder, sort toggle, per-row actions menu,
++ Add), **task detail / new-task** (brief Markdown|Preview), **Playlists**
+(hide/unhide, rescan, new-queue modal, playlist-info takeover), **Repos**
+(workspace, absent-repo warnings, per-queue bindings, rescan), **History** →
+read-only **run detail** with the reconstructed **log viewer** → **Stats**
+(donut charts + tiles), **Workers** (fleet + blocked + queue-dedication editor +
+all four comparison tables), **Settings**. Live SSE convergence throughout.
+
+**Worker** — rich **Now** card (queue/repo/phase badges, model/started/branch/
+worktree metadata, PhaseStepper, auto-scrolling live log), **History** with a
+read-only run detail, **Stats** donuts, **Settings**, theme toggle.
+
+### Known gaps (backend-blocked)
+
+The **add-from / add-to-playlist** task-copy pickers are **not** wired: they
+depend on `POST /api/queue/import` and `GET /api/playlists/{name}/tasks`, which
+exist only on the legacy single-process server (`server/app.py`), not the
+manager (`manager/app.py`). Wiring them requires adding those two endpoints to
+the manager first — out of scope for this frontend-only pass. The new-queue and
+playlist-info surfaces (which use endpoints the manager *does* expose) are wired.
+
+See `docs/REACT_UI.md` for the full endpoint→component map.
 ```

@@ -53,12 +53,20 @@ export function Pill({
 // StatusBadge — maps a RunStatus to a toned Pill (shared by run rows + now view).
 // --------------------------------------------------------------------------- //
 
+// Full legacy status vocabulary → tone. running/pending → accent (blue),
+// completed → green, error/aborted → red, paused/quarantined/blocked → warn,
+// skipped/stopped → neutral. StatusBadge stays the single source of truth.
 const STATUS_TONE: Record<string, PillTone> = {
+  pending: 'accent',
   running: 'accent',
   completed: 'ok',
   error: 'err',
   aborted: 'err',
-  skipped: 'warn',
+  paused: 'warn',
+  quarantined: 'warn',
+  blocked: 'warn',
+  skipped: 'neutral',
+  stopped: 'neutral',
 }
 
 export function StatusBadge({ status }: { status: RunStatus | string }) {

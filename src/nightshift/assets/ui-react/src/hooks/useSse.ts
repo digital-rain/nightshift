@@ -46,6 +46,7 @@ export function useSse(opts: UseSseOptions = {}): void {
       qc.invalidateQueries({ queryKey: qk.leases() })
       qc.invalidateQueries({ queryKey: qk.blocked() })
       qc.invalidateQueries({ queryKey: qk.active() })
+      qc.invalidateQueries({ queryKey: qk.state() })
       qc.invalidateQueries({ queryKey: qk.runsAll() })
       qc.invalidateQueries({ queryKey: qk.queueAll() })
     }
@@ -80,6 +81,7 @@ export function useSse(opts: UseSseOptions = {}): void {
         qc.invalidateQueries({ queryKey: qk.runsAll() })
         qc.invalidateQueries({ queryKey: qk.queueAll() })
         qc.invalidateQueries({ queryKey: qk.active() })
+        qc.invalidateQueries({ queryKey: qk.state() })
       } else if (frame.type === 'event') {
         scheduleFlush()
       }

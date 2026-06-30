@@ -20,6 +20,7 @@ import type {
   PlaylistUpdate,
   QueueConfig,
   QueueItem,
+  ReposPayload,
   Run,
   SettingsResponse,
   SettingsSaveResponse,
@@ -105,8 +106,21 @@ export const manager = {
   models: (queue?: string | null) =>
     api.get<{ models: string[] }>(withQueue('/models', queue)),
 
-  // Transport / now
-  active: () => api.get<ActiveState>('/active'),
+  // Repos
+  repos: () => api.get<ReposPayload>('/repos'),
+  rescanRepos: () => api.post<ReposPayload>('/repos/rescan'),
+
+  // Queue dedication (queue → bound worker ids)
+  getDedication: (queue?: string | null) =>
+    api.get<{ worker_ids: string[] }>(withQueue('/queue/dedication', queue)),
+  setDedication: (workerIds: string[], queue?: string | null) =>
+    api.put(withQueue('/queue/dedication', queue), { worker_ids: workerIds }),
+
+  // Transport / now / active-playlist focus
+  // NB: /active is just {active_playlist}; /state is the full transport state.
+  active: () => api.get<{ active_playlist: string | null }>('/active'),
+  setActive: (playlist: string | null) =>
+    api.post<{ active_playlist: string | null }>('/active', { playlist }),
   state: () => api.get<ActiveState>('/state'),
   transport: (cmd: TransportCommand) =>
     api.post<ActiveState>('/transport', cmd),

@@ -253,6 +253,34 @@ export interface TransportCommand {
 }
 
 // --------------------------------------------------------------------------- //
+// Repos (`GET /api/repos`, `POST /api/repos/rescan`)
+// --------------------------------------------------------------------------- //
+
+export interface RepoEntry {
+  name: string
+  available: boolean
+}
+
+export interface RepoQueueBinding {
+  queue: string
+  repo: string | null
+  available: boolean
+}
+
+export interface RepoWarning {
+  queue: string
+  repo: string
+}
+
+export interface ReposPayload {
+  workspace: string
+  tasks_repo: string | null
+  repos: RepoEntry[]
+  queues: RepoQueueBinding[]
+  warnings: RepoWarning[]
+}
+
+// --------------------------------------------------------------------------- //
 // Stats
 // --------------------------------------------------------------------------- //
 
@@ -286,13 +314,14 @@ export interface ManagerStats {
   by_queue: StatsBucket[]
 }
 
-/** Worker-UI stats (`GET /api/stats` on :8810) — a flat summary. */
+/** Worker-UI stats (`GET /api/stats` on :8810) — a flat summary.
+ *  Mirrors local_store.stats() exactly: errored (not error), total_loc, and no
+ *  token/cost totals. */
 export interface WorkerStats {
   total_runs: number
   completed: number
-  error: number
-  total_turns: number | null
-  total_cost_usd: number | null
+  errored: number
+  total_loc: number
 }
 
 // --------------------------------------------------------------------------- //
@@ -372,15 +401,22 @@ export interface WorkerInfo {
   refresh_ms: number
 }
 
-/** Worker-UI now-playing (`GET /api/now` on :8810). Empty object when idle. */
+/** Worker-UI now-playing (`GET /api/now` on :8810). Empty object ({}) when idle.
+ *  Mirrors local_store NowPlaying.to_dict(). */
 export interface WorkerNow {
-  run_id?: string | null
-  task?: string | null
-  status?: string | null
-  result?: string | null
-  output_lines?: number | null
-  started_at?: string | null
-  finished_at?: string | null
+  run_id?: string
+  task?: string
+  queue?: string
+  title?: string
+  model?: string
+  backend?: string
+  repo?: string
+  branch?: string | null
+  worktree?: string | null
+  phase?: string
+  started_at?: string
+  /** Last MAX_LOG_TAIL stdout lines. */
+  log_tail?: string[]
 }
 
 // --------------------------------------------------------------------------- //

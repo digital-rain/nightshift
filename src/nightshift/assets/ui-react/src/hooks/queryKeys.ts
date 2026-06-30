@@ -9,9 +9,18 @@ export const qk = {
   // manager
   info: () => ['info'] as const,
   active: () => ['active'] as const,
+  state: () => ['state'] as const,
 
   queueAll: () => ['queue'] as const,
   queue: (queue?: string | null) => ['queue', queue ?? 'main'] as const,
+  sort: (queue?: string | null) => ['queue-sort', queue ?? 'main'] as const,
+  playPriorities: (queue?: string | null) =>
+    ['play-priorities', queue ?? 'main'] as const,
+  queueConfig: (queue?: string | null) =>
+    ['queue-config', queue ?? 'main'] as const,
+  dedication: () => ['dedication'] as const,
+  repos: () => ['repos'] as const,
+  runLog: (runId: string, task: string) => ['run-log', runId, task] as const,
 
   task: (task: string, queue?: string | null) =>
     ['task', queue ?? 'main', task] as const,
