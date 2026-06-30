@@ -3736,6 +3736,24 @@ function taskDetailContent(brief, draft, opts = {}) {
   saveBtn.disabled = locked;
   saveBtn.addEventListener("click", () =>
     creating ? createDetail(draft, err) : saveDetail(brief, draft, err));
+  if (!creating) {
+    const delBtn = document.createElement("button");
+    delBtn.className = "btn danger";
+    delBtn.textContent = "Delete";
+    delBtn.disabled = locked;
+    delBtn.addEventListener("click", async () => {
+      const where = state.activePlaylist || "the main queue";
+      if (!confirm(`Remove "${task}.md" from ${where}? This deletes the file from this queue.`)) return;
+      if (locked) { alert("The running task can't be removed — stop it first."); return; }
+      const { ok, data } = await sendJSON(
+        `/api/tasks/${encodeURIComponent(task)}${queueParam()}`, "DELETE");
+      if (!ok) { alert((data && data.error) || "could not remove task"); return; }
+      state.selectedTasks.delete(task);
+      closeDetailScreen();
+      await loadQueue();
+    });
+    actions.append(delBtn);
+  }
   actions.append(err, saveBtn);
   frag.append(actions);
   return frag;
