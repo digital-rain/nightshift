@@ -883,9 +883,10 @@ body {
 .seg-opt:hover:not(:disabled) { color: var(--text); }
 .seg-opt.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
 .seg-opt:disabled { opacity: 0.45; cursor: default; }
-/* Labeled segment groups: a small label above the segmented control. */
-.seg-group:has(.seg-group-label) { display: inline-flex; flex-direction: column; gap: 3px; }
-.seg-group-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-dim); }
+/* Labeled segment groups: label to the left of the segmented control. */
+.settings-row .seg-group { align-items: center; gap: 8px; border: none; border-radius: 0; overflow: visible; }
+.seg-group-label { color: var(--text-dim); font-size: 13px; }
+.seg-group .segmented { border: none; }
 /* The model dropdown sits in line with the segmented controls. */
 .model-select { display: inline-flex; align-items: center; gap: 8px; }
 .model-label { color: var(--text-dim); font-size: 13px; }

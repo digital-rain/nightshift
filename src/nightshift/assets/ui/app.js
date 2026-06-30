@@ -3290,12 +3290,12 @@ function loopSettings(draft, rerender, locked) {
   return row;
 }
 
-// Priority picker: a P0–P5 segmented control (P0 = highest, P5 = lowest) reusing
-// the same `.segmented` / `.seg-opt` pattern as the switches, sitting in line
-// with them and the model dropdown. The chosen level is buffered into
-// `draft.priority`; it drives the queue's priority sort. The per-button title
-// carries the highest/lowest hint, so no separate caption or legend is shown.
 function prioritySegment(draft, rerender, locked) {
+  const group = document.createElement("div");
+  group.className = "seg-group";
+  const lbl = document.createElement("span");
+  lbl.className = "seg-group-label";
+  lbl.textContent = "Priority";
   const seg = document.createElement("div");
   seg.className = "segmented";
   seg.setAttribute("role", "group");
@@ -3317,7 +3317,8 @@ function prioritySegment(draft, rerender, locked) {
     });
     seg.append(seg_btn);
   }
-  return seg;
+  group.append(lbl, seg);
+  return group;
 }
 
 // The model dropdown, right-aligned in line with the segmented switches. Its
