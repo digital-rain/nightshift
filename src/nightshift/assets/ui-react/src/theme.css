@@ -1,6 +1,15 @@
 @import 'tailwindcss';
 
 /*
+ * Tailwind 4 auto-detects content relative to this stylesheet's directory
+ * (src/), so classes used only in the Vite entry roots — manager/ and worker/,
+ * which are siblings of src/ — would be missed and their utilities dropped from
+ * the build. Register those dirs explicitly so every class is emitted.
+ */
+@source '../manager';
+@source '../worker';
+
+/*
  * Nightshift design tokens — ported from the legacy hand-written style.css
  * (:root / :root[data-theme="light"]). Tailwind 4 is CSS-first: tokens declared
  * in @theme become both CSS custom properties (var(--color-bg)) and utility
