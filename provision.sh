@@ -8,9 +8,13 @@
 #                   Opens UFW port 5432 to the local subnet.
 #   --with-claude   Install Node + the Claude Code CLI (the default worker
 #                   backend). Other backends (cursor/gemini/ollama) are BYO.
+#   --with-react    Install Node + the React UI's npm deps and pre-build the
+#                   bundles (assets/ui-react). Needed only to serve the React
+#                   operator/worker UI (just manager-react-prod / worker-react-prod);
+#                   the legacy vanilla UI needs nothing extra.
 #
 # Usage:
-#   ./provision.sh [--with-db] [--with-claude] [--repo=PATH] [--pg-version=NN]
+#   ./provision.sh [--with-db] [--with-claude] [--with-react] [--repo=PATH] [--pg-version=NN]
 #
 # Safe to re-run: every step is guarded by an "is it already there?" check.
 # Opens UFW ports 8800 (manager), 8810 (worker UI), 8799 (legacy UI server).
@@ -32,11 +36,13 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 PG_VERSION="17"
 DO_DB=0
 DO_CLAUDE=0
+DO_REACT=0
 
 for arg in "$@"; do
   case "$arg" in
     --with-db)       DO_DB=1 ;;
     --with-claude)   DO_CLAUDE=1 ;;
+    --with-react)    DO_REACT=1 ;;
     --repo=*)        REPO="${arg#*=}" ;;
     --pg-version=*)  PG_VERSION="${arg#*=}" ;;
     -h|--help)       print_help; exit 0 ;;
@@ -48,6 +54,20 @@ step()  { printf '\n%s==> %s%s\n' "$GREEN" "$1" "$NC"; }
 note()  { printf '%s  - %s%s\n' "$YELLOW" "$1" "$NC"; }
 fail()  { printf '%s!! %s%s\n' "$RED" "$1" "$NC" >&2; exit 1; }
 have()  { command -v "$1" >/dev/null 2>&1; }
+
+# Ensure Node + npm are present (shared by --with-claude and --with-react).
+# Returns non-zero if Node could not be installed, so callers can degrade.
+ensure_node() {
+  if have node; then return 0; fi
+  if have apt-get; then
+    curl -fsSL https://deb.nodesource.com/setup_20.x | $SUDO -E bash -
+    apt_install nodejs
+    have node && note "installed node $(node --version)"
+  else
+    note "cannot auto-install Node (no apt); install Node >=18 manually."
+  fi
+  have node
+}
 
 SUDO=""
 if [[ "$(id -u)" -ne 0 ]]; then SUDO="sudo"; fi
@@ -155,15 +175,7 @@ fi
 # ── optional: Claude Code CLI (default worker backend) ──────────────────────
 if [[ "$DO_CLAUDE" -eq 1 ]]; then
   step "── Claude Code CLI (worker backend) ────────────────────"
-  if ! have node; then
-    if have apt-get; then
-      curl -fsSL https://deb.nodesource.com/setup_20.x | $SUDO -E bash -
-      apt_install nodejs
-      note "installed node $(node --version)"
-    else
-      note "cannot auto-install Node (no apt); install Node >=18 manually."
-    fi
-  fi
+  ensure_node || true
   if have claude; then
     note "claude present: $(claude --version 2>/dev/null || echo installed)"
   elif have npm; then
@@ -171,6 +183,29 @@ if [[ "$DO_CLAUDE" -eq 1 ]]; then
       || note "claude install failed; run: npm install -g @anthropic-ai/claude-code"
   else
     note "npm not found — install Node first, then: npm install -g @anthropic-ai/claude-code"
+  fi
+fi
+
+# ── optional: React UI (assets/ui-react) ────────────────────────────────────
+if [[ "$DO_REACT" -eq 1 ]]; then
+  step "── React UI (assets/ui-react) ──────────────────────────"
+  REACT_DIR="$REPO/src/nightshift/assets/ui-react"
+  if [[ ! -d "$REACT_DIR" ]]; then
+    note "react UI dir not found at $REACT_DIR (skipping)."
+  elif ensure_node && have npm; then
+    note "node $(node --version), npm $(npm --version)"
+    ( cd "$REACT_DIR" && npm install ) \
+      && note "installed React UI npm deps" \
+      || note "npm install failed (run it manually in $REACT_DIR)."
+    # Pre-build both bundles so `just manager-react-prod` / `worker-react-prod`
+    # start without a first-run build. Non-fatal: dev (`just manager-react`)
+    # and the prod recipes both rebuild as needed.
+    ( cd "$REACT_DIR" && npm run build ) \
+      && note "pre-built React bundles (dist-manager, dist-worker)" \
+      || note "React build failed (non-fatal; the just recipes will build on demand)."
+  else
+    note "Node/npm unavailable — cannot set up the React UI. Install Node >=18,"
+    note "then: cd $REACT_DIR && npm install && npm run build"
   fi
 fi
 
@@ -207,4 +242,5 @@ Next steps (run from ${REPO}):
   ${BOLD}2.${NC} just migrate        # apply the schema (Postgres only)
   ${BOLD}3.${NC} just manager        # operator UI + API on :8800
   ${BOLD}4.${NC} just worker         # in another shell / on another box
+$( [[ "$DO_REACT" -eq 1 ]] && printf '  %s5.%s just manager-react-prod  # serve the React UI on :8800 instead' "$BOLD" "$NC" )
 EOF
