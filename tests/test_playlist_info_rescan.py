@@ -166,6 +166,50 @@ def test_manager_playlist_create_info_rename_repo(tmp_path: Path) -> None:
         assert client.get("/api/playlists/gamma").json()["repository"] == "longitude"
 
 
+def test_manager_playlist_validate_command_persists(tmp_path: Path) -> None:
+    # The info page's "Validate command" field must round-trip through the
+    # manager's PUT + GET: set a custom command, then re-read it (mirrors the
+    # user flow of editing the field, saving, leaving, and re-opening get-info).
+    build_workspace(
+        tmp_path, repos=("longitude",),
+        queues={"longitude": {"config": {"repo": "longitude", "order": []}}},
+    )
+    with _mgr(tmp_path) as client:
+        # No custom command yet -> inherits the default (reported as None).
+        assert client.get("/api/playlists/longitude").json()["validate"] is None
+
+        # Save a custom validate command.
+        r = client.put(
+            "/api/playlists/longitude", json={"validate": "just longitude-no-db"}
+        )
+        assert r.status_code == 200
+        assert r.json()["validate"] == "just longitude-no-db"
+
+        # Re-opening get-info shows the saved command (it was persisted on disk).
+        assert (
+            client.get("/api/playlists/longitude").json()["validate"]
+            == "just longitude-no-db"
+        )
+        cfg = json.loads(
+            (tmp_path / "nightshift-tasks" / "longitude" / "config.json").read_text()
+        )
+        assert cfg["validate"] == "just longitude-no-db"
+
+        # Editing to another custom command replaces it.
+        r = client.put(
+            "/api/playlists/longitude", json={"validate": "just validate-no-db"}
+        )
+        assert r.status_code == 200
+        assert client.get("/api/playlists/longitude").json()["validate"] == (
+            "just validate-no-db"
+        )
+
+        # Clearing it (empty string) disables validation: persisted as "".
+        r = client.put("/api/playlists/longitude", json={"validate": ""})
+        assert r.status_code == 200
+        assert client.get("/api/playlists/longitude").json()["validate"] == ""
+
+
 def test_manager_rename_migrates_store_and_blocks_running(tmp_path: Path) -> None:
     build_workspace(
         tmp_path, repos=("longitude",),

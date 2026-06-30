@@ -28,7 +28,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from nightshift import playlists as playlists_mod
 from nightshift import repos
@@ -46,6 +46,7 @@ from nightshift.engine import (
     load_play_priorities,
     load_sort_mode,
     maybe_sync_main_to_origin,
+    normalize_validate_command,
     read_task,
     reorder_queue,
     resolve_title,
@@ -226,11 +227,17 @@ class PlaylistCreate(BaseModel):
 class PlaylistUpdate(BaseModel):
     """Edit a playlist from its info page. ``name`` renames the queue (its
     on-disk dir + every queue-keyed DB row); ``repository`` is the alias the UI
-    shows for the queue's default ``repo`` binding. Both are optional; only the
-    fields present in the request are applied."""
+    shows for the queue's default ``repo`` binding; ``validate`` is the queue's
+    validate command. All optional; only the fields present in the request are
+    applied."""
+
+    # ``validate`` on the wire; the field is named ``validate_cmd`` to avoid
+    # shadowing ``BaseModel.validate``.
+    model_config = ConfigDict(populate_by_name=True)
 
     name: str | None = None
     repository: str | None = None
+    validate_cmd: str | None = Field(default=None, alias="validate")
     # Hide the playlist from the default Playlists view and exclude it from the
     # scheduler's candidate set; ``False`` re-enables it. ``None`` leaves it
     # untouched.
@@ -1692,13 +1699,18 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         return JSONResponse(created, status_code=201)
 
     def _playlist_info(name: str) -> dict[str, Any]:
-        """The playlist-info payload: its name, task count, and the ``repo``
-        binding aliased to ``repository`` for the info page."""
+        """The playlist-info payload: its name, task count, the ``repo`` binding
+        aliased to ``repository``, and the queue's ``validate`` command for the
+        info page. ``validate`` is the raw stored value: ``None`` when the queue
+        inherits the engine default, ``""`` when validation is explicitly
+        disabled, else the custom command."""
+        cfg = load_queue_config(tasks_root, playlists_mod.tasks_rel(name))
         count = len(list((tasks_root / name).glob("*.md")))
         return {
             "name": name,
             "task_count": count,
-            "repository": _queue_repo(name),
+            "repository": cfg.get("repo"),
+            "validate": cfg.get("validate"),
             "disabled": playlists_mod.is_disabled(tasks_root, name),
         }
 
@@ -1753,6 +1765,17 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             )
             commit_tasks(tasks_root, f"nightshift: set repo {queue_label(current)}")
             await _emit("queue_changed", queue=current, payload={"repo": repo_value})
+        # ``validate`` is the queue's validate command. A whitespace-only value
+        # (or the empty-quote literals) normalizes to "" — a deliberate "disable
+        # validation" signal that never falls back to the inherited default; any
+        # other value is stored stripped. An unset field is left untouched.
+        if "validate_cmd" in req.model_dump(exclude_unset=True):
+            cmd = normalize_validate_command(str(req.validate_cmd or ""))
+            save_queue_config_value(
+                tasks_root, "validate", cmd, playlists_mod.tasks_rel(current)
+            )
+            commit_tasks(tasks_root, f"nightshift: set validate {queue_label(current)}")
+            await _emit("queue_changed", queue=current, payload={"validate": cmd})
         # Disabling hides the queue and drops it from the scheduler's candidate
         # set; a no-op for an in-flight lease, which keeps draining until done.
         if req.disabled is not None:
