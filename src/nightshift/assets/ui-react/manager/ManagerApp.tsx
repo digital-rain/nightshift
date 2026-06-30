@@ -42,6 +42,7 @@ import {
   useWorkers,
 } from '../src/hooks/managerQueries'
 import { useSse } from '../src/hooks/useSse'
+import { useSettingsSave } from '../src/hooks/useSettingsSave'
 import { manager } from '../src/api/endpoints'
 
 type View = 'queue' | 'history' | 'stats' | 'workers' | 'settings'
@@ -51,7 +52,11 @@ function QueueScreen() {
   const [openTask, setOpenTask] = useState<string | null>(null)
 
   if (openTask) {
-    return <TaskEditor task={openTask} onBack={() => setOpenTask(null)} />
+    // key={openTask} forces a remount when switching tasks, so TaskDetail's
+    // useState-from-props seeds fresh each time (see TaskDetail's note).
+    return (
+      <TaskEditor key={openTask} task={openTask} onBack={() => setOpenTask(null)} />
+    )
   }
 
   return (
@@ -175,23 +180,14 @@ function WorkersScreen() {
 
 function SettingsScreen() {
   const { data, isLoading, error, refetch } = useSettings()
-  const [saving, setSaving] = useState(false)
+  const { save, saving, error: saveError } = useSettingsSave(
+    manager.saveSettings,
+    refetch,
+  )
   if (error) return <ErrorState error={error} />
   if (isLoading || !data) return <Spinner />
   return (
-    <SettingsEditor
-      data={data}
-      saving={saving}
-      onSave={async (delta) => {
-        setSaving(true)
-        try {
-          await manager.saveSettings(delta)
-          await refetch()
-        } finally {
-          setSaving(false)
-        }
-      }}
-    />
+    <SettingsEditor data={data} saving={saving} saveError={saveError} onSave={save} />
   )
 }
 

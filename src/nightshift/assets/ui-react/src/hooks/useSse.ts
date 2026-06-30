@@ -64,10 +64,22 @@ export function useSse(opts: UseSseOptions = {}): void {
       }
       if (frame.type === 'snapshot') {
         onSnapshotRef.current?.(frame)
-        // Seed caches from the snapshot so the first paint is immediate.
+        // Seed the caches whose keys the snapshot maps to exactly, so first
+        // paint is immediate.
         qc.setQueryData(qk.workers(), frame.workers)
         qc.setQueryData(qk.leases(), frame.leases)
         qc.setQueryData(qk.blocked(), frame.blocked)
+        // The snapshot also carries runs, but the runs cache is keyed by
+        // (queue, limit) and the snapshot is only the main-queue latest slice —
+        // it doesn't map to a specific key. And queue/active aren't in the
+        // snapshot at all. A snapshot arrives on every (re)connect, so anything
+        // that changed during a disconnect must be re-pulled: invalidate those
+        // families here rather than waiting for the next delta. Without this, a
+        // dropped-then-restored connection leaves runs/queue/transport stale
+        // while the link looks healthy.
+        qc.invalidateQueries({ queryKey: qk.runsAll() })
+        qc.invalidateQueries({ queryKey: qk.queueAll() })
+        qc.invalidateQueries({ queryKey: qk.active() })
       } else if (frame.type === 'event') {
         scheduleFlush()
       }

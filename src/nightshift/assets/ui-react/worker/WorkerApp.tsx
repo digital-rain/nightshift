@@ -16,6 +16,7 @@ import { AppShell, NavTab } from '../src/app/AppShell'
 import { TaskList } from '../src/components/TaskList'
 import { WorkerStatsView } from '../src/components/StatsPage'
 import { SettingsEditor } from '../src/components/SettingsEditor'
+import { useSettingsSave } from '../src/hooks/useSettingsSave'
 import {
   ErrorState,
   Pill,
@@ -119,26 +120,14 @@ function StatsView() {
 
 function SettingsView() {
   const { data, isLoading, error, refetch } = useWorkerSettings()
-  const [saving, setSaving] = useState(false)
+  const { save, saving, error: saveError } = useSettingsSave(
+    workerUi.saveSettings,
+    refetch,
+  )
   if (error) return <ErrorState error={error} />
   if (isLoading || !data) return <Spinner />
   return (
-    <SettingsEditor
-      data={data}
-      saving={saving}
-      onSave={async (delta) => {
-        // The backend accepts a nested delta; the worker surface here forwards
-        // the flat working delta and lets the parent app own the shaping. For
-        // this scaffold we send it as-is and re-fetch on success.
-        setSaving(true)
-        try {
-          await workerUi.saveSettings(delta)
-          await refetch()
-        } finally {
-          setSaving(false)
-        }
-      }}
-    />
+    <SettingsEditor data={data} saving={saving} saveError={saveError} onSave={save} />
   )
 }
 

@@ -19,10 +19,14 @@ export function useWorkerInfo() {
   })
 }
 
-/** Resolve the worker's UI poll cadence from /api/info (or the 3s fallback). */
+/** Resolve the worker's UI poll cadence from /api/info (or the 3s fallback).
+ * A 0 / missing refresh_ms must NOT become refetchInterval:0 — that would stop
+ * polling entirely, and the worker UI has no SSE to fall back on. Treat any
+ * non-positive value as "unset" and use the default. */
 export function useRefreshMs(): number {
   const { data } = useWorkerInfo()
-  return data?.refresh_ms ?? DEFAULT_REFRESH_MS
+  const ms = data?.refresh_ms
+  return ms && ms > 0 ? ms : DEFAULT_REFRESH_MS
 }
 
 export function useWorkerNow() {

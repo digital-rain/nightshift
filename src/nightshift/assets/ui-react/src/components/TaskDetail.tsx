@@ -10,6 +10,12 @@
  * It is presentational + local-edit-state only; the parent supplies onSave /
  * onBack so the same component works against the manager and (read-only) worker
  * surfaces.
+ *
+ * IMPORTANT: the edit fields are seeded from props via useState, which only
+ * reads its initializer on mount. To switch to a different task, the caller
+ * MUST remount this component — render it with `key={task}` (the manager queue
+ * does). Without a key, swapping `detail` in place would keep the previous
+ * task's field values and a Save would write them onto the new task.
  */
 
 import { useState } from 'react'

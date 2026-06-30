@@ -5,9 +5,10 @@
  * editor drives both: a left tier+category tree, a right field pane, and a
  * dirty-tracking save bar that PUTs a nested delta.
  *
- * Edits are tracked as a flat {fieldKey: newValue} delta against each field's
- * `effective` value; the parent's onSave turns that into the nested
- * surface→category→field body the backend expects.
+ * Edits are tracked as a flat {surface/category/key: newValue} delta against
+ * each field's `effective` value; the parent's onSave (useSettingsSave) turns
+ * that path-keyed delta into the nested surface→category→field body the backend
+ * expects.
  */
 
 import { useMemo, useState } from 'react'
@@ -24,30 +25,54 @@ import {
 } from './fields'
 import { GhostButton, Pill, PrimaryButton } from './primitives'
 
-/** Map of fieldKey → edited value (the working delta). */
+/** Working delta: `surface/category/key` path → edited value (see fieldPath). */
 export type SettingsDelta = Record<string, unknown>
 
 export interface SettingsEditorProps {
   data: SettingsResponse
   saving?: boolean
-  /** Receives the working delta keyed by field key; map to backend shape in the parent. */
+  /** A failed save to surface in the save bar (instead of silently swallowing). */
+  saveError?: Error | null
+  /**
+   * Receives the working delta keyed by a `surface/category/key` PATH (see
+   * fieldPath). The path keeps fields with the same `key` in different tiers or
+   * categories from colliding; the parent (useSettingsSave) shapes the path-keyed
+   * delta into the nested surface→category→field body the backend expects.
+   */
   onSave: (delta: SettingsDelta) => void
 }
 
-function fieldValue(f: SettingsField, delta: SettingsDelta): unknown {
-  return f.key in delta ? delta[f.key] : f.effective
+/** Stable identity for a field across the whole settings tree. Two fields can
+ * share a `key` across surfaces/categories, so the delta is keyed by this path,
+ * not by `field.key` alone. */
+export function fieldPath(
+  surface: string,
+  category: string,
+  key: string,
+): string {
+  return `${surface}/${category}/${key}`
+}
+
+function fieldValue(
+  f: SettingsField,
+  path: string,
+  delta: SettingsDelta,
+): unknown {
+  return path in delta ? delta[path] : f.effective
 }
 
 function FieldControl({
   field,
+  path,
   delta,
   setValue,
 }: {
   field: SettingsField
+  path: string
   delta: SettingsDelta
-  setValue: (key: string, value: unknown) => void
+  setValue: (path: string, value: unknown) => void
 }) {
-  const value = fieldValue(field, delta)
+  const value = fieldValue(field, path, delta)
   const desc = (
     <>
       {field.desc}
@@ -85,7 +110,7 @@ function FieldControl({
           label={field.label}
           desc={desc}
           checked={Boolean(value)}
-          onChange={(v) => setValue(field.key, v)}
+          onChange={(v) => setValue(path, v)}
         />
       )
     case 'int':
@@ -96,7 +121,7 @@ function FieldControl({
           label={field.label}
           desc={desc}
           value={value === null || value === undefined ? '' : Number(value)}
-          onChange={(v) => setValue(field.key, v === '' ? null : v)}
+          onChange={(v) => setValue(path, v === '' ? null : v)}
         />
       )
     case 'enum':
@@ -106,7 +131,7 @@ function FieldControl({
           label={field.label}
           desc={desc}
           value={String(value ?? '')}
-          onChange={(v) => setValue(field.key, v)}
+          onChange={(v) => setValue(path, v)}
           options={(field.options ?? []).map((o) => ({ value: o, label: o }))}
         />
       )
@@ -124,7 +149,7 @@ function FieldControl({
               ? (value as unknown[]).join(', ')
               : String(value ?? '')
           }
-          onChange={(v) => setValue(field.key, v)}
+          onChange={(v) => setValue(path, v)}
         />
       )
     default:
@@ -134,21 +159,34 @@ function FieldControl({
           label={field.label}
           desc={desc}
           value={field.secret ? '' : String(value ?? '')}
-          onChange={(v) => setValue(field.key, v)}
+          onChange={(v) => setValue(path, v)}
         />
       )
   }
 }
 
-export function SettingsEditor({ data, saving, onSave }: SettingsEditorProps) {
+export function SettingsEditor({
+  data,
+  saving,
+  saveError,
+  onSave,
+}: SettingsEditorProps) {
   const tiers = data.tiers
   const [tierIdx, setTierIdx] = useState(0)
   const [catIdx, setCatIdx] = useState(0)
   const [search, setSearch] = useState('')
   const [delta, setDelta] = useState<SettingsDelta>({})
 
-  const activeTier: SettingsTier | undefined = tiers[tierIdx]
-  const activeCat = activeTier?.categories[catIdx]
+  // Clamp the selection against the current data: a refetch/poll can replace
+  // `tiers` with fewer tiers, or the active tier with fewer categories, which
+  // would otherwise strand tierIdx/catIdx out of bounds and show an empty pane.
+  const safeTierIdx = Math.min(tierIdx, Math.max(0, tiers.length - 1))
+  const activeTier: SettingsTier | undefined = tiers[safeTierIdx]
+  const safeCatIdx = Math.min(
+    catIdx,
+    Math.max(0, (activeTier?.categories.length ?? 1) - 1),
+  )
+  const activeCat = activeTier?.categories[safeCatIdx]
 
   const filteredFields = useMemo(() => {
     const fields = activeCat?.fields ?? []
@@ -164,8 +202,8 @@ export function SettingsEditor({ data, saving, onSave }: SettingsEditorProps) {
 
   const dirtyCount = Object.keys(delta).length
 
-  function setValue(key: string, value: unknown) {
-    setDelta((d) => ({ ...d, [key]: value }))
+  function setValue(path: string, value: unknown) {
+    setDelta((d) => ({ ...d, [path]: value }))
   }
 
   return (
@@ -192,19 +230,19 @@ export function SettingsEditor({ data, saving, onSave }: SettingsEditorProps) {
                     setCatIdx(0)
                   }}
                   className={`mb-1 block w-full text-left text-xs font-semibold uppercase tracking-wide ${
-                    ti === tierIdx ? 'text-accent' : 'text-text-dim'
+                    ti === safeTierIdx ? 'text-accent' : 'text-text-dim'
                   }`}
                 >
                   {tier.surface}
                 </button>
-                {ti === tierIdx &&
+                {ti === safeTierIdx &&
                   tier.categories.map((cat, ci) => (
                     <button
                       key={cat.name}
                       type="button"
                       onClick={() => setCatIdx(ci)}
                       className={`block w-full rounded px-2 py-1 text-left text-sm ${
-                        ci === catIdx
+                        ci === safeCatIdx
                           ? 'bg-bg-elev text-text'
                           : 'text-text-dim hover:text-text'
                       }`}
@@ -219,14 +257,22 @@ export function SettingsEditor({ data, saving, onSave }: SettingsEditorProps) {
 
         {/* field pane */}
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
-          {filteredFields.map((f) => (
-            <FieldControl
-              key={f.key}
-              field={f}
-              delta={delta}
-              setValue={setValue}
-            />
-          ))}
+          {filteredFields.map((f) => {
+            const path = fieldPath(
+              activeTier?.surface ?? '',
+              activeCat?.name ?? '',
+              f.key,
+            )
+            return (
+              <FieldControl
+                key={path}
+                field={f}
+                path={path}
+                delta={delta}
+                setValue={setValue}
+              />
+            )
+          })}
           {filteredFields.length === 0 && (
             <p className="py-8 text-center text-sm text-text-dim">
               No matching settings.
@@ -237,11 +283,17 @@ export function SettingsEditor({ data, saving, onSave }: SettingsEditorProps) {
 
       {/* save bar */}
       {dirtyCount > 0 && (
-        <div className="flex items-center justify-between border-t border-border bg-bg-elev px-4 py-3">
-          <span className="text-sm text-text-dim">
-            {dirtyCount} unsaved {dirtyCount === 1 ? 'change' : 'changes'}
+        <div className="flex items-center justify-between gap-3 border-t border-border bg-bg-elev px-4 py-3">
+          <span className="truncate text-sm">
+            {saveError ? (
+              <span className="text-err">Save failed — {saveError.message}</span>
+            ) : (
+              <span className="text-text-dim">
+                {dirtyCount} unsaved {dirtyCount === 1 ? 'change' : 'changes'}
+              </span>
+            )}
           </span>
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-2">
             <GhostButton onClick={() => setDelta({})}>Discard</GhostButton>
             <PrimaryButton onClick={() => onSave(delta)} disabled={saving}>
               {saving ? 'Saving…' : 'Save'}
