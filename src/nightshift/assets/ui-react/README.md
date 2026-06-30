@@ -59,7 +59,32 @@ in `src/components` and generalise across both:
   same settings shape, so one editor drives both.
 - **primitives** — Pill, StatusBadge, buttons, EmptyState, Spinner, ErrorState.
 
-## Develop
+## Run it (justfile recipes)
+
+From the repo root — these wrap the npm scripts below:
+
+```bash
+just react-install          # one-time: install npm deps
+
+# Dev (HMR), against a running backend in another terminal:
+just manager                #   terminal 1: the real manager (:8800)
+just manager-react          #   terminal 2: Vite dev UI (:5173), proxies /api → :8800
+#   …or the worker pair:
+just worker                 #   terminal 1: the real worker UI backend (:8810)
+just worker-react           #   terminal 2: Vite dev UI (:5273), proxies /api → :8810
+
+# Production: the REAL backend serves the built React bundle (no separate UI server).
+just manager-react-prod     # builds dist-manager, launches the manager serving it (:8800)
+just worker-react-prod      # builds dist-worker, launches the worker serving it  (:8810)
+```
+
+`*-react-prod` works by pointing the backend's static mount at the React build
+via `NIGHTSHIFT_UI_DIR` / `NIGHTSHIFT_WORKER_UI_DIR` (see `nightshift._paths`).
+The API is identical — the React build is just the static surface — so this is
+the same backend you already run, with a different shell. Unset those env vars
+(the default) and you get the legacy vanilla UI.
+
+## Develop (raw npm, if not using just)
 
 ```bash
 cd src/nightshift/assets/ui-react

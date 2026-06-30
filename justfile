@@ -62,6 +62,67 @@ server port="":
     echo "launching server on {{workspace}}:{{port}}"
     {{py}} -m nightshift.server "${args[@]}"
 
+# ----- react UI (assets/ui-react) -----
+
+react_dir := justfile_directory() / "src/nightshift/assets/ui-react"
+
+# Install the React UI's npm deps (idempotent; run once before the react recipes).
+react-install:
+    cd "{{react_dir}}" && npm install
+
+# Build both React bundles → dist-manager / dist-worker (side-by-side; leaves the
+# legacy assets/ui + assets/ui-worker untouched).
+react-build:
+    cd "{{react_dir}}" && npm run build
+
+# Dev: Vite dev server for the operator UI with HMR, proxying /api to a running
+# manager (start `just manager` in another terminal first). Opens on :5173.
+manager-react port="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{react_dir}}"
+    echo "vite dev (manager UI) on :5173 → proxying /api to the manager (:8800)"
+    echo "  ↳ make sure 'just manager' is running in another terminal"
+    npm run dev
+
+# Dev: Vite dev server for the worker UI with HMR, proxying /api to a running
+# worker UI backend (start `just worker` first). Opens on :5273.
+worker-react port="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{react_dir}}"
+    echo "vite dev (worker UI) on :5273 → proxying /api to the worker UI (:8810)"
+    echo "  ↳ make sure 'just worker' is running in another terminal"
+    npm run dev:worker
+
+# Production: build the React operator UI, then launch the real manager backend
+# serving that bundle (via NIGHTSHIFT_UI_DIR) instead of the legacy UI. Same
+# backend, same API — the React build is just the static surface. Default :8800.
+manager-react-prod port="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{react_dir}}" && npm run build:manager
+    cd "{{root}}"
+    args=(--workspace "{{workspace}}")
+    if [ -n "{{port}}" ]; then args+=(--port "{{port}}"); fi
+    export NIGHTSHIFT_UI_DIR="{{react_dir}}/dist-manager"
+    echo "launching manager (serving React build at $NIGHTSHIFT_UI_DIR) on :{{port}}"
+    {{py}} -m nightshift.manager "${args[@]}"
+
+# Production: build the React worker UI, then launch the real worker backend
+# serving that bundle (via NIGHTSHIFT_WORKER_UI_DIR). /shared still resolves from
+# the legacy operator assets (NIGHTSHIFT_UI_DIR is left unset). Worker UI :8810.
+worker-react-prod port="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{react_dir}}" && npm run build:worker
+    cd "{{root}}"
+    args=(--workspace "{{workspace}}")
+    if [ -n "{{port}}" ]; then args+=(--ui-port "{{port}}"); fi
+    export NIGHTSHIFT_WORKER_UI_DIR="{{react_dir}}/dist-worker"
+    echo "launching worker (serving React build at $NIGHTSHIFT_WORKER_UI_DIR) on :{{port}}"
+    {{py}} -m nightshift.worker "${args[@]}"
+
 # Launch the Slack Socket Mode capture daemon (needs the `slack` extra + tokens).
 slackd:
     echo "launching slackd on {{workspace}}"
