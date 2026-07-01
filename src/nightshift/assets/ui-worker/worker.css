@@ -303,6 +303,11 @@ main {
 }
 .w-sf-chip-add:hover { border-color: var(--accent); color: var(--accent); }
 
+/* Model-id composite (vendor dropdown + model input) */
+.w-sf-model-id { display: flex; align-items: center; gap: 4px; flex: 1; min-width: 0; }
+.w-sf-model-id select { width: auto; flex-shrink: 0; }
+.w-sf-model-id input { flex: 1; min-width: 80px; }
+
 /* Queue tags */
 .w-sf-queue-tags { display: flex; flex-direction: column; gap: 8px; }
 .w-sf-queue-tag-list { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-height: 28px; }

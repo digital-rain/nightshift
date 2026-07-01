@@ -674,11 +674,15 @@ function proportionDonut(segments, total, centerText) {
 // --------------------------------------------------------------------------
 // Worker Settings (compact renderer over worker surface)
 // --------------------------------------------------------------------------
-const wSettings = { tiers: [], activeSurface: null, activeCategory: null, searchQuery: "", dirty: {}, errors: {}, restartPending: false };
+const wSettings = { tiers: [], activeSurface: null, activeCategory: null, searchQuery: "", dirty: {}, errors: {}, restartPending: false, providers: [] };
 
 async function loadWorkerSettings() {
   try {
-    const data = await getJSON("/api/settings");
+    const [data, bData] = await Promise.all([
+      getJSON("/api/settings"),
+      getJSON("/api/backends").catch(() => ({ backends: [] })),
+    ]);
+    wSettings.providers = (bData.backends || []).map(b => b.name);
     wSettings.tiers = data.tiers || [];
     wSettings.dirty = {};
     wSettings.errors = {};
@@ -859,6 +863,51 @@ function buildWorkerFieldRow(field, surface) {
   return row;
 }
 
+function buildModelIdComposite(value, onChange, onBlur) {
+  const wrap = document.createElement("div");
+  wrap.className = "w-sf-model-id";
+  let curProvider = "";
+  let curModel = "";
+  if (value && typeof value === "string") {
+    const idx = value.indexOf("/");
+    if (idx >= 0) {
+      curProvider = value.substring(0, idx);
+      curModel = value.substring(idx + 1);
+    } else {
+      curModel = value;
+    }
+  }
+  const select = document.createElement("select");
+  select.className = "w-sf-model-vendor";
+  const providerSet = new Set(wSettings.providers);
+  if (curProvider) providerSet.add(curProvider);
+  for (const p of providerSet) {
+    const o = document.createElement("option");
+    o.value = p; o.textContent = p;
+    if (p === curProvider) o.selected = true;
+    select.appendChild(o);
+  }
+  if (!curProvider && providerSet.size) {
+    select.selectedIndex = 0;
+    curProvider = select.value;
+  }
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "w-sf-model-name";
+  input.value = curModel;
+  input.placeholder = "model-id";
+  const compose = () => {
+    const p = select.value;
+    const m = input.value.trim();
+    return (p && m) ? p + "/" + m : m || null;
+  };
+  select.addEventListener("change", () => { onChange(compose()); if (onBlur) onBlur(); });
+  input.addEventListener("input", () => onChange(compose()));
+  if (onBlur) input.addEventListener("blur", onBlur);
+  wrap.append(select, input);
+  return wrap;
+}
+
 function buildWorkerControl(field, surface, fullKey) {
   const value = fullKey in wSettings.dirty ? wSettings.dirty[fullKey] : field.stored;
 
@@ -934,18 +983,28 @@ function buildWorkerControl(field, surface, fullKey) {
       wrap.dataset.wsfKey = fullKey;
       const rerender = () => {
         wrap.innerHTML = "";
+        const isModelList = field.validate === "model_id_list";
         items.forEach((item, i) => {
           const row = document.createElement("div");
           row.className = "w-sf-chip-row";
-          const input = document.createElement("input");
-          input.type = field.type === "int_list" ? "number" : "text";
-          input.value = item;
-          input.addEventListener("input", () => {
-            items[i] = field.type === "int_list" ? parseInt(input.value, 10) : input.value;
-            wMarkDirty(field, fullKey, [...items]);
-          });
-          if (field.validate) {
-            input.addEventListener("blur", () => wOnFieldBlur(field, fullKey));
+          let editor;
+          if (isModelList) {
+            editor = buildModelIdComposite(
+              item,
+              v => { items[i] = v || ""; wMarkDirty(field, fullKey, [...items]); },
+              () => wOnFieldBlur(field, fullKey),
+            );
+          } else {
+            editor = document.createElement("input");
+            editor.type = field.type === "int_list" ? "number" : "text";
+            editor.value = item;
+            editor.addEventListener("input", () => {
+              items[i] = field.type === "int_list" ? parseInt(editor.value, 10) : editor.value;
+              wMarkDirty(field, fullKey, [...items]);
+            });
+            if (field.validate) {
+              editor.addEventListener("blur", () => wOnFieldBlur(field, fullKey));
+            }
           }
           const del = document.createElement("button");
           del.type = "button";
@@ -956,7 +1015,7 @@ function buildWorkerControl(field, surface, fullKey) {
             wMarkDirty(field, fullKey, [...items]);
             rerender();
           });
-          row.append(input, del);
+          row.append(editor, del);
           wrap.appendChild(row);
         });
         const addBtn = document.createElement("button");
@@ -983,27 +1042,38 @@ function buildWorkerControl(field, surface, fullKey) {
         for (const e of entries) { if (e.k) obj[e.k] = e.v; }
         return obj;
       };
+      const isModelMap = field.validate === "model_id_map";
       const rerender = () => {
         wrap.innerHTML = "";
         entries.forEach((entry, i) => {
           const row = document.createElement("div");
           row.className = "w-sf-map-row";
-          const ki = document.createElement("input");
-          ki.placeholder = "key"; ki.value = entry.k;
-          ki.addEventListener("input", () => { entries[i].k = ki.value; wMarkDirty(field, fullKey, collectMap()); });
-          if (field.validate) {
-            ki.addEventListener("blur", () => wOnFieldBlur(field, fullKey));
-          }
-          const vi = document.createElement("input");
-          vi.placeholder = "value"; vi.value = entry.v;
-          vi.addEventListener("input", () => { entries[i].v = vi.value; wMarkDirty(field, fullKey, collectMap()); });
-          if (field.validate) {
-            vi.addEventListener("blur", () => wOnFieldBlur(field, fullKey));
+          let keyEl, valEl;
+          if (isModelMap) {
+            keyEl = buildModelIdComposite(
+              entry.k,
+              v => { entries[i].k = v || ""; wMarkDirty(field, fullKey, collectMap()); },
+              () => wOnFieldBlur(field, fullKey),
+            );
+            valEl = buildModelIdComposite(
+              entry.v,
+              v => { entries[i].v = v || ""; wMarkDirty(field, fullKey, collectMap()); },
+              () => wOnFieldBlur(field, fullKey),
+            );
+          } else {
+            keyEl = document.createElement("input");
+            keyEl.placeholder = "key"; keyEl.value = entry.k;
+            keyEl.addEventListener("input", () => { entries[i].k = keyEl.value; wMarkDirty(field, fullKey, collectMap()); });
+            if (field.validate) keyEl.addEventListener("blur", () => wOnFieldBlur(field, fullKey));
+            valEl = document.createElement("input");
+            valEl.placeholder = "value"; valEl.value = entry.v;
+            valEl.addEventListener("input", () => { entries[i].v = valEl.value; wMarkDirty(field, fullKey, collectMap()); });
+            if (field.validate) valEl.addEventListener("blur", () => wOnFieldBlur(field, fullKey));
           }
           const del = document.createElement("button");
           del.type = "button"; del.className = "w-sf-chip-del"; del.textContent = "\u00d7";
           del.addEventListener("click", () => { entries.splice(i, 1); wMarkDirty(field, fullKey, collectMap()); rerender(); });
-          row.append(ki, vi, del);
+          row.append(keyEl, valEl, del);
           wrap.appendChild(row);
         });
         const addBtn = document.createElement("button");
@@ -1021,6 +1091,15 @@ function buildWorkerControl(field, surface, fullKey) {
       return el;
     }
     default: {
+      if (field.validate === "model_id" || field.validate === "model_id_or_keyword") {
+        const composite = buildModelIdComposite(
+          value != null ? String(value) : "",
+          v => wMarkDirty(field, fullKey, v),
+          () => wOnFieldBlur(field, fullKey),
+        );
+        composite.dataset.wsfKey = fullKey;
+        return composite;
+      }
       const input = document.createElement("input");
       input.type = "text";
       input.value = value != null ? value : "";
