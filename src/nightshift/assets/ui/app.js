@@ -2127,7 +2127,7 @@ function renderStats() {
   if (s.byModel) {
     const totalTok = s.totalInputTokens + s.totalOutputTokens;
     cards.append(
-      statCard("Tokens", formatCount(totalTok), `${formatCount(s.totalInputTokens)} in · ${formatCount(s.totalOutputTokens)} out`),
+      statCard("Tokens", compactTokens(totalTok), `${compactTokens(s.totalInputTokens)} in · ${compactTokens(s.totalOutputTokens)} out`),
       statCard("Cost", `$${s.totalCost.toFixed(2)}`, "USD across all runs"),
     );
   }
@@ -2237,9 +2237,9 @@ function avgTokensDonut(s) {
   const avgIn = Math.round(s.totalInputTokens / s.total);
   const avgOut = Math.round(s.totalOutputTokens / s.total);
   return proportionDonut([
-    { label: "Input", count: avgIn, display: formatCount(avgIn), cls: CHART_PALETTE[0] },
-    { label: "Output", count: avgOut, display: formatCount(avgOut), cls: CHART_PALETTE[1] },
-  ], avgIn + avgOut, formatCount(avg));
+    { label: "Input", count: avgIn, display: compactTokens(avgIn), cls: CHART_PALETTE[0] },
+    { label: "Output", count: avgOut, display: compactTokens(avgOut), cls: CHART_PALETTE[1] },
+  ], avgIn + avgOut, compactTokens(avg));
 }
 
 // A donut circle chart split into proportional segments.
@@ -2410,8 +2410,8 @@ function modelRingsChart(byModel) {
     const dot = document.createElement("span");
     dot.className = "stat-dot stat-rings-dot";
     const totalTok = u.input + u.output;
-    item.title = `${formatCount(u.input)} in · ${formatCount(u.output)} out · ${u.runs} run${u.runs === 1 ? "" : "s"}`;
-    item.append(dot, document.createTextNode(`${model}  ${formatCount(totalTok)} tok · $${u.cost.toFixed(2)}`));
+    item.title = `${compactTokens(u.input)} in · ${compactTokens(u.output)} out · ${u.runs} run${u.runs === 1 ? "" : "s"}`;
+    item.append(dot, document.createTextNode(`${model}  ${compactTokens(totalTok)} tok · $${u.cost.toFixed(2)}`));
     legend.append(item);
   }
   wrap.append(legend);
@@ -2528,6 +2528,14 @@ function formatCount(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return "0";
   return Math.round(n).toLocaleString("en-US");
+}
+
+function compactTokens(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n === 0) return "0";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+  return String(Math.round(n));
 }
 
 // Update the live "<phase> · elapsed" clock in place without re-rendering.
@@ -3640,8 +3648,8 @@ function runDetailPairs(run, rec) {
   const inTok = typeof rec.input_tokens === "number" ? rec.input_tokens : null;
   const outTok = typeof rec.output_tokens === "number" ? rec.output_tokens : null;
   if (inTok !== null || outTok !== null) {
-    const tok = [inTok !== null ? `${formatCount(inTok)} in` : null,
-                 outTok !== null ? `${formatCount(outTok)} out` : null]
+    const tok = [inTok !== null ? `${compactTokens(inTok)} in` : null,
+                 outTok !== null ? `${compactTokens(outTok)} out` : null]
       .filter(Boolean).join(" · ");
     pairs.push(["Tokens", tok]);
   }

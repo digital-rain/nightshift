@@ -259,6 +259,14 @@ function formatCount(value) {
   return Math.round(n).toLocaleString("en-US");
 }
 
+function compactTokens(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n === 0) return "0";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+  return String(Math.round(n));
+}
+
 function expando(caption, { open = true } = {}) {
   const panel = document.createElement("section");
   panel.className = "xpanel" + (open ? " open" : "");
@@ -324,8 +332,8 @@ function runDetailPairs(rec) {
   const inTok = typeof rec.input_tokens === "number" ? rec.input_tokens : null;
   const outTok = typeof rec.output_tokens === "number" ? rec.output_tokens : null;
   if (inTok !== null || outTok !== null) {
-    const tok = [inTok !== null ? `${formatCount(inTok)} in` : null,
-                 outTok !== null ? `${formatCount(outTok)} out` : null]
+    const tok = [inTok !== null ? `${compactTokens(inTok)} in` : null,
+                 outTok !== null ? `${compactTokens(outTok)} out` : null]
       .filter(Boolean).join(" · ");
     pairs.push(["Tokens", tok]);
   }
@@ -507,7 +515,7 @@ function renderStats() {
   if (s.byModel) {
     const totalTok = s.totalInputTokens + s.totalOutputTokens;
     cards.append(
-      statCard("Tokens", formatCount(totalTok), `${formatCount(s.totalInputTokens)} in · ${formatCount(s.totalOutputTokens)} out`),
+      statCard("Tokens", compactTokens(totalTok), `${compactTokens(s.totalInputTokens)} in · ${compactTokens(s.totalOutputTokens)} out`),
       statCard("Cost", `$${s.totalCost.toFixed(2)}`, "USD across all runs"),
     );
   }
