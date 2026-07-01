@@ -1157,7 +1157,7 @@ def read_task(tasks_root: Path, task: str, tasks_rel: str = "main") -> dict:
 # (``repo: None``) falls the task back to the queue's default ``repo``.
 _EDITABLE_META_KEYS = {
     "disabled", "quarantined", "completed", "evergreen", "automerge", "draft",
-    "model", "priority", "repo", "loop", "loop_max_iterations",
+    "model", "priority", "repo", "loop", "loop_max_iterations", "split",
 }
 
 # The detail-view editor may also rewrite the spec prose (``body``) and the
@@ -1317,6 +1317,8 @@ def build_prompt(
     validate_cmd: str,
     loop: bool = False,
     loop_max_iterations: int = 0,
+    split: bool = False,
+    split_dir: str | None = None,
 ) -> str:
     """Build the worker prompt matching CI injection format.
 
@@ -1331,6 +1333,10 @@ def build_prompt(
     When ``loop`` is True, use the ralph-loop prompt instead of the standard
     nightshift-local prompt. ``loop_max_iterations`` (0 = unlimited) is
     injected as ``$MAX_ITERATIONS``.
+
+    When ``split`` is True, the worker is in decomposition mode — ``$SPLIT`` is
+    injected as ``true`` and ``$SPLIT_DIR`` points to the directory the worker
+    writes subtask ``.md`` briefs into (see :func:`split_output_dir`).
     """
     if loop:
         prompt_file = asset("prompts", "nightshift-ralph-loop.md")
@@ -1345,13 +1351,18 @@ def build_prompt(
         )
     prompt_file = asset("prompts", "nightshift-local.md")
     prompt_body = prompt_file.read_text()
-    return (
+    header = (
         f"Your task file is: {task_file}\n"
         f"The TASK variable is: {task}\n"
         f"The TASK_FILE variable is: {task_file}\n"
-        f"The VALIDATE command is: {validate_cmd}\n\n"
-        f"{prompt_body}"
+        f"The VALIDATE command is: {validate_cmd}\n"
     )
+    if split:
+        header += (
+            f"The SPLIT variable is: true\n"
+            f"The SPLIT_DIR variable is: {split_dir}\n"
+        )
+    return f"{header}\n{prompt_body}"
 
 
 def build_claude_argv(
@@ -1492,6 +1503,83 @@ def materialize_brief(
     scratch.parent.mkdir(parents=True, exist_ok=True)
     scratch.write_text(body if body.endswith("\n") else f"{body}\n")
     return scratch
+
+
+def split_output_dir(
+    workspace: Path, repo: str, task: str, *, queue: str | None = None
+) -> Path:
+    """Return the directory where a ``split: true`` worker writes subtask briefs.
+
+    A dedicated sibling of the worktree dir
+    (``<workspace>/.worktrees/<repo>/task-local-<queue>-<task>.split/``) so
+    generated briefs never collide with other tasks' scratch files or worktrees.
+    The caller creates the directory before the worker runs; after the worker
+    finishes, :func:`harvest_split_output` scans it for ``*.md`` files.
+    """
+    return (
+        workspace / ".worktrees" / repo
+        / f"task-local-{_queue_slug(queue)}-{task}.split"
+    )
+
+
+def harvest_split_output(
+    workspace: Path,
+    tasks_root: Path,
+    repo: str,
+    task: str,
+    meta: dict,
+    *,
+    queue: str | None = None,
+    tasks_rel: str = "main",
+) -> list[str]:
+    """Collect subtask briefs from a decomposition run and enqueue them.
+
+    Scans ``split_output_dir(...)`` for ``*.md`` files the worker wrote,
+    copies each into the content store (``tasks_root/tasks_rel``) with
+    collision-safe naming, commits via :func:`commit_tasks`, retires the
+    parent brief via :func:`drop_completed_task`, and returns the list of
+    created subtask stems (for the result line / event payload).
+
+    If the split dir is empty or missing, returns an empty list (the caller
+    treats this as "no subtasks produced" — an honest-failure path).
+    """
+    from nightshift.spawn_daily import next_sub_id, unique_spawn_name
+
+    sdir = split_output_dir(workspace, repo, task, queue=queue)
+    if not sdir.is_dir():
+        return []
+
+    briefs = sorted(sdir.glob("*.md"))
+    if not briefs:
+        return []
+
+    tasks_dir = tasks_root / tasks_rel
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    parent_num = task.split(".", 1)[0] if "." in task else task
+    sub_id = next_sub_id(tasks_dir, parent_num) - 1
+
+    created: list[str] = []
+    for brief_path in briefs:
+        sub_id += 1
+        stem = brief_path.stem
+        slug = slugify(stem) if stem else f"subtask-{sub_id}"
+        name = unique_spawn_name(tasks_dir, f"{parent_num}.{sub_id}.{slug}")
+        dest = tasks_dir / f"{name}.md"
+        dest.write_text(brief_path.read_text())
+        created.append(name)
+
+    if created:
+        commit_tasks(
+            tasks_root,
+            f"nightshift: decompose {task} into {len(created)} subtask(s)",
+            pathspecs=(tasks_rel,),
+        )
+        drop_completed_task(tasks_root, task, tasks_rel, queue=queue)
+
+    import shutil
+    shutil.rmtree(sdir, ignore_errors=True)
+
+    return created
 
 
 # Serialize every mutation of a target repo's index/HEAD/stash so concurrent
@@ -3235,6 +3323,12 @@ def run_task(
     # Deliver the brief via a run-scratch file outside the worktree (the brief
     # never enters the target repo), then cut the worktree from the target repo.
     scratch = materialize_brief(workspace, repo, task, body, queue=queue)
+    is_split = bool(meta.get("split", False))
+    sdir: str | None = None
+    if is_split:
+        sdir_path = split_output_dir(workspace, repo, task, queue=queue)
+        sdir_path.mkdir(parents=True, exist_ok=True)
+        sdir = str(sdir_path)
     worktree_dir = setup_worktree(workspace, repo, task, queue=queue)
     preserve_worktree = False
 
@@ -3249,6 +3343,8 @@ def run_task(
             validate_cmd=str(config.get("validate") or DEFAULT_VALIDATE_CMD),
             loop=bool(meta.get("loop", False)),
             loop_max_iterations=int(meta.get("loop_max_iterations", 0)),
+            split=is_split,
+            split_dir=sdir,
         )
         env = worker_env(worktree_dir)
         validate_cmd = resolve_validate_cmd(config)
@@ -3322,6 +3418,30 @@ def run_task(
             return TaskResult(
                 task=task, title=title, success=False, error=error,
                 result_line=line, failure_kind="worker_error",
+            )
+
+        # Split (decomposition) runs: harvest subtask briefs and enqueue them,
+        # then retire the parent. No repo commits are expected.
+        if is_split:
+            created = harvest_split_output(
+                workspace, tasks_root, repo, task, meta,
+                queue=queue, tasks_rel=tasks_rel,
+            )
+            if created:
+                result_line = (
+                    f"decomposed into {len(created)} subtask(s): "
+                    + ", ".join(created)
+                )
+            else:
+                result_line = "decomposition run produced no subtasks"
+            emit(Event(TASK_RESULT, {
+                "task": task, "status": "completed", "repo": repo,
+                "result_line": result_line, "timings": _with_total(),
+                "subtasks": created,
+            }))
+            return TaskResult(
+                task=task, title=title, success=bool(created),
+                result_line=result_line,
             )
 
         # No commits → nothing to validate or squash. Finish cleanly instead of

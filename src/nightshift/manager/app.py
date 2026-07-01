@@ -42,6 +42,7 @@ from nightshift.engine import (
     delete_task,
     drop_completed_task,
     format_validate_cmd,
+    harvest_split_output,
     list_queue,
     load_play_priorities,
     load_sort_mode,
@@ -1029,6 +1030,44 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         # Unless the agent landed on main directly during the run — main advanced
         # past the lease's base_ref while the task branch has nothing to squash.
         if not body.landable:
+            # Split (decomposition) runs: harvest subtask briefs from the
+            # split output dir and enqueue them, then retire the parent.
+            split_meta = _task_meta(tasks_root, body.task, queue)
+            if split_meta.get("split"):
+                tasks_rel = playlists_mod.tasks_rel(queue)
+                created = harvest_split_output(
+                    workspace, tasks_root, repo, body.task, split_meta,
+                    queue=queue, tasks_rel=tasks_rel,
+                )
+                if created:
+                    result_line = (
+                        f"decomposed into {len(created)} subtask(s): "
+                        + ", ".join(created)
+                    )
+                else:
+                    result_line = "decomposition run produced no subtasks"
+                await store.update_run(
+                    run_id, status="completed",
+                    result_line=result_line, model=body.model,
+                    **telemetry,
+                )
+                await store.set_lease_status(body.lease_id, "released")
+                await store.clear_task_state(queue, body.task)
+                await _registry().set_idle(body.worker_id)
+                await _emit(
+                    "task_result", run_id=run_id, queue=queue, task=body.task,
+                    payload={
+                        "status": "completed",
+                        "result_line": result_line,
+                        "subtasks": created,
+                    },
+                )
+                await _emit("queue_changed", queue=queue)
+                return JSONResponse({
+                    "landed": False, "status": "completed",
+                    "split": True, "subtasks": created,
+                })
+
             repo_root = workspace / repo
             if (
                 base_ref
@@ -2135,6 +2174,9 @@ def _build_work_order(
         # prompt instead of the standard single-pass nightshift-local prompt.
         "loop": bool(meta.get("loop", False)),
         "loop_max_iterations": int(meta.get("loop_max_iterations", 0)),
+        # Split (decomposition) mode: the worker writes subtask briefs into a
+        # dedicated split output directory instead of implementing directly.
+        "split": bool(meta.get("split", False)),
     }
     return {
         "lease_id": lease_id,

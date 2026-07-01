@@ -68,7 +68,7 @@ class TaskCandidate:
     priority: int
     model: str                     # auto | max | explicit model id
     required_mcps: tuple[str, ...] = ()   # MCP connectors the brief declares
-    after: str | None = None       # frontmatter dependency stem (without .md)
+    after: tuple[str, ...] = ()    # frontmatter dependency stems (without .md)
     # Resolved target repo (task frontmatter ``repo:`` → queue default). ``None``
     # when resolution raised :class:`nightshift.repos.RepoConfigError`, in which
     # case ``repo_error`` carries the message so the manager can mark the task
@@ -140,12 +140,23 @@ class SchedulerState:
         self.served[label] = self.served.get(label, 0) + 1
 
 
-def _after_dep(meta: dict) -> str | None:
-    """The ``after:`` dependency stem from frontmatter, normalized (no ``.md``)."""
+def _after_deps(meta: dict) -> tuple[str, ...]:
+    """Parse the ``after:`` dependency from frontmatter into a tuple of stems.
+
+    Accepts a single stem (``after: 04.1.setup``) or a comma-separated list
+    (``after: 04.1.setup, 04.2.schema``) for DAG fan-in. Each entry is
+    stripped and ``.md`` suffixes are removed.
+    """
     raw = meta.get("after")
     if not raw:
-        return None
-    return str(raw).strip().removesuffix(".md")
+        return ()
+    parts = str(raw).split(",")
+    out: list[str] = []
+    for p in parts:
+        stem = p.strip().removesuffix(".md")
+        if stem:
+            out.append(stem)
+    return tuple(out)
 
 
 def _normalize_model(meta: dict, default_model: str) -> str:
@@ -213,7 +224,7 @@ def build_candidates(
                 priority=task_priority(meta),
                 model=_normalize_model(meta, default_model),
                 required_mcps=parse_required_mcps(meta),
-                after=_after_dep(meta),
+                after=_after_deps(meta),
                 repo=repo,
                 repo_error=repo_error,
             )

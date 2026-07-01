@@ -35,6 +35,7 @@ from nightshift.engine import (
     publish_task_branch,
     run_interruptible,
     setup_worktree,
+    split_output_dir,
     teardown_worktree,
     validate_cmd_from_blob,
     worker_env,
@@ -250,6 +251,12 @@ def execute_work_order(
 
     on_phase("worker")
     scratch = materialize_brief(workspace, repo, task, order["body"], queue=queue)
+    is_split = bool(config_blob.get("split", False))
+    sdir: str | None = None
+    if is_split:
+        sdir_path = split_output_dir(workspace, repo, task, queue=queue)
+        sdir_path.mkdir(parents=True, exist_ok=True)
+        sdir = str(sdir_path)
     base = "HEAD"
     if cfg.rendezvous_remote:
         base = prepare_worktree_base(
@@ -270,6 +277,8 @@ def execute_work_order(
             validate_cmd=prompt_validate,
             loop=bool(config_blob.get("loop", False)),
             loop_max_iterations=int(config_blob.get("loop_max_iterations", 0)),
+            split=is_split,
+            split_dir=sdir,
         )
         env = worker_env(wt_dir)
 
@@ -370,6 +379,17 @@ def execute_work_order(
                 backend=provider,
                 failure_kind="worker_error",
                 failure_reason=reason,
+                worktree=wt_path,
+                **tele,
+            )
+
+        if is_split:
+            return ExecuteOutcome(
+                status="completed",
+                result_line="decomposition run",
+                landable=False,
+                resolved_model=model,
+                backend=provider,
                 worktree=wt_path,
                 **tele,
             )
