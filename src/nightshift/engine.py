@@ -61,6 +61,7 @@ from nightshift.spawn_daily import (
     find_autosplit_sources,
     is_completed,
     is_disabled,
+    is_failed,
     is_quarantined,
     load_config,
     load_queue_config,
@@ -883,6 +884,59 @@ def live_ordered_queue(tasks_root: Path, tasks_rel: str = "main") -> list[str]:
     return _apply_play_filter(tasks_root, ordered, tasks_rel, priorities=priorities)
 
 
+def frontmatter_held_tasks(
+    tasks_root: Path, tasks_rel: str = "main",
+) -> list[dict[str, str]]:
+    """Return quarantined and failed tasks from frontmatter for a queue.
+
+    Used by ``/api/blocked`` to surface these tasks in the "needs attention"
+    list without relying on the DB overlay.
+    """
+    tasks_dir = tasks_root / tasks_rel
+    if not tasks_dir.exists():
+        return []
+    from nightshift import playlists
+    queue = playlists.queue_from_tasks_rel(tasks_rel)
+    queue_key = queue or ""
+    out: list[dict[str, str]] = []
+    for p in tasks_dir.glob("*.md"):
+        text = p.read_text(errors="replace")
+        meta = split_frontmatter(text)[0] if text.startswith("---") else {}
+        if is_quarantined(meta):
+            out.append({
+                "queue": queue_key, "task": p.stem, "state": "quarantined",
+                "blocked_reason": meta.get("quarantine_reason", ""),
+            })
+        elif is_failed(meta):
+            out.append({
+                "queue": queue_key, "task": p.stem, "state": "failed",
+                "blocked_reason": meta.get("failed_reason", ""),
+            })
+    return out
+
+
+def failed_tasks(tasks_root: Path, tasks_rel: str = "main") -> list[dict[str, str]]:
+    """Return frontmatter-failed tasks for a queue as dicts with queue/task keys.
+
+    Used by the Phase B retry logic to find tasks eligible for retry without
+    relying on the DB overlay (frontmatter is the source of truth for failed).
+    Sorted by stem so pick_retry gets a deterministic tiebreaker.
+    """
+    tasks_dir = tasks_root / tasks_rel
+    if not tasks_dir.exists():
+        return []
+    from nightshift import playlists
+    queue = playlists.queue_from_tasks_rel(tasks_rel)
+    queue_key = queue or ""
+    out: list[dict[str, str]] = []
+    for p in sorted(tasks_dir.glob("*.md"), key=lambda p: p.stem):
+        text = p.read_text(errors="replace")
+        meta = split_frontmatter(text)[0] if text.startswith("---") else {}
+        if is_failed(meta) and not is_quarantined(meta) and not is_completed(meta):
+            out.append({"queue": queue_key, "task": p.stem, "state": "failed"})
+    return out
+
+
 def _find_autosplit_tasks(tasks_dir: Path) -> set[str]:
     """Return stems of task files that have autosplit: true in frontmatter."""
     result: set[str] = set()
@@ -1145,6 +1199,9 @@ def read_task(tasks_root: Path, task: str, tasks_rel: str = "main") -> dict:
         "evergreen": evergreen,
         "disabled": is_disabled(meta),
         "quarantined": is_quarantined(meta),
+        "quarantine_reason": meta.get("quarantine_reason", ""),
+        "failed": is_failed(meta),
+        "failed_reason": meta.get("failed_reason", ""),
         "completed": is_completed(meta),
     }
 
@@ -1156,8 +1213,9 @@ def read_task(tasks_root: Path, task: str, tasks_rel: str = "main") -> dict:
 # the per-task target-repo override (a bare workspace-child name); clearing it
 # (``repo: None``) falls the task back to the queue's default ``repo``.
 _EDITABLE_META_KEYS = {
-    "disabled", "quarantined", "completed", "evergreen", "automerge", "draft",
-    "model", "priority", "repo", "loop", "loop_max_iterations", "split",
+    "disabled", "quarantined", "quarantine_reason", "failed", "failed_reason",
+    "completed", "evergreen", "automerge", "draft", "model", "priority", "repo",
+    "loop", "loop_max_iterations", "split",
 }
 
 # The detail-view editor may also rewrite the spec prose (``body``) and the
@@ -1298,6 +1356,7 @@ def list_queue(tasks_root: Path, tasks_rel: str = "main") -> list[dict]:
             "evergreen": evergreen,
             "disabled": is_disabled(meta),
             "quarantined": is_quarantined(meta),
+            "failed": is_failed(meta),
             "completed": is_completed(meta),
             "priority": priorities[p.stem],
         }

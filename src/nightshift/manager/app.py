@@ -41,7 +41,9 @@ from nightshift.engine import (
     create_task,
     delete_task,
     drop_completed_task,
+    failed_tasks,
     format_validate_cmd,
+    frontmatter_held_tasks,
     harvest_split_output,
     list_queue,
     load_play_priorities,
@@ -79,6 +81,7 @@ from nightshift.model_id import provider_of
 from nightshift.spawn_daily import (
     MAX_PRIORITY,
     MIN_PRIORITY,
+    is_failed,
     load_queue_config,
     resolve_config,
     resolve_frontmatter,
@@ -271,6 +274,7 @@ class TaskUpdate(BaseModel):
 
     disabled: bool | None = None
     quarantined: bool | None = None
+    failed: bool | None = None
     completed: bool | None = None
     evergreen: bool | None = None
     automerge: bool | None = None
@@ -476,6 +480,35 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             }
         )
 
+    def _set_frontmatter_flag(
+        queue: str | None, task: str, key: str, value: bool,
+        *, reason_key: str | None = None, reason: str | None = None,
+    ) -> None:
+        """Write a boolean frontmatter field (quarantined/failed) and an
+        optional companion reason field directly to the task's .md file.
+
+        This is the single writer for quarantine/failed state — the .md file
+        is the source of truth, not the DB overlay.
+        """
+        changes: dict[str, object | None] = {key: value}
+        if reason_key:
+            changes[reason_key] = reason if value else None
+        tasks_rel = playlists_mod.tasks_rel(queue)
+        set_task_meta(tasks_root, task, changes, tasks_rel)
+        commit_tasks(tasks_root, f"nightshift: {key} {task}")
+
+    def _task_is_failed_in_frontmatter(queue: str | None, task: str) -> bool:
+        """Check if a task is currently marked ``failed: true`` in frontmatter."""
+        tasks_rel = playlists_mod.tasks_rel(queue)
+        task_path = tasks_root / tasks_rel / f"{task}.md"
+        if not task_path.exists():
+            return False
+        text = task_path.read_text(errors="replace")
+        if not text.startswith("---"):
+            return False
+        meta = split_frontmatter(text)[0]
+        return is_failed(meta)
+
     async def _quarantine_if_looping(
         queue: str | None, task: str, run_id: str, detail: str
     ) -> bool:
@@ -483,11 +516,8 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
 
         Counts the most recent consecutive runs of ``task`` that landed nothing
         (see :func:`no_progress_streak`); once that streak reaches the configured
-        ``quarantine_threshold`` the task is pinned to the ``quarantined`` state.
-        A quarantined task stays in the queue (so the operator sees it) but is
-        excluded from dispatch by every worker — the budget-protection stop. The
-        offending runs (and their logs, kept as ``task_log`` events) are retained
-        for later analysis. Returns ``True`` when it quarantined the task.
+        ``quarantine_threshold`` the task is pinned to the ``quarantined`` state
+        **in frontmatter** (the single source of truth for quarantine).
         """
         if cfg.quarantine_threshold <= 0:
             return False
@@ -500,8 +530,9 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             f"({detail}); execution halted to protect budget — review the run "
             f"logs and edit or delete the task to release it"
         )
-        await _store().set_task_state(
-            queue, task, "quarantined", blocked_reason=reason
+        _set_frontmatter_flag(
+            queue, task, "quarantined", True,
+            reason_key="quarantine_reason", reason=reason,
         )
         await _emit(
             "task_quarantined",
@@ -515,18 +546,14 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
     async def _quarantine_immediate(
         queue: str | None, task: str, run_id: str, detail: str
     ) -> bool:
-        """Quarantine a task on the first failure (worker quarantine mode).
-
-        Unlike :func:`_quarantine_if_looping` which waits for a streak to
-        reach the configured threshold, this quarantines unconditionally —
-        called when the submitting worker has quarantine mode enabled.
-        """
+        """Quarantine a task on the first failure (worker quarantine mode)."""
         reason = (
             f"quarantined by worker on first failure ({detail}); "
             f"review the run logs and edit or delete the task to release it"
         )
-        await _store().set_task_state(
-            queue, task, "quarantined", blocked_reason=reason
+        _set_frontmatter_flag(
+            queue, task, "quarantined", True,
+            reason_key="quarantine_reason", reason=reason,
         )
         await _emit(
             "task_quarantined",
@@ -540,14 +567,16 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
     async def _quarantine_retry_failure(
         queue: str | None, task: str, run_id: str, detail: str
     ) -> None:
-        """Phase B: the retried task failed again. Quarantine it and pause the
-        queue -- a repeat failure on a fresh retry is strong evidence of a
-        systemic issue, not noise."""
+        """Phase B: the retried task failed again. Quarantine it (frontmatter)
+        and pause the queue."""
         reason = (
             f"quarantined after failing again on retry ({detail}); "
             f"review the run logs and edit or delete the task to release it"
         )
-        await _store().set_task_state(queue, task, "quarantined", blocked_reason=reason)
+        _set_frontmatter_flag(
+            queue, task, "quarantined", True,
+            reason_key="quarantine_reason", reason=reason,
+        )
         await _emit(
             "task_quarantined",
             run_id=run_id,
@@ -564,11 +593,18 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
     async def _record_failure_outcome(
         queue: str | None, task: str, *, state: str, blocked_reason: str, retry_eligible: bool
     ) -> None:
-        """Mark a task failed/blocked-retryable and apply the phase-A two-in-a-row
-        pause."""
-        await _store().set_task_state(
-            queue, task, state, blocked_reason=blocked_reason, retry_eligible=retry_eligible,
-        )
+        """Mark a task failed (frontmatter) or blocked (DB overlay) and apply
+        the phase-A two-in-a-row pause."""
+        if state == "failed":
+            _set_frontmatter_flag(
+                queue, task, "failed", True,
+                reason_key="failed_reason", reason=blocked_reason,
+            )
+        else:
+            await _store().set_task_state(
+                queue, task, state, blocked_reason=blocked_reason,
+                retry_eligible=retry_eligible,
+            )
         label = queue_label(queue)
         should_pause = failure_policy.record_outcome(_failure_state(label), is_failure=True)
         if should_pause and label not in _paused_queues:
@@ -780,17 +816,20 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         # Manager-side queue dedication (queue label -> bound worker ids).
         dedication = await store.queue_dedication()
 
-        # Tasks quarantined for re-execution looping are held: excluded from
-        # dispatch and never re-stated by the overlays below, so a quarantine
-        # reason is never clobbered by a (lower-priority) blocked/repo overlay.
-        quarantined = {
-            (_queue_from_label(row["queue"]), row["task"])
-            for row in await store.tasks_in_state("quarantined")
-        }
-        failed = {
-            (_queue_from_label(row["queue"]), row["task"])
-            for row in await store.tasks_in_state("failed")
-        }
+        # Quarantined/failed tasks are sourced from frontmatter (the single
+        # source of truth). live_ordered_queue already skips them so they
+        # won't appear in candidates, but we still need the sets for the
+        # unroutable / repo-check guards below and for Phase B retry.
+        quarantined: set[tuple[str | None, str]] = set()
+        failed: set[tuple[str | None, str]] = set()
+        for q in _all_queues():
+            tasks_rel = playlists_mod.tasks_rel(q)
+            for row in frontmatter_held_tasks(tasks_root, tasks_rel):
+                key = (_queue_from_label(row["queue"]), row["task"])
+                if row["state"] == "quarantined":
+                    quarantined.add(key)
+                elif row["state"] == "failed":
+                    failed.add(key)
 
         # Mark tasks blocked when no live worker can ever currently serve them:
         # an unadvertised pinned model, an unadvertised connector, or a queue
@@ -873,6 +912,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         # Phase B: once a queue has no active leases and no ready (non-failed)
         # candidate left, let its earliest failed/blocked-retryable task back
         # into dispatch -- one at a time, never two failed tasks concurrently.
+        # Failed tasks come from frontmatter; blocked-retryable come from DB.
         for q in list(candidates_by_queue):
             label = queue_label(q)
             if label in _paused_queues:
@@ -883,10 +923,13 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             ready_exists = any((c.queue, c.task) not in blocked for c in cands)
             if ready_exists:
                 continue
-            retryable = await store.retryable_tasks(q)
+            tasks_rel = playlists_mod.tasks_rel(q)
+            fm_failed = failed_tasks(tasks_root, tasks_rel)
+            db_retryable = await store.retryable_tasks(q)
+            retryable = [*fm_failed, *db_retryable]
             if not retryable:
                 continue
-            order_list = load_queue_config(tasks_root, playlists_mod.tasks_rel(q)).get("order") or []
+            order_list = load_queue_config(tasks_root, tasks_rel).get("order") or []
             pick = failure_policy.pick_retry(retryable, order=order_list)
             if pick is not None:
                 blocked.discard((q, pick))
@@ -1051,8 +1094,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                 **telemetry,
             )
             await store.set_lease_status(body.lease_id, "released")
-            prior = await store.get_task_state(queue, body.task)
-            was_retry = bool(prior and prior.get("retry_eligible"))
+            was_retry = _task_is_failed_in_frontmatter(queue, body.task)
             await _record_failure_outcome(
                 queue, body.task, state="blocked", blocked_reason=reason, retry_eligible=True,
             )
@@ -1089,8 +1131,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             # quarantine or count as failures.
             quarantined = False
             if body.status == "error":
-                prior = await store.get_task_state(queue, body.task)
-                was_retry = bool(prior and prior.get("retry_eligible"))
+                was_retry = _task_is_failed_in_frontmatter(queue, body.task)
                 if body.failure_kind == "validation_error":
                     # Validation failures mean the agent DID produce commits
                     # but the validate command rejected them. The branch is
@@ -1209,8 +1250,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                         queue, body.task, run_id, "no changes produced"
                     )
                 if not quarantined:
-                    prior = await store.get_task_state(queue, body.task)
-                    was_retry = bool(prior and prior.get("retry_eligible"))
+                    was_retry = _task_is_failed_in_frontmatter(queue, body.task)
                     await _record_failure_outcome(
                         queue, body.task, state="failed",
                         blocked_reason="no changes produced",
@@ -1602,27 +1642,51 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         commit_tasks(tasks_root, f"nightshift: edit task {task}")
-        # When the operator sets the task back to "ready" (not disabled,
-        # not quarantined, not completed), clear the manager's state
-        # overlay so it is no longer excluded from dispatch.
-        now_ready = (
-            not updated.get("disabled")
-            and not updated.get("quarantined")
-            and not updated.get("completed")
-        )
-        if now_ready:
-            store = _store()
-            prior = await store.get_task_state(target, task)
-            if prior and prior.get("state") in ("quarantined", "blocked", "failed"):
-                await store.clear_task_state(target, task)
-                await _emit(
-                    "task_released",
-                    queue=target,
-                    task=task,
-                    payload={"prior_state": prior.get("state")},
-                )
+        # Quarantined/failed are frontmatter-authoritative: toggling them off
+        # in the detail pane is all that's needed to release the task for
+        # dispatch (live_ordered_queue re-scans frontmatter each cycle). No
+        # DB overlay clearing is required for these two states.
+        # The failure-policy watch is also reset when a quarantine/failure is
+        # cleared so the queue can resume cleanly.
+        label = queue_label(target)
+        if "quarantined" in changes and not updated.get("quarantined"):
+            _queue_failure_state.pop(label, None)
+            await _emit(
+                "task_released", queue=target, task=task,
+                payload={"prior_state": "quarantined"},
+            )
+        if "failed" in changes and not updated.get("failed"):
+            _queue_failure_state.pop(label, None)
+            await _emit(
+                "task_released", queue=target, task=task,
+                payload={"prior_state": "failed"},
+            )
         await _emit("queue_changed", queue=target, task=task)
         return JSONResponse(updated)
+
+    @app.post("/api/tasks/{task}/reset")
+    async def reset_task(task: str, queue: str | None = None) -> JSONResponse:
+        """Clear the DB ``blocked``/``repo_unavailable`` overlay for a task.
+
+        This is the explicit release action for non-auto-clearing blocked
+        states (validation-failed, unroutable, bad-repo-reference). It does
+        NOT touch frontmatter-backed quarantined/failed flags — those are
+        toggled via the normal PATCH/detail-pane save.
+        """
+        target = _resolve_queue(queue)
+        store = _store()
+        prior = await store.get_task_state(target, task)
+        if not prior or prior.get("state") not in ("blocked", "repo_unavailable"):
+            return JSONResponse(
+                {"error": "task is not currently blocked"}, status_code=404,
+            )
+        await store.clear_task_state(target, task)
+        await _emit(
+            "task_released", queue=target, task=task,
+            payload={"prior_state": prior.get("state")},
+        )
+        await _emit("queue_changed", queue=target, task=task)
+        return JSONResponse({"released": True, "prior_state": prior.get("state")})
 
     @app.delete("/api/tasks/{task}")
     async def remove_task(task: str, queue: str | None = None) -> JSONResponse:
@@ -2086,13 +2150,14 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
     @app.get("/api/blocked")
     async def get_blocked() -> JSONResponse:
         store = _store()
-        # Quarantined and failed tasks are surfaced alongside blocked ones so the
-        # operator sees them in the same "needs attention" surface; each carries
-        # its own ``blocked_reason`` and a ``state`` tag.
+        # Quarantined/failed from frontmatter; blocked/repo_unavailable from DB.
+        fm_rows: list[dict[str, Any]] = []
+        for q in _all_queues():
+            tasks_rel = playlists_mod.tasks_rel(q)
+            fm_rows.extend(frontmatter_held_tasks(tasks_root, tasks_rel))
         rows = [
             *await store.list_blocked(),
-            *await store.tasks_in_state("quarantined"),
-            *await store.tasks_in_state("failed"),
+            *fm_rows,
         ]
         return JSONResponse([_jsonable(b) for b in rows])
 
@@ -2147,18 +2212,17 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
 
     async def _snapshot() -> dict[str, Any]:
         store = _store()
+        fm_rows: list[dict[str, Any]] = []
+        for q in _all_queues():
+            tasks_rel = playlists_mod.tasks_rel(q)
+            fm_rows.extend(frontmatter_held_tasks(tasks_root, tasks_rel))
         return {
             "cursor": await store.max_event_id(),
             "workers": [_jsonable(w) for w in await store.list_workers()],
             "leases": [_jsonable(le) for le in await store.active_leases()],
             "runs": [_jsonable(r) for r in await store.list_runs(limit=50)],
             "blocked": [
-                _jsonable(b)
-                for b in (
-                    *await store.list_blocked(),
-                    *await store.tasks_in_state("quarantined"),
-                    *await store.tasks_in_state("failed"),
-                )
+                _jsonable(b) for b in [*await store.list_blocked(), *fm_rows]
             ],
         }
 

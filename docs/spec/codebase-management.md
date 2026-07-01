@@ -275,12 +275,15 @@ All codebase management surfaces talk to the manager HTTP API only.
 
 ### State rendering
 
-| DB state | UI label | CSS treatment |
-|---|---|---|
-| `repo_unavailable` | Paused | `.status.paused` |
-| `blocked` | Blocked | blocked styling |
-| `failed` | Failed | `.status.error` |
-| (normal) | Queued / Running / … | per existing status map |
+| State | Source | UI label | CSS treatment |
+|---|---|---|---|
+| `repo_unavailable` | DB overlay | Paused | `.status.paused` |
+| `blocked` | DB overlay | Blocked | blocked styling |
+| `failed` | Frontmatter (`failed: true`) | Failed | `.status.error` |
+| `quarantined` | Frontmatter (`quarantined: true`) | Quarantined | quarantined styling |
+| (normal) | — | Queued / Running / … | per existing status map |
+
+**Frontmatter is the single source of truth** for `quarantined` and `failed` states. The manager writes these flags directly to the task's `.md` file. The DB overlay is used only for `blocked` and `repo_unavailable` states. See `docs/spec/failure-retry-policy.md` for details.
 
 ---
 

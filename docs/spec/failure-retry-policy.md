@@ -2,7 +2,7 @@
 
 **Subject:** Per-queue failure handling: how Nightshift marks failed tasks, defers retries until ready work is drained, pauses a queue after consecutive unrelated failures, retries failed tasks one-at-a-time, and quarantines tasks that fail twice.
 **Status:** Descriptive — documents the feature **as implemented**. Where prose and code disagree, the code governs and this doc should be updated.
-**Primary sources:** `src/nightshift/manager/failure_policy.py`, `src/nightshift/manager/app.py` (worker_submit, worker_poll), `src/nightshift/worker/loop.py`, `src/nightshift/manager/store.py` (retry_eligible column), `src/nightshift/assets/ui/{app.js,style.css,index.html}`.
+**Primary sources:** `src/nightshift/manager/failure_policy.py`, `src/nightshift/manager/app.py` (worker_submit, worker_poll), `src/nightshift/worker/loop.py`, `src/nightshift/engine.py` (failed_tasks, frontmatter_held_tasks), `src/nightshift/assets/ui/{app.js,style.css,index.html}`.
 
 ---
 
@@ -14,18 +14,30 @@ When a task fails (worker error or blocked without quarantine), Nightshift does 
 
 **Phase B — Retry failed tasks.** Once all ready tasks are processed and the queue is not paused, the manager dispatches the earliest failed task for retry. If the retry succeeds, the task is completed normally and the next failed task is tried. If the retry fails again, that task is quarantined and the queue pauses.
 
-## 2. Task states
+## 2. State model — single source of truth
 
-| State | Meaning |
-|---|---|
-| (ready) | Normal, eligible for dispatch |
-| `failed` | First failure recorded; excluded from normal dispatch; eligible for Phase B retry |
-| `quarantined` | Failed twice (on retry); permanently excluded until operator clears it |
-| `blocked` | Upstream dependency or repo-unavailable; may carry `retry_eligible` flag |
+Task states are split across two stores, each authoritative for distinct states:
 
-### The `retry_eligible` column
+| State | Source of truth | How set | How cleared |
+|---|---|---|---|
+| `failed` | **Frontmatter** (`failed: true`) | Manager writes via `_set_frontmatter_flag` | Operator toggles off in detail pane (PATCH) |
+| `quarantined` | **Frontmatter** (`quarantined: true`) | Manager writes via `_set_frontmatter_flag` | Operator toggles off in detail pane (PATCH) |
+| `blocked` | **DB overlay** (`nightshift.tasks`) | Manager writes via `store.set_task_state` | Auto-clear (Phase B retry, repo-rescan, Resolve) or explicit Reset |
+| `repo_unavailable` | **DB overlay** (`nightshift.tasks`) | Manager writes via `store.set_task_state` | Repo-rescan auto-clears |
 
-A boolean column on `nightshift.tasks` (`DEFAULT false`). Set to `true` when a task enters the `failed` state or is blocked with retry eligibility. Used by `retryable_tasks()` to find Phase B candidates without conflating them with other blocked tasks.
+### Why frontmatter for quarantined/failed
+
+Frontmatter is the file the operator sees and edits. Previously, quarantine/failed lived in a separate DB overlay; the detail pane's Save button sent the full form (always `quarantined: false` for a system-quarantined task), and the backend's implicit "release on ready" logic silently wiped the DB overlay on every unrelated save. This caused manager and worker to disagree on task state.
+
+Now the manager writes `quarantined: true` / `failed: true` (and companion `quarantine_reason` / `failed_reason` fields) directly to the task's `.md` file via `_set_frontmatter_flag`. The detail pane reflects the real state and toggling it off is an explicit operator action, not an accidental side effect.
+
+### Companion reason fields
+
+When setting `failed: true` or `quarantined: true`, the manager also writes:
+- `failed_reason: "..."` — human-readable explanation of the failure
+- `quarantine_reason: "..."` — human-readable explanation of the quarantine
+
+These are surfaced in the UI detail pane and in `/api/blocked` responses.
 
 ## 3. Phase A — Failure watch (two-in-a-row detection)
 
@@ -50,14 +62,20 @@ Pressing Play clears the pause and resets the failure watch for that queue.
 When `worker_poll` finds a queue with:
 - no active leases,
 - no ready (non-failed) tasks remaining, and
-- at least one `retry_eligible` task,
+- at least one failed task (from frontmatter) or `retry_eligible` blocked task (from DB),
 
 it calls `failure_policy.pick_retry()` to select the earliest retryable task according to the queue's configured order. That task is allowed into dispatch by removing it from the blocked exclusion set.
 
+Failed tasks for Phase B are sourced from frontmatter via `engine.failed_tasks()`, which scans `.md` files for `failed: true`. DB-blocked tasks with `retry_eligible: true` are also included.
+
+### Retry detection
+
+A task is considered a "retry" when it is currently marked `failed: true` in frontmatter at the time of submit. The manager checks this via `_task_is_failed_in_frontmatter()`.
+
 ### Retry failure → quarantine
 
-If a retried task (one that was already `retry_eligible`) fails again:
-1. The task is quarantined (state set to `quarantined`).
+If a retried task fails again:
+1. The task is quarantined (`quarantined: true` written to frontmatter).
 2. The queue is paused with reason `retry_failed`.
 3. An SSE `task_quarantined` event is emitted.
 
@@ -83,15 +101,36 @@ The manager tracks pause reasons in `_paused_queues: dict[str, str]`:
 
 The `pause_reason` is exposed in the queue state API and used by the UI to display context-appropriate banner text.
 
-## 7. UI elements
+## 7. Releasing tasks
+
+### Frontmatter states (quarantined/failed)
+
+Toggle `quarantined: false` or `failed: false` via the detail pane's status segmented control (PATCH `/api/tasks/{task}`). No separate "release" action needed — the frontmatter change is immediately reflected in dispatch.
+
+### DB overlay states (blocked/repo_unavailable)
+
+- **Auto-clearing:** merge-conflict blocked tasks can be Resolved (existing flow). `repo_unavailable` tasks auto-clear when the repo becomes available.
+- **Explicit Reset:** non-auto-clearing blocks (validation-failed, unroutable, bad-repo-reference) are cleared via `POST /api/tasks/{task}/reset`, which calls `store.clear_task_state()` and emits `task_released`.
+
+The old implicit "release on ready" side-effect in `patch_task` has been removed. Saving a task's frontmatter (e.g. editing the title) never clears any state.
+
+## 8. UI elements
+
+### Failed status option
+
+The detail pane's status segmented control includes "Failed" as a 5th option alongside Ready, Disabled, Quarantine, and Completed. Toggling it off clears the frontmatter `failed` flag.
+
+### Reset button
+
+The detail pane shows a "Reset" button for tasks in `blocked` state (from DB overlay) that are not merge conflicts. Clicking it POSTs `/api/tasks/{task}/reset`.
 
 ### Failed status pill
 
-Tasks in the `failed` state render with a "Failed" label using the `.status.error` CSS class (red treatment, matching the existing error styling).
+Tasks with `failed: true` in frontmatter render with a "Failed" label using the `.status.error` CSS class.
 
 ### Pause banner
 
-A `.pause-banner` div appears at the top of the queue screen when the queue is paused due to `consecutive_failures` or `retry_failed`. It displays reason-specific copy:
+A `.pause-banner` div appears at the top of the queue screen when the queue is paused due to `consecutive_failures` or `retry_failed`.
 
 | Reason | Banner text |
 |---|---|
@@ -102,7 +141,7 @@ A `.pause-banner` div appears at the top of the queue screen when the queue is p
 
 Queue rows in the playlist view show an amber "paused" badge (`.badge.paused-failures`) when the queue is paused for either failure-related reason.
 
-## 8. Migration
+## 9. Migration
 
 `20260731000001_nightshift_failure_retry.sql` adds the `retry_eligible` boolean column:
 

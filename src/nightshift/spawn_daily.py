@@ -219,6 +219,11 @@ def is_quarantined(meta: dict) -> bool:
     return bool(meta.get("quarantined", False))
 
 
+def is_failed(meta: dict) -> bool:
+    """Return True when frontmatter marks a task as failed."""
+    return bool(meta.get("failed", False))
+
+
 def is_completed(meta: dict) -> bool:
     """Return True when frontmatter marks a task as completed."""
     return bool(meta.get("completed", False))

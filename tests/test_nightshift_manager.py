@@ -321,6 +321,7 @@ def test_patch_quarantined_false_releases_task_for_dispatch(tmp_path: Path) -> N
         client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
 
         # Drive two no-change runs to trigger quarantine (threshold=2).
+        # The first no-change also sets failed=true in frontmatter.
         _poll_and_submit_no_change(client, "10.loop")
         second = _poll_and_submit_no_change(client, "10.loop")
         assert second["quarantined"] is True
@@ -330,15 +331,17 @@ def test_patch_quarantined_false_releases_task_for_dispatch(tmp_path: Path) -> N
             "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
         ).json()["work"] is None
 
-        # Operator sets the task back to "ready" via the detail pane.
+        # Operator sets the task back to "ready" via the detail pane,
+        # clearing both quarantined and failed (both are frontmatter flags).
         r = client.patch(
             "/api/tasks/10.loop",
-            json={"quarantined": False, "disabled": False, "completed": False},
+            json={"quarantined": False, "failed": False, "disabled": False, "completed": False},
         )
         assert r.status_code == 200
         assert r.json()["quarantined"] is False
+        assert r.json()["failed"] is False
 
-        # The store overlay is cleared — task is dispatchable again.
+        # Frontmatter-backed states cleared — task is dispatchable again.
         blocked = {b["task"]: b for b in client.get("/api/blocked").json()}
         assert "10.loop" not in blocked
         work = client.post(
@@ -976,6 +979,11 @@ def test_single_failure_leaves_queue_running_and_marks_task_failed(tmp_path: Pat
         client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
         _poll_and_submit_error(client, "10.a")
 
+        # Failed is now in frontmatter (single source of truth).
+        brief = client.get("/api/tasks/10.a").json()
+        assert brief["failed"] is True
+
+        # Also surfaced in /api/blocked for the "needs attention" list.
         blocked = {b["task"]: b for b in client.get("/api/blocked").json()}
         assert blocked["10.a"]["state"] == "failed"
 
@@ -1103,6 +1111,11 @@ def test_full_failure_lifecycle_drain_then_retry_then_quarantine(tmp_path: Path)
 
         # Phase A: 10.a fails (armed), 20.b is still ready and dispatches fine.
         _poll_and_submit_error(client, "10.a")
+
+        # Verify failed is in frontmatter.
+        brief = client.get("/api/tasks/10.a").json()
+        assert brief["failed"] is True
+
         work = client.post(
             "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
         ).json()["work"]
@@ -1146,12 +1159,140 @@ def test_full_failure_lifecycle_drain_then_retry_then_quarantine(tmp_path: Path)
         blocked = {b["task"]: b for b in client.get("/api/blocked").json()}
         assert blocked["10.a"]["state"] == "quarantined"
 
+        # Quarantine is also in frontmatter.
+        brief = client.get("/api/tasks/10.a").json()
+        assert brief["quarantined"] is True
+        assert brief["quarantine_reason"]
+
         # Play again -> phase B resumes with the next failed task (20.b).
         client.post("/api/transport", json={"action": "play", "queue": None})
         retry2 = client.post(
             "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
         ).json()["work"]
         assert retry2 is not None and retry2["task"] == "20.b"
+
+
+def test_unrelated_save_does_not_clear_quarantine(tmp_path: Path) -> None:
+    """Regression: saving an unrelated field (title) must not accidentally clear
+    system-set quarantine or failed state (the original divergent-state bug)."""
+    root = _seed(tmp_path, {"10.loop": "Move a setting that's already moved."})
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+
+        # Drive two no-change runs to trigger quarantine.
+        _poll_and_submit_no_change(client, "10.loop")
+        second = _poll_and_submit_no_change(client, "10.loop")
+        assert second["quarantined"] is True
+
+        # Verify quarantine is in frontmatter.
+        brief = client.get("/api/tasks/10.loop").json()
+        assert brief["quarantined"] is True
+
+        # Operator edits only the title — must NOT clear quarantine.
+        r = client.patch("/api/tasks/10.loop", json={"title": "New Title"})
+        assert r.status_code == 200
+
+        # Quarantine is still intact.
+        brief2 = client.get("/api/tasks/10.loop").json()
+        assert brief2["quarantined"] is True
+        assert brief2["title"] == "New Title"
+
+        # Still excluded from dispatch.
+        assert client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"] is None
+
+
+def test_unrelated_save_does_not_clear_failed(tmp_path: Path) -> None:
+    """Same as quarantine test but for the failed state."""
+    root = _seed(tmp_path, {"10.a": "Do a thing.", "20.b": "Do another thing."})
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        _poll_and_submit_error(client, "10.a")
+
+        brief = client.get("/api/tasks/10.a").json()
+        assert brief["failed"] is True
+
+        # Edit only the title — must NOT clear failed.
+        r = client.patch("/api/tasks/10.a", json={"title": "Renamed"})
+        assert r.status_code == 200
+
+        brief2 = client.get("/api/tasks/10.a").json()
+        assert brief2["failed"] is True
+        assert brief2["title"] == "Renamed"
+
+
+def test_toggle_failed_off_releases_for_dispatch(tmp_path: Path) -> None:
+    """Toggling failed off via PATCH releases the task for normal dispatch
+    (not just Phase B retry)."""
+    root = _seed(tmp_path, {"10.a": "Do a thing.", "20.b": "Do another thing."})
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        _poll_and_submit_error(client, "10.a")
+        _poll_and_submit_error(client, "20.b")
+
+        # Queue is paused (two consecutive failures).
+        state = client.get("/api/state").json()
+        assert state["queues"]["main"]["pause_reason"] == "consecutive_failures"
+
+        brief = client.get("/api/tasks/10.a").json()
+        assert brief["failed"] is True
+
+        # Unpause and toggle failed off on 10.a only.
+        client.post("/api/transport", json={"action": "play", "queue": None})
+        r = client.patch("/api/tasks/10.a", json={"failed": False})
+        assert r.status_code == 200
+
+        brief2 = client.get("/api/tasks/10.a").json()
+        assert brief2["failed"] is False
+
+        # 10.a dispatchable again (as normal ready task, not a Phase B retry).
+        work = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        assert work is not None and work["task"] == "10.a"
+
+
+def test_reset_clears_blocked_task(tmp_path: Path) -> None:
+    """POST /api/tasks/{task}/reset clears a blocked task's DB overlay."""
+    root = _seed(tmp_path, {"10.a": "A.", "20.b": "B."})
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+
+        # 10.a fails validation -> blocked.
+        work = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        assert work["task"] == "10.a"
+        client.post(
+            f"/api/worker/runs/{work['run_id']}/submit",
+            json={
+                "worker_id": "w1", "lease_id": work["lease_id"], "task": "10.a",
+                "queue": "main", "title": "10.a", "status": "error",
+                "result_line": "validate failed", "failure_kind": "validation_error",
+                "failure_reason": "lint errors",
+                "landable": False, "backend": "claude-code", "model": "claude-sonnet-4-6",
+            },
+        )
+        blocked = {b["task"]: b for b in client.get("/api/blocked").json()}
+        assert blocked["10.a"]["state"] == "blocked"
+
+        # Reset clears the block.
+        r = client.post("/api/tasks/10.a/reset")
+        assert r.status_code == 200
+        assert r.json()["released"] is True
+
+        # No longer blocked.
+        blocked2 = {b["task"]: b for b in client.get("/api/blocked").json()}
+        assert "10.a" not in blocked2
+
+
+def test_reset_not_blocked_returns_404(tmp_path: Path) -> None:
+    """POST /api/tasks/{task}/reset on a non-blocked task returns 404."""
+    root = _seed(tmp_path, {"10.a": "Do a thing."})
+    with _client(root) as client:
+        r = client.post("/api/tasks/10.a/reset")
+        assert r.status_code == 404
 
 
 # --------------------------------------------------------------------------- #

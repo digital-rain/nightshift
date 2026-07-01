@@ -682,7 +682,11 @@ async function loadBlocked() {
     const list = await getJSON("/api/blocked");
     const map = {};
     for (const b of (list || [])) {
-      if (b.task) map[b.task] = { reason: b.blocked_reason || "", state: b.state || "blocked" };
+      if (b.task) map[b.task] = {
+        reason: b.blocked_reason || "",
+        state: b.state || "blocked",
+        failure_kind: b.failure_kind || "",
+      };
     }
     state.blockedTasks = map;
   } catch {
@@ -1327,6 +1331,7 @@ function queueRowAside(item, isNow) {
   if (isNow) status = state.player.state === "paused" ? "paused" : "running";
   else if (item.completed) status = "completed";
   else if (item.quarantined) status = "quarantined";
+  else if (item.failed) status = "failed";
   else if (rec) status = rec.status;
   else if (state.blockedTasks && item.task in state.blockedTasks) {
     const overlay = state.blockedTasks[item.task];
@@ -2578,6 +2583,22 @@ async function resolveTask(runId, task, btn) {
   setView("now");
 }
 
+async function resetTask(task, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "Resetting\u2026"; }
+  const q = queueParam();
+  const { ok, data } = await sendJSON(
+    `/api/tasks/${encodeURIComponent(task)}/reset${q ? "?queue=" + encodeURIComponent(q) : ""}`,
+    "POST",
+  );
+  if (!ok) {
+    alert((data && data.error) || "could not reset task");
+    if (btn) { btn.disabled = false; btn.textContent = "Reset"; }
+    return;
+  }
+  loadBlocked();
+  loadQueue();
+}
+
 // Inline bot glyph + label for the Resolve button (shared by the markup and the
 // re-enable-on-error path).
 function resolveButtonInner() {
@@ -3293,15 +3314,17 @@ function settingsControls(brief, draft, rerender, locked) {
 
 function statusOptions(draft) {
   const statuses = [
-    ["Ready",      () => !draft.disabled && !draft.quarantined && !draft.completed],
+    ["Ready",      () => !draft.disabled && !draft.quarantined && !draft.failed && !draft.completed],
     ["Disabled",   () => !!draft.disabled],
     ["Quarantine", () => !!draft.quarantined],
+    ["Failed",     () => !!draft.failed],
     ["Completed",  () => !!draft.completed],
   ];
   return statuses.map(([label, isOn]) => [label, isOn, (on) => {
     if (!on) return;
     draft.disabled = label === "Disabled";
     draft.quarantined = label === "Quarantine";
+    draft.failed = label === "Failed";
     draft.completed = label === "Completed";
   }]);
 }
@@ -3493,6 +3516,7 @@ function draftFromBrief(brief) {
     body: brief.body || "",
     disabled: !!brief.disabled,
     quarantined: !!brief.quarantined,
+    failed: !!brief.failed,
     completed: !!brief.completed,
     evergreen: !!brief.evergreen,
     automerge: !!(brief.frontmatter && brief.frontmatter.automerge),
@@ -3720,6 +3744,7 @@ function taskDetailContent(brief, draft, opts = {}) {
   else if (isNow) status = state.player.state === "paused" ? "paused" : "running";
   else if (brief.completed) status = "completed";
   else if (brief.quarantined) status = "quarantined";
+  else if (brief.failed) status = "failed";
   else if (rec) status = rec.status;
   else if (state.blockedTasks && task in state.blockedTasks) {
     const overlay = state.blockedTasks[task];
@@ -3734,6 +3759,22 @@ function taskDetailContent(brief, draft, opts = {}) {
     frag.append(metaGrid([["File", "new task"], ["Status", "Not yet created"]]));
   } else {
     frag.append(detailStatusHead(task, status, blockedReason));
+    // Reset button for non-conflict blocked tasks (validation-failed,
+    // unroutable, bad-repo-reference). Conflicts keep their own Resolve flow.
+    if (status === "blocked" && state.blockedTasks && state.blockedTasks[task]) {
+      const overlay = state.blockedTasks[task];
+      const isConflict = overlay && (
+        overlay.failure_kind === "merge_conflict" ||
+        overlay.failure_kind === "merge_rejected"
+      );
+      if (!isConflict) {
+        const resetBtn = document.createElement("button");
+        resetBtn.className = "btn primary";
+        resetBtn.textContent = "Reset";
+        resetBtn.addEventListener("click", () => resetTask(task, resetBtn));
+        frag.append(resetBtn);
+      }
+    }
   }
 
   // TITLE — stands on its own (not inside an expando) and is always editable
@@ -3874,6 +3915,7 @@ async function saveDetail(brief, draft, errEl) {
     body: draft.body,
     disabled: !!draft.disabled,
     quarantined: !!draft.quarantined,
+    failed: !!draft.failed,
     completed: !!draft.completed,
     evergreen: !!draft.evergreen,
     automerge: !!draft.automerge,
