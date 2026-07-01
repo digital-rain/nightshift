@@ -15,15 +15,17 @@ from nightshift.manager.scheduler import (
 
 
 def _cand(
-    task, *, queue=None, priority=5, model="auto", required_mcps=(), after=None
+    task, *, queue=None, priority=5, model="auto", required_mcps=(), after=()
 ) -> TaskCandidate:
+    if isinstance(after, str):
+        after = (after,)
     return TaskCandidate(
         queue=queue,
         task=task,
         priority=priority,
         model=model,
         required_mcps=tuple(required_mcps),
-        after=after,
+        after=tuple(after),
     )
 
 
@@ -189,3 +191,62 @@ def test_no_eligible_task_returns_none() -> None:
         by_queue, worker=wf, leased=set(), blocked=set(), state=SchedulerState()
     )
     assert chosen is None
+
+
+# --------------------------------------------------------------------------- #
+# Multi-dependency after: (DAG fan-in)
+# --------------------------------------------------------------------------- #
+
+
+def test_after_deps_parses_comma_list() -> None:
+    from nightshift.manager.scheduler import _after_deps
+
+    assert _after_deps({}) == ()
+    assert _after_deps({"after": "a"}) == ("a",)
+    assert _after_deps({"after": "a.md"}) == ("a",)
+    assert _after_deps({"after": "a, b"}) == ("a", "b")
+    assert _after_deps({"after": "a.md, b.md, c"}) == ("a", "b", "c")
+    assert _after_deps({"after": "  a , b  "}) == ("a", "b")
+    assert _after_deps({"after": ""}) == ()
+
+
+def test_multi_dep_blocks_until_all_gone() -> None:
+    """A fan-in task with after: a, b is blocked while any dependency remains."""
+    cands = [_cand("merge", priority=0, after=("a", "b"))]
+    wf = WorkerFilter(worker_id="w1")
+
+    head = queue_head(
+        cands, worker=wf, leased=set(), blocked=set(),
+        present_tasks={"a", "merge"},
+    )
+    assert head is None
+
+    head = queue_head(
+        cands, worker=wf, leased=set(), blocked=set(),
+        present_tasks={"b", "merge"},
+    )
+    assert head is None
+
+    head = queue_head(
+        cands, worker=wf, leased=set(), blocked=set(),
+        present_tasks={"merge"},
+    )
+    assert head is not None and head.task == "merge"
+
+
+def test_single_after_backward_compatible() -> None:
+    """A single-element after tuple works identically to the old str field."""
+    cands = [_cand("b", priority=0, after="a")]
+    wf = WorkerFilter(worker_id="w1")
+
+    head = queue_head(
+        cands, worker=wf, leased=set(), blocked=set(),
+        present_tasks={"a", "b"},
+    )
+    assert head is None
+
+    head = queue_head(
+        cands, worker=wf, leased=set(), blocked=set(),
+        present_tasks={"b"},
+    )
+    assert head is not None and head.task == "b"

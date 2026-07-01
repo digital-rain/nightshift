@@ -3163,10 +3163,11 @@ function settingsControls(brief, draft, rerender, locked) {
   const statusSeg = labeledSegment("Status", "Task status", locked, rerender,
     statusOptions(draft));
 
-  // ATTRIBUTES — independent toggles: Evergreen, Loop
+  // ATTRIBUTES — independent toggles: Evergreen, Loop, Split
   const attrSeg = labeledSegment("Attributes", "Task attributes", locked, rerender, [
     ["Evergreen", () => !!draft.evergreen, (on) => { draft.evergreen = on; }],
     ["Loop", () => !!draft.loop, (on) => { draft.loop = on; }],
+    ["Split", () => !!draft.split, (on) => { draft.split = on; }],
   ]);
 
   // PR — independent toggles: Draft, Auto-merge
@@ -3415,6 +3416,9 @@ function draftFromBrief(brief) {
     // development instead of a single pass.
     loop: !!(raw.loop),
     loop_max_iterations: typeof raw.loop_max_iterations === "number" ? raw.loop_max_iterations : 0,
+    // Split (decomposition) mode: worker writes subtask briefs instead of
+    // implementing the spec directly.
+    split: !!(brief.frontmatter && brief.frontmatter.split),
   };
 }
 

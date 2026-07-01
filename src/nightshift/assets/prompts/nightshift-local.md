@@ -41,23 +41,30 @@ The resolved values govern the rest of the lifecycle below.
 
 ## Split tasks (decomposition runs)
 
-When resolved `split` is `true`, **do not implement the spec.**
-Instead, run a decomposition:
+When `$SPLIT` is `true`, **do not implement the spec.**
+Instead, run a decomposition — write subtask briefs into `$SPLIT_DIR`.
 
 1. Read the spec and any plan documents it references.
 2. Decompose the work into subtask brief files named `$NN.<n>.<short-name>.md`
    (e.g. `04.1.migrate-tokens.md`, `04.2.migrate-nav.md`), where `$NN` is the
-   parent's number, written into the same directory as `$TASK_FILE` (the run
-   scratch directory the runner collects). Each subtask must:
+   parent's number, written into `$SPLIT_DIR`. Each subtask must:
    - Fit within the default `loc` budget and a single worker session on its own.
    - Pass `$VALIDATE` independently when implemented (plan slice boundaries
      accordingly — no subtask may leave `main` broken).
-   - Carry frontmatter inheriting the parent's `model` and `automerge`; add
-     `after: <previous subtask>.md` headers where ordering matters; omit them
-     where subtasks are independent so they can run in parallel.
    - Contain a complete, self-sufficient spec for its slice (a subtask worker
      will not see the parent spec).
-3. A split run produces **only** these new subtask briefs and makes no
+   - Carry frontmatter with `automerge` inherited from the parent.
+3. **Parallelism by default.** Omit `after:` unless a subtask literally cannot
+   start without another's output (e.g. a migration that produces a schema
+   another subtask reads). Independent subtasks run in parallel automatically.
+4. **Fan-in (multi-dependency).** When a subtask depends on more than one
+   predecessor, use a comma-separated list: `after: 04.1.setup, 04.2.schema`.
+   The subtask is blocked until *all* listed dependencies complete.
+5. **Per-subtask model selection.** Assign a lighter model (`model: auto`) for
+   straightforward subtasks (renames, config changes, test additions) and a
+   heavier one (`model: max` or a specific qualified id) for complex subtasks
+   (architecture, tricky refactors). Do not blindly inherit the parent's model.
+6. A split run produces **only** these new subtask briefs and makes no
    implementation commit to the target repo. The runner enqueues the subtasks
    and retires the parent brief — do not modify, move, or delete `$TASK_FILE`.
 
@@ -66,7 +73,7 @@ A subtask that itself proves too large may carry `split: true` to decompose agai
 ## Lifecycle
 
 1. **Read the spec** at `$TASK_FILE`. Parse frontmatter and any legacy headers (`after:`, `diff_cap:`).
-   If resolved `split` is `true`, run a decomposition instead of implementing —
+   If `$SPLIT` is `true`, run a decomposition instead of implementing —
    see "Split tasks" above.
 2. **State your interpretation** — describe what you intend to build.
 3. **You are already in an isolated worktree.**

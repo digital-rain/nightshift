@@ -281,6 +281,7 @@ class TaskUpdate(BaseModel):
     repo: str | None = None
     loop: bool | None = None
     loop_max_iterations: int | None = None
+    split: bool | None = None
 
 
 def _normalize_repo(value: object) -> str | None:

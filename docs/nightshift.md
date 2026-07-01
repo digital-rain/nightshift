@@ -58,22 +58,29 @@ Do not create a branch or PR for an empty daily queue file.
 
 ## Split tasks (decomposition runs)
 
-When resolved `split` is `true`, **do not implement the spec.**
-Instead, run a decomposition:
+When `$SPLIT` is `true`, **do not implement the spec.**
+Instead, run a decomposition — write subtask briefs into `$SPLIT_DIR`.
 
 1. Read the spec and any plan documents it references.
-2. Decompose the work into subtask files `.tasks/$NN.<n>.<short-name>.md`
+2. Decompose the work into subtask files `$NN.<n>.<short-name>.md`
    (e.g. `04.1.migrate-tokens.md`, `04.2.migrate-nav.md`), where `$NN` is the
-   parent's number. Each subtask must:
+   parent's number, written into `$SPLIT_DIR`. Each subtask must:
    - Fit within the default `loc` budget and a single worker session on its own.
    - Pass `just validate` independently when implemented (plan slice boundaries
      accordingly — no subtask may leave `main` broken).
-   - Carry frontmatter inheriting the parent's `model` and `automerge`; add
-     `after: <previous subtask>.md` headers where ordering matters; omit them
-     where subtasks are independent so they can run in parallel.
    - Contain a complete, self-sufficient spec for its slice (a subtask worker
      will not see the parent spec).
-3. Open a PR containing **only** the new subtask files plus the deletion of the
+   - Carry frontmatter with `automerge` inherited from the parent.
+3. **Parallelism by default.** Omit `after:` unless a subtask literally cannot
+   start without another's output. Independent subtasks run in parallel
+   automatically.
+4. **Fan-in (multi-dependency).** When a subtask depends on more than one
+   predecessor, use a comma-separated list: `after: 04.1.setup, 04.2.schema`.
+   The subtask is blocked until *all* listed dependencies complete.
+5. **Per-subtask model selection.** Assign a lighter model (`model: auto`) for
+   straightforward subtasks and a heavier one (`model: max` or a specific
+   qualified id) for complex subtasks. Do not blindly inherit the parent's model.
+6. Open a PR containing **only** the new subtask files plus the deletion of the
    parent task file. This PR is the decomposition plan — small, fast to review,
    and the human can edit slice boundaries before implementation runs.
 
@@ -84,7 +91,7 @@ A subtask that itself proves too large may carry `split: true` to decompose agai
 1. **Read the spec** at `.tasks/$TASK.md`. Parse frontmatter and any legacy headers (`after:`, `diff_cap:`).
    If `$TASK` is `00._questions` or `00._todo`, **stop** — the workflow
    dispatches those via `spawn_daily.py`; workers only run spawned subtasks.
-   If resolved `split` is `true`, run a decomposition instead of implementing —
+   If `$SPLIT` is `true`, run a decomposition instead of implementing —
    see "Split tasks" above.
 2. **State your interpretation** — you will include this in the PR body.
 3. **Create or resume the task branch.**

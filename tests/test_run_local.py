@@ -1886,3 +1886,127 @@ def test_run_queue_oneshot_ignores_sort_mode(tmp_path: Path, monkeypatch) -> Non
     run_queue(workspace, tasks_root, ["a"], follow_queue=False)
 
     assert calls == ["a"]
+
+
+# --------------------------------------------------------------------------- #
+# split (decomposition) plumbing
+# --------------------------------------------------------------------------- #
+
+
+def test_build_prompt_split_injects_variables(tmp_path: Path) -> None:
+    """When split=True, $SPLIT and $SPLIT_DIR are injected into the prompt."""
+    workspace, _tr, _rr = _full(tmp_path, tasks={"10.hello": "Do something."})
+    scratch = materialize_brief(workspace, REPO, "10.hello", "Do something.")
+    prompt = build_prompt(
+        "10.hello",
+        task_file=str(scratch),
+        validate_cmd=DEFAULT_VALIDATE_CMD,
+        split=True,
+        split_dir="/tmp/split-dir",
+    )
+    assert "The SPLIT variable is: true" in prompt
+    assert "The SPLIT_DIR variable is: /tmp/split-dir" in prompt
+
+
+def test_build_prompt_no_split_omits_variables(tmp_path: Path) -> None:
+    """When split is False (default), the injected SPLIT/SPLIT_DIR header lines
+    are absent (the prompt body may still reference $SPLIT_DIR in docs)."""
+    workspace, _tr, _rr = _full(tmp_path, tasks={"10.hello": "Do something."})
+    scratch = materialize_brief(workspace, REPO, "10.hello", "Do something.")
+    prompt = build_prompt(
+        "10.hello",
+        task_file=str(scratch),
+        validate_cmd=DEFAULT_VALIDATE_CMD,
+    )
+    assert "The SPLIT variable is:" not in prompt
+    assert "The SPLIT_DIR variable is:" not in prompt
+
+
+def test_set_task_meta_split_round_trips(tmp_path: Path) -> None:
+    """``split`` is in _EDITABLE_META_KEYS and round-trips through set_task_meta."""
+    tasks_root = _store_only(tmp_path, tasks={"a": "---\ntitle: A\n---\nDo a."})
+    set_task_meta(tasks_root, "a", {"split": True})
+    assert read_task(tasks_root, "a")["frontmatter"]["split"] is True
+    set_task_meta(tasks_root, "a", {"split": False})
+    assert read_task(tasks_root, "a")["frontmatter"]["split"] is False
+
+
+def test_harvest_split_output_collects_and_retires(tmp_path: Path) -> None:
+    """harvest_split_output scans the split dir, enqueues subtask briefs, and
+    retires the parent."""
+    from nightshift.engine import harvest_split_output, split_output_dir
+
+    workspace = build_workspace(
+        tmp_path,
+        tasks={"04.parent": "---\ntitle: Parent\nsplit: true\n---\nBig task."},
+    )
+    tasks_root = workspace / DEFAULT_TASKS_REPO
+    repo = REPO
+
+    sdir = split_output_dir(workspace, repo, "04.parent", queue=None)
+    sdir.mkdir(parents=True, exist_ok=True)
+    (sdir / "04.1.setup.md").write_text(
+        "---\ntitle: Setup\nautomerge: true\n---\nDo setup.\n"
+    )
+    (sdir / "04.2.schema.md").write_text(
+        "---\ntitle: Schema\nautomerge: true\nafter: 04.1.setup\n---\nDo schema.\n"
+    )
+
+    created = harvest_split_output(
+        workspace, tasks_root, repo, "04.parent", {"split": True},
+    )
+    assert len(created) == 2
+    for name in created:
+        assert (tasks_root / "main" / f"{name}.md").is_file()
+    assert not (tasks_root / "main" / "04.parent.md").exists()
+    assert not sdir.exists()
+
+
+def test_harvest_split_output_empty_dir(tmp_path: Path) -> None:
+    """An empty split dir returns no subtasks and doesn't crash."""
+    from nightshift.engine import harvest_split_output, split_output_dir
+
+    workspace = build_workspace(
+        tmp_path,
+        tasks={"04.parent": "---\ntitle: Parent\nsplit: true\n---\nBig task."},
+    )
+    tasks_root = workspace / DEFAULT_TASKS_REPO
+    repo = REPO
+
+    sdir = split_output_dir(workspace, repo, "04.parent", queue=None)
+    sdir.mkdir(parents=True, exist_ok=True)
+
+    created = harvest_split_output(
+        workspace, tasks_root, repo, "04.parent", {"split": True},
+    )
+    assert created == []
+    assert (tasks_root / "main" / "04.parent.md").exists()
+
+
+def test_harvest_split_output_no_dir(tmp_path: Path) -> None:
+    """When the split dir doesn't exist, returns empty and parent stays."""
+    from nightshift.engine import harvest_split_output
+
+    workspace = build_workspace(
+        tmp_path,
+        tasks={"04.parent": "---\ntitle: Parent\nsplit: true\n---\nBig task."},
+    )
+    tasks_root = workspace / DEFAULT_TASKS_REPO
+
+    created = harvest_split_output(
+        workspace, tasks_root, REPO, "04.parent", {"split": True},
+    )
+    assert created == []
+    assert (tasks_root / "main" / "04.parent.md").exists()
+
+
+def test_split_output_dir_path_format(tmp_path: Path) -> None:
+    """split_output_dir returns a .split/ sibling of the worktree dir."""
+    from nightshift.engine import split_output_dir
+
+    sdir = split_output_dir(tmp_path, "myrepo", "04.task", queue=None)
+    assert sdir.name == "task-local-main-04.task.split"
+    assert sdir.parent == tmp_path / ".worktrees" / "myrepo"
+
+    sdir_q = split_output_dir(tmp_path, "myrepo", "04.task", queue="nightly")
+    assert "nightly" in sdir_q.name

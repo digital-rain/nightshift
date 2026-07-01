@@ -251,7 +251,7 @@ def queue_head(
         key = (cand.queue, cand.task)
         if key in leased or key in blocked:
             continue
-        if cand.after and cand.after in present_tasks:
+        if cand.after and any(dep in present_tasks for dep in cand.after):
             continue
         if not worker.accepts(cand, dedication=dedication):
             continue
