@@ -40,6 +40,8 @@ class WorkerLoop:
         self.poll_seconds = poll_seconds
         self.heartbeat_seconds = heartbeat_seconds
         self._stop = threading.Event()
+        self._queue_failures: dict[str, int] = {}
+        self._backoff_queues: set[str] = set()
 
     def checkin(self) -> None:
         checkin_meta: dict[str, Any] = {"pid": _safe_pid()}
@@ -77,18 +79,40 @@ class WorkerLoop:
     def run_once(self) -> bool:
         """Poll once; execute + submit if work was handed out. Returns True if a
         task was processed (so the caller can poll again immediately)."""
-        work = self.client.poll(
+        resp = self.client.poll(
             self.cfg.worker_id,
             backend=",".join(sorted(self.cfg.providers())) or None,
             queues=self.cfg.queues,
             priorities=self.cfg.priorities,
             models=self.cfg.advertised_models(),
             mcps=self.cfg.mcps,
+            exclude_queues=sorted(self._backoff_queues) or None,
         )
+        self._sync_backoff_with_manager(resp.get("queue_pauses") or {})
+        work = resp.get("work")
         if not work:
             return False
         self._process(work)
         return True
+
+    def _note_submit_outcome(self, queue_label: str, status: str) -> None:
+        if status == "completed":
+            self._queue_failures[queue_label] = 0
+            self._backoff_queues.discard(queue_label)
+            return
+        if status in ("error", "blocked"):
+            count = self._queue_failures.get(queue_label, 0) + 1
+            self._queue_failures[queue_label] = count
+            if count >= 2:
+                self._backoff_queues.add(queue_label)
+
+    def _sync_backoff_with_manager(self, queue_pauses: dict[str, str]) -> None:
+        """Drop a local backoff once the manager reports that queue is no
+        longer paused (operator pressed Play)."""
+        for label in list(self._backoff_queues):
+            if label not in queue_pauses:
+                self._backoff_queues.discard(label)
+                self._queue_failures[label] = 0
 
     # ------------------------------------------------------------------ #
 
@@ -196,6 +220,7 @@ class WorkerLoop:
             result = self.client.submit(run_id, payload)
         except Exception as exc:
             result = {"landed": False, "error": str(exc)}
+        self._note_submit_outcome(order.get("queue") or "main", outcome.status)
         if outcome.branch_ref and result.get("landed"):
             repo = order.get("repo")
             if repo:

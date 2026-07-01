@@ -286,12 +286,13 @@ class _LoopClient:
                   "meta": meta},
         ).json()
 
-    def poll(self, worker_id, *, backend, queues, priorities, models=None, mcps=None):
+    def poll(self, worker_id, *, backend, queues, priorities, models=None, mcps=None, exclude_queues=None):
         return self._c.post(
             "/api/worker/poll",
             json={"worker_id": worker_id, "backend": backend, "queues": queues,
-                  "priorities": priorities, "models": models, "mcps": mcps},
-        ).json().get("work")
+                  "priorities": priorities, "models": models, "mcps": mcps,
+                  "exclude_queues": exclude_queues},
+        ).json()
 
     def heartbeat(self, worker_id, *, lease_id=None, phase=None) -> None:
         self._c.post(
@@ -385,3 +386,37 @@ def test_execute_dispatches_by_model_provider(tmp_path: Path, monkeypatch) -> No
     assert seen["timeout"] == 42.0
     assert outcome.backend == "ollama-cloud"     # provider recorded on the outcome
     assert outcome.resolved_model == "ollama-cloud/gpt-oss:120b"
+
+
+# --------------------------------------------------------------------------- #
+# Worker-local two-failure backoff
+# --------------------------------------------------------------------------- #
+
+
+def test_worker_backs_off_a_queue_after_two_consecutive_failures(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {})
+    cfg = load_worker_config(root)
+    loop = WorkerLoop(cfg, None, LocalStore(root))
+    loop._note_submit_outcome("main", "error")
+    assert loop._backoff_queues == set()
+    loop._note_submit_outcome("main", "error")
+    assert loop._backoff_queues == {"main"}
+
+
+def test_success_resets_the_backoff_counter(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {})
+    cfg = load_worker_config(root)
+    loop = WorkerLoop(cfg, None, LocalStore(root))
+    loop._note_submit_outcome("main", "error")
+    loop._note_submit_outcome("main", "completed")
+    loop._note_submit_outcome("main", "error")
+    assert loop._backoff_queues == set()
+
+
+def test_backoff_clears_when_queue_absent_from_pauses(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {})
+    cfg = load_worker_config(root)
+    loop = WorkerLoop(cfg, None, LocalStore(root))
+    loop._backoff_queues = {"main"}
+    loop._sync_backoff_with_manager({})
+    assert loop._backoff_queues == set()

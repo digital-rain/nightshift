@@ -178,6 +178,7 @@ const STATE_LABELS = {
   pending: "Queued",
   blocked: "Blocked",
   quarantined: "Quarantined",
+  failed: "Failed",
   running: "Running",
   paused: "Paused",
   // A task whose resolved target repo isn't present in the workspace is paused
@@ -199,6 +200,7 @@ function stateLabel(status) {
 function statusClass(status) {
   if (status === "repo_unavailable") return "paused";
   if (status === "blocked") return "error";
+  if (status === "failed") return "error";
   if (status === "quarantined") return "quarantined";
   return status || "running";
 }
@@ -1047,6 +1049,14 @@ function renderNowInner() {
   if (!wrap) return;
   wrap.innerHTML = "";
 
+  const st = state.players[focusedQueueKey()];
+  if (st && PAUSE_REASON_COPY[st.pause_reason]) {
+    const banner = document.createElement("div");
+    banner.id = "now-pause-banner";
+    banner.className = "pause-banner";
+    wrap.append(banner);
+  }
+
   // Column 1, ordered: Now executing (or idle hero) → spacer → Up Next. The
   // full queue lives on its own page; the Now screen stays focused on what's
   // playing and what's next.
@@ -1054,6 +1064,7 @@ function renderNowInner() {
   wrap.append(active ? executionCard() : idleHero());
   wrap.append(spacer());
   wrap.append(upNextCard());
+  renderPauseBanner("now-pause-banner");
 
   renderNowDetail();
 }
@@ -1232,6 +1243,37 @@ function logTail(text, n) {
 }
 
 // --------------------------------------------------------------------------
+// Failure-pause banner (amber, mirrors .repos-warning styling)
+const PAUSE_REASON_COPY = {
+  consecutive_failures: "Paused: two unrelated tasks failed in a row. Fix the issue, then press Play to retry the failed tasks.",
+  retry_failed: "Paused: a retried task failed again and was quarantined. Fix the issue, then press Play to continue.",
+};
+function renderPauseBanner(containerId) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  const st = state.players[focusedQueueKey()];
+  const reason = st && st.pause_reason;
+  const copy = PAUSE_REASON_COPY[reason];
+  if (!copy) {
+    el.hidden = true;
+    el.innerHTML = "";
+    return;
+  }
+  el.hidden = false;
+  el.innerHTML = "";
+  const text = document.createElement("span");
+  text.textContent = copy;
+  const actions = document.createElement("div");
+  actions.className = "pause-banner-actions";
+  const playBtn = document.createElement("button");
+  playBtn.type = "button";
+  playBtn.className = "ghost-btn";
+  playBtn.textContent = "Play";
+  playBtn.addEventListener("click", () => transport("play"));
+  actions.append(playBtn);
+  el.append(text, actions);
+}
+
 // Queue screen
 // --------------------------------------------------------------------------
 function renderQueue() {
@@ -1263,6 +1305,7 @@ function renderQueueNow() {
   }
   $("queue-empty").hidden = state.queue.length > 0;
   for (const item of state.queue) ul.append(queueItemRow(item));
+  renderPauseBanner("queue-pause-banner");
 }
 
 // The right-hand block of a queue row: a status display sat just left of the
@@ -2866,6 +2909,12 @@ function playlistRow(pl) {
   const count = `${pl.task_count} ${pl.task_count === 1 ? "task" : "tasks"}`;
   meta.textContent = active ? `${count} \u00b7 active queue` : count;
   main.append(name, meta);
+  if (state.players[pl.name] && PAUSE_REASON_COPY[state.players[pl.name].pause_reason]) {
+    const badge = document.createElement("span");
+    badge.className = "badge paused-failures";
+    badge.textContent = "paused";
+    main.append(badge);
+  }
   li.append(main);
 
   // Add task: shortcut to create a new task directly in this queue.

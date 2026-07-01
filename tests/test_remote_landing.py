@@ -701,12 +701,13 @@ class _LoopClient:
                   "priorities": priorities, "models": models, "mcps": mcps, "meta": meta},
         ).json()
 
-    def poll(self, worker_id, *, backend, queues, priorities, models=None, mcps=None):
+    def poll(self, worker_id, *, backend, queues, priorities, models=None, mcps=None, exclude_queues=None):
         return self._c.post(
             "/api/worker/poll",
             json={"worker_id": worker_id, "backend": backend, "queues": queues,
-                  "priorities": priorities, "models": models, "mcps": mcps},
-        ).json().get("work")
+                  "priorities": priorities, "models": models, "mcps": mcps,
+                  "exclude_queues": exclude_queues},
+        ).json()
 
     def heartbeat(self, worker_id, *, lease_id=None, phase=None) -> None:
         self._c.post(

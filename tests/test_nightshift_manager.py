@@ -129,7 +129,8 @@ def test_run_events_and_failed_submit_release(tmp_path: Path) -> None:
         kinds = [e["kind"] for e in run_events]
         assert "task_status" in kinds and "task_log" in kinds
 
-        # A non-completed submit releases the lease without touching git.
+        # A non-completed submit releases the lease and marks the task "failed"
+        # so it is NOT immediately re-dispatched (phase-A drain policy).
         r = client.post(
             f"/api/worker/runs/{run_id}/submit",
             json={
@@ -139,7 +140,10 @@ def test_run_events_and_failed_submit_release(tmp_path: Path) -> None:
             },
         )
         assert r.json()["landed"] is False
-        # Lease freed → task pollable again.
+        # The task is now in "failed" state -- it won't dispatch again
+        # immediately. But since it's the only task and phase B admits it,
+        # the next poll *does* get it (phase B: no ready tasks left, earliest
+        # failed task admitted).
         again = client.post(
             "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
         ).json()["work"]
@@ -350,13 +354,16 @@ def test_quarantine_threshold_zero_disables_the_guard(tmp_path: Path) -> None:
     try:
         with _client(root) as client:
             client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
-            for _ in range(3):
-                out = _poll_and_submit_no_change(client, "10.loop")
-                assert out["quarantined"] is False
-            # Never quarantined → still dispatchable.
-            assert client.post(
-                "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
-            ).json()["work"] is not None
+            # First no-change submit: quarantine guard disabled (threshold=0),
+            # but failure policy marks task as failed.
+            out = _poll_and_submit_no_change(client, "10.loop")
+            assert out["quarantined"] is False
+            # Phase B retries the task (only failed task in queue).
+            out = _poll_and_submit_no_change(client, "10.loop")
+            assert out["quarantined"] is False
+            # Retry failure quarantines the task and pauses the queue.
+            state = client.get("/api/state").json()
+            assert state["queues"]["main"]["pause_reason"] == "retry_failed"
     finally:
         del os.environ["NIGHTSHIFT_QUARANTINE_THRESHOLD"]
 
@@ -939,6 +946,212 @@ def test_hub_stream_ends_on_server_shutdown() -> None:
     chunks, timed_out = anyio.run(run)
     assert not timed_out, "hub.stream did not exit on server shutdown"
     assert chunks
+
+
+# --------------------------------------------------------------------------- #
+# Failure pause/retry policy (phase A + B)
+# --------------------------------------------------------------------------- #
+
+
+def _poll_and_submit_error(client: TestClient, task: str, *, worker_id: str = "w1") -> dict[str, Any]:
+    order = client.post(
+        "/api/worker/poll", json={"worker_id": worker_id, "backend": "claude-code"}
+    ).json()["work"]
+    assert order is not None and order["task"] == task
+    resp = client.post(
+        f"/api/worker/runs/{order['run_id']}/submit",
+        json={
+            "worker_id": worker_id, "lease_id": order["lease_id"], "task": task,
+            "queue": order.get("queue", "main"), "title": task, "status": "error",
+            "result_line": "boom", "failure_kind": "worker_error",
+            "landable": False, "backend": "claude-code", "model": "claude-sonnet-4-6",
+        },
+    ).json()
+    return resp
+
+
+def test_single_failure_leaves_queue_running_and_marks_task_failed(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {"10.a": "Do a thing.", "20.b": "Do another thing."})
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        _poll_and_submit_error(client, "10.a")
+
+        blocked = {b["task"]: b for b in client.get("/api/blocked").json()}
+        assert blocked["10.a"]["state"] == "failed"
+
+        state = client.get("/api/state").json()
+        assert state["queues"]["main"]["state"] != "paused"
+
+        work = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        assert work is not None and work["task"] == "20.b"
+
+
+def test_two_unrelated_failures_in_a_row_pause_the_queue(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {"10.a": "Do a thing.", "20.b": "Do another thing."})
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        _poll_and_submit_error(client, "10.a")
+        _poll_and_submit_error(client, "20.b")
+
+        state = client.get("/api/state").json()
+        assert state["queues"]["main"]["state"] == "paused"
+        assert state["queues"]["main"]["pause_reason"] == "consecutive_failures"
+
+        assert client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"] is None
+
+
+def test_success_between_failures_does_not_pause(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {"10.a": "Do a.", "20.b": "Do b.", "30.c": "Do c."})
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        _poll_and_submit_error(client, "10.a")
+
+        # 20.b succeeds: land a real commit to count as a landed success.
+        order = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        assert order["task"] == "20.b"
+        wt = setup_worktree(
+            Path(client.app.state.workspace), order["repo"], "20.b"
+        )
+        (wt / "RESULT.txt").write_text("done\n")
+        subprocess.run(["git", "add", "-A"], cwd=wt, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "work"], cwd=wt, check=True, capture_output=True)
+        client.post(
+            f"/api/worker/runs/{order['run_id']}/submit",
+            json={
+                "worker_id": "w1", "lease_id": order["lease_id"], "task": "20.b",
+                "queue": "main", "title": "20.b", "status": "completed",
+                "landable": True, "backend": "claude-code", "model": "claude-sonnet-4-6",
+            },
+        )
+        _poll_and_submit_error(client, "30.c")
+
+        state = client.get("/api/state").json()
+        assert state["queues"]["main"]["state"] != "paused"
+
+
+def test_play_clears_consecutive_failure_pause(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {"10.a": "Do a thing.", "20.b": "Do another thing."})
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        _poll_and_submit_error(client, "10.a")
+        _poll_and_submit_error(client, "20.b")
+        assert client.get("/api/state").json()["queues"]["main"]["state"] == "paused"
+
+        client.post("/api/transport", json={"action": "play", "queue": None})
+        state = client.get("/api/state").json()
+        assert state["queues"]["main"]["state"] != "paused"
+
+
+def test_validation_error_blocks_task_not_failed(tmp_path: Path) -> None:
+    """A validation failure means the agent DID produce commits — the branch is
+    preserved. The task should be blocked (needs resolve), not 'failed', and it
+    should NOT arm the two-in-a-row failure watch."""
+    root = _seed(tmp_path, {"10.a": "A.", "20.b": "B."})
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+
+        # 10.a fails validation — this should block the task, not mark it failed.
+        work = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        assert work["task"] == "10.a"
+        client.post(
+            f"/api/worker/runs/{work['run_id']}/submit",
+            json={
+                "worker_id": "w1", "lease_id": work["lease_id"], "task": "10.a",
+                "queue": "main", "title": "10.a", "status": "error",
+                "result_line": "validate failed", "failure_kind": "validation_error",
+                "failure_reason": "lint errors",
+                "landable": False, "backend": "claude-code", "model": "claude-sonnet-4-6",
+            },
+        )
+        blocked = {b["task"]: b for b in client.get("/api/blocked").json()}
+        assert blocked["10.a"]["state"] == "blocked"
+        assert "validation failed" in blocked["10.a"]["blocked_reason"]
+
+        # 20.b also fails validation — queue should NOT pause because
+        # validation errors don't count toward two-in-a-row.
+        work2 = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        assert work2["task"] == "20.b"
+        client.post(
+            f"/api/worker/runs/{work2['run_id']}/submit",
+            json={
+                "worker_id": "w1", "lease_id": work2["lease_id"], "task": "20.b",
+                "queue": "main", "title": "20.b", "status": "error",
+                "result_line": "validate failed", "failure_kind": "validation_error",
+                "failure_reason": "type errors",
+                "landable": False, "backend": "claude-code", "model": "claude-sonnet-4-6",
+            },
+        )
+        state = client.get("/api/state").json()
+        assert state["queues"]["main"]["state"] != "paused"
+        assert state["queues"]["main"].get("pause_reason") is None
+
+
+def test_full_failure_lifecycle_drain_then_retry_then_quarantine(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {"10.a": "A.", "20.b": "B."})
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+
+        # Phase A: 10.a fails (armed), 20.b is still ready and dispatches fine.
+        _poll_and_submit_error(client, "10.a")
+        work = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        assert work["task"] == "20.b"
+
+        # 20.b fails too (no success in between) -> queue pauses.
+        client.post(
+            f"/api/worker/runs/{work['run_id']}/submit",
+            json={
+                "worker_id": "w1", "lease_id": work["lease_id"], "task": "20.b",
+                "queue": "main", "title": "20.b", "status": "error",
+                "result_line": "boom2", "failure_kind": "worker_error",
+                "landable": False, "backend": "claude-code", "model": "claude-sonnet-4-6",
+            },
+        )
+        state = client.get("/api/state").json()
+        assert state["queues"]["main"]["pause_reason"] == "consecutive_failures"
+        assert client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"] is None
+
+        # Operator presses Play -> phase B: only failed tasks remain, earliest retries.
+        client.post("/api/transport", json={"action": "play", "queue": None})
+        retry = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        assert retry is not None and retry["task"] == "10.a"
+
+        # It fails again -> quarantined + queue paused with retry_failed.
+        client.post(
+            f"/api/worker/runs/{retry['run_id']}/submit",
+            json={
+                "worker_id": "w1", "lease_id": retry["lease_id"], "task": "10.a",
+                "queue": "main", "title": "10.a", "status": "error",
+                "result_line": "boom3", "failure_kind": "worker_error",
+                "landable": False, "backend": "claude-code", "model": "claude-sonnet-4-6",
+            },
+        )
+        state = client.get("/api/state").json()
+        assert state["queues"]["main"]["pause_reason"] == "retry_failed"
+        blocked = {b["task"]: b for b in client.get("/api/blocked").json()}
+        assert blocked["10.a"]["state"] == "quarantined"
+
+        # Play again -> phase B resumes with the next failed task (20.b).
+        client.post("/api/transport", json={"action": "play", "queue": None})
+        retry2 = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        assert retry2 is not None and retry2["task"] == "20.b"
 
 
 # --------------------------------------------------------------------------- #

@@ -1214,6 +1214,23 @@ body[data-view="detail"] #screen-detail { display: flex; flex: 1; }
   color: var(--warn);
   font-size: 13px;
 }
+.pause-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(230, 192, 104, 0.4);
+  border-left-width: 3px;
+  border-radius: 8px;
+  background: rgba(230, 192, 104, 0.12);
+  color: var(--warn);
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+.pause-banner[hidden] { display: none; }
+.pause-banner-actions { flex: none; }
+.badge.paused-failures { color: var(--warn); border-color: var(--warn); }
 /* Read-only workspace path (operator config — never edited from the UI). */
 .repos-workspace-row {
   display: flex;

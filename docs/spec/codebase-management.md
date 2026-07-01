@@ -279,6 +279,7 @@ All codebase management surfaces talk to the manager HTTP API only.
 |---|---|---|
 | `repo_unavailable` | Paused | `.status.paused` |
 | `blocked` | Blocked | blocked styling |
+| `failed` | Failed | `.status.error` |
 | (normal) | Queued / Running / … | per existing status map |
 
 ---

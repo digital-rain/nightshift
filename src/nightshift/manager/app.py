@@ -768,11 +768,13 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
 
         # Build candidates across every queue from the canonical briefs in the
         # content store (each candidate already carries its resolved target repo).
-        # Queues paused via the transport controls are excluded from dispatch.
+        # Queues paused via the transport controls or locally backed-off by this
+        # worker are excluded from dispatch.
+        exclude = set(body.exclude_queues or [])
         candidates_by_queue = {
             q: build_candidates(tasks_root, q, default_model=cfg.default_model)
             for q in _all_queues()
-            if queue_label(q) not in _paused_queues
+            if queue_label(q) not in _paused_queues and queue_label(q) not in exclude
         }
 
         # Manager-side queue dedication (queue label -> bound worker ids).
@@ -784,6 +786,10 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         quarantined = {
             (_queue_from_label(row["queue"]), row["task"])
             for row in await store.tasks_in_state("quarantined")
+        }
+        failed = {
+            (_queue_from_label(row["queue"]), row["task"])
+            for row in await store.tasks_in_state("failed")
         }
 
         # Mark tasks blocked when no live worker can ever currently serve them:
@@ -858,10 +864,33 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         leased = {(_queue_from_label(le["queue"]), le["task"]) for le in active}
         blocked_rows = await store.list_blocked()
         blocked = {(_queue_from_label(b["queue"]), b["task"]) for b in blocked_rows}
-        # Never dispatch a paused (repo_unavailable), repo-blocked, or
-        # quarantined (re-execution loop) task.
+        # Never dispatch a paused (repo_unavailable), repo-blocked,
+        # quarantined (re-execution loop), or failed task.
         blocked |= repo_excluded
         blocked |= quarantined
+        blocked |= failed
+
+        # Phase B: once a queue has no active leases and no ready (non-failed)
+        # candidate left, let its earliest failed/blocked-retryable task back
+        # into dispatch -- one at a time, never two failed tasks concurrently.
+        for q in list(candidates_by_queue):
+            label = queue_label(q)
+            if label in _paused_queues:
+                continue
+            if any(le.get("queue", "main") == label for le in active):
+                continue
+            cands = candidates_by_queue[q]
+            ready_exists = any((c.queue, c.task) not in blocked for c in cands)
+            if ready_exists:
+                continue
+            retryable = await store.retryable_tasks(q)
+            if not retryable:
+                continue
+            order_list = load_queue_config(tasks_root, playlists_mod.tasks_rel(q)).get("order") or []
+            pick = failure_policy.pick_retry(retryable, order=order_list)
+            if pick is not None:
+                blocked.discard((q, pick))
+                failed.discard((q, pick))
 
         worker = WorkerFilter(
             worker_id=body.worker_id,
@@ -879,7 +908,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             dedication=dedication,
         )
         if chosen is None:
-            return JSONResponse({"work": None}, status_code=200)
+            return JSONResponse({"work": None, "queue_pauses": dict(_paused_queues)}, status_code=200)
 
         # The chosen candidate is repo-available by construction; clear any prior
         # paused/blocked overlay it may carry (e.g. a now-resolved repo) so the
@@ -955,7 +984,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             task=chosen.task,
             payload={"title": order["title"], "worker_id": body.worker_id},
         )
-        return JSONResponse({"work": order})
+        return JSONResponse({"work": order, "queue_pauses": dict(_paused_queues)})
 
     @app.post("/api/worker/heartbeat", dependencies=[Depends(_require_secret)])
     async def worker_heartbeat(body: HeartbeatBody) -> JSONResponse:
@@ -1022,7 +1051,13 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                 **telemetry,
             )
             await store.set_lease_status(body.lease_id, "released")
-            await store.set_task_state(queue, body.task, "blocked", blocked_reason=reason)
+            prior = await store.get_task_state(queue, body.task)
+            was_retry = bool(prior and prior.get("retry_eligible"))
+            await _record_failure_outcome(
+                queue, body.task, state="blocked", blocked_reason=reason, retry_eligible=True,
+            )
+            if was_retry:
+                await _quarantine_retry_failure(queue, body.task, run_id, reason)
             await _registry().set_idle(body.worker_id)
             await _emit(
                 "task_blocked", queue=queue, task=body.task, payload={"reason": reason},
@@ -1046,21 +1081,54 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                 **telemetry,
             )
             await store.set_lease_status(body.lease_id, "released")
-            # A worker *error* leaves the brief in the queue with no blocking
-            # overlay, so it re-leases on the next poll. Repeated errors are a
-            # re-execution loop → quarantine. Operator-driven stops (aborted) are
-            # intentional and never quarantine. When the worker has quarantine
-            # mode enabled it requests immediate quarantine on the first failure.
+            # A worker *error* marks the task ``failed`` so it is excluded from
+            # immediate dispatch. The failure-policy state machine watches for
+            # two unrelated failures in a row and pauses the queue. Repeated
+            # errors on the *same* task still trigger the existing quarantine
+            # guard. Operator-driven stops (aborted) are intentional and never
+            # quarantine or count as failures.
             quarantined = False
             if body.status == "error":
-                if body.quarantine:
+                prior = await store.get_task_state(queue, body.task)
+                was_retry = bool(prior and prior.get("retry_eligible"))
+                if body.failure_kind == "validation_error":
+                    # Validation failures mean the agent DID produce commits
+                    # but the validate command rejected them. The branch is
+                    # preserved and the work is recoverable — treat this as a
+                    # block (needs resolve) rather than a policy failure so it
+                    # doesn't arm the two-in-a-row watch.
+                    await store.set_task_state(
+                        queue, body.task, "blocked",
+                        blocked_reason="validation failed: " + (
+                            body.result_line or "validate command returned non-zero"
+                        ),
+                    )
+                    await _emit(
+                        "task_blocked", queue=queue, task=body.task,
+                        payload={"reason": "validation_error",
+                                 "detail": body.failure_reason},
+                    )
+                elif body.quarantine:
                     quarantined = await _quarantine_immediate(
                         queue, body.task, run_id, "worker error"
                     )
+                elif await _quarantine_if_looping(queue, body.task, run_id, "worker error"):
+                    quarantined = True
+                    if was_retry:
+                        label = queue_label(queue)
+                        _paused_queues[label] = "retry_failed"
+                        await _emit(
+                            "queue_paused", queue=queue,
+                            payload={"reason": "retry_failed", "task": body.task},
+                        )
                 else:
-                    quarantined = await _quarantine_if_looping(
-                        queue, body.task, run_id, "worker error"
+                    reason = body.result_line or body.failure_reason or "worker error"
+                    await _record_failure_outcome(
+                        queue, body.task, state="failed",
+                        blocked_reason=reason, retry_eligible=True,
                     )
+                    if was_retry:
+                        await _quarantine_retry_failure(queue, body.task, run_id, reason)
             await _registry().set_idle(body.worker_id)
             await _emit(
                 "task_result",
@@ -1141,7 +1209,17 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                         queue, body.task, run_id, "no changes produced"
                     )
                 if not quarantined:
-                    await store.clear_task_state(queue, body.task)
+                    prior = await store.get_task_state(queue, body.task)
+                    was_retry = bool(prior and prior.get("retry_eligible"))
+                    await _record_failure_outcome(
+                        queue, body.task, state="failed",
+                        blocked_reason="no changes produced",
+                        retry_eligible=True,
+                    )
+                    if was_retry:
+                        await _quarantine_retry_failure(
+                            queue, body.task, run_id, "no changes produced"
+                        )
                 await _registry().set_idle(body.worker_id)
                 await _emit(
                     "task_result", run_id=run_id, queue=queue, task=body.task,
@@ -1197,12 +1275,13 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             # confirmed land), so the conflict or rejection is resolvable. Hold the
             # task blocked so it doesn't re-lease while a resolve is pending.
             if result.conflict or result.recoverable:
-                await store.set_task_state(
-                    queue, body.task, "blocked",
-                    blocked_reason="needs resolve: " + (
-                        result.detail.splitlines()[0] if result.detail
-                        else failure_kind
-                    ),
+                land_reason = "needs resolve: " + (
+                    result.detail.splitlines()[0] if result.detail
+                    else failure_kind
+                )
+                await _record_failure_outcome(
+                    queue, body.task, state="blocked",
+                    blocked_reason=land_reason, retry_eligible=False,
                 )
                 await _emit(
                     "task_blocked", queue=queue, task=body.task,
@@ -1258,6 +1337,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         )
         await store.set_lease_status(body.lease_id, "landed")
         await store.clear_task_state(queue, body.task)
+        _record_success_outcome(queue)
         await _registry().set_idle(body.worker_id)
         await _emit(
             "task_result",
@@ -1533,7 +1613,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         if now_ready:
             store = _store()
             prior = await store.get_task_state(target, task)
-            if prior and prior.get("state") in ("quarantined", "blocked"):
+            if prior and prior.get("state") in ("quarantined", "blocked", "failed"):
                 await store.clear_task_state(target, task)
                 await _emit(
                     "task_released",
@@ -1750,17 +1830,18 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         if req.mode is not None:
             _queue_modes[key] = req.mode
         if req.action == "play":
-            _paused_queues.discard(key)
+            _paused_queues.pop(key, None)
+            _queue_failure_state[key] = failure_policy.QueueFailureState()
         elif req.action == "pause":
-            _paused_queues.add(key)
+            _paused_queues[key] = "operator"
         elif req.action == "stop":
-            _paused_queues.add(key)
+            _paused_queues[key] = "operator"
             store = _store()
             for le in await store.active_leases():
                 if le.get("queue", "main") == key:
                     await store.set_lease_status(le["id"], "cancelled")
                     await _emit("run_finished", run_id=le.get("run_id"), queue=target)
-            _paused_queues.discard(key)
+            _paused_queues.pop(key, None)
         elif req.action == "skip":
             store = _store()
             for le in await store.active_leases():
@@ -2005,10 +2086,14 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
     @app.get("/api/blocked")
     async def get_blocked() -> JSONResponse:
         store = _store()
-        # Quarantined tasks are surfaced alongside blocked ones so the operator
-        # sees them in the same "needs attention" surface; each carries its own
-        # ``blocked_reason`` (the quarantine explanation) and a ``state`` tag.
-        rows = [*await store.list_blocked(), *await store.tasks_in_state("quarantined")]
+        # Quarantined and failed tasks are surfaced alongside blocked ones so the
+        # operator sees them in the same "needs attention" surface; each carries
+        # its own ``blocked_reason`` and a ``state`` tag.
+        rows = [
+            *await store.list_blocked(),
+            *await store.tasks_in_state("quarantined"),
+            *await store.tasks_in_state("failed"),
+        ]
         return JSONResponse([_jsonable(b) for b in rows])
 
     @app.get("/api/runs/{run_id}/{task}/log")
@@ -2072,6 +2157,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                 for b in (
                     *await store.list_blocked(),
                     *await store.tasks_in_state("quarantined"),
+                    *await store.tasks_in_state("failed"),
                 )
             ],
         }

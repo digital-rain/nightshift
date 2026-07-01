@@ -61,7 +61,8 @@ class ManagerClient:
         priorities: list[int] | None,
         models: list[str] | None = None,
         mcps: list[str] | None = None,
-    ) -> dict[str, Any] | None:
+        exclude_queues: list[str] | None = None,
+    ) -> dict[str, Any]:
         resp = self._http.post(
             "/api/worker/poll",
             json={
@@ -71,10 +72,11 @@ class ManagerClient:
                 "priorities": priorities,
                 "models": models,
                 "mcps": mcps,
+                "exclude_queues": exclude_queues,
             },
         )
         resp.raise_for_status()
-        return resp.json().get("work")
+        return resp.json()
 
     def heartbeat(
         self, worker_id: str, *, lease_id: str | None = None, phase: str | None = None
