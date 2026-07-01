@@ -29,6 +29,7 @@ from nightshift.engine import (
     build_prompt,
     ensure_env_synced,
     extract_blocked_reason,
+    extract_result_line,
     materialize_brief,
     preflight_cmd_from_blob,
     prepare_worktree_base,
@@ -445,9 +446,18 @@ def execute_work_order(
         if validate.returncode != 0:
             preserve = True
             tail = (validate.stdout[-1500:] + "\n" + validate.stderr[-500:]).strip()
+            on_log(f"\n── validate failed (exit {validate.returncode}) ──\n")
+            if validate.stdout:
+                on_log(validate.stdout[-3000:])
+            if validate.stderr:
+                on_log(validate.stderr[-1500:])
+            on_log("\n── end validate output ──\n")
+            result_line = extract_result_line(
+                validate.stdout, validate.stderr,
+            ) or "validate failed"
             return ExecuteOutcome(
                 status="error",
-                result_line="validate failed",
+                result_line=result_line,
                 landable=False,
                 resolved_model=model,
                 backend=provider,

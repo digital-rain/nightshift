@@ -2953,6 +2953,12 @@ def _agent_resolve(
                     worktree_dir, validate_result, validate_cmd=validate_cmd, env=env,
                 )
             if validate_result.returncode != 0:
+                _emit_log(f"\n── validate failed (exit {validate_result.returncode}) ──\n")
+                if validate_result.stdout:
+                    _emit_log(validate_result.stdout[-3000:])
+                if validate_result.stderr:
+                    _emit_log(validate_result.stderr[-1500:])
+                _emit_log("\n── end validate output ──\n")
                 last_error = (
                     "validate failed after resolution:\n"
                     f"{validate_result.stdout[-1500:]}\n{validate_result.stderr[-1500:]}"
@@ -3503,6 +3509,12 @@ def run_task(
 
             if validate_result.returncode != 0:
                 error = f"just validate failed:\n{validate_result.stdout[-2000:]}\n{validate_result.stderr[-2000:]}"
+                emit(Event(TASK_LOG, {"task": task, "line": f"\n── validate failed (exit {validate_result.returncode}) ──\n"}))
+                if validate_result.stdout:
+                    emit(Event(TASK_LOG, {"task": task, "line": validate_result.stdout[-3000:]}))
+                if validate_result.stderr:
+                    emit(Event(TASK_LOG, {"task": task, "line": validate_result.stderr[-1500:]}))
+                emit(Event(TASK_LOG, {"task": task, "line": "\n── end validate output ──\n"}))
                 _write_failure_log(
                     workspace, repo, worktree_dir, task, error,
                     validate_stdout=validate_result.stdout,
