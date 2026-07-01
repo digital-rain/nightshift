@@ -27,8 +27,10 @@ from nightshift.engine import (
     DEFAULT_VALIDATE_CMD,
     _worktree_has_commits,
     build_prompt,
+    ensure_env_synced,
     extract_blocked_reason,
     materialize_brief,
+    preflight_cmd_from_blob,
     prepare_worktree_base,
     publish_task_branch,
     run_interruptible,
@@ -70,6 +72,8 @@ class ExecuteOutcome:
     cost_usd: float | None = None
     # Validate command the worker actually ran (None when skipped or not reached).
     validate_cmd: str | None = None
+    # Env-preflight command run before the backend (None when disabled/not reached).
+    preflight_cmd: str | None = None
     # The worktree directory the worker used for this task (str path).
     worktree: str | None = None
 
@@ -87,6 +91,7 @@ def _finish_landable(
     on_log: LogCb,
     wip_ref_prefix: str | None = None,
     validate_cmd: str | None = None,
+    preflight_cmd: str | None = None,
     worktree: str | None = None,
 ) -> ExecuteOutcome:
     """Finalize a validated (landable) run.
@@ -106,6 +111,7 @@ def _finish_landable(
             resolved_model=model,
             backend=backend,
             validate_cmd=validate_cmd,
+            preflight_cmd=preflight_cmd,
             worktree=worktree,
             **tele,
         )
@@ -129,6 +135,7 @@ def _finish_landable(
             failure_kind="publish_failed",
             failure_reason=str(exc),
             validate_cmd=validate_cmd,
+            preflight_cmd=preflight_cmd,
             worktree=worktree,
             **tele,
         )
@@ -142,6 +149,7 @@ def _finish_landable(
         branch_ref=branch_ref,
         head_sha=head_sha,
         validate_cmd=validate_cmd,
+        preflight_cmd=preflight_cmd,
         worktree=worktree,
         **tele,
     )
@@ -167,6 +175,7 @@ def execute_work_order(
     config_blob = order.get("config", {})
     validate_argv, validate_display = validate_cmd_from_blob(config_blob)
     prompt_validate = validate_display or DEFAULT_VALIDATE_CMD
+    preflight_argv, preflight_display = preflight_cmd_from_blob(config_blob)
 
     # Resolve the worktree path early (deterministic from task/queue/repo) so
     # every outcome carries it — even early failures that never cut the worktree.
@@ -263,6 +272,42 @@ def execute_work_order(
             loop_max_iterations=int(config_blob.get("loop_max_iterations", 0)),
         )
         env = worker_env(wt_dir)
+
+        # Environment preflight — before any model spend. Keep the worker's
+        # shared venv in step with the committed lockfile so a dependency that
+        # landed on another machine but is missing here fails cheaply *now*,
+        # instead of after the agent runs, at validate time, as an import error.
+        # Fast path is a fingerprint compare; a real change/miss self-heals via
+        # ``uv sync --frozen`` (lockfile-exact). Runs against the repo root,
+        # where the physical ``.venv`` lives (the worktree only symlinks it).
+        if preflight_argv is not None:
+            on_phase("preflight")
+            on_log(f"  preflight: {preflight_display}...\n")
+            pre = ensure_env_synced(
+                workspace / repo,
+                preflight_argv=preflight_argv,
+                preflight_display=preflight_display,
+                env=env,
+            )
+            if pre.synced:
+                on_log("  preflight: environment synced to lockfile\n")
+            if not pre.ok:
+                return ExecuteOutcome(
+                    status="error",
+                    result_line="preflight failed (environment not provisioned)",
+                    landable=False,
+                    resolved_model=model,
+                    backend=provider,
+                    failure_kind="preflight_failed",
+                    failure_reason=pre.detail or f"{preflight_display} failed",
+                    preflight_cmd=preflight_display,
+                    worktree=wt_path,
+                )
+
+        # The preflight command that actually ran (None when disabled), carried
+        # onto downstream outcomes for the manager's telemetry.
+        preflight_ran = preflight_display if preflight_argv is not None else None
+
         max_turns = config_blob.get("max_turns")
         spec = WorkerSpec(
             task=task,
@@ -366,6 +411,7 @@ def execute_work_order(
                 on_log=on_log,
                 wip_ref_prefix=config_blob.get("wip_ref_prefix"),
                 validate_cmd=None,
+                preflight_cmd=preflight_ran,
                 worktree=wt_path,
             )
         on_phase("validate")
@@ -388,6 +434,7 @@ def execute_work_order(
                 failure_kind="validation_error",
                 failure_reason=tail,
                 validate_cmd=validate_display,
+                preflight_cmd=preflight_ran,
                 worktree=wt_path,
                 **tele,
             )
@@ -405,6 +452,7 @@ def execute_work_order(
             on_log=on_log,
             wip_ref_prefix=config_blob.get("wip_ref_prefix"),
             validate_cmd=validate_display,
+            preflight_cmd=preflight_ran,
             worktree=wt_path,
         )
     finally:

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -158,6 +159,195 @@ def validate_cmd_from_blob(config: dict) -> tuple[list[str] | None, str | None]:
     if argv is None:
         return None, None
     return argv, shlex.join(argv)
+
+
+# Environment preflight: keep the worker's shared ``.venv`` in step with the
+# committed lockfile *before* spending model budget. A cross-machine worker can
+# be handed a task whose target-repo commit references a dependency that landed
+# on another box's venv (e.g. a transitive ``cvxpy`` behind an optional extra)
+# but was never installed here. Left unchecked, the miss only surfaces after the
+# agent has run, at ``validate`` time, as an import error — the whole point is to
+# catch it up front and self-heal cheaply. ``uv sync --frozen`` is lockfile-exact
+# (never re-resolves, so it can't silently bump a pinned dep).
+DEFAULT_PREFLIGHT_CMD = "uv sync --frozen"
+
+# Marker file (next to the shared venv) recording the lockfile fingerprint the
+# venv was last successfully synced against, so the common case is a one-line
+# hash compare and ``uv sync`` runs only on a real change/miss.
+LOCK_MARKER_NAME = ".nightshift-lock-hash"
+# Lockfiles a preflight watches, in priority order (first present wins).
+_LOCK_FILENAMES = ("uv.lock", "requirements.lock")
+
+
+def resolve_preflight_cmd(config: dict) -> list[str] | None:
+    """The environment-preflight command for a queue, or ``None`` when disabled.
+
+    Mirrors :func:`resolve_validate_cmd`: an *absent* ``preflight`` key inherits
+    the engine default (``uv sync --frozen``); a key set to an empty/whitespace
+    string opts out. The command only runs when the lockfile fingerprint has
+    changed (see :func:`ensure_env_synced`), so the default is safe to leave on.
+    """
+    if "preflight" not in config:
+        return shlex.split(DEFAULT_PREFLIGHT_CMD)
+    raw = str(config.get("preflight") or "").strip()
+    if not raw:
+        return None
+    return shlex.split(raw)
+
+
+def preflight_cmd_from_blob(config: dict) -> tuple[list[str] | None, str | None]:
+    """Resolve preflight argv + display string from a work-order ``config`` blob.
+
+    Returns ``(argv, display)`` where ``display`` is the command string that
+    would run, or ``(None, None)`` when the preflight is disabled.
+    """
+    if "preflight_cmd" in config:
+        raw = str(config.get("preflight_cmd") or "").strip()
+        if not raw:
+            return None, None
+        return shlex.split(raw), raw
+    argv = resolve_preflight_cmd(config)
+    if argv is None:
+        return None, None
+    return argv, shlex.join(argv)
+
+
+def _lockfile_for(repo_root: Path) -> Path | None:
+    """The lockfile a preflight tracks in ``repo_root`` (first present), or None
+    when the repo has no recognized lockfile (a non-uv repo — preflight no-ops)."""
+    for name in _LOCK_FILENAMES:
+        candidate = repo_root / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def lock_fingerprint(repo_root: Path) -> str | None:
+    """SHA-256 of the repo's lockfile contents, or ``None`` when absent.
+
+    Keyed on file *content* (not a git range) so it is correct regardless of how
+    the checkout got here — fresh clone, fast-forward, or a hand-rebuilt venv —
+    which a "did the last fetch change uv.lock?" diff cannot guarantee.
+    """
+    lockfile = _lockfile_for(repo_root)
+    if lockfile is None:
+        return None
+    return hashlib.sha256(lockfile.read_bytes()).hexdigest()
+
+
+def _venv_dir(repo_root: Path) -> Path:
+    return repo_root / ".venv"
+
+
+def _lock_marker_path(repo_root: Path) -> Path:
+    return _venv_dir(repo_root) / LOCK_MARKER_NAME
+
+
+def _read_lock_marker(repo_root: Path) -> str | None:
+    marker = _lock_marker_path(repo_root)
+    try:
+        return marker.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def _write_lock_marker(repo_root: Path, fingerprint: str) -> None:
+    """Record the synced-against fingerprint next to the venv (best-effort)."""
+    marker = _lock_marker_path(repo_root)
+    with contextlib.suppress(OSError):
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(fingerprint + "\n")
+
+
+def invalidate_lock_marker(repo_root: Path) -> None:
+    """Drop the lock marker so the next :func:`ensure_env_synced` re-syncs.
+
+    Called when a fast-forward pulls in a new lockfile (an eager signal on
+    whichever clone observed the change); the marker gate remains the
+    authoritative check for clones that never fast-forward (e.g. a worker box).
+    """
+    with contextlib.suppress(OSError):
+        _lock_marker_path(repo_root).unlink()
+
+
+def lock_changed_between(repo_root: Path, old: str, new: str) -> bool:
+    """True if any tracked lockfile differs between two commit-ishes.
+
+    Used as an eager fast-forward signal: when local ``main`` advances and a
+    lockfile changed in that range, the venv is (probably) stale and the marker
+    is invalidated so the next preflight re-syncs. Best-effort — a git error
+    returns False and the marker fingerprint remains the authoritative gate.
+    """
+    res = subprocess.run(
+        ["git", "diff", "--name-only", old, new, "--", *_LOCK_FILENAMES],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    return res.returncode == 0 and bool(res.stdout.strip())
+
+
+@dataclass
+class PreflightResult:
+    """Outcome of :func:`ensure_env_synced`.
+
+    ``ok`` is False only when a needed sync actually failed. ``synced`` is True
+    when the sync command ran (lock changed/missing or marker absent); False
+    means the fast path (fingerprint already recorded) or a no-op (no lockfile /
+    preflight disabled). ``detail`` carries the sync output tail on failure.
+    """
+
+    ok: bool
+    synced: bool
+    detail: str = ""
+    display: str = ""
+
+
+def ensure_env_synced(
+    repo_root: Path,
+    *,
+    preflight_argv: list[str] | None,
+    preflight_display: str | None = None,
+    env: dict[str, str] | None = None,
+    should_abort: Callable[[], Any] | None = None,
+) -> PreflightResult:
+    """Make the shared venv match the committed lockfile before a task runs.
+
+    Fast path (the overwhelming common case): the lockfile fingerprint already
+    matches the marker → return immediately, nothing runs. On a change/miss (a
+    new dependency landed, a fresh box, or an invalidated marker) run
+    ``preflight_argv`` (default ``uv sync --frozen``) in ``repo_root`` and, on
+    success, record the new fingerprint so the next task takes the fast path.
+
+    No-ops (``ok=True, synced=False``) when the preflight is disabled or the repo
+    has no recognized lockfile, so non-uv repos are unaffected.
+    """
+    if preflight_argv is None:
+        return PreflightResult(ok=True, synced=False)
+
+    fingerprint = lock_fingerprint(repo_root)
+    if fingerprint is None:
+        # No lockfile to track — nothing to sync against.
+        return PreflightResult(ok=True, synced=False)
+
+    if _read_lock_marker(repo_root) == fingerprint:
+        return PreflightResult(ok=True, synced=False)
+
+    display = preflight_display or shlex.join(preflight_argv)
+    proc = run_interruptible(
+        preflight_argv,
+        cwd=repo_root,
+        env=env,
+        should_abort=should_abort or (lambda: None),
+    )
+    if proc.returncode != 0:
+        tail = (proc.stdout[-1500:] + "\n" + proc.stderr[-500:]).strip()
+        return PreflightResult(ok=False, synced=True, detail=tail, display=display)
+
+    # Re-read the fingerprint post-sync: uv may rewrite uv.lock if it was stale,
+    # and we want the marker to reflect the state we actually synced to.
+    _write_lock_marker(repo_root, lock_fingerprint(repo_root) or fingerprint)
+    return PreflightResult(ok=True, synced=True, display=display)
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
@@ -2286,6 +2476,12 @@ def _sync_main_to_origin_impl(
 
         if reset.returncode != 0:
             return _rev_parse(repo_root, "HEAD")
+        # Eager preflight signal: local main just moved — if a lockfile changed
+        # in the range, drop the venv marker so the next task re-syncs before
+        # spending model budget. The marker fingerprint stays authoritative for
+        # clones that never fast-forward through here (e.g. a worker box).
+        if lock_changed_between(repo_root, head, target):
+            invalidate_lock_marker(repo_root)
         return _rev_parse(repo_root, "HEAD")
 
 

@@ -49,6 +49,7 @@ from nightshift.engine import (
     normalize_validate_command,
     read_task,
     reorder_queue,
+    resolve_preflight_cmd,
     resolve_title,
     resolve_validate_cmd,
     save_play_priorities,
@@ -2111,10 +2112,15 @@ def _build_work_order(
     model = meta.get("model") or cfg.default_model
     raw_turns = meta.get("turns", merged.get("max_turns"))
     validate_argv = resolve_validate_cmd(merged)
+    preflight_argv = resolve_preflight_cmd(merged)
     config_blob = {
         "model": str(model).strip() or cfg.default_model,
         "validate": merged.get("validate"),
         "validate_cmd": format_validate_cmd(validate_argv),
+        # Environment preflight (default `uv sync --frozen`); empty string in a
+        # queue's config opts out. Formatted like validate_cmd for the worker.
+        "preflight": merged.get("preflight"),
+        "preflight_cmd": format_validate_cmd(preflight_argv),
         "diff_cap_lines": merged.get("diff_cap_lines"),
         "forbidden_paths": merged.get("forbidden_paths"),
         "max_turns": int(raw_turns) if raw_turns is not None else None,
