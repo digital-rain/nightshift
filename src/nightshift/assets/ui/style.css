@@ -551,6 +551,20 @@ body {
 /* Multi-selected rows (shift-click): a soft highlight distinct from the
    accent-bordered cursor row and the now-playing row. */
 .q-item.selected { background: var(--accent-soft); border-color: var(--accent); }
+.q-info {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 6px;
+  opacity: 0;
+}
+.q-item:hover .q-info,
+.q-item.selected .q-info { opacity: 1; }
+.q-info:hover { color: var(--accent); background: var(--bg-sunken); }
 /* Per-row "…" actions trigger. Hidden until row hover, but
    always shown while the row is selected (the menu selects its row on open). */
 .q-menu-btn {

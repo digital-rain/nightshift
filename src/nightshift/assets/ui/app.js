@@ -1386,9 +1386,16 @@ function queueItemRow(item) {
     badge.textContent = "completed";
     li.append(badge);
   }
-  // Per-row "…" menu: the row's actions (add to playlist, get info, play
-  // next/last, enable/disable, remove from playlist). Opening it selects the
-  // row (so the menu acts on a known selection) without opening anything.
+  const info = document.createElement("button");
+  info.className = "q-info";
+  info.title = "Get info";
+  info.innerHTML = "&#9432;";
+  info.addEventListener("click", (e) => {
+    e.stopPropagation();
+    openTaskDetail(item.task);
+  });
+  li.append(info);
+
   li.append(queueRowMenuButton(item));
 
   // Queue-row gestures, per the media-player model:
