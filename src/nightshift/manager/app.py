@@ -73,6 +73,7 @@ from nightshift.manager.scheduler import (
     queue_label,
     unroutable,
 )
+from nightshift.manager import failure_policy
 from nightshift.manager.store import NightshiftStore, open_store
 from nightshift.model_id import provider_of
 from nightshift.spawn_daily import (
@@ -116,6 +117,7 @@ class PollBody(BaseModel):
     # whose required MCP set is a subset of ``mcps``.
     models: list[str] | None = None
     mcps: list[str] | None = None
+    exclude_queues: list[str] | None = None
 
 
 class HeartbeatBody(BaseModel):
@@ -534,6 +536,50 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             payload={"reason": reason, "streak": 1},
         )
         return True
+
+    async def _quarantine_retry_failure(
+        queue: str | None, task: str, run_id: str, detail: str
+    ) -> None:
+        """Phase B: the retried task failed again. Quarantine it and pause the
+        queue -- a repeat failure on a fresh retry is strong evidence of a
+        systemic issue, not noise."""
+        reason = (
+            f"quarantined after failing again on retry ({detail}); "
+            f"review the run logs and edit or delete the task to release it"
+        )
+        await _store().set_task_state(queue, task, "quarantined", blocked_reason=reason)
+        await _emit(
+            "task_quarantined",
+            run_id=run_id,
+            queue=queue,
+            task=task,
+            payload={"reason": reason, "streak": 2},
+        )
+        label = queue_label(queue)
+        _paused_queues[label] = "retry_failed"
+        await _emit(
+            "queue_paused", queue=queue, payload={"reason": "retry_failed", "task": task},
+        )
+
+    async def _record_failure_outcome(
+        queue: str | None, task: str, *, state: str, blocked_reason: str, retry_eligible: bool
+    ) -> None:
+        """Mark a task failed/blocked-retryable and apply the phase-A two-in-a-row
+        pause."""
+        await _store().set_task_state(
+            queue, task, state, blocked_reason=blocked_reason, retry_eligible=retry_eligible,
+        )
+        label = queue_label(queue)
+        should_pause = failure_policy.record_outcome(_failure_state(label), is_failure=True)
+        if should_pause and label not in _paused_queues:
+            _paused_queues[label] = "consecutive_failures"
+            await _emit(
+                "queue_paused", queue=queue,
+                payload={"reason": "consecutive_failures", "task": task},
+            )
+
+    def _record_success_outcome(queue: str | None) -> None:
+        failure_policy.record_outcome(_failure_state(queue_label(queue)), is_failure=False)
 
     # ----- worker auth (optional shared secret) ---------------------------- #
 
@@ -1640,15 +1686,20 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
     _VALID_ACTIONS = {"play", "pause", "stop", "skip", "select"}
     _VALID_MODES = {"oneshot", "auto", "repeat"}
 
-    _paused_queues: set[str] = set()
+    _paused_queues: dict[str, str] = {}
+    _queue_failure_state: dict[str, failure_policy.QueueFailureState] = {}
     _queue_modes: dict[str, str] = {}
     _queue_cursors: dict[str, str | None] = {}
+
+    def _failure_state(label: str) -> failure_policy.QueueFailureState:
+        return _queue_failure_state.setdefault(label, failure_policy.QueueFailureState())
 
     def _queue_state(queue: str | None, leases: list[dict[str, Any]]) -> dict[str, Any]:
         """Build a per-queue state dict in the shape the UI expects."""
         key = queue_label(queue)
         lease = next((le for le in leases if le.get("queue", "main") == key), None)
-        paused = key in _paused_queues
+        pause_reason = _paused_queues.get(key)
+        paused = pause_reason is not None
         if paused:
             st = "paused"
         elif lease:
@@ -1657,6 +1708,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             st = "idle"
         return {
             "state": st,
+            "pause_reason": pause_reason,
             "mode": _queue_modes.get(key, "auto"),
             "now_playing": lease["task"] if lease else None,
             "cursor": _queue_cursors.get(key),

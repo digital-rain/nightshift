@@ -94,10 +94,12 @@ class NightshiftStore(Protocol):
         *,
         blocked_reason: str | None = None,
         repo: str | None = None,
+        retry_eligible: bool = False,
     ) -> None: ...
     async def get_task_state(self, queue: str | None, task: str) -> dict[str, Any] | None: ...
     async def list_blocked(self) -> list[dict[str, Any]]: ...
     async def tasks_in_state(self, state: str) -> list[dict[str, Any]]: ...
+    async def retryable_tasks(self, queue: str | None) -> list[dict[str, Any]]: ...
     async def clear_task_state(self, queue: str | None, task: str) -> None: ...
 
     # queue dedication (manager-side queue -> worker binding)
@@ -365,6 +367,7 @@ class MemoryStore:
         *,
         blocked_reason: str | None = None,
         repo: str | None = None,
+        retry_eligible: bool = False,
     ) -> None:
         with self._lock:
             self._tasks[(_qkey(queue), task)] = {
@@ -373,6 +376,7 @@ class MemoryStore:
                 "state": state,
                 "blocked_reason": blocked_reason,
                 "repo": repo,
+                "retry_eligible": retry_eligible,
                 "updated_at": _now(),
             }
 
@@ -397,6 +401,19 @@ class MemoryStore:
                 }
                 for r in self._tasks.values()
                 if r["state"] == state
+            ]
+
+    async def retryable_tasks(self, queue: str | None) -> list[dict[str, Any]]:
+        with self._lock:
+            qk = _qkey(queue)
+            return [
+                {
+                    "queue": r["queue"], "task": r["task"], "state": r["state"],
+                    "blocked_reason": r.get("blocked_reason"),
+                }
+                for r in self._tasks.values()
+                if r["queue"] == qk
+                and (r["state"] == "failed" or (r["state"] == "blocked" and r.get("retry_eligible")))
             ]
 
     async def clear_task_state(self, queue: str | None, task: str) -> None:
@@ -838,19 +855,21 @@ class PgStore:
         *,
         blocked_reason: str | None = None,
         repo: str | None = None,
+        retry_eligible: bool = False,
     ) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO nightshift.tasks (queue, task, state, blocked_reason, repo, updated_at)
-                VALUES ($1, $2, $3, $4, $5, now())
+                INSERT INTO nightshift.tasks (queue, task, state, blocked_reason, repo, retry_eligible, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, now())
                 ON CONFLICT (queue, task) DO UPDATE SET
                     state = EXCLUDED.state,
                     blocked_reason = EXCLUDED.blocked_reason,
                     repo = EXCLUDED.repo,
+                    retry_eligible = EXCLUDED.retry_eligible,
                     updated_at = now()
                 """,
-                _qkey(queue), task, state, blocked_reason, repo,
+                _qkey(queue), task, state, blocked_reason, repo, retry_eligible,
             )
 
     async def get_task_state(self, queue: str | None, task: str) -> dict[str, Any] | None:
@@ -871,6 +890,17 @@ class PgStore:
             rows = await conn.fetch(
                 "SELECT queue, task, state, repo, blocked_reason FROM nightshift.tasks WHERE state = $1",
                 state,
+            )
+        return [dict(r) for r in rows]
+
+    async def retryable_tasks(self, queue: str | None) -> list[dict[str, Any]]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT queue, task, state, blocked_reason FROM nightshift.tasks
+                WHERE queue = $1 AND (state = 'failed' OR (state = 'blocked' AND retry_eligible))
+                """,
+                _qkey(queue),
             )
         return [dict(r) for r in rows]
 

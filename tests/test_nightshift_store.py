@@ -158,6 +158,29 @@ def test_blocked_task_state() -> None:
     assert _run(store.list_blocked()) == []
 
 
+def test_retryable_tasks_includes_failed_state() -> None:
+    store = MemoryStore()
+    _run(store.set_task_state(None, "a", "failed", blocked_reason="worker error"))
+    rows = _run(store.retryable_tasks(None))
+    assert [r["task"] for r in rows] == ["a"]
+
+
+def test_retryable_tasks_includes_retry_eligible_blocked_only() -> None:
+    store = MemoryStore()
+    _run(store.set_task_state(None, "honest", "blocked", blocked_reason="agent declined", retry_eligible=True))
+    _run(store.set_task_state(None, "conflict", "blocked", blocked_reason="needs resolve", retry_eligible=False))
+    rows = {r["task"] for r in _run(store.retryable_tasks(None))}
+    assert rows == {"honest"}
+
+
+def test_retryable_tasks_scoped_to_queue() -> None:
+    store = MemoryStore()
+    _run(store.set_task_state(None, "a", "failed"))
+    _run(store.set_task_state("other", "b", "failed"))
+    rows = _run(store.retryable_tasks(None))
+    assert [r["task"] for r in rows] == ["a"]
+
+
 # --------------------------------------------------------------------------- #
 # runs + stats
 # --------------------------------------------------------------------------- #
