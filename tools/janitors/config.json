@@ -1,0 +1,65 @@
+{
+  "throttle": {
+    "max_prs_per_night": 15
+  },
+  "diff_cap_lines": 500,
+  "diff_cap_exempt_paths": [
+    "^tests/fixtures/",
+    "^docs/",
+    "^prompts/",
+    "\\.md$",
+    "\\.(txt|rst|adoc)$"
+  ],
+  "forbidden_paths": [
+    "^\\.github/workflows/",
+    "^tools/janitors/",
+    "^tools/nightshift/",
+    "^CLAUDE\\.md$",
+    "^AGENTS\\.md$",
+    "^migrations/",
+    "^config/longitude\\.json$",
+    "^pkg/",
+    "^sql/"
+  ],
+  "test_file_patterns": [
+    "/tests/",
+    "test_.*\\.py$",
+    "_test\\.go$"
+  ],
+  "review": {
+    "mode": "single",
+    "single_reviewer": "cursor",
+    "tiered": {
+      "enforcer": "copilot",
+      "deadcode": "copilot",
+      "regression": "cursor",
+      "refactor": "cursor"
+    }
+  },
+  "roles": {
+    "regression": {
+      "enabled": true,
+      "draft": true,
+      "model": "claude-sonnet-4-6",
+      "max_turns": 30
+    },
+    "enforcer": {
+      "enabled": false,
+      "draft": true,
+      "model": "claude-haiku-4-5",
+      "max_turns": 15
+    },
+    "deadcode": {
+      "enabled": false,
+      "draft": true,
+      "model": "claude-sonnet-4-6",
+      "max_turns": 20
+    },
+    "refactor": {
+      "enabled": false,
+      "draft": true,
+      "model": "claude-sonnet-4-6",
+      "max_turns": 25
+    }
+  }
+}
