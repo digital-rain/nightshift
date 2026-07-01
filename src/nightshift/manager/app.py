@@ -60,6 +60,7 @@ from nightshift.engine import (
     task_is_evergreen,
 )
 from nightshift.events import new_run_id
+from nightshift.manager import failure_policy
 from nightshift.manager.config import ManagerConfig, load_manager_config
 from nightshift.manager.hub import Hub
 from nightshift.manager.landing import canonical_head, land, main_advanced_sha
@@ -73,7 +74,6 @@ from nightshift.manager.scheduler import (
     queue_label,
     unroutable,
 )
-from nightshift.manager import failure_policy
 from nightshift.manager.store import NightshiftStore, open_store
 from nightshift.model_id import provider_of
 from nightshift.spawn_daily import (

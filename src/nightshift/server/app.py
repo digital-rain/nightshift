@@ -332,7 +332,11 @@ def create_app(workspace: Path) -> FastAPI:
         if not _queue_exists(target):
             return JSONResponse({"error": "queue not found"}, status_code=404)
         return JSONResponse(
-            {"sort": save_sort_mode(tasks_root, req.sort, playlists_mod.tasks_rel(target))}
+            {
+                "sort": save_sort_mode(
+                    tasks_root, req.sort, playlists_mod.tasks_rel(target)
+                )
+            }
         )
 
     @app.get("/api/queue/play-priorities")
@@ -343,7 +347,11 @@ def create_app(workspace: Path) -> FastAPI:
         if not _queue_exists(target):
             return JSONResponse({"error": "queue not found"}, status_code=404)
         return JSONResponse(
-            {"priorities": load_play_priorities(tasks_root, playlists_mod.tasks_rel(target))}
+            {
+                "priorities": load_play_priorities(
+                    tasks_root, playlists_mod.tasks_rel(target)
+                )
+            }
         )
 
     @app.put("/api/queue/play-priorities")
@@ -371,9 +379,9 @@ def create_app(workspace: Path) -> FastAPI:
         target = _resolve_queue(queue)
         if not _queue_exists(target):
             return JSONResponse({"error": "queue not found"}, status_code=404)
-        repo = load_queue_config(
-            tasks_root, playlists_mod.tasks_rel(target)
-        ).get("repo")
+        repo = load_queue_config(tasks_root, playlists_mod.tasks_rel(target)).get(
+            "repo"
+        )
         return JSONResponse({"repo": repo})
 
     @app.put("/api/queue/repo")
@@ -492,9 +500,7 @@ def create_app(workspace: Path) -> FastAPI:
                 continue
             try:
                 repo = _repo_for_queue(target)
-                if repo and cleanup_task_worktree(
-                    workspace, repo, name, queue=target
-                ):
+                if repo and cleanup_task_worktree(workspace, repo, name, queue=target):
                     cleaned.append(name)
             except Exception:
                 # Best-effort; the records are already cleared.
@@ -539,9 +545,7 @@ def create_app(workspace: Path) -> FastAPI:
                 continue
             try:
                 repo = _repo_for_queue(target)
-                if repo and cleanup_task_worktree(
-                    workspace, repo, name, queue=target
-                ):
+                if repo and cleanup_task_worktree(workspace, repo, name, queue=target):
                     cleaned.append(name)
             except Exception:
                 # Cleanup is best-effort; the run record is already gone.
@@ -584,9 +588,7 @@ def create_app(workspace: Path) -> FastAPI:
                 {"error": f"unknown action: {req.action}"}, status_code=400
             )
         if req.mode is not None and req.mode not in _VALID_MODES:
-            return JSONResponse(
-                {"error": f"unknown mode: {req.mode}"}, status_code=400
-            )
+            return JSONResponse({"error": f"unknown mode: {req.mode}"}, status_code=400)
         target = _resolve_queue(req.queue)
         if not _queue_exists(target):
             return JSONResponse({"error": "queue not found"}, status_code=404)
@@ -667,8 +669,15 @@ def create_app(workspace: Path) -> FastAPI:
         fields = req.model_dump(
             exclude_unset=True,
             include={
-                "disabled", "evergreen", "automerge", "draft", "model",
-                "priority", "repo", "loop", "loop_max_iterations",
+                "disabled",
+                "evergreen",
+                "automerge",
+                "draft",
+                "model",
+                "priority",
+                "repo",
+                "loop",
+                "loop_max_iterations",
             },
         )
         changes: dict[str, object | None] = {}
@@ -699,7 +708,9 @@ def create_app(workspace: Path) -> FastAPI:
         return st.get("running_playlist") == target and st.get("now_playing") == task
 
     @app.patch("/api/tasks/{task}")
-    def patch_task(task: str, req: TaskUpdate, queue: str | None = None) -> JSONResponse:
+    def patch_task(
+        task: str, req: TaskUpdate, queue: str | None = None
+    ) -> JSONResponse:
         """Save a queue task's edits (title, brief body, and the frontmatter
         toggles: enable/disable, evergreen, automerge, draft, model) from the
         detail-view pane. Refused only while the task is the live track of the
@@ -771,7 +782,9 @@ def create_app(workspace: Path) -> FastAPI:
         Always allowed — it only moves the UI's view/edit focus. A run on another
         queue keeps running and is unaffected, so you can browse and edit any
         queue while one is playing."""
-        if req.playlist is not None and not playlists_mod.exists(tasks_root, req.playlist):
+        if req.playlist is not None and not playlists_mod.exists(
+            tasks_root, req.playlist
+        ):
             return JSONResponse({"error": "playlist not found"}, status_code=404)
         return JSONResponse(player.set_active(req.playlist))
 
@@ -779,9 +792,25 @@ def create_app(workspace: Path) -> FastAPI:
     def get_playlists() -> list[dict]:
         return playlists_mod.list_playlists(tasks_root)
 
+    @app.get("/api/main/info")
+    def get_main_info() -> JSONResponse:
+        """The main queue’s info payload, mirroring the per-playlist info
+        endpoint so the playlist-info screen can display it."""
+        count = len(list_queue(tasks_root, playlists_mod.tasks_rel(None)))
+        cfg = load_queue_config(tasks_root, playlists_mod.tasks_rel(None))
+        return JSONResponse(
+            {
+                "name": "library",
+                "task_count": count,
+                "repository": cfg.get("repo"),
+                "validate": cfg.get("validate"),
+                "disabled": False,
+            }
+        )
+
     @app.get("/api/main/tasks")
     def get_main_tasks() -> JSONResponse:
-        """The main ``.tasks/`` queue's tasks, surfaced in the Add-from picker
+        """The main ``.tasks/`` queue’s tasks, surfaced in the Add-from picker
         as the special ‘library’ playlist (so a playlist can pull from main)."""
         return JSONResponse(list_queue(tasks_root, playlists_mod.tasks_rel(None)))
 
@@ -962,13 +991,14 @@ def create_app(workspace: Path) -> FastAPI:
 
         applied_live, restart_required = write_delta(workspace, resolved)
 
-        return JSONResponse({
-            "ok": True,
-            "applied_live": applied_live,
-            "restart_required": restart_required,
-            **build_get_response(workspace, _SERVER_SURFACES),
-        })
-
+        return JSONResponse(
+            {
+                "ok": True,
+                "applied_live": applied_live,
+                "restart_required": restart_required,
+                **build_get_response(workspace, _SERVER_SURFACES),
+            }
+        )
 
     # ----- repos (workspace target repos) ------------------------------ #
 

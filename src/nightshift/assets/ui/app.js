@@ -93,6 +93,8 @@ const state = {
   selectedPlaylists: new Set(),  // multi-selected playlist names (shift-click extends)
 };
 
+const LIBRARY_QUEUE = "__library__";
+
 // Transport glyphs for the Now box (borderless triangle / pause bars).
 const PLAY_GLYPH = "\u25B6";          // ▶
 const PAUSE_GLYPH = "\u275A\u275A";   // ❚❚
@@ -2808,6 +2810,16 @@ function libraryRow() {
   main.append(name, meta);
   li.append(main);
 
+  const info = document.createElement("button");
+  info.className = "pl-info";
+  info.title = "Get info";
+  info.innerHTML = "&#9432;";
+  info.addEventListener("click", (e) => {
+    e.stopPropagation();
+    openPlaylistInfo(LIBRARY_QUEUE);
+  });
+  li.append(info);
+
   const chev = document.createElement("button");
   chev.className = "upnext-chev pl-chev";
   chev.innerHTML = "&#8250;";
@@ -3028,8 +3040,11 @@ function renderPlaylistInfo() {
   const name = state.playlistInfoName;
   const body = $("playlist-info-body");
   if (!name || !body) return;
-  $("playlist-info-title").textContent = "Playlist info";
-  getJSON(`/api/playlists/${encodeURIComponent(name)}`)
+  $("playlist-info-title").textContent = name === LIBRARY_QUEUE ? "Queue info" : "Playlist info";
+  const url = name === LIBRARY_QUEUE
+    ? "/api/main/info"
+    : `/api/playlists/${encodeURIComponent(name)}`;
+  getJSON(url)
     .then((info) => {
       if (state.playlistInfoName !== name) return;
       if (!info || info.error) {
@@ -3050,10 +3065,15 @@ function buildPlaylistInfoContent(info) {
   const body = $("playlist-info-body");
   if (!body) return;
   body.innerHTML = "";
-  $("playlist-info-title").textContent = info.name;
+  const isLibrary = state.playlistInfoName === LIBRARY_QUEUE;
+  $("playlist-info-title").textContent = isLibrary ? "library" : info.name;
 
   const nameField = playlistInfoField("Name", info.name, "playlist-info-name",
-    "the playlist's name (also its on-disk queue)");
+    isLibrary ? "the main queue (not renameable)" : "the playlist's name (also its on-disk queue)");
+  if (isLibrary) {
+    const input = nameField.querySelector("input");
+    if (input) input.readOnly = true;
+  }
   const repoField = playlistInfoField("Repository", info.repository || "",
     "playlist-info-repo", "the workspace repo this playlist's tasks target");
   const validateField = playlistInfoField("Validate command", info.validate || "",
@@ -3089,6 +3109,7 @@ function playlistInfoField(label, value, id, placeholder) {
 }
 
 async function savePlaylistInfo(info, errEl) {
+  const isLibrary = state.playlistInfoName === LIBRARY_QUEUE;
   const nameEl = $("playlist-info-name");
   const repoEl = $("playlist-info-repo");
   const validateEl = $("playlist-info-validate");
@@ -3099,6 +3120,21 @@ async function savePlaylistInfo(info, errEl) {
     if (errEl) { errEl.textContent = "name is required"; errEl.hidden = false; }
     return;
   }
+
+  if (isLibrary) {
+    const payload = {};
+    if (newRepo !== (info.repository || "")) payload.repo = newRepo;
+    if (newValidate !== (info.validate || "")) payload.validate_cmd = newValidate;
+    if (!Object.keys(payload).length) { closePlaylistInfo(); return; }
+    const { ok, data } = await sendJSON("/api/queue/config?queue=", "PUT", payload);
+    if (!ok) {
+      if (errEl) { errEl.textContent = (data && data.error) || "could not save queue config"; errEl.hidden = false; }
+      return;
+    }
+    closePlaylistInfo();
+    return;
+  }
+
   // Send only the fields that changed: a rename is a separate, heavier op than
   // a repo edit, so leaving name untouched avoids a needless directory move.
   const payload = {};

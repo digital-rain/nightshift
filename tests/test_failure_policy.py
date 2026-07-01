@@ -1,4 +1,8 @@
-from nightshift.manager.failure_policy import QueueFailureState, record_outcome, pick_retry
+from nightshift.manager.failure_policy import (
+    QueueFailureState,
+    pick_retry,
+    record_outcome,
+)
 
 
 def test_first_failure_arms_watch_no_pause():
