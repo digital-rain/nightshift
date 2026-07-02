@@ -1,66 +1,102 @@
-"""Landing / integrate locks for a target repo's shared working tree.
+"""RepoLock — one mutual-exclusion device per (workspace, repo) target repo
+(git greenfield §4).
 
-Moved verbatim from ``engine.py`` in Phase 3 of the rebuild-in-place migration.
+Everything that mutates the canonical repo — landing, origin sync, transport
+fetch/prune — serializes on the SAME lock, held at orchestration boundaries
+(``land()``, ``push_resolved_main``, the public sync entry points, the CLI
+land path). The git primitives themselves are lock-free and *assert* the
+caller holds it (:meth:`RepoLock.is_held_by_current_thread`), which makes a
+forgotten lock a loud test failure instead of a silent race.
+
+Two layers, like the locks this replaces:
+
+* an in-process :class:`threading.Lock` keyed per ``(workspace, repo)`` in a
+  registry — NOT module-global, so lands on different repos never serialize;
+* a cross-process ``flock`` at ``<workspace>/.worktrees/<repo>/.lock`` so a
+  manager land and an out-of-process resolve push (or a CLI land) can't
+  collide.
+
+Re-entry raises ``RuntimeError``: the flock is not reentrant, and nesting the
+lock on one thread is always a layering bug (a primitive trying to act like
+an orchestrator). The pre-Phase-6 ``landing_lock``/``integrate_lock`` pair —
+one module-global mutex each, serializing across unrelated repos — is gone.
 """
 
 from __future__ import annotations
 
-import contextlib
 import fcntl
 import os
 import threading
 from pathlib import Path
 
 
-# Serialize every mutation of a target repo's index/HEAD/stash so concurrent
-# queue runners (and a stray CLI process) can never interleave on the shared
-# working tree. Two layers: a process-local lock across registry runner threads,
-# and a cross-process file lock (per workspace+repo) so a server land and a CLI
-# land can't collide.
-_LANDING_LOCK = threading.Lock()
-_INTEGRATE_LOCK = threading.Lock()
+class RepoLock:
+    """The per-(workspace, repo) repo mutation lock. Obtain instances via
+    :func:`repo_lock` (the registry) — constructing one directly bypasses the
+    per-repo keying and only makes sense in tests."""
 
+    def __init__(self, workspace: Path, repo: str) -> None:
+        self._lock = threading.Lock()
+        self._owner: int | None = None
+        self._fd: int | None = None
+        self._path = workspace / ".worktrees" / repo / ".lock"
 
-@contextlib.contextmanager
-def landing_lock(workspace: Path, repo: str):
-    """Hold the in-process + cross-process landing lock for a short critical
-    section (a squash-merge + commit) on a target repo. The cross-process lock
-    file lives at ``<workspace>/.worktrees/<repo>/.nightshift-landing.lock``. Not
-    reentrant — never nest ``landing_lock`` calls on one thread."""
-    with _LANDING_LOCK:
-        path = workspace / ".worktrees" / repo / ".nightshift-landing.lock"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(path), os.O_CREAT | os.O_WRONLY, 0o644)
+    def is_held_by_current_thread(self) -> bool:
+        return self._owner == threading.get_ident()
+
+    def acquire(self) -> None:
+        if self.is_held_by_current_thread():
+            raise RuntimeError(
+                f"RepoLock({self._path}) re-entered on the same thread — "
+                "primitives must not re-acquire the orchestration lock"
+            )
+        self._lock.acquire()
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
-        finally:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(self._path), os.O_CREAT | os.O_WRONLY, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except OSError:
+                os.close(fd)
+                raise
+        except OSError:
+            self._lock.release()
+            raise
+        self._fd = fd
+        self._owner = threading.get_ident()
+
+    def release(self) -> None:
+        if not self.is_held_by_current_thread():
+            raise RuntimeError(f"RepoLock({self._path}) released by a non-owner")
+        fd = self._fd
+        self._owner = None
+        self._fd = None
+        if fd is not None:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
+        self._lock.release()
+
+    def __enter__(self) -> RepoLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.release()
 
 
-@contextlib.contextmanager
-def integrate_lock(workspace: Path, repo: str):
-    """Serialize a whole *integrate-and-push* section (sync origin -> preview ->
-    squash -> push, with retries) across every land path and the out-of-process
-    resolve runner, so concurrent merges to a target repo are strictly
-    serialized while the long-running work that *precedes* the merge stays
-    unlocked.
+# Registry: one lock object per (workspace, repo), created on first use. The
+# registry mutex only guards the dict itself (creation races), never the repo.
+_REGISTRY: dict[tuple[str, str], RepoLock] = {}
+_REGISTRY_MUTEX = threading.Lock()
 
-    This is a DIFFERENT lock from :func:`landing_lock`: the inner git primitives
-    (``sync_main_to_origin``, ``squash_to_main``, the push) each still take
-    ``landing_lock`` for their own critical section, so this outer lock must
-    never be the landing lock (that would self-deadlock on the non-reentrant
-    flock). The cross-process lock file lives at
-    ``<workspace>/.worktrees/<repo>/.nightshift-integrate.lock``. Not reentrant.
-    """
-    with _INTEGRATE_LOCK:
-        path = workspace / ".worktrees" / repo / ".nightshift-integrate.lock"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(path), os.O_CREAT | os.O_WRONLY, 0o644)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
+
+def repo_lock(workspace: Path, repo: str) -> RepoLock:
+    """The one :class:`RepoLock` for a target repo (registry-keyed by resolved
+    workspace + repo name, so every code path in the process shares it)."""
+    key = (str(workspace.resolve()), repo)
+    with _REGISTRY_MUTEX:
+        lock = _REGISTRY.get(key)
+        if lock is None:
+            lock = RepoLock(workspace, repo)
+            _REGISTRY[key] = lock
+        return lock

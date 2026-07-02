@@ -94,7 +94,6 @@ These live at the root of `config.json` and are resolved into each work order or
 | `max_fix_attempts` | `6` | Fix retries (dispatch path). |
 | `max_nights_before_parking` | `2` | Nights a failing task retries before being parked. |
 | `resolve_model` / `resolve_backend` | `null` | Optional overrides for resolve runs. |
-| `autostash_operator_work` | `true` | Stash uncommitted operator work before a local landing. |
 | `model` / `cursor_model` / `worker_backend` | (see file) | Legacy defaults for the GitHub Actions and local-runner paths. |
 
 > Note: several keys (`max_per_day`, `model`, `cursor_model`, `worker_backend`, `max_fix_attempts`, …) originate in the older GitHub Actions / local-runner flow. In the manager/worker architecture, model selection and backend are worker-owned (below); these remain for the compat paths.

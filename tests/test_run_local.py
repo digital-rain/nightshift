@@ -32,7 +32,6 @@ from _workspace import build_workspace, git, git_commit_all
 from nightshift._paths import PROMPTS_DIR, TEMPLATES_DIR
 from nightshift.backends import AgentStreamParser, WorkerResult
 from nightshift.engine import (
-    AUTOSTASH_MESSAGE,
     DEFAULT_VALIDATE_CMD,
     TaskResult,
     _landing_blockers,
@@ -670,12 +669,12 @@ def test_run_store_backfill_skips_records_without_a_commit(tmp_path: Path) -> No
     assert rec["loc"] is None
 
 
-def test_squash_to_main_autostash_lands_over_dirty_code(tmp_path: Path) -> None:
-    """With autostash on (the default), tracked operator code WIP on the target
-    repo's main is set aside for the merge+commit and restored afterward, so the
-    land succeeds and the operator's edit is byte-identical with no leftover
-    stash. Briefs live in the separate content store, so every tracked change
-    here is genuine operator code WIP."""
+def test_squash_to_main_lands_over_dirty_code_wip(tmp_path: Path) -> None:
+    """Tracked operator code WIP on the target repo's main never blocks a land:
+    the plumbing pipeline moves the ref without touching the working tree, and
+    the checkout advance carries non-overlapping WIP forward verbatim — no
+    stash involved. Briefs live in the separate content store, so every tracked
+    change here is genuine operator code WIP."""
     workspace, _tasks_root, repo_root = _full(tmp_path, tasks={"10.hello": "Do something."})
     wip = repo_root / "app.py"
     wip.write_text("x = 1\n")
@@ -691,41 +690,48 @@ def test_squash_to_main_autostash_lands_over_dirty_code(tmp_path: Path) -> None:
     assert detail == ""
     assert recoverable is False
 
-    # The task landed, and the operator's WIP is restored verbatim (and NOT part
-    # of the task commit — it was stashed during the merge).
+    # The task landed, the checkout advanced with it, and the operator's WIP is
+    # carried forward verbatim (and NOT part of the task commit).
     assert (repo_root / "new_file.py").exists()
     assert wip.read_text() == dirty
     committed = git(repo_root, "show", "--name-only", "--format=", "HEAD")
     assert "app.py" not in committed
-    # No autostash entry is left behind.
-    assert AUTOSTASH_MESSAGE not in git(repo_root, "stash", "list")
+    # No stash machinery is involved at all.
+    assert git(repo_root, "stash", "list").strip() == ""
 
     teardown_worktree(workspace, REPO, "10.hello")
 
 
-def test_squash_to_main_refuses_dirty_main_when_autostash_off(tmp_path: Path) -> None:
-    """With autostash off, a tracked code change on the target repo's main blocks
-    the squash with a precise recoverable reason and must not leave a half-merged
-    tree."""
+def test_squash_to_main_overlapping_wip_leaves_checkout_behind(tmp_path: Path) -> None:
+    """Uncommitted operator edits to a file the land also changes no longer
+    block (and are never stashed): the land succeeds on the ref, the checkout
+    advance refuses rather than clobber the WIP, and the detail says so — the
+    checkout is left behind main with the operator's work exactly as it was."""
     workspace, _tasks_root, repo_root = _full(tmp_path, tasks={"10.hello": "Do something."})
-    wip = repo_root / "app.py"
-    wip.write_text("x = 1\n")
+    target = repo_root / "app.py"
+    target.write_text("base\n")
     git_commit_all(repo_root, "add app.py")
-    _commit_work_on_branch(workspace, REPO, "10.hello")
-
     head_before = git(repo_root, "rev-parse", "HEAD")
 
-    wip.write_text(wip.read_text() + "\n# local edit\n")
+    # Branch edits an existing tracked file.
+    worktree = setup_worktree(workspace, REPO, "10.hello")
+    (worktree / "app.py").write_text('{"branch": true}\n')
+    git(worktree, "add", ".")
+    git(worktree, "commit", "-m", "branch edit")
 
-    sha, detail, recoverable = squash_to_main(
-        workspace, REPO, "10.hello", "hello world", autostash=False,
-    )
-    assert sha is None
-    assert "uncommitted changes" in detail
-    assert recoverable is True  # clearing the dirty tree lets a retry succeed
+    # Operator has uncommitted edits to the SAME file → the advance must refuse.
+    target.write_text('{"operator": true}\n')
 
+    sha, detail, recoverable = squash_to_main(workspace, REPO, "10.hello", "hello world")
+    assert sha is not None  # the land happened — main's ref moved
+    assert recoverable is False
+    assert "behind main" in detail
+
+    # main is authoritative; the checkout stayed put with the WIP untouched.
+    assert git(repo_root, "rev-parse", "refs/heads/main") != head_before
     assert git(repo_root, "rev-parse", "HEAD") == head_before
-    assert "# local edit" in wip.read_text()
+    assert target.read_text() == '{"operator": true}\n'
+    assert git(repo_root, "stash", "list").strip() == ""
 
     teardown_worktree(workspace, REPO, "10.hello")
 
@@ -761,33 +767,6 @@ def test_squash_to_main_lands_over_dirty_queue_state(tmp_path: Path) -> None:
     assert (playlist / "queue-view.md").read_text() == (
         "---\ntitle: Queue view\n---\nEdited.\n"
     )
-
-    teardown_worktree(workspace, REPO, "10.hello")
-
-
-def test_squash_to_main_autostash_pop_conflict_preserves_work(tmp_path: Path) -> None:
-    """When restoring set-aside WIP conflicts with the file the task just landed,
-    the land still records, the failure detail explains it, and the stash entry is
-    preserved so nothing is lost."""
-    workspace, _tasks_root, repo_root = _full(tmp_path, tasks={"10.hello": "Do something."})
-    target = repo_root / "app.py"
-    target.write_text("base\n")
-    git_commit_all(repo_root, "add app.py")
-
-    # Branch edits an existing tracked file.
-    worktree = setup_worktree(workspace, REPO, "10.hello")
-    (worktree / "app.py").write_text('{"branch": true}\n')
-    git(worktree, "add", ".")
-    git(worktree, "commit", "-m", "branch edit")
-
-    # Operator has uncommitted edits to the SAME file → pop will conflict.
-    target.write_text('{"operator": true}\n')
-
-    sha, detail, recoverable = squash_to_main(workspace, REPO, "10.hello", "hello world")
-    assert sha is not None  # the land happened
-    assert "set-aside" in detail and "stash" in detail
-    # The stash entry is preserved for manual restore.
-    assert AUTOSTASH_MESSAGE in git(repo_root, "stash", "list")
 
     teardown_worktree(workspace, REPO, "10.hello")
 
@@ -868,9 +847,11 @@ def test_check_preconditions_ignores_dirty_queue_state(tmp_path: Path, monkeypat
     check_preconditions(workspace, REPO)
 
 
-def test_check_preconditions_notice_on_code_wip_autostash_on(
+def test_check_preconditions_notice_on_code_wip(
     tmp_path: Path, monkeypatch, capsys,
 ) -> None:
+    """Tracked code WIP never blocks a run (lands don't touch the working tree)
+    but earns an up-front notice about a possible checkout left behind main."""
     workspace, _tasks_root, repo_root = _full(tmp_path, tasks={"10.hello": "Do something."})
     _prep_preconditions(repo_root, monkeypatch)
 
@@ -880,52 +861,38 @@ def test_check_preconditions_notice_on_code_wip_autostash_on(
     git_commit_all(repo_root, "add app.py")
     code.write_text("x = 2\n")
 
-    check_preconditions(workspace, REPO)  # autostash defaults on → notice, no exit
-    assert "set aside" in capsys.readouterr().out
+    check_preconditions(workspace, REPO)  # notice, never an exit
+    assert "behind main" in capsys.readouterr().out
 
 
-def test_check_preconditions_exits_on_code_wip_autostash_off(
-    tmp_path: Path, monkeypatch,
-) -> None:
-    workspace, _tasks_root, repo_root = _full(
-        tmp_path,
-        tasks={"10.hello": "Do something."},
-        config={"autostash_operator_work": False},
-    )
-    _prep_preconditions(repo_root, monkeypatch)
+def _seed_failed_land(workspace: Path, repo_root: Path) -> str:
+    """Drive a real failed land: main gains a commit that add/add-conflicts with
+    the branch's ``new_file.py``, so the squash refuses and preserves the branch.
+    Returns the pre-conflict main sha (reset main to it to clear the blocker)."""
+    _commit_work_on_branch(workspace, REPO, "10.hello")
+    clean = git(repo_root, "rev-parse", "HEAD")
+    (repo_root / "new_file.py").write_text("print('conflicting')\n")
+    git(repo_root, "add", ".")
+    git(repo_root, "commit", "-m", "conflicting main edit")
 
-    code = repo_root / "app.py"
-    code.write_text("x = 1\n")
-    git_commit_all(repo_root, "add app.py")
-    # A tracked code blocker that, with autostash off, must hard-exit.
-    code.write_text("x = 2\n")
-
-    with pytest.raises(SystemExit):
-        check_preconditions(workspace, REPO)
+    sha, detail, recoverable = squash_to_main(workspace, REPO, "10.hello", "hello world")
+    assert sha is None
+    assert recoverable is False and "conflict" in detail.lower()
+    return clean
 
 
 def test_recover_task_relands_after_blocker_cleared(tmp_path: Path) -> None:
-    """A squash that fails on a dirty tree leaves the branch intact; once the
-    blocker is cleared, recover_task lands the work and tears the branch down."""
+    """A squash that fails on a conflicting main commit leaves the branch intact;
+    once the operator drops that commit, recover_task lands the work and tears
+    the branch down."""
     workspace, _tasks_root, repo_root = _full(tmp_path, tasks={"10.hello": "Do something."})
-    wip = repo_root / "app.py"
-    wip.write_text("x = 1\n")
-    git_commit_all(repo_root, "add app.py")
-    _commit_work_on_branch(workspace, REPO, "10.hello")
-
-    original = wip.read_text()
-    wip.write_text(original + "\n# local edit\n")
-
-    sha, _detail, _ = squash_to_main(
-        workspace, REPO, "10.hello", "hello world", autostash=False,
-    )
-    assert sha is None  # blocked by the dirty tree
+    clean = _seed_failed_land(workspace, repo_root)
 
     # Branch is preserved so the validated work can be recovered.
     assert "task-local/main/10.hello" in git(repo_root, "branch")
 
-    # Clear the blocker, then recover.
-    wip.write_text(original)
+    # The operator clears the blocker (drops the conflicting commit), then recovers.
+    git(repo_root, "reset", "--hard", clean)
     result = recover_task(workspace, REPO, "10.hello", "hello world")
     assert result.success
     assert result.commit_sha
@@ -1067,22 +1034,12 @@ def test_resolve_task_without_branch_reports_clearly(tmp_path: Path) -> None:
     assert result.failure_kind == "merge_rejected"
 
 
-def test_resolve_task_lands_transient_via_cheap_path(tmp_path: Path) -> None:
-    """A transient blocker (dirty main) that has cleared lands on the cheap
-    re-squash path — no agent involved."""
+def test_resolve_task_lands_cleared_blocker_via_cheap_path(tmp_path: Path) -> None:
+    """A blocker that has since cleared lands on the cheap re-squash path — no
+    agent involved."""
     workspace, tasks_root, repo_root = _full(tmp_path, tasks={"10.hello": "Do something."})
-    wip = repo_root / "app.py"
-    wip.write_text("x = 1\n")
-    git_commit_all(repo_root, "add app.py")
-    _commit_work_on_branch(workspace, REPO, "10.hello")
-
-    original = wip.read_text()
-    wip.write_text(original + "\n# local edit\n")
-    sha, _detail, _rec = squash_to_main(
-        workspace, REPO, "10.hello", "hello world", autostash=False,
-    )
-    assert sha is None  # blocked by the dirty tree
-    wip.write_text(original)  # clear the blocker
+    clean = _seed_failed_land(workspace, repo_root)
+    git(repo_root, "reset", "--hard", clean)  # the operator clears the blocker
 
     result = resolve_task(
         workspace, REPO, tasks_root, "10.hello", "hello world", emit=lambda _e: None
@@ -1336,10 +1293,10 @@ def test_worktree_namespacing_isolates_same_named_tasks(tmp_path: Path) -> None:
         teardown_worktree(workspace, REPO, "shared", queue="foo")
 
 
-def test_landing_lock_serializes_concurrent_squashes(tmp_path: Path) -> None:
+def test_repo_lock_serializes_concurrent_squashes(tmp_path: Path) -> None:
     """Two runner threads squashing distinct task branches at the same instant
-    both land cleanly — the landing lock serializes their root index/HEAD writes
-    so neither sees a half-merged tree or a corrupt index.lock."""
+    both land cleanly — the RepoLock serializes their ref CAS + checkout advance
+    so neither loses its update or sees a half-advanced checkout."""
     workspace, _tasks_root, repo_root = _full(tmp_path, tasks={"10.a": "A", "20.b": "B"})
     for task, fname in (("10.a", "file_a.py"), ("20.b", "file_b.py")):
         wt = setup_worktree(workspace, REPO, task)
@@ -1373,10 +1330,10 @@ def test_landing_lock_serializes_concurrent_squashes(tmp_path: Path) -> None:
     assert not (repo_root / ".git/index.lock").exists()
 
 
-def test_autostash_does_not_disturb_existing_human_stash(tmp_path: Path) -> None:
-    """The set-aside is stack-independent (``git stash create``): a land over
-    operator WIP restores it without consuming a pre-existing human stash entry,
-    and leaves no ``nightshift-autostash`` on the stack on success."""
+def test_land_never_touches_the_stash(tmp_path: Path) -> None:
+    """A land over operator WIP is a pure ref operation: the WIP is carried
+    forward in place and a pre-existing human stash entry is never consumed,
+    reordered, or added to (the autostash machinery is gone)."""
     workspace, _tasks_root, repo_root = _full(tmp_path, tasks={"10.hello": "Do something."})
     wip = repo_root / "app.py"
     wip.write_text("base\n")
@@ -1391,17 +1348,16 @@ def test_autostash_does_not_disturb_existing_human_stash(tmp_path: Path) -> None
     sentinel.write_text("# human wip\n")
     git(repo_root, "stash", "push", "-m", "human-wip", "--", str(sentinel))
 
-    # Operator now has unrelated code WIP; the land must set it aside + restore it.
+    # Operator has unrelated code WIP; the land must carry it forward in place.
     dirty = wip.read_text() + "\n# operator edit\n"
     wip.write_text(dirty)
 
     sha, detail, recoverable = squash_to_main(workspace, REPO, "10.hello", "hello world")
     assert sha is not None
     assert detail == ""
-    assert wip.read_text() == dirty  # operator WIP restored verbatim
+    assert wip.read_text() == dirty  # operator WIP carried forward verbatim
 
     stash_list = git(repo_root, "stash", "list")
-    assert AUTOSTASH_MESSAGE not in stash_list  # no leftover autostash on success
     assert "human-wip" in stash_list  # the human's stash was never consumed
     assert stash_list.count("\n") == 0  # exactly one entry remains (no trailing nl)
 

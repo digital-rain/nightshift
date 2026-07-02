@@ -2,6 +2,10 @@
 tooling preconditions, the workspace lock, and interruptible subprocess runs.
 
 Moved verbatim from ``engine.py`` in Phase 3 of the rebuild-in-place migration.
+The working-tree status helpers (:func:`landing_blockers`,
+:func:`porcelain_path`) moved here from ``git/squash.py`` in Phase 6: they are
+preflight information now — landing became a ref operation that never touches
+(or is blocked by) operator WIP.
 """
 
 from __future__ import annotations
@@ -21,8 +25,38 @@ from pathlib import Path
 from typing import Any
 
 from nightshift.git import GitRunner
-from nightshift.git.squash import landing_blockers
-from nightshift.spawn_daily import load_config
+
+
+def _tracked_changes(repo_root: Path) -> list[str]:
+    """Porcelain status lines for *tracked* changes in ``repo_root`` (ignores
+    untracked ``??`` files, which a land can never clobber)."""
+    result = GitRunner(repo_root).run("status", "--porcelain")
+    return [
+        line for line in result.stdout.splitlines()
+        if line.strip() and not line.startswith("??")
+    ]
+
+
+def porcelain_path(line: str) -> str:
+    """Extract the working path from a ``git status --porcelain`` line.
+
+    Lines are ``XY <path>``; a rename is ``R  <old> -> <new>`` — we want the
+    destination. Surrounding quotes (git quotes paths with special chars) are
+    stripped so callers see a clean repo-relative path."""
+    path = line[3:] if len(line) > 3 else line.strip()
+    if " -> " in path:
+        path = path.split(" -> ", 1)[1]
+    return path.strip().strip('"')
+
+
+def landing_blockers(repo_root: Path) -> list[str]:
+    """Tracked operator code WIP in the target repo, reported at preflight.
+
+    The content store is a *separate* repo, so briefs/queue config never live in
+    ``repo_root`` and can't show up here. Since Phase 6 this WIP never blocks a
+    land (landing is a ref operation that leaves the working tree alone) — it
+    only means an overlapping land will leave the checkout behind ``main``."""
+    return _tracked_changes(repo_root)
 
 
 # Environment preflight: keep the worker's shared ``.venv`` in step with the
@@ -302,29 +336,20 @@ def check_preconditions(workspace: Path, repo: str) -> None:
             "error: ANTHROPIC_API_KEY is not set.\n"
             "Add it to .env or export it in your shell."
         )
-    # Untracked files never block a run. Only genuine tracked *code* WIP in the
-    # target repo matters, and only when autostash is off (otherwise the land
-    # step sets it aside). Briefs/queue config live in the separate content
-    # store, never in the target repo, so they can't be a blocker here.
+    # Untracked files never block a run, and since Phase 6 neither does tracked
+    # code WIP: landing is a ref operation that leaves the working tree alone.
+    # The only consequence is that a land overlapping this WIP will refuse to
+    # advance the checkout (it stays behind main) — worth a note up front.
+    # Briefs/queue config live in the separate content store, never in the
+    # target repo, so they can't appear here.
     blockers = landing_blockers(repo_root)
     if blockers:
         shown = "\n".join(f"  {line}" for line in blockers[:10])
-        try:
-            host_config = load_config(workspace)
-        except (FileNotFoundError, ValueError):
-            host_config = {}
-        autostash = bool(host_config.get("autostash_operator_work", True))
-        if autostash:
-            print(
-                "note: main has uncommitted code — it will be set aside "
-                f"(git stash) during each land and restored after:\n{shown}"
-            )
-        else:
-            sys.exit(
-                "error: working tree has uncommitted code and "
-                "autostash_operator_work is off — commit or stash before "
-                f"running.\n{shown}"
-            )
+        print(
+            "note: main has uncommitted code — lands never touch it, but a "
+            "land that overlaps it will leave your checkout behind main "
+            f"(commit or stash to advance):\n{shown}"
+        )
     print("Running just validate (pre-flight)...")
     result = subprocess.run(
         ["just", "validate"],

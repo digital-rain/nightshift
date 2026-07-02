@@ -25,7 +25,8 @@ from nightshift.lifecycle import (
     FailureKind,
     GitPhase,
     LandingMode,
-    LandResult,
+    LandKind,
+    LandOutcome,
     LeaseStatus,
     Outcome,
     Progress,
@@ -493,8 +494,8 @@ def test_split_result_with_no_subtasks() -> None:
 # ---- land results -------------------------------------------------------------- #
 
 
-def _no_change(**kw: Any) -> LandResult:
-    return LandResult(landed=False, nothing_to_land=True, **kw)
+def _no_change(**kw: Any) -> LandOutcome:
+    return LandOutcome(kind=LandKind.NO_CHANGES, **kw)
 
 
 def test_nothing_to_land_records_no_changes_and_counts_as_failure() -> None:
@@ -565,8 +566,8 @@ def test_nothing_to_land_on_retry_quarantines_and_pauses() -> None:
 
 def test_landed_clears_state_disarms_watch_and_drops_brief() -> None:
     out = _outcome(RunStatus.COMPLETED, landable=True, result_line="did the thing")
-    land = LandResult(
-        landed=True, sha="abc123", remote="push", pushed=True, loc=42,
+    land = LandOutcome(
+        kind=LandKind.LANDED, sha="abc123", remote="push", pushed=True, loc=42,
     )
     t = on_land_result(REF, out, land, SubmitPolicy(watch_armed=True))
     assert t.run_fields["status"] == RunStatus.COMPLETED
@@ -594,15 +595,16 @@ def test_landed_clears_state_disarms_watch_and_drops_brief() -> None:
 def test_landed_evergreen_keeps_the_brief() -> None:
     out = _outcome(RunStatus.COMPLETED, landable=True)
     t = on_land_result(
-        REF, out, LandResult(landed=True, sha="abc"), SubmitPolicy(evergreen=True)
+        REF, out, LandOutcome(kind=LandKind.LANDED, sha="abc"),
+        SubmitPolicy(evergreen=True),
     )
     assert t.effects.drop_brief is False
 
 
 def test_adopted_non_landable_records_agent_landed_on_main() -> None:
     out = _outcome(RunStatus.COMPLETED, landable=False, result_line="no changes")
-    land = LandResult(
-        landed=True, sha="abc", detail="adopted agent land on main", adopted=True,
+    land = LandOutcome(
+        kind=LandKind.ADOPTED, sha="abc", detail="adopted agent land on main",
     )
     t = on_land_result(REF, out, land, SubmitPolicy())
     assert t.run_fields["result_line"] == "agent landed on main"
@@ -611,8 +613,8 @@ def test_adopted_non_landable_records_agent_landed_on_main() -> None:
 
 def test_adopted_landable_keeps_the_workers_result_line() -> None:
     out = _outcome(RunStatus.COMPLETED, landable=True, result_line="validated")
-    land = LandResult(
-        landed=True, sha="abc", detail="adopted agent land on main", adopted=True,
+    land = LandOutcome(
+        kind=LandKind.ADOPTED, sha="abc", detail="adopted agent land on main",
     )
     t = on_land_result(REF, out, land, SubmitPolicy())
     assert t.run_fields["result_line"] == "validated"
@@ -620,7 +622,7 @@ def test_adopted_landable_keeps_the_workers_result_line() -> None:
 
 def test_land_conflict_blocks_for_resolve_and_arms_watch() -> None:
     out = _outcome(RunStatus.COMPLETED, landable=True)
-    land = LandResult(landed=False, conflict=True, detail="squash conflicts\non x")
+    land = LandOutcome(kind=LandKind.CONFLICT, detail="squash conflicts\non x")
     t = on_land_result(REF, out, land, SubmitPolicy())
     assert t.run_fields["status"] == RunStatus.ERROR
     assert t.run_fields["result_line"] == "squash conflicts"
@@ -643,7 +645,7 @@ def test_land_conflict_blocks_for_resolve_and_arms_watch() -> None:
 
 def test_land_conflict_auto_resolve_starts_a_resolve() -> None:
     out = _outcome(RunStatus.COMPLETED, landable=True)
-    land = LandResult(landed=False, conflict=True, detail="conflict")
+    land = LandOutcome(kind=LandKind.CONFLICT, detail="conflict")
     t = on_land_result(REF, out, land, SubmitPolicy(auto_resolve=True))
     assert t.effects.start_resolve is True
     # PR mode lands via GitHub — never escalated to the local resolver.
@@ -655,7 +657,7 @@ def test_land_conflict_auto_resolve_starts_a_resolve() -> None:
 
 def test_land_recoverable_rejection_blocks_as_merge_rejected() -> None:
     out = _outcome(RunStatus.COMPLETED, landable=True)
-    land = LandResult(landed=False, recoverable=True, detail="push rejected")
+    land = LandOutcome(kind=LandKind.PUSH_REJECTED, detail="push rejected")
     t = on_land_result(REF, out, land, SubmitPolicy(watch_armed=True))
     assert t.run_fields["failure_kind"] == FailureKind.MERGE_REJECTED
     assert t.effects.hold is not None
@@ -665,7 +667,7 @@ def test_land_recoverable_rejection_blocks_as_merge_rejected() -> None:
 
 def test_land_unrecoverable_failure_releases_without_hold() -> None:
     out = _outcome(RunStatus.COMPLETED, landable=True)
-    land = LandResult(landed=False, detail="head_sha mismatch")
+    land = LandOutcome(kind=LandKind.TRANSPORT_FAILED, detail="head_sha mismatch")
     t = on_land_result(REF, out, land, SubmitPolicy(watch_armed=True))
     assert t.effects.hold is None
     assert t.effects.watch_armed is None
@@ -676,8 +678,49 @@ def test_land_unrecoverable_failure_releases_without_hold() -> None:
 
 def test_land_failed_empty_detail_defaults_result_line() -> None:
     out = _outcome(RunStatus.COMPLETED, landable=True)
-    t = on_land_result(REF, out, LandResult(landed=False), SubmitPolicy())
+    t = on_land_result(
+        REF, out, LandOutcome(kind=LandKind.TRANSPORT_FAILED), SubmitPolicy()
+    )
     assert t.run_fields["result_line"] == "land failed"
+
+
+def test_retryable_transport_failure_holds_for_retry() -> None:
+    """A fetch hiccup (retryable TRANSPORT_FAILED) keeps the WIP ref usable:
+    the task is held blocked so a re-submit can re-fetch."""
+    out = _outcome(RunStatus.COMPLETED, landable=True)
+    land = LandOutcome(
+        kind=LandKind.TRANSPORT_FAILED, retryable=True, detail="fetch failed",
+    )
+    t = on_land_result(REF, out, land, SubmitPolicy())
+    assert t.run_fields["failure_kind"] == FailureKind.MERGE_REJECTED
+    assert t.effects.hold is not None
+
+
+def test_checkout_behind_is_a_landed_success() -> None:
+    """A land whose checkout advance was refused (operator WIP overlap) is
+    still a success: the ref is authoritative."""
+    out = _outcome(RunStatus.COMPLETED, landable=True, result_line="")
+    land = LandOutcome(
+        kind=LandKind.CHECKOUT_BEHIND, sha="abc123",
+        detail="landed (abc123); your uncommitted changes kept the checkout from advancing",
+    )
+    t = on_land_result(REF, out, land, SubmitPolicy())
+    assert t.run_fields["status"] == RunStatus.COMPLETED
+    assert t.run_fields["commit_sha"] == "abc123"
+    assert t.lease_status == LeaseStatus.LANDED
+    assert t.effects.clear_hold is True
+    assert "checkout" in t.run_fields["result_line"]
+
+
+def test_every_land_kind_has_a_transition() -> None:
+    """Exhaustiveness pin: every LandKind produces a Transition (a newly-added
+    kind that falls through raises via assert_never instead)."""
+    out = _outcome(RunStatus.COMPLETED, landable=True)
+    for kind in LandKind:
+        t = on_land_result(
+            REF, out, LandOutcome(kind=kind, sha="abc"), SubmitPolicy()
+        )
+        assert isinstance(t, Transition)
 
 
 # ---- deadline ------------------------------------------------------------------ #

@@ -100,10 +100,6 @@ class OperatorConfig:
     draft: bool = field(default=False, metadata=meta(
         category="Landing & Git", label="Draft",
         desc="Default draft state for PR-mode landings."))
-    autostash_operator_work: bool = field(default=True, metadata=meta(
-        category="Landing & Git", label="Autostash operator work",
-        desc="Stash uncommitted operator work before a local landing.",
-        ))
     max_push_retries: int = field(default=3, metadata=meta(
         category="Landing & Git", label="Max push retries",
         desc=(
@@ -314,7 +310,6 @@ def load_manager_settings(workspace: Path) -> ManagerSettings:
             or "nightshift-tasks"),
         automerge=bool(data.get("automerge", False)),
         draft=bool(data.get("draft", False)),
-        autostash_operator_work=bool(data.get("autostash_operator_work", True)),
         max_push_retries=_as_int(data.get("max_push_retries"), 3),
         validate_on_integrate=bool(data.get("validate_on_integrate", False)),
         forbidden_paths=_as_tuple(
@@ -383,7 +378,6 @@ def save_manager_settings(workspace: Path, settings: ManagerSettings) -> None:
         "max_nights_before_parking": settings.operator.max_nights_before_parking,
         "automerge": settings.operator.automerge,
         "draft": settings.operator.draft,
-        "autostash_operator_work": settings.operator.autostash_operator_work,
         "max_push_retries": settings.operator.max_push_retries,
         "validate_on_integrate": settings.operator.validate_on_integrate,
         "diff_cap_lines": settings.operator.diff_cap_lines,

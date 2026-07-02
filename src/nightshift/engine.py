@@ -21,10 +21,7 @@ this file is deleted in the next phase.
 from __future__ import annotations
 
 from nightshift.git.locks import (
-    integrate_lock as integrate_lock,
-)
-from nightshift.git.locks import (
-    landing_lock as landing_lock,
+    repo_lock as repo_lock,
 )
 from nightshift.git.refs import (
     branch_exists as branch_exists,
@@ -36,31 +33,13 @@ from nightshift.git.refs import (
     rev_parse as rev_parse,
 )
 from nightshift.git.squash import (
-    AUTOSTASH_MESSAGE as AUTOSTASH_MESSAGE,
-)
-from nightshift.git.squash import (
     compute_code_loc as compute_code_loc,
-)
-from nightshift.git.squash import (
-    conflicted_paths as conflicted_paths,
-)
-from nightshift.git.squash import (
-    landing_blockers as landing_blockers,
-)
-from nightshift.git.squash import (
-    porcelain_path as porcelain_path,
-)
-from nightshift.git.squash import (
-    restore_operator_work as restore_operator_work,
 )
 from nightshift.git.squash import (
     squash_failure_kind as squash_failure_kind,
 )
 from nightshift.git.squash import (
     squash_to_main as squash_to_main,
-)
-from nightshift.git.squash import (
-    stash_operator_work as stash_operator_work,
 )
 from nightshift.git.store import (
     commit_dispatch as commit_dispatch,
@@ -165,10 +144,16 @@ from nightshift.preflight import (
     kill_process_group as kill_process_group,
 )
 from nightshift.preflight import (
+    landing_blockers as landing_blockers,
+)
+from nightshift.preflight import (
     lock_changed_between as lock_changed_between,
 )
 from nightshift.preflight import (
     lock_fingerprint as lock_fingerprint,
+)
+from nightshift.preflight import (
+    porcelain_path as porcelain_path,
 )
 from nightshift.preflight import (
     preflight_cmd_from_blob as preflight_cmd_from_blob,
@@ -414,6 +399,9 @@ from nightshift.task_files import (
 
 # Old private spellings, kept so external imports of the previously
 # cross-module private names survive the shim's one-release window.
+# (The autostash names — _stash_operator_work, _restore_operator_work,
+# _conflicted_paths, AUTOSTASH_MESSAGE — are deleted with the machinery,
+# not re-exported: Phase 6 retired working-tree landing entirely.)
 _worktree_has_commits = has_commits
 _queue_slug = queue_slug
 _rev_parse = rev_parse
@@ -421,9 +409,6 @@ _is_ancestor = is_ancestor
 _branch_exists = branch_exists
 _landing_blockers = landing_blockers
 _porcelain_path = porcelain_path
-_stash_operator_work = stash_operator_work
-_restore_operator_work = restore_operator_work
-_conflicted_paths = conflicted_paths
 _squash_failure_kind = squash_failure_kind
 _commit_dispatch = commit_dispatch
 _find_autosplit_tasks = find_autosplit_tasks

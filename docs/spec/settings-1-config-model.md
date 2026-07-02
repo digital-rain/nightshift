@@ -254,7 +254,6 @@ Source of truth for Parts 2–3. `apply` is the initial classification (verify p
 | `tasks_repo` | Landing & Git | string | `nightshift-tasks` | restart | env `NIGHTSHIFT_TASKS_REPO` |
 | `automerge` | Landing & Git | bool | `false` | next-task | **standardized false** (see §9) |
 | `draft` | Landing & Git | bool | `false` | next-task | |
-| `autostash_operator_work` | Landing & Git | bool | `true` | next-task | |
 | `forbidden_paths` | Worker execution policy | regex_list | (file) | next-task | baked into work order |
 | `forbidden_template_paths` | Worker execution policy | regex_list | (file) | next-task | template/decomposition runs |
 | `diff_cap_lines` | Worker execution policy | int | `1500` | next-task | |
@@ -352,7 +351,6 @@ And a committed **`.env.example`** at the repo root for secrets + launch env.
   "max_nights_before_parking": 2,
   "automerge": false,
   "draft": false,
-  "autostash_operator_work": true,
   "diff_cap_lines": 1500,
   "diff_cap_exempt_paths": ["^tests/fixtures/", "^docs/", "\\.md$"],
   "forbidden_paths": ["^\\.github/workflows/", "^CLAUDE\\.md$", "^AGENTS\\.md$"],

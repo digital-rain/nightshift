@@ -59,7 +59,6 @@ from nightshift.spawn_daily import (
     is_completed,
     is_disabled,
     is_quarantined,
-    load_config,
     load_queue_config,
     resolve_config,
     resolve_frontmatter,
@@ -161,16 +160,7 @@ def recover_task(
             ),
         )
 
-    # Autostash is an operator/global default in ``<workspace>/config.json``;
-    # recovery doesn't carry a tasks_root so it reads the host config directly.
-    try:
-        host_config = load_config(workspace)
-    except (FileNotFoundError, ValueError):
-        host_config = {}
-    autostash = bool(host_config.get("autostash_operator_work", True))
-    sha, detail, _ = squash_to_main(
-        workspace, repo, task, title, queue=queue, autostash=autostash
-    )
+    sha, detail, _ = squash_to_main(workspace, repo, task, title, queue=queue)
     if sha is None:
         return TaskResult(
             task=task, title=title, success=False,
@@ -247,9 +237,8 @@ def resolve_task(
 
     # 1. Cheap path: re-attempt the squash. Lands transient blockers that cleared.
     emit(Event(TASK_STATUS, {"task": task, "status": "running", "phase": "commit"}))
-    autostash = bool(config.get("autostash_operator_work", True))
     sha, detail, recoverable = squash_to_main(
-        workspace, repo, task, title, queue=queue, autostash=autostash
+        workspace, repo, task, title, queue=queue
     )
     if sha is not None:
         loc = compute_code_loc(repo_root, sha)
@@ -437,7 +426,6 @@ def _agent_resolve(
         emit(Event(TASK_STATUS, {"task": task, "status": "running", "phase": "commit"}))
         sha, squash_detail, _recoverable = squash_to_main(
             workspace, repo, task, title, queue=queue,
-            autostash=bool(config.get("autostash_operator_work", True)),
         )
         if sha is not None:
             loc = compute_code_loc(repo_root, sha)
@@ -972,11 +960,11 @@ def run_task(
         t_commit = time.monotonic()
         sha, squash_error, recoverable = squash_to_main(
             workspace, repo, task, title, queue=queue,
-            autostash=bool(config.get("autostash_operator_work", True)),
         )
         timings["commit"] = round(time.monotonic() - t_commit, 1)
-        # A successful land that couldn't reapply set-aside operator work surfaces
-        # squash_error as a warning (the commit still landed; stash is preserved).
+        # A successful land whose checkout advance was refused (operator WIP
+        # overlaps) surfaces squash_error as a warning (the commit still landed;
+        # the checkout is simply left behind main).
         if sha is not None and squash_error:
             emit(Event(TASK_LOG, {"task": task, "line": f"  warning: {squash_error}\n"}))
         if sha is None:

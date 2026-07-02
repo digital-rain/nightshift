@@ -12,7 +12,7 @@ What it does, in order:
    (rebase onto main → agent resolves conflicts → re-validate → squash to local
    main), streaming the run's events back to the manager so the live log and
    ``resolve`` phase show in the UI.
-3. Push the resolved commit to origin/main under the integrate lock (bounded
+3. Push the resolved commit to origin/main under the repo's RepoLock (bounded
    retry that replays onto a freshly-advanced origin), so the merge is strictly
    serialized against every other land while the agent work above ran unlocked.
 4. Report the final outcome to the manager's resolve-result endpoint, which
@@ -107,7 +107,6 @@ def main(argv: list[str] | None = None) -> int:
             remote,
             sha or "",
             max_retries=args.max_push_retries,
-            autostash=bool(config.get("autostash_operator_work", True)),
         )
         if ok:
             sha = info

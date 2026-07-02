@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -33,12 +34,12 @@ from nightshift.git.squash import compute_code_loc
 from nightshift.git.store import commit_tasks
 from nightshift.git.sync import maybe_sync_main_to_origin
 from nightshift.lifecycle import (
+    LAND_SUCCESS_KINDS,
     RUN_RESOLVABLE_STATUSES,
     AttemptRef,
     FailureKind,
     GitPhase,
     LandingMode,
-    LandResult,
     LeaseStatus,
     Outcome,
     RetryPolicy,
@@ -52,12 +53,7 @@ from nightshift.lifecycle import (
 )
 from nightshift.manager import failure_policy
 from nightshift.manager.config import ManagerConfig
-from nightshift.manager.landing import (
-    LandingResult,
-    adopt_or_nothing,
-    canonical_head,
-    land,
-)
+from nightshift.manager.landing import adopt_or_nothing, canonical_head, land
 from nightshift.manager.registry import Registry
 from nightshift.manager.scheduler import (
     WorkerFilter,
@@ -678,11 +674,6 @@ def register_worker_api(
                         landing_mode=effective_mode,
                         automerge=bool(meta.get("automerge", True)),
                         draft=bool(meta.get("draft", False)),
-                        autostash=bool(
-                            resolve_config(workspace, tasks_root, tasks_rel).get(
-                                "autostash_operator_work", True
-                            )
-                        ),
                         branch_ref=body.branch_ref,
                         head_sha=body.head_sha,
                         rendezvous_remote=cfg.rendezvous_remote,
@@ -702,13 +693,12 @@ def register_worker_api(
                     )
                 case _:
                     assert_never(phase)
-            loc = None
-            if result.landed and result.sha:
+            if result.kind in LAND_SUCCESS_KINDS and result.sha:
                 with contextlib.suppress(Exception):
-                    loc = await asyncio.to_thread(
+                    result = replace(result, loc=await asyncio.to_thread(
                         compute_code_loc, workspace / repo, result.sha
-                    )
-            return on_land_result(ref, body, _pure_land_result(result, loc), policy)
+                    ))
+            return on_land_result(ref, body, result, policy)
 
         computed = on_submit(ref, body, policy)
         t = computed if isinstance(computed, Transition) else await _git_phase(computed)
@@ -874,25 +864,6 @@ def jsonable(row: dict[str, Any] | None) -> dict[str, Any]:
         else:
             out[key] = value
     return out
-
-
-def _pure_land_result(result: LandingResult, loc: int | None) -> LandResult:
-    """Map the git layer's :class:`LandingResult` (plus the computed LOC) to
-    the pure :class:`~nightshift.lifecycle.LandResult` consumed by
-    :func:`~nightshift.lifecycle.on_land_result`."""
-    return LandResult(
-        landed=result.landed,
-        sha=result.sha,
-        detail=result.detail,
-        conflict=result.conflict,
-        recoverable=result.recoverable,
-        remote=result.remote,
-        pushed=result.pushed,
-        pr_url=result.pr_url,
-        adopted=result.adopted,
-        nothing_to_land=result.nothing_to_land,
-        loc=loc,
-    )
 
 
 def _task_meta(tasks_root: Path, task: str, queue: str | None) -> dict[str, Any]:

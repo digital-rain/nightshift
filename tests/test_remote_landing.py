@@ -42,9 +42,10 @@ from nightshift.engine import (
     worktree_dir,
 )
 from nightshift.git import GitRunner
+from nightshift.lifecycle import LandKind, LandOutcome
 from nightshift.manager.app import create_app
 from nightshift.manager.config import load_manager_config
-from nightshift.manager.landing import LandingResult, canonical_head, land
+from nightshift.manager.landing import canonical_head, land
 from nightshift.manager.store import MemoryStore
 from nightshift.worker.config import WorkerConfig, load_worker_config
 from nightshift.worker.execute import execute_work_order
@@ -237,34 +238,33 @@ def test_fetch_returns_none_on_error(tmp_path: Path) -> None:
     assert fetched is None
 
 
-def test_sync_main_to_origin_resets_orphan_divergence(tmp_path: Path) -> None:
+def test_sync_main_to_origin_collapses_redundant_pr_squash(tmp_path: Path) -> None:
+    """The pr-mode divergence: local main carries the manager's own squash and
+    GitHub squash-merged the *same content* into a different commit object on
+    origin/main. The rescue replay collapses the redundant local commit to a
+    no-op instead of re-introducing it — the old ``drop_shas`` bookkeeping is
+    gone by construction."""
     workspace, repo, repo_root, bare = _setup_manager_repo(tmp_path)
     m0 = canonical_head(repo_root)
 
-    # Manager local main carries an ephemeral pr-mode squash (orphan-to-be).
-    (repo_root / "ephemeral.txt").write_text("local squash\n")
-    git_commit_all(repo_root, "ephemeral pr squash")
+    # Manager local main carries the pr-mode squash.
+    (repo_root / "merged.txt").write_text("the change\n")
+    git_commit_all(repo_root, "task: the change")
     local = canonical_head(repo_root)
 
-    # GitHub re-squashed the PR into a *different* commit on origin/main.
+    # GitHub re-squashed the PR: same tree change, different commit object.
     other = _clone(bare, tmp_path / "github")
-    (other / "merged.txt").write_text("github merge\n")
+    (other / "merged.txt").write_text("the change\n")
     git(other, "add", "-A")
-    git(other, "commit", "-m", "squash-merge of PR")
+    git(other, "commit", "-m", "squash-merge of PR (#1)")
     git(other, "push", "origin", "HEAD:main")
     merged = git(other, "rev-parse", "HEAD")
     assert merged not in (m0, local)
 
-    # The orphan is dropped only because the caller names it explicitly; an
-    # unnamed divergent commit would be rescued + replayed (see the operator
-    # cherry-pick tests below).
-    new_head = sync_main_to_origin(
-        workspace, repo, "origin", drop_shas=frozenset({local})
-    )
+    new_head = sync_main_to_origin(workspace, repo, "origin")
     assert new_head == merged
     assert canonical_head(repo_root) == merged
-    assert (repo_root / "merged.txt").exists()
-    assert not (repo_root / "ephemeral.txt").exists()  # orphan dropped, no divergence
+    assert (repo_root / "merged.txt").read_text() == "the change\n"
 
 
 def test_sync_main_to_origin_rescues_operator_commit_over_divergence(
@@ -298,63 +298,84 @@ def test_sync_main_to_origin_rescues_operator_commit_over_divergence(
     assert "operator cherry-pick lint fix" in log
 
 
-def test_sync_drops_orphan_but_keeps_operator_commit(tmp_path: Path) -> None:
-    """When main carries both the manager's orphan squash AND an operator
-    commit, naming only the orphan drops it while the operator commit replays."""
+def test_sync_collapses_redundant_squash_but_keeps_operator_commit(tmp_path: Path) -> None:
+    """When main carries both the manager's own squash (whose content GitHub
+    already merged) AND an operator commit, the rescue replays the operator
+    commit and collapses the redundant squash to a no-op."""
     workspace, repo, repo_root, bare = _setup_manager_repo(tmp_path)
 
-    # Operator commit first, then the manager's orphan squash on top.
+    # Operator commit first, then the manager's pr-mode squash on top.
     (repo_root / "lint.txt").write_text("lint fix\n")
     git_commit_all(repo_root, "operator cherry-pick")
-    (repo_root / "ephemeral.txt").write_text("orphan squash\n")
-    git_commit_all(repo_root, "ephemeral pr squash")
-    orphan = canonical_head(repo_root)
+    (repo_root / "merged.txt").write_text("the change\n")
+    git_commit_all(repo_root, "task: the change")
 
+    # GitHub squash-merged the same content as a different commit object.
     other = _clone(bare, tmp_path / "github")
-    (other / "merged.txt").write_text("github merge\n")
+    (other / "merged.txt").write_text("the change\n")
     git(other, "add", "-A")
-    git(other, "commit", "-m", "squash-merge of PR")
+    git(other, "commit", "-m", "squash-merge of PR (#1)")
     git(other, "push", "origin", "HEAD:main")
     merged = git(other, "rev-parse", "HEAD")
 
+    dropped: list[str] = []
     new_head = sync_main_to_origin(
-        workspace, repo, "origin", drop_shas=frozenset({orphan})
+        workspace, repo, "origin", dropped_commits=dropped
     )
     assert new_head is not None
     assert _is_ancestor(repo_root, merged, new_head)
     assert (repo_root / "merged.txt").exists()
     assert (repo_root / "lint.txt").exists()  # operator commit replayed
-    assert not (repo_root / "ephemeral.txt").exists()  # named orphan dropped
+    assert dropped == []  # a redundant collapse is not a casualty
 
 
-def test_sync_refuses_reset_when_stash_create_fails(tmp_path: Path, monkeypatch) -> None:
-    """A failed ``git stash create`` must refuse the sync (mirroring
-    squash_to_main's wip_sha guard) — never proceed to ``reset --hard`` over the
-    operator's uncommitted work."""
+def test_sync_fast_forward_carries_clean_operator_wip(tmp_path: Path) -> None:
+    """The ``reset --keep`` posture: a fast-forward carries non-overlapping
+    uncommitted operator work forward instead of stashing it (the autostash
+    machinery is gone)."""
     workspace, repo, repo_root, bare = _setup_manager_repo(tmp_path)
 
-    # origin/main advances (a plain fast-forward would normally follow).
     other = _clone(bare, tmp_path / "other")
     (other / "ahead.txt").write_text("ahead\n")
     git(other, "add", "-A")
     git(other, "commit", "-m", "advance origin main")
     git(other, "push", "origin", "HEAD:main")
+    advanced = git(other, "rev-parse", "HEAD")
 
-    # Operator has uncommitted WIP on a tracked file...
+    # Operator has uncommitted WIP on an unrelated tracked file.
     (repo_root / "README.md").write_text("precious uncommitted work\n")
+
+    new_head = sync_main_to_origin(workspace, repo, "origin")
+    assert new_head == advanced
+    assert canonical_head(repo_root) == advanced
+    assert (repo_root / "ahead.txt").exists()  # checkout advanced with main
+    assert (repo_root / "README.md").read_text() == "precious uncommitted work\n"
+
+
+def test_sync_never_clobbers_overlapping_operator_wip(tmp_path: Path) -> None:
+    """When the advance would overwrite dirty operator work, the ``main`` ref
+    still moves (it is authoritative) but the checkout is refused and left
+    behind — the WIP is byte-identical, never stashed or reset away."""
+    workspace, repo, repo_root, bare = _setup_manager_repo(tmp_path)
     head_before = canonical_head(repo_root)
 
-    # ...and `git stash create` fails to capture it.
-    monkeypatch.setattr(
-        "nightshift.git.sync.stash_operator_work", lambda *a, **k: None
-    )
-    new_head = sync_main_to_origin(workspace, repo, "origin")
+    # origin/main advances by editing README.md...
+    other = _clone(bare, tmp_path / "other")
+    (other / "README.md").write_text("origin rewrote this\n")
+    git(other, "add", "-A")
+    git(other, "commit", "-m", "advance origin main over README")
+    git(other, "push", "origin", "HEAD:main")
+    advanced = git(other, "rev-parse", "HEAD")
 
-    # The sync was refused: HEAD did not move and the WIP is intact.
-    assert new_head == head_before
-    assert canonical_head(repo_root) == head_before
+    # ...while the operator has uncommitted WIP on the same file.
+    (repo_root / "README.md").write_text("precious uncommitted work\n")
+
+    new_head = sync_main_to_origin(workspace, repo, "origin")
+    assert new_head == advanced
+    assert canonical_head(repo_root) == advanced  # the branch ref is authoritative
     assert (repo_root / "README.md").read_text() == "precious uncommitted work\n"
-    assert not (repo_root / "ahead.txt").exists()
+    # The checkout was left behind at the pre-sync commit (detached).
+    assert git(repo_root, "rev-parse", "HEAD") == head_before
 
 
 def test_sync_rescue_reports_dropped_conflicting_commit(tmp_path: Path) -> None:
@@ -389,7 +410,8 @@ def test_sync_rescue_reports_dropped_conflicting_commit(tmp_path: Path) -> None:
 
 def test_land_push_retry_reports_rescue_dropped_commit(tmp_path: Path) -> None:
     """End to end: a push-mode land whose retry re-sync drops a conflicting
-    operator commit reports the SHA in ``LandingResult.detail``."""
+    operator commit reports the SHA in ``LandOutcome.detail`` and
+    ``dropped_commits``."""
     workspace, repo, repo_root, bare = _setup_manager_repo(tmp_path)
     reset_origin_sync_throttle()
     (repo_root / "file.txt").write_text("base\n")
@@ -418,11 +440,12 @@ def test_land_push_retry_reports_rescue_dropped_commit(tmp_path: Path) -> None:
         workspace, repo, "10.add", "add file", queue=None, base_ref=base,
         landing_mode="push", rendezvous_remote="origin",
     )
-    assert result.landed is True
+    assert result.kind is LandKind.LANDED
     assert result.pushed is True
     assert (repo_root / "file.txt").read_text() == "origin version\n"
     assert (repo_root / "new.txt").read_text() == "task work\n"
     assert operator_sha[:12] in result.detail  # the casualty is surfaced
+    assert result.dropped_commits == (operator_sha,)  # never silent
 
 
 def test_maybe_sync_preserves_local_cherry_pick(tmp_path: Path) -> None:
@@ -531,7 +554,7 @@ def test_cross_machine_land_happy_path(tmp_path: Path) -> None:
         workspace, repo, "10.add", "add new file", queue=None, base_ref=base,
         branch_ref=wip_ref, head_sha=head, rendezvous_remote="origin",
     )
-    assert result.landed is True
+    assert result.kind is LandKind.LANDED
     assert (repo_root / "new.txt").read_text() == "hello\n"
     # WIP ref is pruned once consumed.
     assert _ls_remote(bare, wip_ref) == ""
@@ -547,8 +570,8 @@ def test_cross_machine_head_sha_mismatch_fails_closed(tmp_path: Path) -> None:
         workspace, repo, "10.add", "add new file", queue=None, base_ref=base,
         branch_ref=wip_ref, head_sha="0" * 40, rendezvous_remote="origin",
     )
-    assert result.landed is False
-    assert result.recoverable is False
+    assert result.kind is LandKind.TRANSPORT_FAILED
+    assert result.retryable is False
     assert "mismatch" in result.detail
     assert not (repo_root / "new.txt").exists()
     assert _ls_remote(bare, wip_ref) != ""  # kept for a resolve re-fetch
@@ -564,13 +587,15 @@ def test_cross_machine_missing_remote_or_head_fails_closed(tmp_path: Path) -> No
         workspace, repo, "10.add", "t", queue=None, base_ref=base,
         branch_ref=wip_ref, head_sha=None, rendezvous_remote="origin",
     )
-    assert no_head.landed is False and no_head.recoverable is False
+    assert no_head.kind is LandKind.TRANSPORT_FAILED
+    assert no_head.retryable is False
 
     no_remote = land(
         workspace, repo, "10.add", "t", queue=None, base_ref=base,
         branch_ref=wip_ref, head_sha=head, rendezvous_remote=None,
     )
-    assert no_remote.landed is False and no_remote.recoverable is False
+    assert no_remote.kind is LandKind.TRANSPORT_FAILED
+    assert no_remote.retryable is False
 
 
 def test_cross_machine_fetch_error_is_recoverable(tmp_path: Path) -> None:
@@ -581,8 +606,8 @@ def test_cross_machine_fetch_error_is_recoverable(tmp_path: Path) -> None:
         branch_ref="refs/heads/nightshift-wip/main/10.add",  # never published
         head_sha="a" * 40, rendezvous_remote="origin",
     )
-    assert result.landed is False
-    assert result.recoverable is True
+    assert result.kind is LandKind.TRANSPORT_FAILED
+    assert result.retryable is True
 
 
 def test_cross_machine_conflict_keeps_wip_ref(tmp_path: Path) -> None:
@@ -604,8 +629,7 @@ def test_cross_machine_conflict_keeps_wip_ref(tmp_path: Path) -> None:
         workspace, repo, "20.edit", "edit file", queue=None, base_ref=base,
         branch_ref=wip_ref, head_sha=head, rendezvous_remote="origin",
     )
-    assert result.landed is False
-    assert result.conflict is True
+    assert result.kind is LandKind.CONFLICT
     assert _ls_remote(bare, wip_ref) != ""  # kept for resolve
 
 
@@ -621,7 +645,7 @@ def test_cross_machine_reland_refetches_corrected_head(tmp_path: Path) -> None:
         workspace, repo, "30.fix", "t", queue=None, base_ref=base,
         branch_ref=wip_ref, head_sha="0" * 40, rendezvous_remote="origin",
     )
-    assert rejected.landed is False
+    assert rejected.kind is LandKind.TRANSPORT_FAILED
 
     # Worker republishes a corrected commit B over the same WIP ref.
     _wip_ref2, head_b = _publish_from_worker(
@@ -635,7 +659,7 @@ def test_cross_machine_reland_refetches_corrected_head(tmp_path: Path) -> None:
         workspace, repo, "30.fix", "t", queue=None, base_ref=base,
         branch_ref=wip_ref, head_sha=head_b, rendezvous_remote="origin",
     )
-    assert landed.landed is True
+    assert landed.kind is LandKind.LANDED
     assert (repo_root / "x.txt").read_text() == "B\n"
 
 
@@ -653,7 +677,7 @@ def test_colocated_land_ignores_rendezvous(tmp_path: Path) -> None:
         workspace, repo, "40.local", "local", queue=None, base_ref=base,
         branch_ref=None, head_sha=None, rendezvous_remote="origin",
     )
-    assert result.landed is True
+    assert result.kind is LandKind.LANDED
     assert (repo_root / "local.txt").read_text() == "local\n"
 
 
@@ -832,7 +856,7 @@ def _run_once_capturing_land_mode(tmp_path: Path, monkeypatch, brief: str) -> st
 
     def spy_land(*args, **kwargs):
         captured["landing_mode"] = kwargs.get("landing_mode")
-        return LandingResult(landed=True, sha="deadbeef")
+        return LandOutcome(kind=LandKind.LANDED, sha="deadbeef")
 
     monkeypatch.setattr("nightshift.manager.api_worker.land", spy_land)
 

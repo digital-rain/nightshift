@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 
 from nightshift.git import GitRunner
-from nightshift.git.refs import branch_exists
+from nightshift.git.refs import branch_exists, main_sha
 
 
 SYMLINK_TARGETS = [
@@ -66,21 +66,24 @@ def worktree_dir(workspace: Path, repo: str, task: str, queue: str | None = None
 
 
 def setup_worktree(
-    workspace: Path, repo: str, task: str, *, queue: str | None = None, base: str = "HEAD"
+    workspace: Path, repo: str, task: str, *, queue: str | None = None, base: str | None = None
 ) -> Path:
     """Create a git worktree (checked out from the target ``repo_root`` but
     placed outside it under ``<workspace>/.worktrees/<repo>/``) and symlink build
     artifacts from the target repo into it.
 
-    ``base`` is the commit-ish the worktree branch is cut from (default the target
-    repo's ``HEAD``). A cross-machine worker passes the work order's ``base_ref``
-    so its branch is anchored to the same commit the manager will squash onto;
-    the caller must have made ``base`` reachable in ``repo_root`` first (e.g. a
-    fetch of the rendezvous remote).
+    ``base`` is the commit-ish the worktree branch is cut from (default the
+    target repo's canonical ``main`` — not ``HEAD``, which a refused checkout
+    advance may have left behind). A cross-machine worker passes the work
+    order's ``base_ref`` so its branch is anchored to the same commit the
+    manager will squash onto; the caller must have made ``base`` reachable in
+    ``repo_root`` first (e.g. a fetch of the rendezvous remote).
 
     A failed ``worktree add`` raises a typed :class:`GitError` (task-fatal;
     callers map it to ``failure_kind=worktree_failed``)."""
     repo_root = workspace / repo
+    if base is None:
+        base = main_sha(repo_root) or "HEAD"
     wt_dir = worktree_dir(workspace, repo, task, queue)
     branch = worktree_branch(task, queue)
 
@@ -140,15 +143,18 @@ def cleanup_task_worktree(
 def has_commits(
     workspace: Path, repo: str, task: str, *, queue: str | None = None
 ) -> bool:
-    """True if the task's worktree branch has commits beyond ``HEAD``.
+    """True if the task's worktree branch has commits beyond canonical ``main``.
 
     A worker that made no commit (a non-agentic API backend, or an agentic one
     that decided nothing was needed) leaves nothing to validate or squash. When
     we can't tell, err on the side of "yes" so the normal path still runs.
-    """
+    Measured against the ``main`` ref, not ``HEAD``: a checkout left behind by
+    a refused advance (CHECKOUT_BEHIND) must not make merged branches look
+    unmerged."""
     repo_root = workspace / repo
     branch = worktree_branch(task, queue)
-    result = GitRunner(repo_root).run("rev-list", "--count", f"HEAD..{branch}")
+    base = main_sha(repo_root) or "HEAD"
+    result = GitRunner(repo_root).run("rev-list", "--count", f"{base}..{branch}")
     try:
         return int(result.stdout.strip() or "0") > 0
     except ValueError:

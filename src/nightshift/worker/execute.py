@@ -214,7 +214,8 @@ def execute_work_order(
         sdir_path = split_output_dir(workspace, repo, task, queue=queue)
         sdir_path.mkdir(parents=True, exist_ok=True)
         sdir = str(sdir_path)
-    base = "HEAD"
+    # None → setup_worktree cuts from canonical main (not a possibly-behind HEAD).
+    base: str | None = None
     if cfg.rendezvous_remote:
         base = prepare_worktree_base(
             workspace, repo, cfg.rendezvous_remote, order.get("base_ref")

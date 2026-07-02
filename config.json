@@ -31,7 +31,6 @@
   "max_fix_attempts": 6,
   "max_nights_before_parking": 2,
   "auto_resolve": true,
-  "autostash_operator_work": true,
   "max_concurrent_queues": 2,
   "max_resolve_attempts": 2,
   "resolve_model": null,

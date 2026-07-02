@@ -20,7 +20,6 @@
   "max_nights_before_parking": 2,
   "automerge": false,
   "draft": false,
-  "autostash_operator_work": true,
   "max_push_retries": 3,
   "validate_on_integrate": false,
   "diff_cap_lines": 1500,

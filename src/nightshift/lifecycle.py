@@ -420,22 +420,70 @@ class GitPhase(Enum):
     HARVEST_SPLIT = auto()  # decomposition run: harvest subtask briefs
 
 
-@dataclass(frozen=True)
-class LandResult:
-    """Pure view of a landing attempt's result (mapped from
-    ``manager.landing.LandingResult`` plus the computed LOC), so
-    :func:`on_land_result` never imports the git layer."""
+class LandKind(StrEnum):
+    """Every way a land can end (git greenfield §0/§3) — the ONE result
+    vocabulary shared by the git layer's pipeline and this transition core."""
 
-    landed: bool
+    LANDED = "landed"
+    NO_CHANGES = "no_changes"
+    ADOPTED = "adopted"
+    CONFLICT = "conflict"
+    CHECKOUT_BEHIND = "checkout_behind"   # ref advanced; operator checkout left behind
+    PUSH_REJECTED = "push_rejected"
+    TRANSPORT_FAILED = "transport_failed"
+
+
+# The kinds where canonical main advanced (a real land happened). ADOPTED and
+# CHECKOUT_BEHIND are successes: the branch ref is authoritative.
+LAND_SUCCESS_KINDS = frozenset({
+    LandKind.LANDED, LandKind.CHECKOUT_BEHIND, LandKind.ADOPTED,
+})
+
+
+def land_failure_kind(kind: LandKind) -> FailureKind:
+    """THE one mapping from a refused :class:`LandKind` to the ``failure_kind``
+    the manager stores (behavior-compat: conflicts stay ``merge_conflict``;
+    rejections and transport failures stay ``merge_rejected``)."""
+    match kind:
+        case LandKind.CONFLICT:
+            return FailureKind.MERGE_CONFLICT
+        case LandKind.PUSH_REJECTED | LandKind.TRANSPORT_FAILED:
+            return FailureKind.MERGE_REJECTED
+        case (
+            LandKind.LANDED
+            | LandKind.NO_CHANGES
+            | LandKind.ADOPTED
+            | LandKind.CHECKOUT_BEHIND
+        ):
+            raise ValueError(f"{kind} is not a land failure")
+        case _:
+            assert_never(kind)
+
+
+@dataclass(frozen=True)
+class LandOutcome:
+    """The typed result of a landing attempt (git greenfield §0), produced by
+    the git layer's plumbing pipeline and consumed by :func:`on_land_result`.
+    Pure data — this module still never imports the git layer.
+
+    ``dropped_commits`` is the never-silent casualty list: local commits an
+    origin re-sync rescue could not replay (preserved only in the reflog).
+    ``retryable`` refines TRANSPORT_FAILED: a fetch hiccup is retryable (hold
+    the task blocked for a re-fetch); a verification refusal (missing
+    remote/head_sha, mismatch) is not (release with an error, no hold).
+    """
+
+    kind: LandKind
     sha: str | None = None
     detail: str = ""
-    conflict: bool = False
-    recoverable: bool = False
-    remote: str | None = None
-    pushed: bool | None = None
+    conflicts: tuple[str, ...] = ()
+    dropped_commits: tuple[str, ...] = ()
     pr_url: str | None = None
-    adopted: bool = False           # agent landed on main directly; HEAD adopted
-    nothing_to_land: bool = False   # empty branch and main did not advance
+    remote: str | None = None       # remote action taken: 'push' | 'pr' | None
+    # Whether the configured remote step succeeded. ``None`` when no remote
+    # action was attempted (``landing_mode=none``).
+    pushed: bool | None = None
+    retryable: bool = False
     loc: int | None = None
 
 
@@ -844,11 +892,12 @@ def _no_change_transition(
 
 
 def _landed_transition(
-    ref: AttemptRef, outcome: Outcome, land: LandResult, policy: SubmitPolicy
+    ref: AttemptRef, outcome: Outcome, land: LandOutcome, policy: SubmitPolicy
 ) -> Transition:
-    """A confirmed land (squash or adopted agent land): record success, clear
+    """A confirmed land (squash, adopted agent land, or a land whose checkout
+    advance was refused — the ref is authoritative): record success, clear
     every hold, disarm the failure watch, consume the brief (non-evergreen)."""
-    if land.adopted and not outcome.landable:
+    if land.kind is LandKind.ADOPTED and not outcome.landable:
         # A non-landable submit whose agent landed on main directly: the run
         # records the adoption, not the worker's "no changes" line.
         result_line = "agent landed on main"
@@ -893,18 +942,20 @@ def _landed_transition(
 
 
 def _land_failed_transition(
-    ref: AttemptRef, outcome: Outcome, land: LandResult, policy: SubmitPolicy
+    ref: AttemptRef, outcome: Outcome, land: LandOutcome, policy: SubmitPolicy
 ) -> Transition:
     """A refused land. The branch is preserved, so a conflict or recoverable
-    rejection holds the task blocked (resolvable) and may auto-escalate."""
-    failure_kind = (
-        FailureKind.MERGE_CONFLICT if land.conflict else FailureKind.MERGE_REJECTED
+    rejection holds the task blocked (resolvable) and may auto-escalate; an
+    unretryable transport failure releases with an error and no hold."""
+    failure_kind = land_failure_kind(land.kind)
+    resolvable = land.kind in (LandKind.CONFLICT, LandKind.PUSH_REJECTED) or (
+        land.kind is LandKind.TRANSPORT_FAILED and land.retryable
     )
     events: list[TransitionEvent] = []
     hold: TaskHold | None = None
     pause: str | None = None
     watch: bool | None = None
-    if land.conflict or land.recoverable:
+    if resolvable:
         land_reason = "needs resolve: " + (
             land.detail.splitlines()[0] if land.detail else failure_kind
         )
@@ -937,29 +988,33 @@ def _land_failed_transition(
             pause_queue=pause,
             watch_armed=watch,
             start_resolve=(
-                policy.auto_resolve
-                and (land.conflict or land.recoverable)
-                and not policy.pr_mode
+                policy.auto_resolve and resolvable and not policy.pr_mode
             ),
         ),
         events=tuple(events),
         response={
-            "landed": False, "conflict": land.conflict,
+            "landed": False, "conflict": land.kind is LandKind.CONFLICT,
             "detail": land.detail, "resolving": False,
         },
     )
 
 
 def on_land_result(
-    ref: AttemptRef, outcome: Outcome, land: LandResult, policy: SubmitPolicy
+    ref: AttemptRef, outcome: Outcome, land: LandOutcome, policy: SubmitPolicy
 ) -> Transition:
-    """The landing transition table: landed (including adopted agent lands),
-    nothing-to-land (the no-change path), or refused (conflict / rejection)."""
-    if land.nothing_to_land:
-        return _no_change_transition(ref, outcome, policy)
-    if land.landed:
-        return _landed_transition(ref, outcome, land, policy)
-    return _land_failed_transition(ref, outcome, land, policy)
+    """The landing transition table (git greenfield §9), exhaustive over
+    :class:`LandKind`: successes (including adopted agent lands and a land
+    whose checkout advance was refused), nothing-to-land, or refused
+    (conflict / rejection / transport failure)."""
+    match land.kind:
+        case LandKind.NO_CHANGES:
+            return _no_change_transition(ref, outcome, policy)
+        case LandKind.LANDED | LandKind.CHECKOUT_BEHIND | LandKind.ADOPTED:
+            return _landed_transition(ref, outcome, land, policy)
+        case LandKind.CONFLICT | LandKind.PUSH_REJECTED | LandKind.TRANSPORT_FAILED:
+            return _land_failed_transition(ref, outcome, land, policy)
+        case _:
+            assert_never(land.kind)
 
 
 def on_deadline(ref: AttemptRef) -> Transition:
