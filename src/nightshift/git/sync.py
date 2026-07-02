@@ -25,6 +25,7 @@ primitive for callers already holding it (the land pipeline).
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 
@@ -42,22 +43,36 @@ from nightshift.git.refs import (
 from nightshift.preflight import invalidate_lock_marker, lock_changed_between
 
 
-# Per-target-repo throttle for origin/main refresh (monotonic timestamps).
-_LAST_ORIGIN_SYNC_CHECK: dict[tuple[str, str], float] = {}
+class SyncThrottle:
+    """Per-target-repo throttle for origin/main refresh (monotonic timestamps).
 
+    Phase 7 (git greenfield §7): an injected object owned by the manager app —
+    the pre-Phase-7 module-global dict (and its tests-only reset hook) is gone.
+    Callers that pass no throttle are simply unthrottled. Thread-safe: the
+    repo executors and the event loop both consult it.
+    """
 
-def _origin_sync_key(workspace: Path, repo: str) -> tuple[str, str]:
-    return (str(workspace.resolve()), repo)
+    def __init__(self) -> None:
+        self._last_check: dict[tuple[str, str], float] = {}
+        self._mutex = threading.Lock()
 
+    @staticmethod
+    def _key(workspace: Path, repo: str) -> tuple[str, str]:
+        return (str(workspace.resolve()), repo)
 
-def reset_origin_sync_throttle(workspace: Path | None = None, repo: str | None = None) -> None:
-    """Clear origin-sync throttle state (tests only)."""
-    if workspace is None and repo is None:
-        _LAST_ORIGIN_SYNC_CHECK.clear()
-        return
-    if workspace is None or repo is None:
-        raise ValueError("workspace and repo must both be set or both omitted")
-    _LAST_ORIGIN_SYNC_CHECK.pop(_origin_sync_key(workspace, repo), None)
+    def due(self, workspace: Path, repo: str, min_interval_seconds: float) -> bool:
+        """True when a sync check for this repo is due (never checked, or the
+        last check is older than ``min_interval_seconds``)."""
+        if min_interval_seconds <= 0:
+            return True
+        with self._mutex:
+            last = self._last_check.get(self._key(workspace, repo))
+        return last is None or (time.monotonic() - last) >= min_interval_seconds
+
+    def mark(self, workspace: Path, repo: str) -> None:
+        """Record that a sync check just ran for this repo."""
+        with self._mutex:
+            self._last_check[self._key(workspace, repo)] = time.monotonic()
 
 
 def maybe_sync_main_to_origin(
@@ -69,12 +84,13 @@ def maybe_sync_main_to_origin(
     force: bool = False,
     reset_divergence: bool = False,
     dropped_commits: list[str] | None = None,
+    throttle: SyncThrottle | None = None,
 ) -> str | None:
     """Refresh local ``main`` from ``<remote>/main`` when due.
 
-    When ``force`` is false and the last fetch for this repo was less than
-    ``min_interval_seconds`` ago, skip the network round-trip and return the
-    current local ``main``. Otherwise:
+    When ``force`` is false, a ``throttle`` is given, and its last check for
+    this repo was less than ``min_interval_seconds`` ago, skip the network
+    round-trip and return the current local ``main``. Otherwise:
 
     1. ``git fetch <remote> main``
     2. Compare local ``main`` to ``FETCH_HEAD`` (no work when already current)
@@ -101,6 +117,7 @@ def maybe_sync_main_to_origin(
             force=force,
             reset_divergence=reset_divergence,
             dropped_commits=dropped_commits,
+            throttle=throttle,
         )
 
 
@@ -146,6 +163,7 @@ def sync_main_locked(
     force: bool = True,
     reset_divergence: bool = False,
     dropped_commits: list[str] | None = None,
+    throttle: SyncThrottle | None = None,
 ) -> str | None:
     """The sync primitive: caller must hold the repo's :class:`RepoLock`
     (asserted). Throttle semantics match :func:`maybe_sync_main_to_origin`."""
@@ -153,13 +171,10 @@ def sync_main_locked(
         "sync_main_locked requires the caller to hold the RepoLock"
     )
     repo_root = workspace / repo
-    key = _origin_sync_key(workspace, repo)
-    now = time.monotonic()
     if (
         not force
-        and min_interval_seconds > 0
-        and key in _LAST_ORIGIN_SYNC_CHECK
-        and (now - _LAST_ORIGIN_SYNC_CHECK[key]) < min_interval_seconds
+        and throttle is not None
+        and not throttle.due(workspace, repo, min_interval_seconds)
     ):
         return main_sha(repo_root)
 
@@ -170,7 +185,8 @@ def sync_main_locked(
         reset_divergence=reset_divergence,
         dropped_commits=dropped_commits,
     )
-    _LAST_ORIGIN_SYNC_CHECK[key] = time.monotonic()
+    if throttle is not None:
+        throttle.mark(workspace, repo)
     return result
 
 

@@ -35,13 +35,13 @@ from nightshift.engine import (
     normalize_wip_prefix,
     prune_rendezvous_branch,
     publish_task_branch,
-    reset_origin_sync_throttle,
     setup_worktree,
     sync_main_to_origin,
     worktree_branch,
     worktree_dir,
 )
 from nightshift.git import GitRunner
+from nightshift.git.sync import SyncThrottle
 from nightshift.lifecycle import LandKind, LandOutcome
 from nightshift.manager.app import create_app
 from nightshift.manager.config import load_manager_config
@@ -413,7 +413,6 @@ def test_land_push_retry_reports_rescue_dropped_commit(tmp_path: Path) -> None:
     operator commit reports the SHA in ``LandOutcome.detail`` and
     ``dropped_commits``."""
     workspace, repo, repo_root, bare = _setup_manager_repo(tmp_path)
-    reset_origin_sync_throttle()
     (repo_root / "file.txt").write_text("base\n")
     git_commit_all(repo_root, "add file")
     git(repo_root, "push", "origin", "main")
@@ -451,7 +450,6 @@ def test_land_push_retry_reports_rescue_dropped_commit(tmp_path: Path) -> None:
 def test_maybe_sync_preserves_local_cherry_pick(tmp_path: Path) -> None:
     """Periodic/poll sync must not reset main when it carries unpushed commits."""
     workspace, repo, repo_root, _bare = _setup_manager_repo(tmp_path)
-    reset_origin_sync_throttle()
     before = canonical_head(repo_root)
     (repo_root / "lint.txt").write_text("lint fix\n")
     git_commit_all(repo_root, "cherry-pick lint fix")
@@ -484,14 +482,16 @@ def test_sync_main_to_origin_none_without_remote_main(tmp_path: Path) -> None:
     repo_root = workspace / "longitude"
     bare = make_bare_remote(tmp_path / "remotes" / "empty.git")
     add_remote(repo_root, "origin", bare, push_main=False)  # remote has no main
-    reset_origin_sync_throttle()
     assert sync_main_to_origin(workspace, "longitude", "origin") is None
 
 
 def test_maybe_sync_main_to_origin_throttles_fetch(tmp_path: Path, monkeypatch) -> None:
-    """Repeated checks within git_refresh_seconds skip the network fetch."""
+    """Repeated checks within git_refresh_seconds skip the network fetch.
+
+    Phase 7: the throttle is an injected object (no module-global state), so
+    the test owns its instance instead of resetting a hidden global."""
     workspace, repo, repo_root, bare = _setup_manager_repo(tmp_path)
-    reset_origin_sync_throttle()
+    throttle = SyncThrottle()
     other = _clone(bare, tmp_path / "other")
     (other / "ahead.txt").write_text("ahead\n")
     git(other, "add", "-A")
@@ -512,7 +512,7 @@ def test_maybe_sync_main_to_origin_throttles_fetch(tmp_path: Path, monkeypatch) 
     monkeypatch.setattr(GitRunner, "run", _run)
 
     assert maybe_sync_main_to_origin(
-        workspace, repo, "origin", min_interval_seconds=60.0,
+        workspace, repo, "origin", min_interval_seconds=60.0, throttle=throttle,
     ) == advanced
     assert fetch_calls == [["git", "fetch", "origin", "main"]]
 
@@ -525,14 +525,14 @@ def test_maybe_sync_main_to_origin_throttles_fetch(tmp_path: Path, monkeypatch) 
 
     # Throttled: no second fetch; local main stays on the first advance.
     assert maybe_sync_main_to_origin(
-        workspace, repo, "origin", min_interval_seconds=60.0,
+        workspace, repo, "origin", min_interval_seconds=60.0, throttle=throttle,
     ) == advanced
     assert fetch_calls == []
 
-    reset_origin_sync_throttle()
     fetch_calls.clear()
     assert maybe_sync_main_to_origin(
         workspace, repo, "origin", min_interval_seconds=60.0, force=True,
+        throttle=throttle,
     ) == again
     assert fetch_calls == [["git", "fetch", "origin", "main"]]
 
@@ -848,7 +848,10 @@ class _LoopClient:
 
 
 def _run_once_capturing_land_mode(tmp_path: Path, monkeypatch, brief: str) -> str | None:
-    """Drive one poll->execute->submit and return the landing_mode land() saw."""
+    """Drive one poll->execute->submit and return the landing_mode the land job
+    saw. Phase 7: the land runs as a repo-executor job calling ``land_locked``;
+    exiting the TestClient context drains the executors, so the capture is
+    complete before the return."""
     workspace = build_workspace(tmp_path, tasks={"10.do": brief})
     monkeypatch.setattr(backends_mod, "require_backend", lambda name: _CommittingBackend())
 
@@ -858,7 +861,7 @@ def _run_once_capturing_land_mode(tmp_path: Path, monkeypatch, brief: str) -> st
         captured["landing_mode"] = kwargs.get("landing_mode")
         return LandOutcome(kind=LandKind.LANDED, sha="deadbeef")
 
-    monkeypatch.setattr("nightshift.manager.api_worker.land", spy_land)
+    monkeypatch.setattr("nightshift.manager.api_worker.land_locked", spy_land)
 
     with TestClient(create_app(workspace, store=MemoryStore())) as tc:
         cfg = WorkerConfig(

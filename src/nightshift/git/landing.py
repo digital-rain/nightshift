@@ -47,7 +47,7 @@ from nightshift.git.refs import (
     replay_commit,
     update_main_cas,
 )
-from nightshift.git.sync import sync_main_locked
+from nightshift.git.sync import SyncThrottle, sync_main_locked
 from nightshift.git.worktrees import queue_slug
 from nightshift.lifecycle import LandingMode, LandKind, LandOutcome
 
@@ -81,6 +81,8 @@ class RepoContext:
     git_refresh_seconds: float = 0.0
     rescue_divergence_on_first_sync: bool = False
     pr: PrSpec | None = None
+    # App-owned sync throttle (Phase 7); None = unthrottled first sync.
+    throttle: SyncThrottle | None = None
 
     @property
     def repo_root(self) -> Path:
@@ -331,6 +333,7 @@ def integrate_and_push_locked(
                 force=attempt > 0,
                 reset_divergence=attempt > 0 or ctx.rescue_divergence_on_first_sync,
                 dropped_commits=dropped,
+                throttle=ctx.throttle,
             )
 
         base = main_sha(repo_root)

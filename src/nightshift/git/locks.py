@@ -2,19 +2,24 @@
 (git greenfield §4).
 
 Everything that mutates the canonical repo — landing, origin sync, transport
-fetch/prune — serializes on the SAME lock, held at orchestration boundaries
-(``land()``, ``push_resolved_main``, the public sync entry points, the CLI
-land path). The git primitives themselves are lock-free and *assert* the
-caller holds it (:meth:`RepoLock.is_held_by_current_thread`), which makes a
-forgotten lock a loud test failure instead of a silent race.
+fetch/prune — serializes on the SAME lock, held at orchestration boundaries.
+Since Phase 7 the manager's boundary is the per-repo executor thread
+(:class:`nightshift.git.executor.RepoExecutor` acquires the lock around each
+job and jobs call the ``*_locked`` pipeline variants); the public wrappers
+(``land()``, ``push_resolved_main``, the sync entry points) remain the
+boundary for direct/CLI/legacy callers. The git primitives themselves are
+lock-free and *assert* the caller holds it
+(:meth:`RepoLock.is_held_by_current_thread`), which makes a forgotten lock a
+loud test failure instead of a silent race.
 
 Two layers, like the locks this replaces:
 
 * an in-process :class:`threading.Lock` keyed per ``(workspace, repo)`` in a
   registry — NOT module-global, so lands on different repos never serialize;
-* a cross-process ``flock`` at ``<workspace>/.worktrees/<repo>/.lock`` so a
-  manager land and an out-of-process resolve push (or a CLI land) can't
-  collide.
+* a cross-process ``flock`` at ``<workspace>/.worktrees/<repo>/.lock`` —
+  solely the guard against a *separate process* touching the repo (a CLI
+  land, the resolve subprocess's pre-sync); in-process, the executor thread
+  is the serialization.
 
 Re-entry raises ``RuntimeError``: the flock is not reentrant, and nesting the
 lock on one thread is always a layering bug (a primitive trying to act like

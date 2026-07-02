@@ -217,7 +217,12 @@ class WorkerLoop:
         except Exception as exc:
             result = {"landed": False, "error": str(exc)}
         self._note_submit_outcome(order.get("queue") or "main", outcome.status)
-        if outcome.branch_ref and result.get("landed"):
+        # Phase 7: a landable submit returns immediately with {"queued": true}
+        # (the land runs async on the manager's repo executor). The published
+        # WIP ref is the transport — once the manager accepted the submit, the
+        # local worktree is consumed either way (a later land failure resolves
+        # from the manager's fetched branch, never from this box).
+        if outcome.branch_ref and (result.get("landed") or result.get("queued")):
             repo = order.get("repo")
             if repo:
                 queue_internal = playlists.queue_from_tasks_rel(

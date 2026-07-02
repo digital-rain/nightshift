@@ -1,25 +1,40 @@
 """Worker-facing manager API — checkin / poll / heartbeat / run events /
-submit / resolve-result — plus the work-order assembly helpers.
+submit / resolve-result.
 
-Split out of ``manager/app.py`` in Phase 3 of the rebuild-in-place migration.
-Phase 4 rewrote ``worker_submit`` around the pure transition core: the handler
-parses the submit, computes a :class:`~nightshift.lifecycle.Transition` (running
-the git phase — land / adopt-check / split harvest — first when the outcome
-needs one), applies it atomically via ``store.apply_transition`` (the CAS is
-the stale-submit fence), then executes the non-store side effects the
-transition enumerates. Endpoints are registered onto the shared FastAPI app by
+Split out of ``manager/app.py`` in Phase 3 of the rebuild-in-place migration;
+Phase 4 rewrote ``worker_submit`` around the pure transition core; Phase 7 made
+landing asynchronous. The submit handler parses the outcome, computes a
+:class:`~nightshift.lifecycle.Transition` or a :class:`~nightshift.lifecycle.
+GitPhase`, and branches:
+
+* no git work (blocked/error/no-change) — apply the transition synchronously,
+  exactly as Phase 4 did;
+* adopt-check / split harvest — bounded git jobs on the per-repo executor,
+  awaited inline (the response reports their result);
+* land — mark the run ``phase="landing"``, enqueue the serialized land job,
+  and return ``{"queued": true}`` immediately so heartbeats and polls keep
+  flowing during a slow land. The job's completion applies the same
+  ``on_land_result`` transition via ``store.apply_transition``, whose CAS
+  (lease still LEASED, still this worker's) is the stale-result fence; a
+  refused result is logged and traced on the run's event log.
+
+``worker_poll`` is a read-only hot path (candidates → pick → lease → return);
+lease reclaim, stale-worker reaping, and hold writes live in the reconciler.
+Endpoints are registered onto the shared FastAPI app by
 :func:`register_worker_api`; the app wiring (store, registry, event emitter,
-SSE broadcaster, shared queue state) is injected by ``create_app``.
+SSE broadcaster, executor pool, sync throttle) is injected by ``create_app``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, assert_never
 
@@ -30,9 +45,10 @@ from pydantic import BaseModel
 from nightshift import playlists as playlists_mod
 from nightshift import repos
 from nightshift.events import new_run_id
+from nightshift.git.executor import ExecutorPool
 from nightshift.git.squash import compute_code_loc
 from nightshift.git.store import commit_tasks
-from nightshift.git.sync import maybe_sync_main_to_origin
+from nightshift.git.sync import SyncThrottle, sync_main_locked
 from nightshift.lifecycle import (
     LAND_SUCCESS_KINDS,
     RUN_RESOLVABLE_STATUSES,
@@ -40,6 +56,8 @@ from nightshift.lifecycle import (
     FailureKind,
     GitPhase,
     LandingMode,
+    LandKind,
+    LandOutcome,
     LeaseStatus,
     Outcome,
     RetryPolicy,
@@ -53,20 +71,22 @@ from nightshift.lifecycle import (
 )
 from nightshift.manager import failure_policy
 from nightshift.manager.config import ManagerConfig
-from nightshift.manager.landing import adopt_or_nothing, canonical_head, land
+from nightshift.manager.landing import (
+    adopt_or_nothing_locked,
+    canonical_head,
+    land_locked,
+    push_resolved_main_locked,
+)
 from nightshift.manager.registry import Registry
 from nightshift.manager.scheduler import (
     WorkerFilter,
     build_candidates,
-    parse_required_mcps,
     pick_next,
     queue_label,
-    unroutable,
 )
 from nightshift.manager.store import NightshiftStore
+from nightshift.manager.work_orders import build_work_order, task_meta
 from nightshift.model_id import provider_of
-from nightshift.preflight import resolve_preflight_cmd
-from nightshift.queue_config import format_validate_cmd, resolve_validate_cmd
 from nightshift.spawn_daily import (
     is_failed,
     load_queue_config,
@@ -78,7 +98,6 @@ from nightshift.task_files import (
     failed_tasks,
     frontmatter_held_tasks,
     harvest_split_output,
-    resolve_title,
     set_task_meta,
     task_is_evergreen,
 )
@@ -89,6 +108,8 @@ from nightshift.task_files import (
 # task may have been re-leased elsewhere — honoring the stale submit would
 # double-land it. 409, no writes (enforced by apply_transition's CAS).
 _STALE_SUBMIT = "stale submit: lease is not live for this worker"
+
+_log = logging.getLogger("nightshift.manager.api_worker")
 
 # How long an environment failure cools the submitting worker down for its
 # queue (Phase 5): long enough that a broken box stops eating the queue,
@@ -240,28 +261,32 @@ def register_worker_api(
     cfg: ManagerConfig,
     workspace: Path,
     tasks_root: Path,
+    tasks_repo: str,
     _store: Callable[[], NightshiftStore],
     _registry: Callable[[], Registry],
     _emit: EmitFn,
     _queue_from_label: Callable[[str | None], str | None],
     _all_queues: Callable[[], list[str | None]],
-    # Shared mutable pause state, owned by create_app: queue label -> pause
-    # reason ("operator" | "consecutive_failures" | "retry_failed").
-    _paused_queues: dict[str, str],
     _failure_state: Callable[[str], failure_policy.QueueFailureState],
     _start_resolve: StartResolveFn,
     _broadcast: BroadcastFn,
+    # Phase 7: the per-repo git executor pool and the app-owned sync throttle
+    # (all git mutation routes through the pool; the throttle replaces the
+    # old module-global sync state).
+    _executors: ExecutorPool,
+    _sync_throttle: SyncThrottle,
 ) -> None:
     """Register the worker endpoints. Shared wiring (store/registry accessors,
-    the event emitter, the SSE broadcaster, queue-pause state, and the resolve
+    the event emitter, the SSE broadcaster, the executor pool, and the resolve
     spawner) is injected by ``create_app`` under the same names the handler
     bodies always used."""
-    def _set_frontmatter_flag(
+    def _set_frontmatter_flag_job(
         queue: str | None, task: str, key: str, value: bool,
         *, reason_key: str | None = None, reason: str | None = None,
     ) -> None:
         """Write a boolean frontmatter field (quarantined/failed) and an
         optional companion reason field directly to the task's .md file.
+        Runs as a tasks-repo executor job (content-store mutation).
 
         This is the single writer for quarantine/failed state — the .md file
         is the source of truth, not the DB overlay.
@@ -323,8 +348,10 @@ def register_worker_api(
     @app.post("/api/worker/poll", dependencies=[Depends(_require_secret)])
     async def worker_poll(body: PollBody) -> JSONResponse:
         store = _store()
-        await store.reclaim_expired_leases()
-        await _registry().reap_stale()
+        # Phase 7: the poll hot path is pure reads — build candidates → pick →
+        # lease → return. Lease reclaim, stale-worker reaping, and the
+        # unroutable / repo-availability hold *writes* all moved to the
+        # reconciler; a no-work poll performs zero store writes.
 
         # Build candidates across every queue from the canonical briefs in the
         # content store (each candidate already carries its resolved target repo).
@@ -334,10 +361,11 @@ def register_worker_api(
         # Environment-failure cooldowns: a worker that just env-failed in a
         # queue isn't offered that queue until the cooldown expires.
         exclude |= _cooldown_exclusions(app.state.worker_cooldowns, body.worker_id)
+        queue_pauses = await store.queue_pauses()
         candidates_by_queue = {
             q: build_candidates(tasks_root, q, default_model=cfg.default_model)
             for q in _all_queues()
-            if queue_label(q) not in _paused_queues and queue_label(q) not in exclude
+            if queue_label(q) not in queue_pauses and queue_label(q) not in exclude
         }
 
         # Manager-side queue dedication (queue label -> bound worker ids).
@@ -346,7 +374,7 @@ def register_worker_api(
         # Quarantined/failed tasks are sourced from frontmatter (the single
         # source of truth). live_ordered_queue already skips them so they
         # won't appear in candidates, but we still need the sets for the
-        # unroutable / repo-check guards below and for Phase B retry.
+        # repo-check guard below and for Phase B retry.
         quarantined: set[tuple[str | None, str]] = set()
         failed: set[tuple[str | None, str]] = set()
         for q in _all_queues():
@@ -358,74 +386,16 @@ def register_worker_api(
                 elif row["state"] == TaskHoldKind.FAILED:
                     failed.add(key)
 
-        # Mark tasks blocked when no live worker can ever currently serve them:
-        # an unadvertised pinned model, an unadvertised connector, or a queue
-        # dedicated only to offline workers.
-        reg = _registry()
-        available_models = await reg.available_models()
-        available_mcps = await reg.available_mcps()
-        online_workers = await reg.online_worker_ids()
-        for cand, reason in unroutable(
-            candidates_by_queue,
-            available_models=available_models,
-            available_mcps=available_mcps,
-            dedication=dedication,
-            online_workers=online_workers,
-        ):
-            if (cand.queue, cand.task) in quarantined:
-                continue
-            existing = await store.get_task_state(cand.queue, cand.task)
-            if not existing or existing.get("state") != TaskHoldKind.BLOCKED:
-                await store.set_task_state(
-                    cand.queue, cand.task, TaskHoldKind.BLOCKED, blocked_reason=reason
-                )
-                await _emit(
-                    "task_blocked",
-                    queue=cand.queue,
-                    task=cand.task,
-                    payload={"reason": reason},
-                )
-
-        # Repo resolution & availability: a malformed/unset repo reference is an
-        # authoring error (-> blocked); a well-formed name whose repo is absent
-        # pauses the task (-> repo_unavailable) and warns once per queue. Both
-        # are excluded from dispatch; neither records a failed run.
+        # Dispatch exclusion for bad/absent repo references stays here (read
+        # only — never hand out undispatchable work); the corresponding hold
+        # writes and warnings are the reconciler's.
         repo_excluded: set[tuple[str | None, str]] = set()
         for cands in candidates_by_queue.values():
             for cand in cands:
-                key = (cand.queue, cand.task)
-                if key in quarantined:
-                    continue
-                if cand.repo_error is not None:
-                    existing = await store.get_task_state(cand.queue, cand.task)
-                    if not existing or existing.get("state") != TaskHoldKind.BLOCKED:
-                        await store.set_task_state(
-                            cand.queue, cand.task, TaskHoldKind.BLOCKED,
-                            blocked_reason=cand.repo_error,
-                        )
-                        await _emit(
-                            "task_blocked",
-                            queue=cand.queue,
-                            task=cand.task,
-                            payload={"reason": cand.repo_error},
-                        )
-                    repo_excluded.add(key)
-                elif cand.repo and not repos.repo_available(workspace, cand.repo):
-                    existing = await store.get_task_state(cand.queue, cand.task)
-                    if not existing or existing.get("state") != TaskHoldKind.REPO_UNAVAILABLE:
-                        await store.set_task_state(
-                            cand.queue, cand.task, TaskHoldKind.REPO_UNAVAILABLE,
-                            repo=cand.repo,
-                        )
-                    repo_excluded.add(key)
-                    if cand.queue not in app.state.repo_warnings:
-                        app.state.repo_warnings.add(cand.queue)
-                        await _emit(
-                            "repo_unavailable",
-                            queue=cand.queue,
-                            task=cand.task,
-                            payload={"repo": cand.repo},
-                        )
+                if cand.repo_error is not None or (
+                    cand.repo and not repos.repo_available(workspace, cand.repo)
+                ):
+                    repo_excluded.add((cand.queue, cand.task))
 
         active = await store.active_leases()
         leased = {(_queue_from_label(le["queue"]), le["task"]) for le in active}
@@ -450,7 +420,7 @@ def register_worker_api(
         # Failed tasks come from frontmatter; blocked-retryable come from DB.
         for q in list(candidates_by_queue):
             label = queue_label(q)
-            if label in _paused_queues:
+            if label in queue_pauses:
                 continue
             if any(le.get("queue", "main") == label for le in active):
                 continue
@@ -491,7 +461,7 @@ def register_worker_api(
             dedication=dedication,
         )
         if chosen is None:
-            return JSONResponse({"work": None, "queue_pauses": dict(_paused_queues)}, status_code=200)
+            return JSONResponse({"work": None, "queue_pauses": dict(queue_pauses)}, status_code=200)
 
         # The chosen candidate is repo-available by construction; clear any prior
         # paused/blocked overlay it may carry (e.g. a now-resolved repo) so the
@@ -508,17 +478,23 @@ def register_worker_api(
         # ephemeral pr-mode squash is dropped). Best-effort: a transient fetch
         # failure must not fail the poll — base_ref then pins the local HEAD and
         # the land re-syncs anyway. See remote-landing.md.
-        poll_meta = _task_meta(tasks_root, chosen.task, chosen.queue)
+        poll_meta = task_meta(tasks_root, chosen.task, chosen.queue)
         effective_mode = LandingMode.PR if poll_meta.get("make_pr") else cfg.landing_mode
-        if effective_mode.is_remote and cfg.rendezvous_remote:
+        if (
+            effective_mode.is_remote
+            and cfg.rendezvous_remote
+            # Throttle pre-check keeps the common (recently-synced) case from
+            # even enqueuing an executor job behind a possibly-slow land.
+            and _sync_throttle.due(workspace, repo, cfg.cadences.git_refresh_seconds)
+        ):
             with contextlib.suppress(Exception):
-                await asyncio.to_thread(
-                    maybe_sync_main_to_origin,
-                    workspace,
-                    repo,
-                    cfg.rendezvous_remote,
+                await asyncio.wrap_future(_executors.submit(repo, partial(
+                    sync_main_locked,
+                    workspace, repo, cfg.rendezvous_remote,
                     min_interval_seconds=cfg.cadences.git_refresh_seconds,
-                )
+                    force=False,
+                    throttle=_sync_throttle,
+                )))
         base_ref = canonical_head(workspace / repo)
         lease = await store.acquire_lease(
             task=chosen.task,
@@ -533,7 +509,7 @@ def register_worker_api(
             return JSONResponse({"work": None}, status_code=200)
 
         run_id = new_run_id()
-        order = _build_work_order(
+        order = build_work_order(
             workspace, tasks_root, chosen.task, chosen.queue, repo,
             lease["id"], run_id, base_ref, cfg,
         )
@@ -569,7 +545,7 @@ def register_worker_api(
             task=chosen.task,
             payload={"title": order["title"], "worker_id": body.worker_id},
         )
-        return JSONResponse({"work": order, "queue_pauses": dict(_paused_queues)})
+        return JSONResponse({"work": order, "queue_pauses": dict(queue_pauses)})
 
     @app.post("/api/worker/heartbeat", dependencies=[Depends(_require_secret)])
     async def worker_heartbeat(body: HeartbeatBody) -> JSONResponse:
@@ -619,7 +595,7 @@ def register_worker_api(
         # workspace-relative); landing materialises ``workspace / repo``.
         repo = run.get("repo")
         tasks_rel = playlists_mod.tasks_rel(queue)
-        meta = _task_meta(tasks_root, body.task, queue)
+        meta = task_meta(tasks_root, body.task, queue)
         # A task may force PR mode with `make_pr: true`; otherwise the manager's
         # configured landing_mode applies. make_pr never forces squash/push.
         effective_mode = LandingMode.PR if meta.get("make_pr") else cfg.landing_mode
@@ -638,7 +614,7 @@ def register_worker_api(
             ),
             was_retry=_task_is_failed_in_frontmatter(queue, body.task),
             watch_armed=_failure_state(label).watch_armed,
-            queue_paused=label in _paused_queues,
+            queue_paused=label in await store.queue_pauses(),
             split=bool(meta.get("split")),
             evergreen=task_is_evergreen(
                 meta, body.task, resolve_config(workspace, tasks_root, tasks_rel)
@@ -650,100 +626,191 @@ def register_worker_api(
             run_id=run_id, lease_id=body.lease_id, queue=queue, task=body.task
         )
 
-        async def _git_phase(phase: GitPhase) -> Transition:
-            """Run the git/filesystem work a completed submit needs, then fold
-            its result into the land/split transition. Git work runs off the
-            event loop so polls/heartbeats/SSE stay live; the CAS makes a slow
-            land safe (a re-leased task's stale submit is rejected, not raced).
+        async def _finish(t: Transition, *, set_idle: bool) -> dict[str, Any] | None:
+            """Apply the transition and run its post-commit side effects.
+
+            The CAS (lease still LEASED, still this worker's) is the
+            authoritative fence: a lease consumed while a queued land ran means
+            the result is stale — return ``None``, write nothing. Content-store
+            mutations (frontmatter flags, brief drop) route through the
+            tasks-repo executor. ``set_idle`` is false on the deferred land
+            path, where the worker went idle at enqueue time.
             """
-            match phase:
-                case GitPhase.HARVEST_SPLIT:
-                    # Decomposition run: harvest subtask briefs from the split
-                    # output dir and enqueue them, then retire the parent.
-                    created = harvest_split_output(
-                        workspace, tasks_root, repo, body.task, meta,
-                        queue=queue, tasks_rel=tasks_rel,
-                    )
-                    return on_split_result(ref, body, created)
-                case GitPhase.LAND:
-                    result = await asyncio.to_thread(
-                        land,
-                        workspace, repo, body.task, body.title,
+            event_ids = await store.apply_transition(
+                t, expected_status=LeaseStatus.LEASED, expected_worker_id=body.worker_id
+            )
+            if event_ids is None:
+                return None
+            response = dict(t.response)
+            for flag in t.effects.frontmatter:
+                await _run_tasks_repo_job(_executors, tasks_repo, partial(
+                    _set_frontmatter_flag_job,
+                    queue, body.task, flag.key, flag.value,
+                    reason_key=flag.reason_key, reason=flag.reason,
+                ))
+            if t.effects.watch_armed is not None:
+                _failure_state(label).watch_armed = t.effects.watch_armed
+            if t.effects.pause_queue is not None:
+                # Phase 7: pauses are durable — a manager restart no longer
+                # silently unpauses a failure-tripped queue.
+                await store.set_queue_pause(label, t.effects.pause_queue)
+            if t.effects.worker_cooldown:
+                app.state.worker_cooldowns[(body.worker_id, label)] = (
+                    datetime.now(UTC) + timedelta(seconds=WORKER_COOLDOWN_SECONDS)
+                )
+            if t.effects.drop_brief:
+                # Backstop the worker's queue removal: a landed regular task must
+                # leave the content store (evergreen tasks keep their file).
+                with contextlib.suppress(Exception):
+                    await _run_tasks_repo_job(_executors, tasks_repo, partial(
+                        drop_completed_task, tasks_root, body.task, tasks_rel,
                         queue=queue,
-                        base_ref=lease.get("base_ref"),
-                        landing_mode=effective_mode,
-                        automerge=bool(meta.get("automerge", True)),
-                        draft=bool(meta.get("draft", False)),
-                        branch_ref=body.branch_ref,
-                        head_sha=body.head_sha,
-                        rendezvous_remote=cfg.rendezvous_remote,
-                        git_refresh_seconds=cfg.cadences.git_refresh_seconds,
-                    )
-                case GitPhase.ADOPT_CHECK:
-                    # Nothing landable: the cheap adopt-or-nothing detection
-                    # (never an origin sync or squash attempt).
-                    result = await asyncio.to_thread(
-                        adopt_or_nothing,
-                        workspace, repo, body.task, body.title,
-                        queue=queue,
-                        base_ref=lease.get("base_ref"),
-                        landing_mode=effective_mode,
-                        automerge=bool(meta.get("automerge", True)),
-                        draft=bool(meta.get("draft", False)),
-                    )
-                case _:
-                    assert_never(phase)
+                    ))
+            if set_idle:
+                await _registry().set_idle(body.worker_id)
+            for event_id, ev in zip(event_ids, t.events, strict=True):
+                await _broadcast({
+                    "id": event_id, "kind": ev.kind, "run_id": ev.run_id,
+                    "queue": ev.queue, "task": ev.task, "payload": dict(ev.payload or {}),
+                })
+            if t.effects.start_resolve:
+                # Auto-escalate: immediately spawn the out-of-process resolver
+                # instead of waiting for an operator to click Resolve.
+                started, _child, _err = await _start_resolve(
+                    run_id, task=body.task, queue=queue, repo=repo, title=body.title,
+                )
+                response["resolving"] = started
+            return response
+
+        async def _with_loc(result: LandOutcome) -> LandOutcome:
+            """Annotate a landed outcome with its LOC delta (read-only git)."""
             if result.kind in LAND_SUCCESS_KINDS and result.sha:
                 with contextlib.suppress(Exception):
-                    result = replace(result, loc=await asyncio.to_thread(
+                    return replace(result, loc=await asyncio.to_thread(
                         compute_code_loc, workspace / repo, result.sha
                     ))
-            return on_land_result(ref, body, result, policy)
+            return result
 
         computed = on_submit(ref, body, policy)
-        t = computed if isinstance(computed, Transition) else await _git_phase(computed)
+        if isinstance(computed, Transition):
+            # No git work (blocked/error/validation-failed/...): fully
+            # synchronous, exactly as before.
+            response = await _finish(computed, set_idle=True)
+            if response is None:
+                raise HTTPException(status_code=409, detail=_STALE_SUBMIT)
+            return JSONResponse(response)
 
-        event_ids = await store.apply_transition(
-            t, expected_status=LeaseStatus.LEASED, expected_worker_id=body.worker_id
-        )
-        if event_ids is None:
-            raise HTTPException(status_code=409, detail=_STALE_SUBMIT)
+        match computed:
+            case GitPhase.HARVEST_SPLIT:
+                # Decomposition run: harvest subtask briefs from the split
+                # output dir and enqueue them, then retire the parent. A
+                # content-store mutation -> the tasks-repo executor,
+                # synchronous-wait (cheap, and the response reports `created`).
+                created = await asyncio.wrap_future(_executors.submit(
+                    tasks_repo, partial(
+                        harvest_split_output,
+                        workspace, tasks_root, repo, body.task, meta,
+                        queue=queue, tasks_rel=tasks_rel,
+                    ),
+                ))
+                t = on_split_result(ref, body, created)
+            case GitPhase.ADOPT_CHECK:
+                # Nothing landable: the cheap adopt-or-nothing detection (never
+                # an origin sync or squash attempt). Its adopt path applies
+                # remote policy (a push/PR) = target-repo mutation, so it runs
+                # on the repo executor too — synchronous-wait, because it is
+                # bounded (no integrate loop) and its response is consumed
+                # inline.
+                result = await asyncio.wrap_future(_executors.submit(
+                    repo, partial(
+                        adopt_or_nothing_locked,
+                        workspace, repo, body.task, body.title,
+                        queue=queue,
+                        base_ref=lease.get("base_ref"),
+                        landing_mode=effective_mode,
+                        automerge=bool(meta.get("automerge", True)),
+                        draft=bool(meta.get("draft", False)),
+                    ),
+                ))
+                t = on_land_result(ref, body, await _with_loc(result), policy)
+            case GitPhase.LAND:
+                # Async land (Phase 7): mark the run's phase, enqueue the
+                # serialized land job, and return immediately — heartbeats and
+                # polls keep flowing while a slow land runs. The result arrives
+                # as the same on_land_result transition the synchronous path
+                # applied, CAS-fenced against a lease consumed mid-land.
+                await store.update_run(run_id, phase="landing")
+                land_future = _executors.submit(repo, partial(
+                    land_locked,
+                    workspace, repo, body.task, body.title,
+                    queue=queue,
+                    base_ref=lease.get("base_ref"),
+                    landing_mode=effective_mode,
+                    automerge=bool(meta.get("automerge", True)),
+                    draft=bool(meta.get("draft", False)),
+                    branch_ref=body.branch_ref,
+                    head_sha=body.head_sha,
+                    rendezvous_remote=cfg.rendezvous_remote,
+                    git_refresh_seconds=cfg.cadences.git_refresh_seconds,
+                    throttle=_sync_throttle,
+                ))
 
-        # Non-store side effects, post-commit, driven by the transition.
-        response = dict(t.response)
-        for flag in t.effects.frontmatter:
-            _set_frontmatter_flag(
-                queue, body.task, flag.key, flag.value,
-                reason_key=flag.reason_key, reason=flag.reason,
-            )
-        if t.effects.watch_armed is not None:
-            _failure_state(label).watch_armed = t.effects.watch_armed
-        if t.effects.pause_queue is not None:
-            _paused_queues[label] = t.effects.pause_queue
-        if t.effects.worker_cooldown:
-            app.state.worker_cooldowns[(body.worker_id, label)] = (
-                datetime.now(UTC) + timedelta(seconds=WORKER_COOLDOWN_SECONDS)
-            )
-        if t.effects.drop_brief:
-            # Backstop the worker's queue removal: a landed regular task must
-            # leave the content store (evergreen tasks keep their file).
-            with contextlib.suppress(Exception):
-                await asyncio.to_thread(
-                    drop_completed_task, tasks_root, body.task, tasks_rel, queue=queue
+                async def _complete_land() -> None:
+                    try:
+                        result = await asyncio.wrap_future(land_future)
+                    except Exception as exc:
+                        # A crashed land job maps to the same terminal shape an
+                        # in-band pipeline error would produce; the branch is
+                        # preserved for a resolve.
+                        result = LandOutcome(
+                            kind=LandKind.TRANSPORT_FAILED,
+                            detail=f"land job crashed: {exc}",
+                        )
+                    else:
+                        result = await _with_loc(result)
+                    applied = await _finish(
+                        on_land_result(ref, body, result, policy), set_idle=False
+                    )
+                    if applied is None:
+                        # The lease was consumed (cancelled/expired) while the
+                        # land job ran and the CAS refused the result. The git
+                        # work may already be on origin — never let that vanish
+                        # silently: leave an operator-visible trace on the run
+                        # (task_log rides the existing wire kind).
+                        line = (
+                            "land result discarded: lease no longer live "
+                            f"(kind={result.kind}, sha={result.sha or '-'})"
+                        )
+                        _log.warning("run %s %s/%s: %s",
+                                     run_id, label, body.task, line)
+                        with contextlib.suppress(Exception):
+                            await _emit(
+                                "task_log", run_id=run_id, queue=queue,
+                                task=body.task,
+                                payload={
+                                    "line": line,
+                                    "land_kind": str(result.kind),
+                                    "sha": result.sha,
+                                },
+                            )
+
+                # Completion runs on the event loop (never blocks the executor
+                # thread — a land targeting the tasks repo itself would
+                # otherwise self-deadlock on the content-store side effects).
+                # The tracking set is the drain seam's second half.
+                completion = asyncio.create_task(_complete_land())
+                app.state.land_completions.add(completion)
+                completion.add_done_callback(app.state.land_completions.discard)
+                await _registry().set_idle(body.worker_id)
+                return JSONResponse(
+                    {"landed": None, "status": "landing", "queued": True}
                 )
-        await _registry().set_idle(body.worker_id)
-        for event_id, ev in zip(event_ids, t.events, strict=True):
-            await _broadcast({
-                "id": event_id, "kind": ev.kind, "run_id": ev.run_id,
-                "queue": ev.queue, "task": ev.task, "payload": dict(ev.payload or {}),
-            })
-        if t.effects.start_resolve:
-            # Auto-escalate: immediately spawn the out-of-process resolver
-            # instead of waiting for an operator to click Resolve.
-            started, _child, _err = await _start_resolve(
-                run_id, task=body.task, queue=queue, repo=repo, title=body.title,
-            )
-            response["resolving"] = started
+            case _:
+                assert_never(computed)
+
+        response = await _finish(t, set_idle=True)
+        if response is None:
+            raise HTTPException(status_code=409, detail=_STALE_SUBMIT)
         return JSONResponse(response)
 
     @app.post(
@@ -754,6 +821,11 @@ def register_worker_api(
         run_id: str, body: ResolveResultBody
     ) -> JSONResponse:
         """Record the outcome of an out-of-process resolve (see resolve_job).
+
+        Phase 7: the resolver subprocess stops at the resolved squash SHA on
+        its local main — push authority is the manager's. A push-mode resolve
+        reports ``pushed: None`` and the origin push runs here, on the repo
+        executor (the last cross-process integrate-lock consumer is gone).
 
         On a landed resolve: complete the resolve run, reflect the land onto the
         original run, clear the task overlay, and drop the brief (non-evergreen).
@@ -778,15 +850,47 @@ def register_worker_api(
             "output_tokens": body.output_tokens,
             "cost_usd": body.cost_usd,
         }
-        if body.landed and body.status == RunStatus.COMPLETED:
+        landed = bool(body.landed and body.status == RunStatus.COMPLETED)
+        sha, remote_kind, pushed = body.sha, body.remote, body.pushed
+        result_line = body.result_line
+        failure_kind, failure_reason = body.failure_kind, body.failure_reason
+        if (
+            landed
+            and sha
+            and pushed is None
+            and cfg.landing_mode is LandingMode.PUSH
+            and cfg.rendezvous_remote
+        ):
+            run = await store.get_run(run_id)
+            repo = (run or {}).get("repo")
+            if repo:
+                ok, info = await asyncio.wrap_future(_executors.submit(
+                    repo, partial(
+                        push_resolved_main_locked,
+                        workspace, repo, cfg.rendezvous_remote, sha,
+                        max_retries=cfg.max_push_retries,
+                        throttle=_sync_throttle,
+                    ),
+                ))
+                if ok:
+                    sha, remote_kind, pushed = info, "push", True
+                else:
+                    # Same terminal shape the subprocess used to report on its
+                    # own push failure: the resolved commit stays on local main
+                    # and the task re-blocks for another resolve.
+                    landed = False
+                    result_line = result_line or "resolve failed"
+                    failure_kind = failure_kind or FailureKind.MERGE_CONFLICT
+                    failure_reason = failure_reason or info
+        if landed:
             await store.update_run(
                 run_id,
                 status=RunStatus.COMPLETED,
-                result_line=body.result_line or "resolved: landed",
-                commit_sha=body.sha,
+                result_line=result_line or "resolved: landed",
+                commit_sha=sha,
                 loc=body.loc,
-                remote=body.remote,
-                pushed=body.pushed,
+                remote=remote_kind,
+                pushed=pushed,
                 **telemetry,
             )
             if body.origin_run_id:
@@ -794,23 +898,26 @@ def register_worker_api(
                     await store.update_run(
                         body.origin_run_id,
                         status=RunStatus.COMPLETED,
-                        result_line=body.result_line or "resolved",
-                        commit_sha=body.sha,
+                        result_line=result_line or "resolved",
+                        commit_sha=sha,
                     )
             # A landed resolve is real progress — the retry counter resets.
             await store.clear_task_state(queue, body.task, reset_progress=True)
             tasks_rel = playlists_mod.tasks_rel(queue)
-            meta = _task_meta(tasks_root, body.task, queue)
+            meta = task_meta(tasks_root, body.task, queue)
             if not task_is_evergreen(
                 meta, body.task, resolve_config(workspace, tasks_root, tasks_rel)
             ):
                 with contextlib.suppress(Exception):
-                    drop_completed_task(tasks_root, body.task, tasks_rel, queue=queue)
+                    await asyncio.wrap_future(_executors.submit(tasks_repo, partial(
+                        drop_completed_task, tasks_root, body.task, tasks_rel,
+                        queue=queue,
+                    )))
             await _emit(
                 "task_result", run_id=run_id, queue=queue, task=body.task,
                 payload={
-                    "status": "completed", "commit_sha": body.sha,
-                    "remote": body.remote, "pushed": body.pushed,
+                    "status": "completed", "commit_sha": sha,
+                    "remote": remote_kind, "pushed": pushed,
                 },
             )
             await _emit("queue_changed", queue=queue)
@@ -818,24 +925,24 @@ def register_worker_api(
             await store.update_run(
                 run_id,
                 status=RunStatus.ERROR,
-                result_line=body.result_line or "resolve failed",
-                failure_kind=body.failure_kind or FailureKind.MERGE_CONFLICT,
-                failure_reason=body.failure_reason,
+                result_line=result_line or "resolve failed",
+                failure_kind=failure_kind or FailureKind.MERGE_CONFLICT,
+                failure_reason=failure_reason,
                 **telemetry,
             )
             reason = "needs resolve: " + (
-                body.result_line or body.failure_reason or "resolve failed"
+                result_line or failure_reason or "resolve failed"
             )
             await store.set_task_state(
                 queue, body.task, TaskHoldKind.BLOCKED, blocked_reason=reason,
             )
             await _emit(
                 "task_blocked", queue=queue, task=body.task,
-                payload={"reason": body.failure_kind or "merge_conflict"},
+                payload={"reason": failure_kind or "merge_conflict"},
             )
             await _emit(
                 "task_result", run_id=run_id, queue=queue, task=body.task,
-                payload={"status": "error", "failure_kind": body.failure_kind},
+                payload={"status": "error", "failure_kind": failure_kind},
             )
         app.state.resolves.pop(run_id, None)
         return JSONResponse({"ok": True})
@@ -844,6 +951,14 @@ def register_worker_api(
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+
+
+async def _run_tasks_repo_job(
+    executors: ExecutorPool, tasks_repo: str, fn: Callable[[], Any]
+) -> Any:
+    """Run a content-store mutation as a job on the tasks repo's executor —
+    the tasks repo is a repo like any other target (Phase 7)."""
+    return await asyncio.wrap_future(executors.submit(tasks_repo, fn))
 
 
 def jsonable(row: dict[str, Any] | None) -> dict[str, Any]:
@@ -866,82 +981,3 @@ def jsonable(row: dict[str, Any] | None) -> dict[str, Any]:
     return out
 
 
-def _task_meta(tasks_root: Path, task: str, queue: str | None) -> dict[str, Any]:
-    path = tasks_root / playlists_mod.tasks_rel(queue) / f"{task}.md"
-    try:
-        return split_frontmatter(path.read_text(errors="replace"))[0]
-    except OSError:
-        return {}
-
-
-def _build_work_order(
-    workspace: Path,
-    tasks_root: Path,
-    task: str,
-    queue: str | None,
-    repo: str,
-    lease_id: str,
-    run_id: str,
-    base_ref: str | None,
-    cfg: ManagerConfig,
-) -> dict[str, Any]:
-    """Assemble the JSON work order handed to a worker.
-
-    The brief is read from the content store (``tasks_root``) and its body is
-    embedded (frontmatter stripped) so the brief never enters the target repo.
-    Every path is **workspace-relative**: ``repo`` is a bare child name and
-    ``task_path`` is ``<tasks_repo>/<queue>/<task>.md``. ``base_ref`` is the
-    target repo's canonical HEAD. Landing policy (landing/automerge/draft) and
-    backend choice are intentionally *not* included — landing is manager-side,
-    backend is worker-owned.
-    """
-    tasks_rel = playlists_mod.tasks_rel(queue)
-    tasks_repo = tasks_root.name
-    path = tasks_root / tasks_rel / f"{task}.md"
-    text = path.read_text(errors="replace") if path.exists() else ""
-    meta, body = split_frontmatter(text)
-    merged = resolve_config(workspace, tasks_root, tasks_rel)
-
-    model = meta.get("model") or cfg.default_model
-    raw_turns = meta.get("turns", merged.get("max_turns"))
-    validate_argv = resolve_validate_cmd(merged)
-    preflight_argv = resolve_preflight_cmd(merged)
-    config_blob = {
-        "model": str(model).strip() or cfg.default_model,
-        "validate": merged.get("validate"),
-        "validate_cmd": format_validate_cmd(validate_argv),
-        # Environment preflight (default `uv sync --frozen`); empty string in a
-        # queue's config opts out. Formatted like validate_cmd for the worker.
-        "preflight": merged.get("preflight"),
-        "preflight_cmd": format_validate_cmd(preflight_argv),
-        "diff_cap_lines": merged.get("diff_cap_lines"),
-        "forbidden_paths": merged.get("forbidden_paths"),
-        "max_turns": int(raw_turns) if raw_turns is not None else None,
-        # MCP connectors the brief declares (informational for the worker; the
-        # manager already routed to a worker that advertises this superset).
-        "required_mcps": list(parse_required_mcps(meta)),
-        # WIP namespace the worker publishes its cross-machine branch under. The
-        # worker never reads the centralized config, so the manager hands it the
-        # operator-configured prefix here (co-located workers ignore it).
-        "wip_ref_prefix": cfg.wip_ref_prefix,
-        # Ralph-loop mode: when true, the worker uses the iterative ralph-loop
-        # prompt instead of the standard single-pass nightshift-local prompt.
-        "loop": bool(meta.get("loop", False)),
-        "loop_max_iterations": int(meta.get("loop_max_iterations", 0)),
-        # Split (decomposition) mode: the worker writes subtask briefs into a
-        # dedicated split output directory instead of implementing directly.
-        "split": bool(meta.get("split", False)),
-    }
-    return {
-        "lease_id": lease_id,
-        "run_id": run_id,
-        "task": task,
-        "queue": queue_label(queue),
-        "priority": int(meta.get("priority", 5)) if str(meta.get("priority", "")).strip() != "" else 5,
-        "title": resolve_title(task, meta),
-        "body": body.strip(),
-        "repo": repo,
-        "task_path": f"{tasks_repo}/{tasks_rel}/{task}.md",
-        "base_ref": base_ref,
-        "config": config_blob,
-    }

@@ -9,9 +9,11 @@ emitter, shared queue state) is injected by ``create_app``.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from nightshift import playlists as playlists_mod
 from nightshift import repos
 from nightshift.config.validate import build_get_response, validate_delta, write_delta
+from nightshift.git.executor import ExecutorPool
 from nightshift.git.store import commit_tasks
 from nightshift.lifecycle import LeaseStatus, TaskHoldKind
 from nightshift.manager import failure_policy
@@ -234,21 +237,29 @@ def register_operator_api(
     _emit: EmitFn,
     _queue_from_label: Callable[[str | None], str | None],
     _all_queues: Callable[[], list[str | None]],
-    # Shared mutable pause state, owned by create_app: queue label -> pause
-    # reason ("operator" | "consecutive_failures" | "retry_failed").
-    _paused_queues: dict[str, str],
     # Per-queue-label failure-policy watch state; popped here when an operator
     # clears a quarantine/failure or presses play.
     _queue_failure_state: dict[str, failure_policy.QueueFailureState],
     _start_resolve: StartResolveFn,
+    # Phase 7: the per-repo git executor pool (content-store commits are
+    # tasks-repo jobs). Queue pause/mode state lives in the store now.
+    _executors: ExecutorPool,
 ) -> None:
     """Register the operator endpoints. Shared wiring (store/registry accessors,
-    the event emitter, queue-pause/failure state, and the resolve spawner) is
+    the event emitter, queue-failure state, and the resolve spawner) is
     injected by ``create_app`` under the same names the handler bodies always
     used."""
     # UI focus: the playlist the operator is looking at. Declared ahead of
     # ``_resolve_queue`` (which closes over it); mutated only by ``set_active``.
     _active_playlist: str | None = None
+
+    async def _commit(message: str) -> None:
+        """Commit content-store churn as a tasks-repo executor job — the tasks
+        repo is a repo like any other, so its commits serialize with every
+        other git job targeting it (Phase 7)."""
+        await asyncio.wrap_future(
+            _executors.submit(tasks_repo, partial(commit_tasks, tasks_root, message))
+        )
 
     def _resolve_queue(queue: str | None) -> str | None:
         """Operator API queue resolution: absent param (None) falls back to the
@@ -388,7 +399,7 @@ def register_operator_api(
                 set_task_meta(
                     tasks_root, created["task"], meta_changes, target_rel
                 )
-        commit_tasks(tasks_root, f"nightshift: create task {created['task']}")
+        await _commit(f"nightshift: create task {created['task']}")
         await _emit("queue_changed", queue=target, task=created.get("task"))
         return JSONResponse(created)
 
@@ -426,7 +437,7 @@ def register_operator_api(
             return JSONResponse({"error": "task not found"}, status_code=404)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
-        commit_tasks(tasks_root, f"nightshift: edit task {task}")
+        await _commit(f"nightshift: edit task {task}")
         # Quarantined/failed are frontmatter-authoritative: toggling them off
         # in the detail pane is all that's needed to release the task for
         # dispatch (live_ordered_queue re-scans frontmatter each cycle). No
@@ -483,7 +494,7 @@ def register_operator_api(
     async def remove_task(task: str, queue: str | None = None) -> JSONResponse:
         target = _resolve_queue(queue)
         result = delete_task(tasks_root, task, playlists_mod.tasks_rel(target))
-        commit_tasks(tasks_root, f"nightshift: delete task {task}")
+        await _commit(f"nightshift: delete task {task}")
         await _emit("queue_changed", queue=target, task=task)
         return JSONResponse(result)
 
@@ -494,7 +505,7 @@ def register_operator_api(
             return JSONResponse({"error": "queue not found"}, status_code=404)
         target_rel = playlists_mod.tasks_rel(target)
         order = reorder_queue(tasks_root, req.order, target_rel)
-        commit_tasks(tasks_root, f"nightshift: reorder queue {queue_label(target)}")
+        await _commit(f"nightshift: reorder queue {queue_label(target)}")
         await _emit("queue_changed", queue=target, payload={"order": order})
         return JSONResponse({"order": order})
 
@@ -508,7 +519,7 @@ def register_operator_api(
         target = _resolve_queue(queue)
         target_rel = playlists_mod.tasks_rel(target)
         sort = save_sort_mode(tasks_root, req.sort, target_rel)
-        commit_tasks(tasks_root, f"nightshift: set sort {queue_label(target)}")
+        await _commit(f"nightshift: set sort {queue_label(target)}")
         await _emit("queue_changed", queue=target, payload={"sort": sort})
         return JSONResponse({"sort": sort})
 
@@ -526,7 +537,7 @@ def register_operator_api(
         target = _resolve_queue(queue)
         target_rel = playlists_mod.tasks_rel(target)
         priorities = save_play_priorities(tasks_root, req.priorities, target_rel)
-        commit_tasks(tasks_root, f"nightshift: set play-priorities {queue_label(target)}")
+        await _commit(f"nightshift: set play-priorities {queue_label(target)}")
         await _emit("queue_changed", queue=target, payload={"priorities": priorities})
         return JSONResponse({"priorities": priorities})
 
@@ -557,7 +568,7 @@ def register_operator_api(
             )
         target_rel = playlists_mod.tasks_rel(target)
         save_queue_config_value(tasks_root, "repo", repo_value, target_rel)
-        commit_tasks(tasks_root, f"nightshift: set repo {queue_label(target)}")
+        await _commit(f"nightshift: set repo {queue_label(target)}")
         await _emit("queue_changed", queue=target, payload={"repo": repo_value})
         return JSONResponse({"repo": repo_value})
 
@@ -620,14 +631,20 @@ def register_operator_api(
     _VALID_ACTIONS = {"play", "pause", "stop", "skip", "select"}
     _VALID_MODES = {"oneshot", "auto", "repeat"}
 
-    _queue_modes: dict[str, str] = {}
+    # Pause/mode state lives in the store since Phase 7 (a manager restart no
+    # longer silently unpauses queues); only the UI cursor stays in-memory.
     _queue_cursors: dict[str, str | None] = {}
 
-    def _queue_state(queue: str | None, leases: list[dict[str, Any]]) -> dict[str, Any]:
+    def _queue_state(
+        queue: str | None,
+        leases: list[dict[str, Any]],
+        pauses: dict[str, str],
+        modes: dict[str, str],
+    ) -> dict[str, Any]:
         """Build a per-queue state dict in the shape the UI expects."""
         key = queue_label(queue)
         lease = next((le for le in leases if le.get("queue", "main") == key), None)
-        pause_reason = _paused_queues.get(key)
+        pause_reason = pauses.get(key)
         paused = pause_reason is not None
         if paused:
             st = "paused"
@@ -638,7 +655,7 @@ def register_operator_api(
         return {
             "state": st,
             "pause_reason": pause_reason,
-            "mode": _queue_modes.get(key, "auto"),
+            "mode": modes.get(key, "auto"),
             "now_playing": lease["task"] if lease else None,
             "cursor": _queue_cursors.get(key),
             "run_id": lease.get("run_id") if lease else None,
@@ -647,15 +664,18 @@ def register_operator_api(
         }
 
     async def _state_payload() -> dict[str, Any]:
-        leases = await _store().active_leases()
+        store = _store()
+        leases = await store.active_leases()
+        pauses = await store.queue_pauses()
+        modes = await store.queue_modes()
         focused = _active_playlist
-        focused_state = _queue_state(focused, leases)
+        focused_state = _queue_state(focused, leases, pauses, modes)
         queues: dict[str, dict[str, Any]] = {}
         queues[queue_label(focused)] = focused_state
         for q in _all_queues():
             key = queue_label(q)
             if key not in queues:
-                queues[key] = _queue_state(q, leases)
+                queues[key] = _queue_state(q, leases, pauses, modes)
         return {**focused_state, "active_playlist": focused, "queues": queues}
 
     @app.get("/api/state")
@@ -676,23 +696,24 @@ def register_operator_api(
         key = queue_label(target)
         if not _queue_exists(target):
             return JSONResponse({"error": "queue not found"}, status_code=404)
+        store = _store()
         if req.mode is not None:
-            _queue_modes[key] = req.mode
+            # "auto" is the default — persisting None lets the store prune the
+            # row once neither a pause nor a non-default mode remains.
+            await store.set_queue_mode(key, None if req.mode == "auto" else req.mode)
         if req.action == "play":
-            _paused_queues.pop(key, None)
+            await store.set_queue_pause(key, None)
             _queue_failure_state[key] = failure_policy.QueueFailureState()
         elif req.action == "pause":
-            _paused_queues[key] = "operator"
+            await store.set_queue_pause(key, "operator")
         elif req.action == "stop":
-            _paused_queues[key] = "operator"
-            store = _store()
+            await store.set_queue_pause(key, "operator")
             for le in await store.active_leases():
                 if le.get("queue", "main") == key:
                     await store.set_lease_status(le["id"], LeaseStatus.CANCELLED)
                     await _emit("run_finished", run_id=le.get("run_id"), queue=target)
-            _paused_queues.pop(key, None)
+            await store.set_queue_pause(key, None)
         elif req.action == "skip":
-            store = _store()
             for le in await store.active_leases():
                 if le.get("queue", "main") == key:
                     await store.set_lease_status(le["id"], LeaseStatus.CANCELLED)
@@ -717,7 +738,7 @@ def register_operator_api(
             return JSONResponse(
                 {"error": f"playlist already exists: {exc}"}, status_code=409
             )
-        commit_tasks(tasks_root, f"nightshift: create playlist {created['name']}")
+        await _commit(f"nightshift: create playlist {created['name']}")
         await _emit("queue_changed", queue=created["name"])
         return JSONResponse(created, status_code=201)
 
@@ -768,7 +789,7 @@ def register_operator_api(
             except FileNotFoundError:
                 return JSONResponse({"error": "playlist not found"}, status_code=404)
             await _store().rename_queue(name, new_name)
-            commit_tasks(tasks_root, f"nightshift: rename playlist {name} -> {new_name}")
+            await _commit(f"nightshift: rename playlist {name} -> {new_name}")
             await _emit(
                 "queue_changed",
                 queue=new_name,
@@ -786,7 +807,7 @@ def register_operator_api(
             save_queue_config_value(
                 tasks_root, "repo", repo_value, playlists_mod.tasks_rel(current)
             )
-            commit_tasks(tasks_root, f"nightshift: set repo {queue_label(current)}")
+            await _commit(f"nightshift: set repo {queue_label(current)}")
             await _emit("queue_changed", queue=current, payload={"repo": repo_value})
         # ``validate`` is the queue's validate command. A whitespace-only value
         # (or the empty-quote literals) normalizes to "" — a deliberate "disable
@@ -797,14 +818,14 @@ def register_operator_api(
             save_queue_config_value(
                 tasks_root, "validate", cmd, playlists_mod.tasks_rel(current)
             )
-            commit_tasks(tasks_root, f"nightshift: set validate {queue_label(current)}")
+            await _commit(f"nightshift: set validate {queue_label(current)}")
             await _emit("queue_changed", queue=current, payload={"validate": cmd})
         # Disabling hides the queue and drops it from the scheduler's candidate
         # set; a no-op for an in-flight lease, which keeps draining until done.
         if req.disabled is not None:
             playlists_mod.set_playlist_disabled(tasks_root, current, req.disabled)
             verb = "disable" if req.disabled else "enable"
-            commit_tasks(tasks_root, f"nightshift: {verb} playlist {current}")
+            await _commit(f"nightshift: {verb} playlist {current}")
             await _emit(
                 "queue_changed", queue=current, payload={"disabled": req.disabled}
             )
@@ -820,7 +841,7 @@ def register_operator_api(
             )
         if not playlists_mod.delete_playlist(tasks_root, name):
             return JSONResponse({"error": "playlist not found"}, status_code=404)
-        commit_tasks(tasks_root, f"nightshift: delete playlist {name}")
+        await _commit(f"nightshift: delete playlist {name}")
         await _emit("queue_changed", queue=name)
         return JSONResponse({"name": name, "deleted": True})
 
@@ -835,7 +856,7 @@ def register_operator_api(
             tasks_root, repo_names, skip={tasks_repo}
         )
         if result["created"] or result["configured"]:
-            commit_tasks(tasks_root, "nightshift: rescan workspace repos into playlists")
+            await _commit("nightshift: rescan workspace repos into playlists")
         await _emit("queue_changed", payload=result)
         return JSONResponse(
             {**result, "playlists": playlists_mod.list_playlists(tasks_root)}
@@ -887,7 +908,9 @@ def register_operator_api(
                 resumed.append({"queue": queue_label(queue), "task": row["task"]})
                 await _emit("queue_changed", queue=queue, task=row["task"])
         # Reset the per-queue warning dedupe so a still-missing repo re-warns.
-        app.state.repo_warnings = set()
+        # Mutate in place: the reconciler captured this set at construction, so
+        # rebinding would leave it deduping against a stale object forever.
+        app.state.repo_warnings.clear()
         await _emit("repos_changed", payload={"resumed": resumed})
         return JSONResponse(_repos_payload())
 

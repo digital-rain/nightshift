@@ -164,6 +164,13 @@ _TASK_VIEW_COLUMNS = (
 _LEASE_ACTIVE_SQL = ", ".join(f"'{s}'" for s in sorted(LEASE_ACTIVE_STATUSES))
 _LEASE_RELEASED_AT_SQL = ", ".join(f"'{s}'" for s in sorted(LEASE_RELEASED_AT_STATUSES))
 
+# Row-lifecycle invariant for the durable transport state (Phase 7): a
+# queue_state row exists only while it carries a pause or a non-default mode.
+_QUEUE_STATE_PRUNE_SQL = """
+    DELETE FROM nightshift.queue_state
+    WHERE queue = $1 AND paused_reason IS NULL AND mode IS NULL
+"""
+
 
 # --------------------------------------------------------------------------- #
 # Interface
@@ -219,6 +226,9 @@ class NightshiftStore(Protocol):
         self, lease_id: str, status: str, *, run_id: str | None = None
     ) -> None: ...
     async def heartbeat_lease(self, lease_id: str, ttl_seconds: float) -> None: ...
+    # No production caller since Phase 7: the reconciler expires deadlines per
+    # lease via on_deadline transitions (CAS-fenced, mid-land exempt) instead
+    # of this bulk sweep. Kept for store-level tests; Phase 9 retires it.
     async def reclaim_expired_leases(self) -> list[dict[str, Any]]: ...
 
     # transitions (the one write path for lifecycle state changes)
@@ -257,6 +267,13 @@ class NightshiftStore(Protocol):
     async def set_queue_dedication(
         self, queue_label: str, worker_ids: list[str]
     ) -> None: ...
+
+    # queue transport state (Phase 7: durable pause reasons + playback modes,
+    # keyed by queue LABEL — a manager restart no longer unpauses queues)
+    async def queue_pauses(self) -> dict[str, str]: ...
+    async def set_queue_pause(self, queue_label: str, reason: str | None) -> None: ...
+    async def queue_modes(self) -> dict[str, str]: ...
+    async def set_queue_mode(self, queue_label: str, mode: str | None) -> None: ...
 
     # queue rename (migrate every row keyed on a queue name)
     async def rename_queue(self, old: str, new: str) -> None: ...
@@ -332,6 +349,9 @@ class MemoryStore:
         self._event_seq = 0
         # queue label -> bound worker ids (manager-side dedication)
         self._dedication: dict[str, list[str]] = {}
+        # queue label -> {"paused_reason", "mode"} (durable transport state;
+        # a row exists only while it carries a pause or a non-default mode)
+        self._queue_state: dict[str, dict[str, str | None]] = {}
 
     async def init(self) -> None:
         return None
@@ -754,6 +774,44 @@ class MemoryStore:
             else:
                 self._dedication.pop(queue_label, None)
 
+    # ---- queue transport state (Phase 7) ----------------------------------- #
+
+    def _queue_state_row(self, queue_label: str) -> dict[str, str | None]:
+        return self._queue_state.setdefault(
+            queue_label, {"paused_reason": None, "mode": None}
+        )
+
+    def _prune_queue_state(self, queue_label: str) -> None:
+        row = self._queue_state.get(queue_label)
+        if row is not None and row["paused_reason"] is None and row["mode"] is None:
+            self._queue_state.pop(queue_label, None)
+
+    async def queue_pauses(self) -> dict[str, str]:
+        with self._lock:
+            return {
+                q: row["paused_reason"]
+                for q, row in self._queue_state.items()
+                if row["paused_reason"] is not None
+            }
+
+    async def set_queue_pause(self, queue_label: str, reason: str | None) -> None:
+        with self._lock:
+            self._queue_state_row(queue_label)["paused_reason"] = reason
+            self._prune_queue_state(queue_label)
+
+    async def queue_modes(self) -> dict[str, str]:
+        with self._lock:
+            return {
+                q: row["mode"]
+                for q, row in self._queue_state.items()
+                if row["mode"] is not None
+            }
+
+    async def set_queue_mode(self, queue_label: str, mode: str | None) -> None:
+        with self._lock:
+            self._queue_state_row(queue_label)["mode"] = mode
+            self._prune_queue_state(queue_label)
+
     # ---- queue rename ----------------------------------------------------- #
 
     async def rename_queue(self, old: str, new: str) -> None:
@@ -778,6 +836,8 @@ class MemoryStore:
                     self._tasks[(nk, row["task"])] = self._tasks.pop(key)
             if old in self._dedication:
                 self._dedication[new] = self._dedication.pop(old)
+            if old in self._queue_state:
+                self._queue_state[new] = self._queue_state.pop(old)
 
     # ---- runs ------------------------------------------------------------- #
 
@@ -1348,15 +1408,58 @@ class PgStore:
                     queue_label, wid,
                 )
 
+    async def queue_pauses(self) -> dict[str, str]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT queue, paused_reason FROM nightshift.queue_state "
+                "WHERE paused_reason IS NOT NULL"
+            )
+        return {r["queue"]: r["paused_reason"] for r in rows}
+
+    async def set_queue_pause(self, queue_label: str, reason: str | None) -> None:
+        async with self._pool.acquire() as conn, conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO nightshift.queue_state (queue, paused_reason, updated_at)
+                VALUES ($1, $2, now())
+                ON CONFLICT (queue) DO UPDATE SET
+                    paused_reason = EXCLUDED.paused_reason, updated_at = now()
+                """,
+                queue_label, reason,
+            )
+            await conn.execute(_QUEUE_STATE_PRUNE_SQL, queue_label)
+
+    async def queue_modes(self) -> dict[str, str]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT queue, mode FROM nightshift.queue_state "
+                "WHERE mode IS NOT NULL"
+            )
+        return {r["queue"]: r["mode"] for r in rows}
+
+    async def set_queue_mode(self, queue_label: str, mode: str | None) -> None:
+        async with self._pool.acquire() as conn, conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO nightshift.queue_state (queue, mode, updated_at)
+                VALUES ($1, $2, now())
+                ON CONFLICT (queue) DO UPDATE SET
+                    mode = EXCLUDED.mode, updated_at = now()
+                """,
+                queue_label, mode,
+            )
+            await conn.execute(_QUEUE_STATE_PRUNE_SQL, queue_label)
+
     async def rename_queue(self, old: str, new: str) -> None:
         """Repoint every queue-keyed row from ``old`` to ``new`` (playlists only;
         the main queue is never renamed). Playlist queue keys equal the playlist
-        name across runs/leases/tasks/events/queue_routing, so one value maps
-        them all."""
+        name across runs/leases/tasks/events/queue_routing/queue_state, so one
+        value maps them all."""
         if not old or old == new:
             return
         async with self._pool.acquire() as conn:
-            for table in ("runs", "leases", "tasks", "events", "queue_routing"):
+            for table in ("runs", "leases", "tasks", "events", "queue_routing",
+                          "queue_state"):
                 await conn.execute(
                     f"UPDATE nightshift.{table} SET queue = $2 WHERE queue = $1",
                     old, new,

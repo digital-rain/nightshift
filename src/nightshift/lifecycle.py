@@ -1017,6 +1017,47 @@ def on_land_result(
             assert_never(land.kind)
 
 
+def on_land_interrupted(ref: AttemptRef) -> Transition:
+    """A ``LANDING`` run found at manager startup with its lease still live:
+    the previous process died (or was restarted) mid-land, and without the
+    Phase 8 land trailer there is no way to verify whether the squash reached
+    canonical main. The conservative resolution: error the run
+    (``merge_rejected``), release the lease, and hold the task blocked for a
+    resolve — the branch is preserved, nothing is double-landed, and the
+    operator (or auto-resolve via the Resolve button) recovers it. Phase 8's
+    trailer upgrades this to a true idempotent re-enqueue."""
+    detail = "manager restarted mid-land; task branch preserved for resolve"
+    return Transition(
+        ref=ref,
+        run_fields=dict(
+            status=RunStatus.ERROR,
+            result_line=detail,
+            failure_kind=FailureKind.MERGE_REJECTED,
+            failure_reason=detail,
+        ),
+        lease_status=LeaseStatus.RELEASED,
+        effects=TaskEffects(
+            hold=TaskHold(
+                TaskHoldKind.BLOCKED, f"needs resolve: {detail}",
+                retry_eligible=False,
+            ),
+        ),
+        events=(
+            TransitionEvent(
+                "task_blocked", queue=ref.queue, task=ref.task,
+                payload={"reason": FailureKind.MERGE_REJECTED, "detail": detail},
+            ),
+            TransitionEvent(
+                "task_result", run_id=ref.run_id, queue=ref.queue, task=ref.task,
+                payload={
+                    "status": RunStatus.ERROR,
+                    "failure_kind": FailureKind.MERGE_REJECTED,
+                },
+            ),
+        ),
+    )
+
+
 def on_deadline(ref: AttemptRef) -> Transition:
     """Deadline expiry as a transition: the lease flips to ``expired``
     (stamping ``released_at``). Today's reclaim touches nothing else — the run

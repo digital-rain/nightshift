@@ -528,11 +528,17 @@ def test_land_resets_the_retry_counter(tmp_path: Path) -> None:
         state = asyncio.run(store.get_task_state(None, "10.hello"))
         assert state["attempts_without_progress"] == 1
 
-        # Release it for retry, then land for real.
+        # Release it for retry, then land for real. Phase 7: the land is async
+        # (the submit returns queued); drain before asserting its effects.
         client.patch("/api/tasks/10.hello", json={"failed": False})
         order = _poll_with_landable_branch(client, workspace, "10.hello")
         r = _submit_completed(client, order)
-        assert r.json()["landed"] is True
+        assert r.json()["queued"] is True
+        _drain_git(client)
+        run = next(
+            x for x in client.get("/api/runs").json() if x["id"] == order["run_id"]
+        )
+        assert run["status"] == "completed" and run["commit_sha"]
         assert asyncio.run(store.get_task_state(None, "10.hello")) is None
 
 
@@ -781,6 +787,14 @@ def _submit_completed(
     )
 
 
+def _drain_git(client: TestClient) -> None:
+    """Phase 7: a landable submit enqueues the land on the repo executor and
+    returns immediately ({"queued": true}); block until every git job and its
+    completion transition have applied (the executor drain seam)."""
+    assert client.portal is not None, "drain needs the context-managed client"
+    client.portal.call(client.app.state.drain_git_jobs)
+
+
 def test_submit_with_expired_lease_rejected_without_writes(tmp_path: Path) -> None:
     """An expired lease (the task may already be re-leased to another worker)
     must reject the slow worker's eventual submit: 409, nothing lands, the run
@@ -920,6 +934,9 @@ _ARMED_ALLOWED = frozenset({
     "events_since", "max_event_id", "run_events",
     "stats_overall", "stats_by_worker", "stats_by_backend",
     "stats_by_model", "stats_by_queue",
+    # Phase 7: queue pauses live in the store; the submit path reads them for
+    # the failure-watch policy (still not a write).
+    "queue_pauses", "queue_modes",
 })
 
 
@@ -1099,7 +1116,10 @@ def test_content_store_commits_are_local_and_pushless(tmp_path: Path) -> None:
                 "landable": True, "backend": "claude-code", "model": "claude-sonnet-4-6",
             },
         )
-        assert r.json()["landed"] is True
+        # Phase 7: the land is queued on the repo executor; drain, then the
+        # brief drop is a local content-store commit exactly as before.
+        assert r.json()["queued"] is True
+        _drain_git(client)
         assert store_log_subject() == f"nightshift: drop completed task {task}"
         assert not (tasks_root / "main" / f"{task}.md").exists()
 
@@ -1359,11 +1379,17 @@ def test_conflict_auto_escalates_to_resolve(tmp_path: Path) -> None:
                 "landable": True, "backend": "claude-code",
             },
         )
-        body = r.json()
-        assert body["landed"] is False
-        assert body["conflict"] is True
-        assert body["resolving"] is True
+        # Phase 7: the conflict surfaces when the queued land completes (the
+        # submit response no longer carries the final land result); the
+        # auto-escalation still spawns the resolver from the completion.
+        assert r.json()["queued"] is True
+        _drain_git(client)
         assert len(calls) == 1 and calls[0]["task"] == "10.edit"
+        run = next(
+            x for x in client.get("/api/runs").json() if x["id"] == order["run_id"]
+        )
+        assert run["status"] == "error"
+        assert run["failure_kind"] == "merge_conflict"
 
 
 # --------------------------------------------------------------------------- #
@@ -1516,6 +1542,9 @@ def test_success_between_failures_does_not_pause(tmp_path: Path) -> None:
                 "landable": True, "backend": "claude-code", "model": "claude-sonnet-4-6",
             },
         )
+        # Phase 7: the land (whose completion disarms the failure watch) is
+        # async — drain before the next failure so the success is on record.
+        _drain_git(client)
         _poll_and_submit_error(client, "30.c")
 
         state = client.get("/api/state").json()

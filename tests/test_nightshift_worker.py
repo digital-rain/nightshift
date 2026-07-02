@@ -323,6 +323,9 @@ def test_worker_lands_a_task_via_manager(tmp_path: Path, monkeypatch) -> None:
 
         did = loop.run_once()
         assert did is True
+        # Phase 7: the submit queues the land on the manager's repo executor
+        # and returns; drain before asserting the landed state.
+        tc.portal.call(tc.app.state.drain_git_jobs)
 
         # The task landed on the TARGET repo's main (the generated file is now
         # committed there, not in the workspace or the content store).

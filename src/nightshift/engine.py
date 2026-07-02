@@ -54,9 +54,6 @@ from nightshift.git.sync import (
     maybe_sync_main_to_origin as maybe_sync_main_to_origin,
 )
 from nightshift.git.sync import (
-    reset_origin_sync_throttle as reset_origin_sync_throttle,
-)
-from nightshift.git.sync import (
     sync_main_to_origin as sync_main_to_origin,
 )
 from nightshift.git.transport import (

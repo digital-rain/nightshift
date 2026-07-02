@@ -28,7 +28,6 @@ from nightshift.git.landing import (
     PrSpec,
     RepoContext,
     cherry_produce,
-    integrate_and_push,
     integrate_and_push_locked,
     merge_tree_conflicts,
     open_pr,
@@ -37,6 +36,7 @@ from nightshift.git.landing import (
 )
 from nightshift.git.locks import repo_lock
 from nightshift.git.refs import main_sha, rev_parse
+from nightshift.git.sync import SyncThrottle
 from nightshift.git.transport import fetch_rendezvous_branch, prune_rendezvous_branch
 from nightshift.git.worktrees import (
     has_commits,
@@ -54,12 +54,15 @@ from nightshift.lifecycle import (
 
 __all__ = [
     "adopt_or_nothing",
+    "adopt_or_nothing_locked",
     "base_ref_drifted",
     "canonical_head",
     "land",
+    "land_locked",
     "main_advanced_sha",
     "merge_tree_conflicts",
     "push_resolved_main",
+    "push_resolved_main_locked",
 ]
 
 
@@ -111,9 +114,49 @@ def land(
     rendezvous_remote: str | None = None,
     max_push_retries: int = 3,
     git_refresh_seconds: float = 15.0,
+    throttle: SyncThrottle | None = None,
 ) -> LandOutcome:
     """Land a submitted task branch onto canonical ``main`` of the target
-    ``repo``, then sync remotely.
+    ``repo``, then sync remotely — the orchestration boundary that takes the
+    RepoLock and runs :func:`land_locked` (direct/CLI callers; the manager's
+    repo executor holds the lock itself and calls the locked variant)."""
+    with repo_lock(workspace, repo):
+        return land_locked(
+            workspace, repo, task, title,
+            queue=queue,
+            base_ref=base_ref,
+            landing_mode=landing_mode,
+            automerge=automerge,
+            draft=draft,
+            branch_ref=branch_ref,
+            head_sha=head_sha,
+            rendezvous_remote=rendezvous_remote,
+            max_push_retries=max_push_retries,
+            git_refresh_seconds=git_refresh_seconds,
+            throttle=throttle,
+        )
+
+
+def land_locked(
+    workspace: Path,
+    repo: str,
+    task: str,
+    title: str,
+    *,
+    queue: str | None,
+    base_ref: str | None = None,
+    landing_mode: LandingMode | str = LandingMode.NONE,
+    automerge: bool = True,
+    draft: bool = False,
+    branch_ref: str | None = None,
+    head_sha: str | None = None,
+    rendezvous_remote: str | None = None,
+    max_push_retries: int = 3,
+    git_refresh_seconds: float = 15.0,
+    throttle: SyncThrottle | None = None,
+) -> LandOutcome:
+    """:func:`land` for callers already holding the RepoLock (the repo
+    executor's land jobs).
 
     ``repo`` is the workspace-relative child name; the target repo path
     (``repo_root = workspace / repo``) is materialised here only for the git
@@ -123,11 +166,14 @@ def land(
 
     Cross-machine (transport B): when the worker ran on another box, the task
     branch is absent here — only ``branch_ref``/``head_sha`` arrive over the API.
-    With no local worktree dir, ``land`` fetches ``branch_ref`` from
+    With no local worktree dir, the land fetches ``branch_ref`` from
     ``rendezvous_remote`` and verifies it matches ``head_sha`` (fail-closed →
     TRANSPORT_FAILED) before the existing flow. The whole fetch → adopt →
-    integrate section holds the repo's RepoLock once.
+    integrate section runs under the one held RepoLock.
     """
+    assert repo_lock(workspace, repo).is_held_by_current_thread(), (
+        "land_locked requires the caller to hold the RepoLock"
+    )
     branch = worktree_branch(task, queue)
     # Callers inside the manager hand in a parsed LandingMode; the str form is
     # accepted for direct/legacy callers and validated here (fail loudly).
@@ -141,71 +187,71 @@ def land(
         workspace, repo, task, queue
     ).exists()
 
-    with repo_lock(workspace, repo):
-        if cross_machine:
-            if not rendezvous_remote or not head_sha:
-                return LandOutcome(
-                    kind=LandKind.TRANSPORT_FAILED,
-                    detail="cross-machine land requires a rendezvous remote and head_sha",
-                )
-            fetched = fetch_rendezvous_branch(
-                workspace, repo, rendezvous_remote, branch_ref, task, queue=queue
+    if cross_machine:
+        if not rendezvous_remote or not head_sha:
+            return LandOutcome(
+                kind=LandKind.TRANSPORT_FAILED,
+                detail="cross-machine land requires a rendezvous remote and head_sha",
             )
-            if fetched is None:
-                return LandOutcome(
-                    kind=LandKind.TRANSPORT_FAILED,
-                    retryable=True,
-                    detail=f"failed to fetch '{branch_ref}' from '{rendezvous_remote}'",
-                )
-            if fetched != head_sha:
-                return LandOutcome(
-                    kind=LandKind.TRANSPORT_FAILED,
-                    detail=(
-                        f"head_sha mismatch: worker published {head_sha[:8]}, "
-                        f"fetched {fetched[:8]} — refusing to land unverified content"
-                    ),
-                )
-
-        adopted = _adopt_agent_land_on_main(
-            workspace, repo, task, base_ref=base_ref, queue=queue,
-            landing_mode=mode, pr=pr, remote=rendezvous_remote,
+        fetched = fetch_rendezvous_branch(
+            workspace, repo, rendezvous_remote, branch_ref, task, queue=queue
         )
-        if adopted is not None:
-            outcome = adopted
-        else:
-            # Sync is gated on an explicitly configured rendezvous remote (a
-            # ``none`` mode or an unconfigured remote stays purely local). The
-            # push target itself defaults to ``origin`` inside the loop so
-            # ``push`` mode works without a separate rendezvous remote,
-            # matching the historical direct-push behavior.
-            ctx = RepoContext(
-                workspace=workspace,
-                repo=repo,
-                remote=rendezvous_remote,
-                sync=bool(rendezvous_remote) and mode.is_remote,
-                git_refresh_seconds=git_refresh_seconds,
-                pr=pr,
+        if fetched is None:
+            return LandOutcome(
+                kind=LandKind.TRANSPORT_FAILED,
+                retryable=True,
+                detail=f"failed to fetch '{branch_ref}' from '{rendezvous_remote}'",
             )
-            outcome = integrate_and_push_locked(
-                ctx,
-                squash_produce(workspace / repo, branch, title),
-                mode=mode,
-                max_retries=max_push_retries,
+        if fetched != head_sha:
+            return LandOutcome(
+                kind=LandKind.TRANSPORT_FAILED,
+                detail=(
+                    f"head_sha mismatch: worker published {head_sha[:8]}, "
+                    f"fetched {fetched[:8]} — refusing to land unverified content"
+                ),
             )
-            if outcome.kind not in LAND_SUCCESS_KINDS:
-                # Refused: the branch (and, cross-machine, the WIP ref) is
-                # preserved for a resolve.
-                return outcome
 
-            # The branch has landed on canonical main; reclaim its worktree +
-            # branch (mirrors the engine's post-squash teardown).
-            teardown_worktree(workspace, repo, task, queue=queue)
+    adopted = _adopt_agent_land_on_main(
+        workspace, repo, task, base_ref=base_ref, queue=queue,
+        landing_mode=mode, pr=pr, remote=rendezvous_remote,
+    )
+    if adopted is not None:
+        outcome = adopted
+    else:
+        # Sync is gated on an explicitly configured rendezvous remote (a
+        # ``none`` mode or an unconfigured remote stays purely local). The
+        # push target itself defaults to ``origin`` inside the loop so
+        # ``push`` mode works without a separate rendezvous remote,
+        # matching the historical direct-push behavior.
+        ctx = RepoContext(
+            workspace=workspace,
+            repo=repo,
+            remote=rendezvous_remote,
+            sync=bool(rendezvous_remote) and mode.is_remote,
+            git_refresh_seconds=git_refresh_seconds,
+            pr=pr,
+            throttle=throttle,
+        )
+        outcome = integrate_and_push_locked(
+            ctx,
+            squash_produce(workspace / repo, branch, title),
+            mode=mode,
+            max_retries=max_push_retries,
+        )
+        if outcome.kind not in LAND_SUCCESS_KINDS:
+            # Refused: the branch (and, cross-machine, the WIP ref) is
+            # preserved for a resolve.
+            return outcome
 
-        # Cross-machine: the WIP ref is transport-only and now consumed (in PR
-        # mode the PR head is the separate task/* branch), so prune it
-        # best-effort. A conflict/rejection returns earlier and keeps the ref.
-        if cross_machine and rendezvous_remote and branch_ref:
-            prune_rendezvous_branch(workspace, repo, rendezvous_remote, branch_ref)
+        # The branch has landed on canonical main; reclaim its worktree +
+        # branch (mirrors the engine's post-squash teardown).
+        teardown_worktree(workspace, repo, task, queue=queue)
+
+    # Cross-machine: the WIP ref is transport-only and now consumed (in PR
+    # mode the PR head is the separate task/* branch), so prune it
+    # best-effort. A conflict/rejection returns earlier and keeps the ref.
+    if cross_machine and rendezvous_remote and branch_ref:
+        prune_rendezvous_branch(workspace, repo, rendezvous_remote, branch_ref)
 
     return outcome
 
@@ -288,18 +334,45 @@ def adopt_or_nothing(
     automerge: bool = True,
     draft: bool = False,
 ) -> LandOutcome:
-    """The completed-but-nothing-landable check: adopt an agent land on main,
-    or report NO_CHANGES.
+    """The completed-but-nothing-landable check, taking the RepoLock (direct
+    callers; the repo executor calls :func:`adopt_or_nothing_locked`)."""
+    with repo_lock(workspace, repo):
+        return adopt_or_nothing_locked(
+            workspace, repo, task, title,
+            queue=queue,
+            base_ref=base_ref,
+            landing_mode=landing_mode,
+            automerge=automerge,
+            draft=draft,
+        )
 
-    This is :func:`land`'s adopt phase exposed on its own, so a submit with no
+
+def adopt_or_nothing_locked(
+    workspace: Path,
+    repo: str,
+    task: str,
+    title: str,
+    *,
+    queue: str | None,
+    base_ref: str | None,
+    landing_mode: LandingMode | str = LandingMode.NONE,
+    automerge: bool = True,
+    draft: bool = False,
+) -> LandOutcome:
+    """The completed-but-nothing-landable check: adopt an agent land on main,
+    or report NO_CHANGES. Caller must hold the RepoLock.
+
+    This is the land's adopt phase exposed on its own, so a submit with no
     landable branch stays cheap (two rev-parses and a branch existence check —
     never an origin sync or a squash attempt)."""
+    assert repo_lock(workspace, repo).is_held_by_current_thread(), (
+        "adopt_or_nothing_locked requires the caller to hold the RepoLock"
+    )
     pr = PrSpec(task=task, title=title, queue=queue, automerge=automerge, draft=draft)
-    with repo_lock(workspace, repo):
-        adopted = _adopt_agent_land_on_main(
-            workspace, repo, task, base_ref=base_ref, queue=queue,
-            landing_mode=LandingMode(landing_mode), pr=pr,
-        )
+    adopted = _adopt_agent_land_on_main(
+        workspace, repo, task, base_ref=base_ref, queue=queue,
+        landing_mode=LandingMode(landing_mode), pr=pr,
+    )
     if adopted is not None:
         return adopted
     return LandOutcome(kind=LandKind.NO_CHANGES)
@@ -312,17 +385,38 @@ def push_resolved_main(
     sha: str,
     *,
     max_retries: int = 3,
+    throttle: SyncThrottle | None = None,
+) -> tuple[bool, str]:
+    """Land an already-squashed resolved commit on origin ``main``, taking the
+    RepoLock (direct/CLI callers; the manager's repo executor calls
+    :func:`push_resolved_main_locked`)."""
+    with repo_lock(workspace, repo):
+        return push_resolved_main_locked(
+            workspace, repo, remote, sha,
+            max_retries=max_retries, throttle=throttle,
+        )
+
+
+def push_resolved_main_locked(
+    workspace: Path,
+    repo: str,
+    remote: str,
+    sha: str,
+    *,
+    max_retries: int = 3,
+    throttle: SyncThrottle | None = None,
 ) -> tuple[bool, str]:
     """Land an already-squashed *resolved* commit (``sha``) on origin ``main``.
+    Caller must hold the RepoLock.
 
     The out-of-process resolve runner produces a single squash commit on local
     ``main`` (``runner_legacy.resolve_task``); origin may have advanced while
-    its agent worked, so this is :func:`integrate_and_push` with the cherry
-    producer: re-sync origin (rescuing the divergence the resolved commit
-    deliberately created — hence ``rescue_divergence_on_first_sync``), replay
-    the commit onto the fresh tip in pure plumbing, and push, bounded by
-    ``max_retries``. The long agent work that produced ``sha`` ran unlocked;
-    only this section holds the RepoLock.
+    its agent worked, so this is the integrate loop with the cherry producer:
+    re-sync origin (rescuing the divergence the resolved commit deliberately
+    created — hence ``rescue_divergence_on_first_sync``), replay the commit
+    onto the fresh tip in pure plumbing, and push, bounded by ``max_retries``.
+    The long agent work that produced ``sha`` ran unlocked; only this section
+    holds the RepoLock.
 
     Returns ``(True, new_sha)`` on a confirmed push, or ``(False, detail)`` when
     the replay hits a content conflict (re-escalate) or the push keeps being
@@ -334,8 +428,9 @@ def push_resolved_main(
         remote=remote,
         sync=bool(remote),
         rescue_divergence_on_first_sync=True,
+        throttle=throttle,
     )
-    outcome = integrate_and_push(
+    outcome = integrate_and_push_locked(
         ctx,
         cherry_produce(workspace / repo, sha),
         mode=LandingMode.PUSH,

@@ -42,6 +42,29 @@ from nightshift.task_files import live_ordered_queue
 # task carrying one of these, so they never gate routing or mark a task blocked.
 AGNOSTIC_MODELS = frozenset({"auto", "max", "", "default"})
 
+# Unroutable-hold reason vocabulary (Phase 7). The reconciler auto-clears
+# exactly the holds it set from :func:`unroutable`, recognizing them by these
+# prefixes — so every reason built here MUST go through the constructors below,
+# and the reconciler imports THESE prefixes (never restates the strings). A
+# rewording that bypasses this fails tests/test_reconciler.py's drift check.
+NO_CAPABLE_WORKER_PREFIX = "no live worker provides "
+DEDICATED_OFFLINE_PREFIX = "queue '"
+UNROUTABLE_REASON_PREFIXES: tuple[str, ...] = (
+    NO_CAPABLE_WORKER_PREFIX,
+    DEDICATED_OFFLINE_PREFIX,
+)
+
+
+def _no_capable_worker_reason(kind: str, name: str) -> str:
+    return f"{NO_CAPABLE_WORKER_PREFIX}{kind} '{name}'"
+
+
+def _dedicated_offline_reason(label: str, owners: list[str]) -> str:
+    return (
+        f"{DEDICATED_OFFLINE_PREFIX}{label}' is dedicated to offline "
+        f"worker(s) {', '.join(owners)}"
+    )
+
 
 def is_agnostic_model(model: str | None) -> bool:
     """True when ``model`` pins nothing concrete (auto / max / unset)."""
@@ -336,22 +359,17 @@ def unroutable(
                 not is_agnostic_model(cand.model)
                 and cand.model.strip().lower() not in avail_models
             ):
-                reason = f"no live worker provides model '{cand.model}'"
+                reason = _no_capable_worker_reason("model", cand.model)
             else:
                 missing = [
                     m for m in cand.required_mcps if m.strip().lower() not in avail_mcps
                 ]
                 if missing:
-                    reason = (
-                        f"no live worker provides connector '{missing[0]}'"
-                    )
+                    reason = _no_capable_worker_reason("connector", missing[0])
                 elif dedication:
                     owners = dedication.get(cand.label)
                     if owners and not any(o in online for o in owners):
-                        reason = (
-                            f"queue '{cand.label}' is dedicated to offline "
-                            f"worker(s) {', '.join(owners)}"
-                        )
+                        reason = _dedicated_offline_reason(cand.label, owners)
             if reason is not None:
                 out.append((cand, reason))
     return out
@@ -359,6 +377,7 @@ def unroutable(
 
 __all__ = [
     "AGNOSTIC_MODELS",
+    "UNROUTABLE_REASON_PREFIXES",
     "SchedulerState",
     "TaskCandidate",
     "WorkerFilter",
