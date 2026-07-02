@@ -40,6 +40,7 @@ from nightshift.engine import (
     validate_cmd_from_blob,
     worker_env,
 )
+from nightshift.git import GitError
 from nightshift.lifecycle import FailureKind, Outcome, RunStatus
 from nightshift.manager.landing import main_advanced_sha
 from nightshift.model_id import split_model
@@ -221,7 +222,15 @@ def execute_work_order(
         base = prepare_worktree_base(
             workspace, repo, cfg.rendezvous_remote, order.get("base_ref")
         )
-    wt_dir = setup_worktree(workspace, repo, task, queue=queue, base=base)
+    try:
+        wt_dir = setup_worktree(workspace, repo, task, queue=queue, base=base)
+    except GitError as exc:
+        # A failed `worktree add` is task-fatal but typed — never a raw traceback.
+        return fail(
+            FailureKind.WORKTREE_FAILED,
+            str(exc),
+            line="worktree setup failed",
+        )
     preserve = False
     captured: list[str] = []
 

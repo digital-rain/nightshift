@@ -10,12 +10,12 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from nightshift._paths import asset
+from nightshift.git import GitRunner
 from nightshift.repos import DEFAULT_TASKS_REPO
 
 
@@ -458,19 +458,15 @@ def matrix_from_task_names(
 def recover_matrix(
     tasks_root: Path, *, base_ref: str, tasks_rel: str = "main"
 ) -> list[dict]:
-    out = subprocess.check_output(
-        [
-            "git",
-            "diff",
-            "--name-only",
-            "--diff-filter=A",
-            f"{base_ref}...HEAD",
-            "--",
-            f"{tasks_rel}/",
-        ],
-        text=True,
-        cwd=tasks_root,
-    )
+    # A bad base_ref / non-repo is exceptional here (was check_output): raise typed.
+    out = GitRunner(tasks_root).must(
+        "diff",
+        "--name-only",
+        "--diff-filter=A",
+        f"{base_ref}...HEAD",
+        "--",
+        f"{tasks_rel}/",
+    ).stdout
     names: list[str] = []
     for line in out.splitlines():
         if not line.endswith(".md"):

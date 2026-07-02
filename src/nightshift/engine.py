@@ -53,6 +53,8 @@ from nightshift.events import (
     Event,
     Listener,
 )
+from nightshift.git import GitError, GitRunner
+from nightshift.lifecycle import FailureKind
 from nightshift.model_id import split_model
 from nightshift.spawn_daily import (
     DEFAULT_PRIORITY,
@@ -279,13 +281,8 @@ def lock_changed_between(repo_root: Path, old: str, new: str) -> bool:
     is invalidated so the next preflight re-syncs. Best-effort — a git error
     returns False and the marker fingerprint remains the authoritative gate.
     """
-    res = subprocess.run(
-        ["git", "diff", "--name-only", old, new, "--", *_LOCK_FILENAMES],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-    )
-    return res.returncode == 0 and bool(res.stdout.strip())
+    res = GitRunner(repo_root).run("diff", "--name-only", old, new, "--", *_LOCK_FILENAMES)
+    return res.ok and bool(res.stdout.strip())
 
 
 @dataclass
@@ -967,39 +964,20 @@ def commit_tasks(
     """
     if not (tasks_root / ".git").exists():
         return None
-    add = subprocess.run(
-        ["git", "-c", "advice.addIgnoredFile=false", "add", "--", *pathspecs],
-        cwd=tasks_root,
-        capture_output=True,
-        text=True,
-    )
-    if add.returncode != 0 and (
+    git = GitRunner(tasks_root)
+    add = git.run("-c", "advice.addIgnoredFile=false", "add", "--", *pathspecs)
+    if not add.ok and (
         add.returncode != 1
         or "ignored by one of your .gitignore" not in add.stderr
     ):
         return None
-    staged = subprocess.run(
-        ["git", "diff", "--cached", "--name-only", "--", *pathspecs],
-        cwd=tasks_root,
-        capture_output=True,
-        text=True,
-    )
+    staged = git.run("diff", "--cached", "--name-only", "--", *pathspecs)
     if not staged.stdout.strip():
         return None
-    commit = subprocess.run(
-        ["git", "commit", "-m", message, "--", *pathspecs],
-        cwd=tasks_root,
-        capture_output=True,
-        text=True,
-    )
-    if commit.returncode != 0:
+    commit = git.run("commit", "-m", message, "--", *pathspecs)
+    if not commit.ok:
         return None
-    return subprocess.run(
-        ["git", "rev-parse", "--short", "HEAD"],
-        cwd=tasks_root,
-        capture_output=True,
-        text=True,
-    ).stdout.strip() or None
+    return git.run("rev-parse", "--short", "HEAD").stdout.strip() or None
 
 
 def _commit_dispatch(tasks_root: Path, tasks_rel: str = "main") -> None:
@@ -1706,30 +1684,23 @@ def setup_worktree(
     repo's ``HEAD``). A cross-machine worker passes the work order's ``base_ref``
     so its branch is anchored to the same commit the manager will squash onto;
     the caller must have made ``base`` reachable in ``repo_root`` first (e.g. a
-    fetch of the rendezvous remote)."""
+    fetch of the rendezvous remote).
+
+    A failed ``worktree add`` raises a typed :class:`GitError` (task-fatal;
+    callers map it to ``failure_kind=worktree_failed``)."""
     repo_root = workspace / repo
     wt_dir = worktree_dir(workspace, repo, task, queue)
     branch = worktree_branch(task, queue)
 
+    git = GitRunner(repo_root)
+    # Best-effort teardown of stale state from a previous attempt: the add
+    # below is the call that actually has to succeed.
     if wt_dir.exists():
-        subprocess.run(
-            ["git", "worktree", "remove", "--force", str(wt_dir)],
-            cwd=repo_root,
-            capture_output=True,
-        )
-    subprocess.run(
-        ["git", "branch", "-D", branch],
-        cwd=repo_root,
-        capture_output=True,
-    )
+        git.run("worktree", "remove", "--force", str(wt_dir))
+    git.run("branch", "-D", branch)
 
     wt_dir.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["git", "worktree", "add", str(wt_dir), "-b", branch, base],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-    )
+    git.must("worktree", "add", str(wt_dir), "-b", branch, base)
 
     for target in SYMLINK_TARGETS:
         src = repo_root / target
@@ -1749,16 +1720,11 @@ def teardown_worktree(
     wt_dir = worktree_dir(workspace, repo, task, queue)
     branch = worktree_branch(task, queue)
 
-    subprocess.run(
-        ["git", "worktree", "remove", "--force", str(wt_dir)],
-        cwd=repo_root,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "branch", "-D", branch],
-        cwd=repo_root,
-        capture_output=True,
-    )
+    # Best-effort: either half may already be gone (a cleanly-landed task, a
+    # hand-removed dir) and a failed removal must never fail the caller.
+    git = GitRunner(repo_root)
+    git.run("worktree", "remove", "--force", str(wt_dir))
+    git.run("branch", "-D", branch)
 
 
 def cleanup_task_worktree(
@@ -1790,12 +1756,7 @@ def _worktree_has_commits(
     """
     repo_root = workspace / repo
     branch = worktree_branch(task, queue)
-    result = subprocess.run(
-        ["git", "rev-list", "--count", f"HEAD..{branch}"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-    )
+    result = GitRunner(repo_root).run("rev-list", "--count", f"HEAD..{branch}")
     try:
         return int(result.stdout.strip() or "0") > 0
     except ValueError:
@@ -1806,12 +1767,7 @@ def _tracked_changes(repo_root: Path) -> list[str]:
     """Porcelain status lines for *tracked* changes in ``repo_root`` (ignores
     untracked ``??`` files, which only block a merge if they collide — and that
     case surfaces via git's own stderr instead)."""
-    result = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-    )
+    result = GitRunner(repo_root).run("status", "--porcelain")
     return [
         line for line in result.stdout.splitlines()
         if line.strip() and not line.startswith("??")
@@ -1854,22 +1810,15 @@ def _stash_operator_work(repo_root: Path, paths: list[str]) -> str | None:
     we then explicitly clean just the blocker ``paths``."""
     if not paths:
         return None
-    created = subprocess.run(
-        ["git", "stash", "create", AUTOSTASH_MESSAGE],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-    )
+    git = GitRunner(repo_root)
+    created = git.run("stash", "create", AUTOSTASH_MESSAGE)
     sha = created.stdout.strip()
-    if created.returncode != 0 or not sha:
+    if not created.ok or not sha:
         return None
     # `stash create` captured the WIP but left the tree dirty; clean exactly the
-    # blocker paths so the merge sees them at HEAD.
-    subprocess.run(
-        ["git", "checkout", "HEAD", "--", *paths],
-        cwd=repo_root,
-        capture_output=True,
-    )
+    # blocker paths so the merge sees them at HEAD. Best-effort: the WIP is
+    # already safely captured in ``sha``.
+    git.run("checkout", "HEAD", "--", *paths)
     return sha
 
 
@@ -1882,27 +1831,16 @@ def _restore_operator_work(repo_root: Path, sha: str, paths: list[str]) -> str |
     the tree is left clean, not littered with conflict markers) and the WIP is
     preserved on the stash stack under the ``nightshift-autostash`` message via
     ``git stash store`` so the operator can recover it by hand — never lost."""
-    result = subprocess.run(
-        ["git", "stash", "apply", sha],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode == 0:
+    git = GitRunner(repo_root)
+    result = git.run("stash", "apply", sha)
+    if result.ok:
         return None
     # Conflict: clear the half-applied blocker paths and stash-store the sha so
-    # the WIP is findable for a manual restore.
+    # the WIP is findable for a manual restore. Both are best-effort — the WIP
+    # commit ``sha`` itself is what must survive, and it already exists.
     if paths:
-        subprocess.run(
-            ["git", "checkout", "HEAD", "--", *paths],
-            cwd=repo_root,
-            capture_output=True,
-        )
-    subprocess.run(
-        ["git", "stash", "store", "-m", AUTOSTASH_MESSAGE, sha],
-        cwd=repo_root,
-        capture_output=True,
-    )
+        git.run("checkout", "HEAD", "--", *paths)
+    git.run("stash", "store", "-m", AUTOSTASH_MESSAGE, sha)
     detail = (result.stderr.strip() or result.stdout.strip()
               or "git stash apply failed")
     return detail
@@ -1912,18 +1850,15 @@ def _reset_to_head(repo_root: Path) -> None:
     """Undo a half-applied squash so a failed merge never leaves ``repo_root`` in
     a conflicted/partly-staged state. Safe only because :func:`squash_to_main`
     refuses to start when the tree already has tracked changes."""
-    subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=repo_root, capture_output=True)
+    # Best-effort: this is already the failure-recovery path; there is nothing
+    # more to do if the reset itself fails.
+    GitRunner(repo_root).run("reset", "--hard", "HEAD")
 
 
 def _conflicted_paths(repo_root: Path) -> list[str]:
     """Files left with unmerged (conflicted) entries in the index after a failed
     ``git merge --squash``. Must be read *before* :func:`_reset_to_head`."""
-    result = subprocess.run(
-        ["git", "diff", "--name-only", "--diff-filter=U"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-    )
+    result = GitRunner(repo_root).run("diff", "--name-only", "--diff-filter=U")
     return [line for line in result.stdout.splitlines() if line.strip()]
 
 
@@ -2033,13 +1968,10 @@ def compute_code_loc(repo_root: Path, sha: str) -> int:
     Reads the commit's own diff (``git show <sha>``) so a squash commit is
     measured against its parent. Returns 0 on any git error or for the initial
     commit (no parent) so a missing figure never breaks a run record."""
-    result = subprocess.run(
-        ["git", "show", sha, "--format=", "--unified=0", "--no-color", "--no-renames"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
+    result = GitRunner(repo_root).run(
+        "show", sha, "--format=", "--unified=0", "--no-color", "--no-renames"
     )
-    if result.returncode != 0:
+    if not result.ok:
         return 0
     return _count_diff_code_lines(result.stdout)
 
@@ -2072,11 +2004,9 @@ def _count_diff_code_lines(diff: str) -> int:
 
 
 def _branch_exists(repo_root: Path, branch: str) -> bool:
-    return subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
-        cwd=repo_root,
-        capture_output=True,
-    ).returncode == 0
+    return GitRunner(repo_root).run(
+        "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"
+    ).ok
 
 
 def _squash_failure_kind(recoverable: bool, detail: str) -> str:
@@ -2161,14 +2091,10 @@ def squash_to_main(
                 ), True
 
         restore_detail: str | None = None
+        git = GitRunner(repo_root)
         try:
-            merge = subprocess.run(
-                ["git", "merge", "--squash", branch],
-                cwd=repo_root,
-                capture_output=True,
-                text=True,
-            )
-            if merge.returncode != 0:
+            merge = git.run("merge", "--squash", branch)
+            if not merge.ok:
                 conflicts = _conflicted_paths(repo_root)
                 _reset_to_head(repo_root)
                 if conflicts:
@@ -2186,13 +2112,8 @@ def squash_to_main(
                 )
                 return None, f"merge --squash failed:\n{detail}", False
 
-            commit = subprocess.run(
-                ["git", "commit", "-m", f"task: {title}"],
-                cwd=repo_root,
-                capture_output=True,
-                text=True,
-            )
-            if commit.returncode != 0:
+            commit = git.run("commit", "-m", f"task: {title}")
+            if not commit.ok:
                 detail = (
                     commit.stderr.strip()
                     or commit.stdout.strip()
@@ -2201,12 +2122,7 @@ def squash_to_main(
                 _reset_to_head(repo_root)
                 return None, f"commit failed:\n{detail}", False
 
-            sha = subprocess.run(
-                ["git", "rev-parse", "--short", "HEAD"],
-                cwd=repo_root,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
+            sha = git.run("rev-parse", "--short", "HEAD").stdout.strip()
         finally:
             if wip_sha:
                 restore_detail = _restore_operator_work(repo_root, wip_sha, blocker_paths)
@@ -2264,21 +2180,12 @@ def _wip_ref(task: str, queue: str | None, prefix: str = WIP_REF_PREFIX) -> str:
 
 
 def _rev_parse(repo_root: Path, ref: str) -> str | None:
-    res = subprocess.run(
-        ["git", "rev-parse", ref], cwd=repo_root, capture_output=True, text=True
-    )
-    return res.stdout.strip() if res.returncode == 0 else None
+    return GitRunner(repo_root).out("rev-parse", ref)
 
 
 def _is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
     """True when ``ancestor`` is reachable from ``descendant`` (inclusive)."""
-    res = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-    )
-    return res.returncode == 0
+    return GitRunner(repo_root).run("merge-base", "--is-ancestor", ancestor, descendant).ok
 
 
 def publish_task_branch(
@@ -2308,16 +2215,10 @@ def publish_task_branch(
     if head_sha is None:
         raise RuntimeError(f"no task branch '{branch}' to publish")
 
-    push = subprocess.run(
-        ["git", "push", "-f", remote, f"{branch}:{wip_ref}"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-    )
-    if push.returncode != 0:
+    push = GitRunner(repo_root).run("push", "-f", remote, f"{branch}:{wip_ref}")
+    if not push.ok:
         raise RuntimeError(
-            f"publish of '{branch}' to {remote} {wip_ref} failed: "
-            f"{(push.stderr or push.stdout).strip()[:300]}"
+            f"publish of '{branch}' to {remote} {wip_ref} failed: {push.detail}"
         )
     return wip_ref, head_sha
 
@@ -2336,13 +2237,8 @@ def fetch_rendezvous_branch(
     error (the caller maps that to a recoverable land failure)."""
     repo_root = workspace / repo
     branch = worktree_branch(task, queue)
-    fetch = subprocess.run(
-        ["git", "fetch", "-f", remote, f"{wip_ref}:refs/heads/{branch}"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-    )
-    if fetch.returncode != 0:
+    fetch = GitRunner(repo_root).run("fetch", "-f", remote, f"{wip_ref}:refs/heads/{branch}")
+    if not fetch.ok:
         return None
     return _rev_parse(repo_root, branch)
 
@@ -2354,12 +2250,8 @@ def prune_rendezvous_branch(
     failure is swallowed: the ref is transport-only and a leftover is harmless
     (and eligible for a future scheduled GC)."""
     repo_root = workspace / repo
-    subprocess.run(
-        ["git", "push", remote, "--delete", wip_ref],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-    )
+    # Best-effort by contract (see docstring): the result is deliberately discarded.
+    GitRunner(repo_root).run("push", remote, "--delete", wip_ref)
 
 
 def prepare_worktree_base(
@@ -2376,12 +2268,8 @@ def prepare_worktree_base(
     if not base_ref:
         return "HEAD"
     repo_root = workspace / repo
-    subprocess.run(
-        ["git", "fetch", remote, "main"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-    )
+    # Best-effort fetch: the reachability check below is what actually decides.
+    GitRunner(repo_root).run("fetch", remote, "main")
     return base_ref if _rev_parse(repo_root, base_ref) is not None else "HEAD"
 
 
@@ -2504,13 +2392,8 @@ def _unpushed_commits(repo_root: Path, target: str, head: str) -> list[str]:
     These are the commits a ``reset --hard target`` over a divergence would drop
     (e.g. an operator cherry-pick on ``main`` plus the manager's own orphan
     squash). Returned oldest-first so a replay re-applies them in order."""
-    res = subprocess.run(
-        ["git", "rev-list", "--reverse", f"{target}..{head}"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-    )
-    if res.returncode != 0:
+    res = GitRunner(repo_root).run("rev-list", "--reverse", f"{target}..{head}")
+    if not res.ok:
         return []
     return [line.strip() for line in res.stdout.splitlines() if line.strip()]
 
@@ -2529,35 +2412,21 @@ def _replay_commits(repo_root: Path, shas: list[str]) -> list[str]:
     base) so callers can surface the casualty to the operator — the reflog is
     not a UI. Redundant (empty) picks are not drops: their content is present.
     """
+    git = GitRunner(repo_root)
     dropped: list[str] = []
     for sha in shas:
-        cp = subprocess.run(
-            ["git", "cherry-pick", sha],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-        )
-        if cp.returncode == 0:
+        if git.run("cherry-pick", sha).ok:
             continue
         # Unmerged index entries distinguish a genuine conflict (content lost —
         # report it) from an empty, already-applied pick (content present).
         if _conflicted_paths(repo_root):
             dropped.append(sha)
         # Empty (already-applied) or conflicted: abort this pick and move on.
-        # ``--skip`` advances past an empty pick; ``--abort`` unwinds a conflict.
+        # ``--skip`` advances past an empty pick; ``--abort`` unwinds a conflict
+        # (best-effort — a failed abort leaves nothing further to unwind).
         # Try skip first (the common, redundant-squash case), then abort.
-        if subprocess.run(
-            ["git", "cherry-pick", "--skip"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-        ).returncode != 0:
-            subprocess.run(
-                ["git", "cherry-pick", "--abort"],
-                cwd=repo_root,
-                capture_output=True,
-                text=True,
-            )
+        if not git.run("cherry-pick", "--skip").ok:
+            git.run("cherry-pick", "--abort")
     return dropped
 
 
@@ -2587,14 +2456,10 @@ def _sync_main_to_origin_impl(
     """
     drop = drop_shas or frozenset()
     repo_root = workspace / repo
+    git = GitRunner(repo_root)
     with landing_lock(workspace, repo):
-        fetch = subprocess.run(
-            ["git", "fetch", remote, "main"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-        )
-        if fetch.returncode != 0:
+        fetch = git.run("fetch", remote, "main")
+        if not fetch.ok:
             return None
         target = _rev_parse(repo_root, "FETCH_HEAD")
         if target is None:
@@ -2637,13 +2502,8 @@ def _sync_main_to_origin_impl(
                 return head
 
         try:
-            reset = subprocess.run(
-                ["git", "reset", "--hard", target],
-                cwd=repo_root,
-                capture_output=True,
-                text=True,
-            )
-            if reset.returncode == 0 and rescue:
+            reset = git.run("reset", "--hard", target)
+            if reset.ok and rescue:
                 lost = _replay_commits(repo_root, rescue)
                 if dropped_commits is not None:
                     dropped_commits.extend(lost)
@@ -2651,7 +2511,7 @@ def _sync_main_to_origin_impl(
             if wip_sha:
                 _restore_operator_work(repo_root, wip_sha, blocker_paths)
 
-        if reset.returncode != 0:
+        if not reset.ok:
             return _rev_parse(repo_root, "HEAD")
         # Eager preflight signal: local main just moved — if a lockfile changed
         # in the range, drop the venv marker so the next task re-syncs before
@@ -2755,11 +2615,9 @@ def _ensure_worktree_for_branch(
     wt_dir = worktree_dir(workspace, repo, task, queue)
     if not wt_dir.exists():
         wt_dir.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            ["git", "worktree", "add", str(wt_dir), branch],
-            cwd=repo_root,
-            capture_output=True,
-        )
+        # Best-effort: success is judged by the dir-existence check below,
+        # which turns a failed add into the caller's ``None`` return.
+        GitRunner(repo_root).run("worktree", "add", str(wt_dir), branch)
     if not wt_dir.exists():
         return None
     _link_worktree_artifacts(repo_root, wt_dir)
@@ -2768,17 +2626,12 @@ def _ensure_worktree_for_branch(
 
 def _rebase_in_progress(worktree_dir: Path) -> bool:
     """True while a rebase is paused (e.g. on conflicts) in ``worktree_dir``."""
-    return subprocess.run(
-        ["git", "rebase", "--show-current-patch"],
-        cwd=worktree_dir,
-        capture_output=True,
-    ).returncode == 0
+    return GitRunner(worktree_dir).run("rebase", "--show-current-patch").ok
 
 
 def _abort_rebase(worktree_dir: Path) -> None:
-    subprocess.run(
-        ["git", "rebase", "--abort"], cwd=worktree_dir, capture_output=True
-    )
+    # Best-effort: aborting when no rebase is in progress simply fails.
+    GitRunner(worktree_dir).run("rebase", "--abort")
 
 
 def _rebase_onto_main(worktree_dir: Path) -> tuple[str, str]:
@@ -2790,13 +2643,8 @@ def _rebase_onto_main(worktree_dir: Path) -> tuple[str, str]:
     """
     if _rebase_in_progress(worktree_dir):
         _abort_rebase(worktree_dir)
-    result = subprocess.run(
-        ["git", "rebase", "main"],
-        cwd=worktree_dir,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode == 0:
+    result = GitRunner(worktree_dir).run("rebase", "main")
+    if result.ok:
         return "clean", ""
     detail = (result.stdout + "\n" + result.stderr).strip()
     if _rebase_in_progress(worktree_dir):
@@ -3154,23 +3002,13 @@ def _attempt_repair(
         cwd=worktree_dir,
         capture_output=True,
     )
-    dirty = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=worktree_dir,
-        capture_output=True,
-        text=True,
-    )
+    git = GitRunner(worktree_dir)
+    dirty = git.run("status", "--porcelain")
     if dirty.stdout.strip():
-        subprocess.run(
-            ["git", "add", "-A"],
-            cwd=worktree_dir,
-            capture_output=True,
-        )
-        subprocess.run(
-            ["git", "commit", "-m", "autofix: ruff check --fix + format"],
-            cwd=worktree_dir,
-            capture_output=True,
-        )
+        # Best-effort commit of whatever ruff fixed: the validate retry below
+        # is the real gate, whether or not the autofix commit landed.
+        git.run("add", "-A")
+        git.run("commit", "-m", "autofix: ruff check --fix + format")
         print("  applied ruff auto-fixes, retrying validate...")
     else:
         print("  no auto-fixable issues; retrying validate...")
@@ -3424,7 +3262,22 @@ def run_task(
         sdir_path = split_output_dir(workspace, repo, task, queue=queue)
         sdir_path.mkdir(parents=True, exist_ok=True)
         sdir = str(sdir_path)
-    worktree_dir = setup_worktree(workspace, repo, task, queue=queue)
+    try:
+        worktree_dir = setup_worktree(workspace, repo, task, queue=queue)
+    except GitError as err:
+        # A failed `worktree add` is task-fatal but must surface as a typed
+        # failure (worktree_failed), never a raw traceback.
+        error = f"could not create the task worktree: {err}"
+        emit(Event(TASK_RESULT, {
+            "task": task, "status": "error", "error": error, "repo": repo,
+            "result_line": "worktree setup failed",
+            "failure_kind": FailureKind.WORKTREE_FAILED,
+        }))
+        return TaskResult(
+            task=task, title=title, success=False, error=error,
+            result_line="worktree setup failed",
+            failure_kind=FailureKind.WORKTREE_FAILED,
+        )
     preserve_worktree = False
 
     # Imported here, not at module top, to avoid a backends<->engine import

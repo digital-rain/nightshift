@@ -41,6 +41,7 @@ from nightshift.engine import (
     worktree_branch,
     worktree_dir,
 )
+from nightshift.git import GitRunner
 from nightshift.manager.app import create_app
 from nightshift.manager.config import load_manager_config
 from nightshift.manager.landing import LandingResult, canonical_head, land
@@ -475,15 +476,17 @@ def test_maybe_sync_main_to_origin_throttles_fetch(tmp_path: Path, monkeypatch) 
     git(other, "push", "origin", "HEAD:main")
     advanced = git(other, "rev-parse", "HEAD")
 
+    # Spy on the GitRunner seam (not subprocess): count fetches while
+    # delegating to the real runner so the sync still talks to the bare remote.
     fetch_calls: list[list[str]] = []
-    real_run = subprocess.run
+    real_run = GitRunner.run
 
-    def _run(cmd, **kwargs):
-        if cmd[:3] == ["git", "fetch", "origin"]:
-            fetch_calls.append(cmd)
-        return real_run(cmd, **kwargs)
+    def _run(self: GitRunner, *args: str):
+        if args[:2] == ("fetch", "origin"):
+            fetch_calls.append(["git", *args])
+        return real_run(self, *args)
 
-    monkeypatch.setattr("nightshift.engine.subprocess.run", _run)
+    monkeypatch.setattr(GitRunner, "run", _run)
 
     assert maybe_sync_main_to_origin(
         workspace, repo, "origin", min_interval_seconds=60.0,

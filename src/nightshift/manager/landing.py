@@ -35,6 +35,7 @@ from nightshift.engine import (
     worktree_branch,
     worktree_dir,
 )
+from nightshift.git import GitRunner
 from nightshift.lifecycle import LandingMode
 
 
@@ -53,10 +54,7 @@ class LandingResult:
 
 
 def _rev_parse(repo_root: Path, ref: str) -> str | None:
-    res = subprocess.run(
-        ["git", "rev-parse", ref], cwd=repo_root, capture_output=True, text=True
-    )
-    return res.stdout.strip() if res.returncode == 0 else None
+    return GitRunner(repo_root).out("rev-parse", ref)
 
 
 def canonical_head(repo_root: Path) -> str | None:
@@ -72,13 +70,8 @@ def merge_tree_conflicts(repo_root: Path, branch: str, *, base: str = "HEAD") ->
     paths (empty when the merge is clean). Any failure to run the preview returns
     ``[]`` so detection never blocks a land that ``squash_to_main`` would handle.
     """
-    res = subprocess.run(
-        ["git", "merge-tree", "--write-tree", "--name-only", base, branch],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-    )
-    if res.returncode == 0:
+    res = GitRunner(repo_root).run("merge-tree", "--write-tree", "--name-only", base, branch)
+    if res.ok:
         return []  # clean merge
     # Non-zero exit = conflicts. Output is: <tree-oid>\n<conflicted paths...>.
     lines = [ln for ln in res.stdout.splitlines() if ln.strip()]
@@ -408,17 +401,12 @@ def _push_main(workspace: Path, repo: str, result: LandingResult) -> None:
     recorded in ``detail`` but never unwinds the already-landed local commit."""
     repo_root = workspace / repo
     with landing_lock(workspace, repo):
-        res = subprocess.run(
-            ["git", "push", "origin", "HEAD:main"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-        )
-    if res.returncode != 0:
+        res = GitRunner(repo_root).run("push", "origin", "HEAD:main")
+    if not res.ok:
         result.pushed = False
         result.detail = (
             f"{result.detail}\nlocal land ok ({result.sha}); push to GitHub main failed: "
-            f"{(res.stderr or res.stdout).strip()[:300]}"
+            f"{res.detail}"
         ).strip()
     else:
         result.pushed = True
@@ -432,14 +420,9 @@ def _push_head_to_main(
     with the trimmed git stderr so the caller can retry or escalate."""
     repo_root = workspace / repo
     with landing_lock(workspace, repo):
-        res = subprocess.run(
-            ["git", "push", remote, "HEAD:main"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-        )
-    if res.returncode != 0:
-        return False, (res.stderr or res.stdout).strip()[:300]
+        res = GitRunner(repo_root).run("push", remote, "HEAD:main")
+    if not res.ok:
+        return False, res.detail
     return True, ""
 
 
@@ -467,6 +450,7 @@ def push_resolved_main(
     the resolve worktree.
     """
     repo_root = workspace / repo
+    git = GitRunner(repo_root)
     last_detail = ""
     with integrate_lock(workspace, repo):
         for _attempt in range(max_retries + 1):
@@ -486,33 +470,19 @@ def push_resolved_main(
                 # fast-forward when main already is ``sha``), then push.
                 head = _rev_parse(repo_root, "HEAD")
                 if head != sha:
-                    cp = subprocess.run(
-                        ["git", "cherry-pick", "--allow-empty", sha],
-                        cwd=repo_root,
-                        capture_output=True,
-                        text=True,
-                    )
-                    if cp.returncode != 0:
-                        subprocess.run(
-                            ["git", "cherry-pick", "--abort"],
-                            cwd=repo_root,
-                            capture_output=True,
-                            text=True,
-                        )
+                    cp = git.run("cherry-pick", "--allow-empty", sha)
+                    if not cp.ok:
+                        # Best-effort unwind of the conflicted pick before bailing.
+                        git.run("cherry-pick", "--abort")
                         return False, (
                             f"resolved commit {sha[:8]} conflicts with current "
-                            f"origin/main:\n{(cp.stderr or cp.stdout).strip()[:300]}"
+                            f"origin/main:\n{cp.detail}"
                         )
                     head = _rev_parse(repo_root, "HEAD") or sha
-                push = subprocess.run(
-                    ["git", "push", remote or "origin", "HEAD:main"],
-                    cwd=repo_root,
-                    capture_output=True,
-                    text=True,
-                )
-            if push.returncode == 0:
+                push = git.run("push", remote or "origin", "HEAD:main")
+            if push.ok:
                 return True, head
-            last_detail = (push.stderr or push.stdout).strip()[:300]
+            last_detail = push.detail
             # Rejected: origin advanced again — re-sync and replay on the next pass.
     return False, f"push of resolved commit rejected after retries:\n{last_detail}"
 
@@ -536,17 +506,12 @@ def _open_pr(
     repo_root = workspace / repo
     pr_branch = f"task/{_queue_slug(queue)}-{task}"
     with landing_lock(workspace, repo):
-        push = subprocess.run(
-            ["git", "push", "-f", "origin", f"HEAD:refs/heads/{pr_branch}"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-        )
-    if push.returncode != 0:
+        push = GitRunner(repo_root).run("push", "-f", "origin", f"HEAD:refs/heads/{pr_branch}")
+    if not push.ok:
         result.pushed = False
         result.detail = (
             f"{result.detail}\nlocal land ok ({result.sha}); PR branch push failed: "
-            f"{(push.stderr or push.stdout).strip()[:300]}"
+            f"{push.detail}"
         ).strip()
         return
     result.pushed = True

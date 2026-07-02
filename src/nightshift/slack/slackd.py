@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import subprocess
 import sys
 import uuid
 from collections.abc import Callable
@@ -27,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from nightshift.git import GitRunner
 from nightshift.repos import DEFAULT_TASKS_REPO
 from nightshift.slack.config import SlackConfig, resolve_slack_config
 from nightshift.slack.intake import (
@@ -469,7 +469,9 @@ def _unconfigured_reason(config: SlackConfig) -> str:
 
 
 def _git(root: Path, args: list[str]) -> None:
-    subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True)
+    """Run git, raising a typed ``GitError`` on failure (the enqueue path's
+    ``except Exception`` reports it back to the Slack thread)."""
+    GitRunner(root).must(*args)
 
 
 def main(argv: list[str] | None = None) -> int:

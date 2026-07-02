@@ -87,6 +87,7 @@ class FailureKind(StrEnum):
     BACKEND_UNAVAILABLE = "backend_unavailable"
     REPO_UNAVAILABLE = "repo_unavailable"
     PREFLIGHT_FAILED = "preflight_failed"
+    WORKTREE_FAILED = "worktree_failed"
     WORKER_LAUNCH = "worker_launch"
     PUBLISH_FAILED = "publish_failed"
     # task — the work itself failed (or honestly declared a hold).
