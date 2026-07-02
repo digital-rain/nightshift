@@ -23,6 +23,8 @@ workspace is a fresh temp dir, ports are ephemeral, and every ``NIGHTSHIFT_*``
 environment variable is scrubbed so the manager under test always uses the
 in-memory store (never a shared Postgres) and the worker never targets a live
 manager.
+
+Full walkthrough: docs/topics/smoke-test.md.
 """
 
 from __future__ import annotations
