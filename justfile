@@ -168,6 +168,12 @@ rollback:
 test *args:
     {{py}} -m pytest tests {{args}}
 
+# End-to-end smoke: real manager + worker subprocesses driving a task through
+# play/pause/stop/start + an error path, in an isolated temp workspace with
+# ephemeral ports (safe to run while a live manager/UI is up on this host).
+smoke *args:
+    {{py}} tools/smoke.py {{args}}
+
 # Lint + test.
 validate:
     {{py}} -m ruff check src tests

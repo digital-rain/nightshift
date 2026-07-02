@@ -622,7 +622,9 @@ def register_operator_api(
     def _queue_state(queue: str | None, leases: list[dict[str, Any]]) -> dict[str, Any]:
         """Build a per-queue state dict in the shape the UI expects."""
         key = queue_label(queue)
-        lease = next((le for le in leases if le.get("queue", "main") == key), None)
+        # Lease rows store the main queue as '' (see store._qkey); normalize to
+        # the label before comparing.
+        lease = next((le for le in leases if queue_label(le.get("queue")) == key), None)
         pause_reason = _paused_queues.get(key)
         paused = pause_reason is not None
         if paused:
@@ -683,14 +685,14 @@ def register_operator_api(
             _paused_queues[key] = "operator"
             store = _store()
             for le in await store.active_leases():
-                if le.get("queue", "main") == key:
+                if queue_label(le.get("queue")) == key:
                     await store.set_lease_status(le["id"], LeaseStatus.CANCELLED)
                     await _emit("run_finished", run_id=le.get("run_id"), queue=target)
             _paused_queues.pop(key, None)
         elif req.action == "skip":
             store = _store()
             for le in await store.active_leases():
-                if le.get("queue", "main") == key:
+                if queue_label(le.get("queue")) == key:
                     await store.set_lease_status(le["id"], LeaseStatus.CANCELLED)
                     await _emit("run_finished", run_id=le.get("run_id"), queue=target)
         elif req.action == "select":

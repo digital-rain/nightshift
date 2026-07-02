@@ -89,6 +89,7 @@ The same settings can come from `NIGHTSHIFT_*` environment variables (env wins o
 | Slack capture daemon | `just slackd` (needs `uv sync --extra slack`) |
 | Run tests | `just test` |
 | Lint + tests | `just validate` |
+| End-to-end smoke (manager + worker) | `just smoke` |
 
 ## Backends
 
