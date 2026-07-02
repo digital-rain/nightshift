@@ -20,16 +20,29 @@ SYMLINK_TARGETS = [
 ]
 
 
+def _safe_component(kind: str, value: str) -> str:
+    """Path-safety guard for names interpolated into worktree paths and branch
+    names. Task and queue names normally arrive as slugs, but they also flow in
+    from request payloads and stored run records, and downstream they reach
+    destructive operations (``worktree remove --force``, ``branch -D``) — so a
+    name that could add path segments (``/``, ``\\``, NUL) must be rejected at
+    this chokepoint rather than trusted.
+    """
+    if not value or value in (".", "..") or any(c in value for c in ("/", "\\", "\0")):
+        raise ValueError(f"unsafe {kind} name {value!r}")
+    return value
+
+
 def queue_slug(queue: str | None) -> str:
     """Path/branch-safe token for a queue: ``main`` for the default queue,
     otherwise the queue name (already a slug)."""
-    return queue or "main"
+    return _safe_component("queue", queue or "main")
 
 
 def worktree_branch(task: str, queue: str | None = None) -> str:
     """Branch name for a task's local worktree, namespaced by queue so two queues
     holding a same-named task cut distinct branches."""
-    return f"task-local/{queue_slug(queue)}/{task}"
+    return f"task-local/{queue_slug(queue)}/{_safe_component('task', task)}"
 
 
 def worktree_dir(workspace: Path, repo: str, task: str, queue: str | None = None) -> Path:
@@ -37,7 +50,10 @@ def worktree_dir(workspace: Path, repo: str, task: str, queue: str | None = None
     workspace-level ``<workspace>/.worktrees/<repo>/`` so the target repo stays
     pristine; namespaced by queue (see :func:`worktree_branch`)."""
     return (
-        workspace / ".worktrees" / repo / f"task-local-{queue_slug(queue)}-{task}"
+        workspace
+        / ".worktrees"
+        / _safe_component("repo", repo)
+        / f"task-local-{queue_slug(queue)}-{_safe_component('task', task)}"
     )
 
 

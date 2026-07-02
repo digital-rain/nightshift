@@ -17,7 +17,12 @@ import pytest
 
 from _workspace import build_workspace, git, git_commit_all, git_init
 from nightshift.git import GitError, GitResult, GitRunner
-from nightshift.git.worktrees import setup_worktree
+from nightshift.git.worktrees import (
+    cleanup_task_worktree,
+    setup_worktree,
+    worktree_branch,
+    worktree_dir,
+)
 from nightshift.lifecycle import FailureKind, RunStatus
 from nightshift.repos import DEFAULT_TASKS_REPO
 from nightshift.runner_legacy import run_task
@@ -222,3 +227,45 @@ def test_no_git_subprocess_outside_runner() -> None:
         "git subprocess calls outside the GitRunner seam "
         f"(nightshift/git/runner.py): {offenders}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Path-safety guard: task/queue/repo names reach worktree paths and branch
+# names from request payloads and stored run records, and flow into
+# destructive git operations — traversal attempts must be rejected.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("bad", ["../escape", "a/b", "a\\b", "..", ".", "", "a\0b"])
+def test_worktree_dir_rejects_unsafe_task_names(tmp_path: Path, bad: str) -> None:
+    with pytest.raises(ValueError, match="unsafe"):
+        worktree_dir(tmp_path, "repo", bad)
+
+
+@pytest.mark.parametrize("bad", ["../escape", "q/x", ".."])
+def test_worktree_dir_rejects_unsafe_queue_and_repo(tmp_path: Path, bad: str) -> None:
+    with pytest.raises(ValueError, match="unsafe"):
+        worktree_dir(tmp_path, "repo", "task", bad)
+    with pytest.raises(ValueError, match="unsafe"):
+        worktree_dir(tmp_path, bad, "task")
+
+
+def test_worktree_branch_rejects_unsafe_task_names() -> None:
+    with pytest.raises(ValueError, match="unsafe"):
+        worktree_branch("x/../../y")
+
+
+def test_worktree_naming_accepts_normal_slugs(tmp_path: Path) -> None:
+    assert worktree_branch("add-feature", "nightly") == "task-local/nightly/add-feature"
+    assert worktree_dir(tmp_path, "proj", "add-feature") == (
+        tmp_path / ".worktrees" / "proj" / "task-local-main-add-feature"
+    )
+
+
+def test_cleanup_task_worktree_refuses_traversal(tmp_path: Path) -> None:
+    # A poisoned task name in a stored run record must not reach the
+    # `worktree remove --force` / `branch -D` teardown path.
+    (tmp_path / "escape").mkdir()
+    with pytest.raises(ValueError, match="unsafe"):
+        cleanup_task_worktree(tmp_path, "repo", "x/../../escape")
+    assert (tmp_path / "escape").exists()
