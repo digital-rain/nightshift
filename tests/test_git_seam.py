@@ -16,10 +16,11 @@ from pathlib import Path
 import pytest
 
 from _workspace import build_workspace, git, git_commit_all, git_init
-from nightshift.engine import run_task, setup_worktree
 from nightshift.git import GitError, GitResult, GitRunner
+from nightshift.git.worktrees import setup_worktree
 from nightshift.lifecycle import FailureKind, RunStatus
 from nightshift.repos import DEFAULT_TASKS_REPO
+from nightshift.runner_legacy import run_task
 from nightshift.worker.config import WorkerConfig
 from nightshift.worker.execute import execute_work_order
 
@@ -147,7 +148,7 @@ def test_run_task_maps_worktree_failure(tmp_path: Path, monkeypatch) -> None:
     def boom(*args, **kwargs):
         raise GitError("git worktree add failed (exit 128): fatal: boom")
 
-    monkeypatch.setattr("nightshift.engine.setup_worktree", boom)
+    monkeypatch.setattr("nightshift.runner_legacy.setup_worktree", boom)
     events = []
     result = run_task(
         workspace, workspace / DEFAULT_TASKS_REPO, "10-do", emit=events.append

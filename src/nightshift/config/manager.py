@@ -15,7 +15,7 @@ from typing import Any
 
 from nightshift.config.io import load_dotenv, load_json, manager_json_path, save_json
 from nightshift.config.meta import meta
-from nightshift.engine import WIP_REF_PREFIX, normalize_wip_prefix
+from nightshift.git.transport import WIP_REF_PREFIX, normalize_wip_prefix
 from nightshift.lifecycle import LandingMode
 
 

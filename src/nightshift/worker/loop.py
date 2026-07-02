@@ -13,7 +13,7 @@ import threading
 from typing import Any
 
 from nightshift import playlists
-from nightshift.engine import teardown_worktree, worktree_branch, worktree_dir
+from nightshift.git.worktrees import teardown_worktree, worktree_branch, worktree_dir
 from nightshift.lifecycle import Outcome, RunStatus
 from nightshift.model_id import provider_of
 from nightshift.worker.client import ManagerClient

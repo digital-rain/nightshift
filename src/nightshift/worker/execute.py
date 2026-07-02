@@ -22,28 +22,26 @@ from collections.abc import Callable
 from typing import Any
 
 from nightshift import playlists, repos
-from nightshift.engine import (
-    DEFAULT_VALIDATE_CMD,
-    _worktree_has_commits,
-    build_prompt,
-    ensure_env_synced,
-    extract_blocked_reason,
-    extract_result_line,
-    materialize_brief,
-    preflight_cmd_from_blob,
-    prepare_worktree_base,
-    publish_task_branch,
-    run_interruptible,
-    setup_worktree,
-    split_output_dir,
-    teardown_worktree,
-    validate_cmd_from_blob,
-    worker_env,
-)
 from nightshift.git import GitError
+from nightshift.git.transport import prepare_worktree_base, publish_task_branch
+from nightshift.git.worktrees import has_commits as worktree_has_commits
+from nightshift.git.worktrees import setup_worktree, teardown_worktree
 from nightshift.lifecycle import FailureKind, Outcome, RunStatus
 from nightshift.manager.landing import main_advanced_sha
 from nightshift.model_id import split_model
+from nightshift.preflight import (
+    ensure_env_synced,
+    preflight_cmd_from_blob,
+    run_interruptible,
+)
+from nightshift.prompts import (
+    build_prompt,
+    extract_blocked_reason,
+    extract_result_line,
+    worker_env,
+)
+from nightshift.queue_config import DEFAULT_VALIDATE_CMD, validate_cmd_from_blob
+from nightshift.task_files import materialize_brief, split_output_dir
 from nightshift.worker.config import WorkerConfig
 
 
@@ -135,7 +133,7 @@ def execute_work_order(
 ) -> Outcome:
     """Run one work order to a landable (or failed) state. Never touches main."""
     from nightshift.backends import LAUNCH_FAILED, WorkerSpec, require_backend
-    from nightshift.engine import worktree_dir
+    from nightshift.git.worktrees import worktree_dir
 
     workspace = cfg.workspace
     task = order["task"]
@@ -303,7 +301,7 @@ def execute_work_order(
                 line="worker executable not found",
             )
 
-        has_commits = _worktree_has_commits(workspace, repo, task, queue=queue)
+        has_commits = worktree_has_commits(workspace, repo, task, queue=queue)
 
         blocked_reason = extract_blocked_reason("".join(captured))
         if blocked_reason and not has_commits:

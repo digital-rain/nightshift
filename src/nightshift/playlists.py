@@ -201,7 +201,7 @@ def set_playlist_repo(tasks_root: Path, name: str, repo: str | None) -> str | No
     """Set (or clear, with ``None``) a queue's default target ``repo`` binding in
     its ``config.json``, preserving sibling keys. Returns the value written.
 
-    Mirrors :func:`nightshift.engine.save_queue_config_value` for the ``repo``
+    Mirrors :func:`nightshift.queue_config.save_queue_config_value` for the ``repo``
     key but stays inside this low-level module (no engine import) so the rescan
     helper below can configure queues without a cross-layer dependency.
     """

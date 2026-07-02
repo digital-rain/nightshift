@@ -22,10 +22,10 @@ against the agent CLIs and to give a foundation for a future tool loop. Because
 they don't edit files, a run using them finishes as "no changes" (the engine's
 no-commit guard) rather than landing a commit.
 
-This module intentionally does **not** import :mod:`nightshift.engine` at the
-top level for the claude helpers it reuses; instead it references the engine
-*module* so monkeypatching (and the no-import-cycle property) both hold:
-``engine`` imports this module lazily, from inside ``run_task``.
+This module references the :mod:`nightshift.prompts` / :mod:`nightshift.preflight`
+*modules* (not bare names) for the claude helpers it reuses so monkeypatching
+(and the no-import-cycle property) both hold: the legacy runner imports this
+module lazily, from inside ``run_task``.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ from typing import Any
 
 import httpx
 
-from nightshift import engine
+from nightshift import preflight, prompts
 
 
 EmitLog = Callable[[str], None]
@@ -197,7 +197,7 @@ def resolve_bin(name: str, override: str | None) -> str:
     found = shutil.which(name)
     if found:
         return found
-    for d in engine._EXTRA_BIN_DIRS:
+    for d in prompts.EXTRA_BIN_DIRS:
         cand = Path(d) / name
         if cand.exists():
             return str(cand)
@@ -255,7 +255,7 @@ def _stream_subprocess(
                 reason = "timeout"
             if reason is not None:
                 aborted["reason"] = reason
-                engine._kill_process_group(proc)
+                preflight.kill_process_group(proc)
                 return
 
     watcher = threading.Thread(target=_watch_abort, daemon=True)
@@ -268,7 +268,7 @@ def _stream_subprocess(
                 reason = "timeout"
             if reason is not None:
                 aborted["reason"] = reason
-                engine._kill_process_group(proc)
+                preflight.kill_process_group(proc)
                 break
         returncode = proc.wait()
     finally:
@@ -316,7 +316,7 @@ def _run_buffered(
                 reason = "timeout"
             if reason is not None:
                 aborted["reason"] = reason
-                engine._kill_process_group(proc)
+                preflight.kill_process_group(proc)
                 return
 
     watcher = threading.Thread(target=_watch_abort, daemon=True)
@@ -329,7 +329,7 @@ def _run_buffered(
                 reason = "timeout"
             if reason is not None:
                 aborted["reason"] = reason
-                engine._kill_process_group(proc)
+                preflight.kill_process_group(proc)
                 break
         returncode = proc.wait()
     finally:
@@ -442,8 +442,8 @@ class ClaudeCodeBackend:
         should_abort: ShouldAbort,
         on_worker_start: OnWorkerStart | None = None,
     ) -> WorkerResult:
-        argv = engine.build_claude_argv(spec.prompt, spec.model, spec.max_turns)
-        argv[0] = engine.resolve_claude_bin(spec.config)
+        argv = prompts.build_claude_argv(spec.prompt, spec.model, spec.max_turns)
+        argv[0] = prompts.resolve_claude_bin(spec.config)
         return _stream_subprocess(
             argv, cwd=spec.cwd, env=spec.env, emit_log=emit_log,
             should_abort=should_abort, on_start=on_worker_start,

@@ -346,7 +346,7 @@ def test_sync_refuses_reset_when_stash_create_fails(tmp_path: Path, monkeypatch)
 
     # ...and `git stash create` fails to capture it.
     monkeypatch.setattr(
-        "nightshift.engine._stash_operator_work", lambda *a, **k: None
+        "nightshift.git.sync.stash_operator_work", lambda *a, **k: None
     )
     new_head = sync_main_to_origin(workspace, repo, "origin")
 
@@ -834,7 +834,7 @@ def _run_once_capturing_land_mode(tmp_path: Path, monkeypatch, brief: str) -> st
         captured["landing_mode"] = kwargs.get("landing_mode")
         return LandingResult(landed=True, sha="deadbeef")
 
-    monkeypatch.setattr("nightshift.manager.app.land", spy_land)
+    monkeypatch.setattr("nightshift.manager.api_worker.land", spy_land)
 
     with TestClient(create_app(workspace, store=MemoryStore())) as tc:
         cfg = WorkerConfig(

@@ -32,15 +32,6 @@ from pathlib import Path
 from typing import Any
 
 from nightshift import playlists, repos
-from nightshift.engine import (
-    Controller,
-    build_task_list,
-    enough_free_disk,
-    read_task,
-    resolve_config,
-    resolve_task,
-    run_queue,
-)
 from nightshift.events import (
     RUN_FINISHED,
     RUN_STARTED,
@@ -50,9 +41,12 @@ from nightshift.events import (
     RunStore,
     fan_out,
 )
+from nightshift.preflight import enough_free_disk
+from nightshift.runner_legacy import Controller, resolve_task, run_queue
 from nightshift.server.settings import load_settings, parse_duration
 from nightshift.slack import listener_for_queue
-from nightshift.spawn_daily import load_config, load_queue_config
+from nightshift.spawn_daily import load_config, load_queue_config, resolve_config
+from nightshift.task_files import build_task_list, read_task
 
 
 def resolve_tasks_repo(workspace: Path) -> str:

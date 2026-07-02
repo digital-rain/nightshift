@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from _workspace import build_workspace, make_target_repo
-from nightshift import engine
+from nightshift import engine, prompts, runner_legacy
 from nightshift.engine import (
     Controller,
     TaskResult,
@@ -259,7 +259,7 @@ def test_resolve_claude_bin(monkeypatch: pytest.MonkeyPatch) -> None:
     # Explicit override wins and expands ~.
     assert resolve_claude_bin({"claude_bin": "/custom/claude"}) == "/custom/claude"
     # Otherwise PATH lookup.
-    monkeypatch.setattr(engine.shutil, "which", lambda name: "/usr/bin/claude")
+    monkeypatch.setattr(prompts.shutil, "which", lambda name: "/usr/bin/claude")
     assert resolve_claude_bin({}) == "/usr/bin/claude"
 
     # worker_env keeps existing PATH and appends the common bin dirs.
@@ -300,11 +300,11 @@ def test_run_task_missing_claude_errors_gracefully(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     tasks_root = _seed(tmp_path, tasks={"10.x": "do x"})
-    monkeypatch.setattr(engine, "setup_worktree", lambda ws, repo, task, *, queue=None: tmp_path)
-    monkeypatch.setattr(engine, "teardown_worktree", lambda ws, repo, task, *, queue=None: None)
-    monkeypatch.setattr(engine, "build_prompt", lambda task, *, task_file=None, validate_cmd=None, loop=False, loop_max_iterations=0, split=False, split_dir=None: "p")
-    monkeypatch.setattr(engine, "_write_failure_log", lambda *a, **k: None)
-    monkeypatch.setattr(engine, "resolve_claude_bin", lambda config=None: "no-such-bin-xyz")
+    monkeypatch.setattr(runner_legacy, "setup_worktree", lambda ws, repo, task, *, queue=None: tmp_path)
+    monkeypatch.setattr(runner_legacy, "teardown_worktree", lambda ws, repo, task, *, queue=None: None)
+    monkeypatch.setattr(runner_legacy, "build_prompt", lambda task, *, task_file=None, validate_cmd=None, loop=False, loop_max_iterations=0, split=False, split_dir=None: "p")
+    monkeypatch.setattr(runner_legacy, "write_failure_log", lambda *a, **k: None)
+    monkeypatch.setattr(prompts, "resolve_claude_bin", lambda config=None: "no-such-bin-xyz")
 
     events: list[Event] = []
     result = engine.run_task(tmp_path, tasks_root, "10.x", emit=events.append)
@@ -725,7 +725,7 @@ def test_controller_pause_resume() -> None:
 
 
 def test_run_queue_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(engine, "run_task", _fake_worker())
+    monkeypatch.setattr(runner_legacy, "run_task", _fake_worker())
     started: list[str] = []
 
     def track(ev: Event) -> None:
@@ -750,7 +750,7 @@ def test_run_queue_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def test_run_queue_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(engine, "run_task", _fake_worker())
+    monkeypatch.setattr(runner_legacy, "run_task", _fake_worker())
     controller = Controller()
     out: list = []
     th = threading.Thread(
@@ -769,7 +769,7 @@ def test_run_queue_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def test_run_queue_pause_holds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(engine, "run_task", _fake_worker(sleep_steps=10))
+    monkeypatch.setattr(runner_legacy, "run_task", _fake_worker(sleep_steps=10))
     order: list[str] = []
 
     def track(ev: Event) -> None:
@@ -796,7 +796,7 @@ def test_run_queue_pause_holds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
 def test_player_oneshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _seed(tmp_path)
-    monkeypatch.setattr(engine, "run_task", _fake_worker(sleep_steps=2))
+    monkeypatch.setattr(runner_legacy, "run_task", _fake_worker(sleep_steps=2))
     monkeypatch.setattr("nightshift.server.player.build_task_list", lambda root, arg, tasks_rel="main": [arg])
 
     player = Player(tmp_path)
@@ -810,7 +810,7 @@ def test_player_oneshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_player_repeat_loops_then_stops(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _seed(tmp_path)
-    monkeypatch.setattr(engine, "run_task", _fake_worker(sleep_steps=2))
+    monkeypatch.setattr(runner_legacy, "run_task", _fake_worker(sleep_steps=2))
     monkeypatch.setattr("nightshift.server.player.build_task_list", lambda root, arg, tasks_rel="main": ["10.x"])
     save_settings(tmp_path, {"transport_mode": "repeat", "repeat_interval": "1s"})
 
@@ -1461,10 +1461,10 @@ def test_run_task_no_changes_completes_cleanly(
     from nightshift import backends
 
     tasks_root = _seed(tmp_path, tasks={"10.x": "do x"})
-    monkeypatch.setattr(engine, "setup_worktree", lambda ws, repo, task, *, queue=None: tmp_path)
-    monkeypatch.setattr(engine, "teardown_worktree", lambda ws, repo, task, *, queue=None: None)
-    monkeypatch.setattr(engine, "build_prompt", lambda task, *, task_file=None, validate_cmd=None, loop=False, loop_max_iterations=0, split=False, split_dir=None: "p")
-    monkeypatch.setattr(engine, "_worktree_has_commits", lambda ws, repo, task, *, queue=None: False)
+    monkeypatch.setattr(runner_legacy, "setup_worktree", lambda ws, repo, task, *, queue=None: tmp_path)
+    monkeypatch.setattr(runner_legacy, "teardown_worktree", lambda ws, repo, task, *, queue=None: None)
+    monkeypatch.setattr(runner_legacy, "build_prompt", lambda task, *, task_file=None, validate_cmd=None, loop=False, loop_max_iterations=0, split=False, split_dir=None: "p")
+    monkeypatch.setattr(runner_legacy, "has_commits", lambda ws, repo, task, *, queue=None: False)
 
     class _NoopBackend:
         name = "noop"
@@ -1669,7 +1669,7 @@ def test_player_set_active_focus_decoupled_from_running_queue(
     *different* queue mid-run is now allowed — it never stops the run, the
     running queue stays pinned, and the focused store follows the new queue."""
     tasks_root = _seed(tmp_path, queues={"ns": {"config": {"order": []}}})
-    monkeypatch.setattr(engine, "run_task", _fake_worker(sleep_steps=2000))
+    monkeypatch.setattr(runner_legacy, "run_task", _fake_worker(sleep_steps=2000))
     monkeypatch.setattr(
         "nightshift.server.player.build_task_list",
         lambda root, arg, tasks_rel="main": ["10.x"],
@@ -1786,7 +1786,7 @@ def test_registry_runs_two_queues_concurrently(
         tmp_path, tasks={"10.x": "x"}, queues={"ns": {"config": {"order": []}}}
     )
 
-    monkeypatch.setattr(engine, "run_task", _fake_worker(sleep_steps=20))
+    monkeypatch.setattr(runner_legacy, "run_task", _fake_worker(sleep_steps=20))
     monkeypatch.setattr(
         "nightshift.server.player.build_task_list",
         lambda root, arg, tasks_rel="main": (
@@ -1836,7 +1836,7 @@ def test_disk_admission_fails_task_without_cutting_worktree(
         ran["n"] += 1
         return TaskResult(task="10.x", title="10.x", success=True)
 
-    monkeypatch.setattr(engine, "run_task", spy_run_task)
+    monkeypatch.setattr(runner_legacy, "run_task", spy_run_task)
 
     reg = PlayerRegistry(tmp_path)
     runner = reg.runner(None)
@@ -1892,7 +1892,7 @@ def test_transport_drives_explicit_queue_without_moving_focus(
     leaves both the focused queue and the other queue untouched."""
     tasks_root = _seed(tmp_path, tasks={"10.x": "x"})
     _make_playlist(tasks_root, "ns")
-    monkeypatch.setattr(engine, "run_task", _fake_worker(sleep_steps=400))
+    monkeypatch.setattr(runner_legacy, "run_task", _fake_worker(sleep_steps=400))
     monkeypatch.setattr(
         "nightshift.server.player.build_task_list",
         lambda root, arg, tasks_rel="main": (
@@ -1928,7 +1928,7 @@ def test_transport_omitted_queue_falls_back_to_focused(
     """With no explicit queue, transport targets the focused queue."""
     tasks_root = _seed(tmp_path, tasks={"10.x": "x"})
     _make_playlist(tasks_root, "ns")
-    monkeypatch.setattr(engine, "run_task", _fake_worker(sleep_steps=400))
+    monkeypatch.setattr(runner_legacy, "run_task", _fake_worker(sleep_steps=400))
     monkeypatch.setattr(
         "nightshift.server.player.build_task_list",
         lambda root, arg, tasks_rel="main": (

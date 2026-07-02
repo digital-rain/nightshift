@@ -18,7 +18,8 @@ from starlette.testclient import TestClient
 
 from _workspace import build_workspace, make_target_repo
 from nightshift.engine import setup_worktree
-from nightshift.manager.app import _jsonable, create_app, no_progress_streak
+from nightshift.manager.api_worker import jsonable, no_progress_streak
+from nightshift.manager.app import create_app
 from nightshift.manager.hub import Hub
 from nightshift.manager.landing import canonical_head
 from nightshift.manager.store import MemoryStore
@@ -202,7 +203,7 @@ def test_jsonable_coerces_decimal_cost() -> None:
     # endpoints must not 500 serializing it under the PgStore.
     from decimal import Decimal
 
-    out = _jsonable({"total_cost_usd": Decimal("0.1234"), "total_turns": 8})
+    out = jsonable({"total_cost_usd": Decimal("0.1234"), "total_turns": 8})
     assert isinstance(out["total_cost_usd"], float)
     assert round(out["total_cost_usd"], 4) == 0.1234
     assert out["total_turns"] == 8

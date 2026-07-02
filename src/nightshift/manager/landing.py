@@ -21,21 +21,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import assert_never
 
-from nightshift.engine import (
-    _queue_slug,
-    _worktree_has_commits,
-    fetch_rendezvous_branch,
-    integrate_lock,
-    landing_lock,
-    maybe_sync_main_to_origin,
-    prune_rendezvous_branch,
-    squash_to_main,
-    sync_main_to_origin,
+from nightshift.git import GitRunner
+from nightshift.git.locks import integrate_lock, landing_lock
+from nightshift.git.refs import rev_parse
+from nightshift.git.squash import squash_to_main
+from nightshift.git.sync import maybe_sync_main_to_origin, sync_main_to_origin
+from nightshift.git.transport import fetch_rendezvous_branch, prune_rendezvous_branch
+from nightshift.git.worktrees import (
+    has_commits,
+    queue_slug,
     teardown_worktree,
     worktree_branch,
     worktree_dir,
 )
-from nightshift.git import GitRunner
 from nightshift.lifecycle import LandingMode
 
 
@@ -53,14 +51,10 @@ class LandingResult:
     pushed: bool | None = None
 
 
-def _rev_parse(repo_root: Path, ref: str) -> str | None:
-    return GitRunner(repo_root).out("rev-parse", ref)
-
-
 def canonical_head(repo_root: Path) -> str | None:
     """Current canonical ``main`` SHA of a target repo — the ``base_ref`` handed
     to a worker."""
-    return _rev_parse(repo_root, "HEAD")
+    return rev_parse(repo_root, "HEAD")
 
 
 def merge_tree_conflicts(repo_root: Path, branch: str, *, base: str = "HEAD") -> list[str]:
@@ -83,7 +77,7 @@ def base_ref_drifted(repo_root: Path, base_ref: str | None) -> bool:
     if not base_ref:
         return False
     head = canonical_head(repo_root)
-    return head is not None and head != base_ref and _rev_parse(repo_root, base_ref) is not None
+    return head is not None and head != base_ref and rev_parse(repo_root, base_ref) is not None
 
 
 def main_advanced_sha(repo_root: Path, base_ref: str | None) -> str | None:
@@ -98,7 +92,7 @@ def main_advanced_sha(repo_root: Path, base_ref: str | None) -> str | None:
     head = canonical_head(repo_root)
     if not head or head == base_ref:
         return None
-    if _rev_parse(repo_root, base_ref) is None:
+    if rev_parse(repo_root, base_ref) is None:
         return None
     return head
 
@@ -271,7 +265,7 @@ def land(
             # is rejected, the next re-sync drops exactly this commit (the next
             # iteration re-squashes onto the freshly advanced origin) while any
             # operator commit on main is rescued + replayed.
-            orphan_squash = _rev_parse(repo_root, "HEAD")
+            orphan_squash = rev_parse(repo_root, "HEAD")
             result = LandingResult(landed=True, sha=sha, detail=squash_error)
 
             # 4. Apply the remote policy.
@@ -380,7 +374,7 @@ def _adopt_agent_land_on_main(
     """
     repo_root = workspace / repo
     sha = main_advanced_sha(repo_root, base_ref)
-    if not sha or _worktree_has_commits(workspace, repo, task, queue=queue):
+    if not sha or has_commits(workspace, repo, task, queue=queue):
         return None
     teardown_worktree(workspace, repo, task, queue=queue)
     result = LandingResult(
@@ -438,7 +432,7 @@ def push_resolved_main(
     """Land an already-squashed *resolved* commit (``sha``) on origin ``main``.
 
     The out-of-process resolve runner produces a single squash commit locally
-    (``engine.resolve_task``); origin may have advanced while its agent worked,
+    (``runner_legacy.resolve_task``); origin may have advanced while its agent worked,
     so this replays that commit onto the freshest origin/main and pushes,
     bounded by ``max_retries``. The whole section holds :func:`integrate_lock`
     so it serializes against every other land on the repo, while the long agent
@@ -468,7 +462,7 @@ def push_resolved_main(
             with landing_lock(workspace, repo):
                 # Replay the resolved commit on top of the fresh main (a no-op
                 # fast-forward when main already is ``sha``), then push.
-                head = _rev_parse(repo_root, "HEAD")
+                head = rev_parse(repo_root, "HEAD")
                 if head != sha:
                     cp = git.run("cherry-pick", "--allow-empty", sha)
                     if not cp.ok:
@@ -478,7 +472,7 @@ def push_resolved_main(
                             f"resolved commit {sha[:8]} conflicts with current "
                             f"origin/main:\n{cp.detail}"
                         )
-                    head = _rev_parse(repo_root, "HEAD") or sha
+                    head = rev_parse(repo_root, "HEAD") or sha
                 push = git.run("push", remote or "origin", "HEAD:main")
             if push.ok:
                 return True, head
@@ -504,7 +498,7 @@ def _open_pr(
     branch points at the squash commit on main so the PR is exactly the landed
     change. GitHub auth lives only on the manager (``gh``)."""
     repo_root = workspace / repo
-    pr_branch = f"task/{_queue_slug(queue)}-{task}"
+    pr_branch = f"task/{queue_slug(queue)}-{task}"
     with landing_lock(workspace, repo):
         push = GitRunner(repo_root).run("push", "-f", "origin", f"HEAD:refs/heads/{pr_branch}")
     if not push.ok:

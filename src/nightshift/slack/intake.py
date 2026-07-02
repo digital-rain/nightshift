@@ -415,7 +415,7 @@ class ClaudeNormaliseBackend:
     def normalise(self, text: str) -> tuple[str, str]:
         import subprocess
 
-        from nightshift.engine import resolve_claude_bin
+        from nightshift.prompts import resolve_claude_bin
 
         prompt = _NORMALISE_PROMPT.format(text=text)
         argv = [

@@ -530,9 +530,9 @@ class RunStore:
         shas = [s.strip() for s in (rec.get("commit_sha") or "").split(",") if s.strip()]
         if not shas:
             return
-        # Lazy import: engine imports this module, so importing it at module load
-        # would be circular.
-        from nightshift.engine import compute_code_loc
+        # Lazy import: the legacy runner imports this module, so importing its
+        # sibling layer at module load risks a cycle.
+        from nightshift.git.squash import compute_code_loc
 
         total = 0
         for sha in shas:
