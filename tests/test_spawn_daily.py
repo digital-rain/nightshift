@@ -9,6 +9,7 @@ from nightshift.spawn_daily import (
     find_autosplit_sources,
     inspect_source,
     is_disabled,
+    load_queue_config,
     matrix_from_task_names,
     recover_matrix,
     spawn_all,
@@ -206,3 +207,16 @@ def test_recover_matrix_from_git_diff(tmp_path: Path) -> None:
     assert len(matrix) == 1
     assert matrix[0]["task"].startswith("00.")
     assert matrix[0]["model"] == "auto"
+
+def test_load_queue_config_refuses_traversal(tmp_path: Path) -> None:
+    # ``tasks_rel`` can arrive from a request query param; an escaping value
+    # must read nothing from outside the content store.
+    tasks_root = tmp_path / "store"
+    (tasks_root / "main").mkdir(parents=True)
+    (tasks_root / "main" / "config.json").write_text('{"repo": "proj"}')
+    (tmp_path / "outside").mkdir()
+    (tmp_path / "outside" / "config.json").write_text('{"repo": "evil"}')
+
+    assert load_queue_config(tasks_root, "main") == {"repo": "proj"}
+    assert load_queue_config(tasks_root, "../outside") == {}
+    assert load_queue_config(tasks_root, "/etc") == {}

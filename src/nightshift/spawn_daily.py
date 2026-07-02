@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import asdict, dataclass
@@ -101,7 +102,14 @@ def load_queue_config(tasks_root: Path, tasks_rel: str = "main") -> dict:
     """Read a queue's ``config.json`` (``<tasks_root>/<tasks_rel>/config.json``;
     ``tasks_rel`` is the queue dir, default ``main``). Returns ``{}`` when the
     file is absent or malformed. The queue's ``repo`` key is read from here."""
-    path = tasks_root / tasks_rel / "config.json"
+    # ``tasks_rel`` is normally a queue slug, but it can arrive from a request
+    # query param — a traversal attempt must not read config from outside the
+    # content store. Escaping paths get the same {} as a missing file.
+    root = os.path.abspath(tasks_root)
+    resolved = os.path.abspath(os.path.join(root, tasks_rel, "config.json"))
+    if not resolved.startswith(root + os.sep):
+        return {}
+    path = Path(resolved)
     if not path.exists():
         return {}
     try:

@@ -677,6 +677,15 @@ def test_parse_duration() -> None:
         parse_duration("0s")
 
 
+def test_parse_duration_rejects_pathological_input_quickly() -> None:
+    # The bounded-quantifier pattern must stay linear on junk (ReDoS guard)
+    # and reject absurd magnitudes rather than parse them.
+    start = time.monotonic()
+    with pytest.raises(ValueError):
+        parse_duration("9" * 100_000)
+    assert time.monotonic() - start < 1.0
+
+
 def test_settings_round_trip_and_validation(tmp_path: Path) -> None:
     _seed(tmp_path)
     assert load_settings(tmp_path)["transport_mode"] == "auto"

@@ -7,6 +7,7 @@ Moved verbatim from ``engine.py`` in Phase 3 of the rebuild-in-place migration
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from nightshift.git import GitRunner
@@ -49,12 +50,19 @@ def worktree_dir(workspace: Path, repo: str, task: str, queue: str | None = None
     """Worktree directory for a task, placed **outside** the target repo under a
     workspace-level ``<workspace>/.worktrees/<repo>/`` so the target repo stays
     pristine; namespaced by queue (see :func:`worktree_branch`)."""
-    return (
-        workspace
-        / ".worktrees"
-        / _safe_component("repo", repo)
-        / f"task-local-{queue_slug(queue)}-{_safe_component('task', task)}"
+    root = os.path.abspath(workspace / ".worktrees")
+    path = os.path.abspath(
+        os.path.join(
+            root,
+            _safe_component("repo", repo),
+            f"task-local-{queue_slug(queue)}-{_safe_component('task', task)}",
+        )
     )
+    # Containment double-check behind _safe_component, in the normalize-then-
+    # startswith shape static analyzers recognize as a traversal sanitizer.
+    if not path.startswith(root + os.sep):
+        raise ValueError(f"worktree path escapes {root!r}: {path!r}")
+    return Path(path)
 
 
 def setup_worktree(
