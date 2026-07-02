@@ -34,8 +34,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from nightshift import playlists, repos
-from nightshift.engine import live_ordered_queue
 from nightshift.spawn_daily import load_queue_config, split_frontmatter, task_priority
+from nightshift.task_files import live_ordered_queue
 
 
 # Worker-interpreted keywords that pin no specific model: any worker may take a

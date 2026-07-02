@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
-import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from nightshift._paths import asset
+from nightshift.git import GitRunner
 from nightshift.repos import DEFAULT_TASKS_REPO
 
 
@@ -101,7 +102,14 @@ def load_queue_config(tasks_root: Path, tasks_rel: str = "main") -> dict:
     """Read a queue's ``config.json`` (``<tasks_root>/<tasks_rel>/config.json``;
     ``tasks_rel`` is the queue dir, default ``main``). Returns ``{}`` when the
     file is absent or malformed. The queue's ``repo`` key is read from here."""
-    path = tasks_root / tasks_rel / "config.json"
+    # ``tasks_rel`` is normally a queue slug, but it can arrive from a request
+    # query param — a traversal attempt must not read config from outside the
+    # content store. Escaping paths get the same {} as a missing file.
+    root = os.path.abspath(tasks_root)
+    resolved = os.path.abspath(os.path.join(root, tasks_rel, "config.json"))
+    if not resolved.startswith(root + os.sep):
+        return {}
+    path = Path(resolved)
     if not path.exists():
         return {}
     try:
@@ -458,19 +466,15 @@ def matrix_from_task_names(
 def recover_matrix(
     tasks_root: Path, *, base_ref: str, tasks_rel: str = "main"
 ) -> list[dict]:
-    out = subprocess.check_output(
-        [
-            "git",
-            "diff",
-            "--name-only",
-            "--diff-filter=A",
-            f"{base_ref}...HEAD",
-            "--",
-            f"{tasks_rel}/",
-        ],
-        text=True,
-        cwd=tasks_root,
-    )
+    # A bad base_ref / non-repo is exceptional here (was check_output): raise typed.
+    out = GitRunner(tasks_root).must(
+        "diff",
+        "--name-only",
+        "--diff-filter=A",
+        f"{base_ref}...HEAD",
+        "--",
+        f"{tasks_rel}/",
+    ).stdout
     names: list[str] = []
     for line in out.splitlines():
         if not line.endswith(".md"):

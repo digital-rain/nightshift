@@ -41,6 +41,7 @@ from nightshift.engine import (
     worktree_branch,
     worktree_dir,
 )
+from nightshift.git import GitRunner
 from nightshift.manager.app import create_app
 from nightshift.manager.config import load_manager_config
 from nightshift.manager.landing import LandingResult, canonical_head, land
@@ -326,6 +327,104 @@ def test_sync_drops_orphan_but_keeps_operator_commit(tmp_path: Path) -> None:
     assert not (repo_root / "ephemeral.txt").exists()  # named orphan dropped
 
 
+def test_sync_refuses_reset_when_stash_create_fails(tmp_path: Path, monkeypatch) -> None:
+    """A failed ``git stash create`` must refuse the sync (mirroring
+    squash_to_main's wip_sha guard) — never proceed to ``reset --hard`` over the
+    operator's uncommitted work."""
+    workspace, repo, repo_root, bare = _setup_manager_repo(tmp_path)
+
+    # origin/main advances (a plain fast-forward would normally follow).
+    other = _clone(bare, tmp_path / "other")
+    (other / "ahead.txt").write_text("ahead\n")
+    git(other, "add", "-A")
+    git(other, "commit", "-m", "advance origin main")
+    git(other, "push", "origin", "HEAD:main")
+
+    # Operator has uncommitted WIP on a tracked file...
+    (repo_root / "README.md").write_text("precious uncommitted work\n")
+    head_before = canonical_head(repo_root)
+
+    # ...and `git stash create` fails to capture it.
+    monkeypatch.setattr(
+        "nightshift.git.sync.stash_operator_work", lambda *a, **k: None
+    )
+    new_head = sync_main_to_origin(workspace, repo, "origin")
+
+    # The sync was refused: HEAD did not move and the WIP is intact.
+    assert new_head == head_before
+    assert canonical_head(repo_root) == head_before
+    assert (repo_root / "README.md").read_text() == "precious uncommitted work\n"
+    assert not (repo_root / "ahead.txt").exists()
+
+
+def test_sync_rescue_reports_dropped_conflicting_commit(tmp_path: Path) -> None:
+    """A divergence rescue that cannot replay an operator commit (it conflicts
+    with the fresh origin/main) must surface the dropped SHA to the caller
+    instead of silently burying it in the reflog."""
+    workspace, repo, repo_root, bare = _setup_manager_repo(tmp_path)
+    (repo_root / "file.txt").write_text("base\n")
+    git_commit_all(repo_root, "add file")
+    git(repo_root, "push", "origin", "main")
+
+    # Operator commits one version locally (unpushed)...
+    (repo_root / "file.txt").write_text("operator version\n")
+    git_commit_all(repo_root, "operator edit")
+    operator_sha = git(repo_root, "rev-parse", "HEAD")
+
+    # ...while origin advances with a conflicting edit to the same file.
+    other = _clone(bare, tmp_path / "other")
+    (other / "file.txt").write_text("origin version\n")
+    git(other, "add", "-A")
+    git(other, "commit", "-m", "conflicting origin edit")
+    git(other, "push", "origin", "HEAD:main")
+
+    dropped: list[str] = []
+    new_head = sync_main_to_origin(
+        workspace, repo, "origin", dropped_commits=dropped
+    )
+    assert new_head is not None
+    assert (repo_root / "file.txt").read_text() == "origin version\n"
+    assert dropped == [operator_sha]
+
+
+def test_land_push_retry_reports_rescue_dropped_commit(tmp_path: Path) -> None:
+    """End to end: a push-mode land whose retry re-sync drops a conflicting
+    operator commit reports the SHA in ``LandingResult.detail``."""
+    workspace, repo, repo_root, bare = _setup_manager_repo(tmp_path)
+    reset_origin_sync_throttle()
+    (repo_root / "file.txt").write_text("base\n")
+    git_commit_all(repo_root, "add file")
+    git(repo_root, "push", "origin", "main")
+    base = canonical_head(repo_root)
+
+    # The task branch (cut before the operator edit) touches an unrelated file.
+    wt = setup_worktree(workspace, repo, "10.add")
+    (wt / "new.txt").write_text("task work\n")
+    git(wt, "add", "-A")
+    git(wt, "commit", "-m", "task work")
+
+    # Operator commits on local main; origin advances with a conflicting edit,
+    # so the first push is rejected and the retry re-sync must rescue-and-drop.
+    (repo_root / "file.txt").write_text("operator version\n")
+    git_commit_all(repo_root, "operator edit")
+    operator_sha = git(repo_root, "rev-parse", "HEAD")
+    other = _clone(bare, tmp_path / "other")
+    (other / "file.txt").write_text("origin version\n")
+    git(other, "add", "-A")
+    git(other, "commit", "-m", "conflicting origin edit")
+    git(other, "push", "origin", "HEAD:main")
+
+    result = land(
+        workspace, repo, "10.add", "add file", queue=None, base_ref=base,
+        landing_mode="push", rendezvous_remote="origin",
+    )
+    assert result.landed is True
+    assert result.pushed is True
+    assert (repo_root / "file.txt").read_text() == "origin version\n"
+    assert (repo_root / "new.txt").read_text() == "task work\n"
+    assert operator_sha[:12] in result.detail  # the casualty is surfaced
+
+
 def test_maybe_sync_preserves_local_cherry_pick(tmp_path: Path) -> None:
     """Periodic/poll sync must not reset main when it carries unpushed commits."""
     workspace, repo, repo_root, _bare = _setup_manager_repo(tmp_path)
@@ -377,15 +476,17 @@ def test_maybe_sync_main_to_origin_throttles_fetch(tmp_path: Path, monkeypatch) 
     git(other, "push", "origin", "HEAD:main")
     advanced = git(other, "rev-parse", "HEAD")
 
+    # Spy on the GitRunner seam (not subprocess): count fetches while
+    # delegating to the real runner so the sync still talks to the bare remote.
     fetch_calls: list[list[str]] = []
-    real_run = subprocess.run
+    real_run = GitRunner.run
 
-    def _run(cmd, **kwargs):
-        if cmd[:3] == ["git", "fetch", "origin"]:
-            fetch_calls.append(cmd)
-        return real_run(cmd, **kwargs)
+    def _run(self: GitRunner, *args: str):
+        if args[:2] == ("fetch", "origin"):
+            fetch_calls.append(["git", *args])
+        return real_run(self, *args)
 
-    monkeypatch.setattr("nightshift.engine.subprocess.run", _run)
+    monkeypatch.setattr(GitRunner, "run", _run)
 
     assert maybe_sync_main_to_origin(
         workspace, repo, "origin", min_interval_seconds=60.0,
@@ -733,7 +834,7 @@ def _run_once_capturing_land_mode(tmp_path: Path, monkeypatch, brief: str) -> st
         captured["landing_mode"] = kwargs.get("landing_mode")
         return LandingResult(landed=True, sha="deadbeef")
 
-    monkeypatch.setattr("nightshift.manager.app.land", spy_land)
+    monkeypatch.setattr("nightshift.manager.api_worker.land", spy_land)
 
     with TestClient(create_app(workspace, store=MemoryStore())) as tc:
         cfg = WorkerConfig(

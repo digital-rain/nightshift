@@ -17,11 +17,11 @@ Runs one task at a time, sequentially. After each agent finishes:
 
 A lockfile prevents concurrent instances from running.
 
-This module is a thin CLI front-end over :mod:`nightshift.engine`. The
-orchestration core lives in the engine so the server reuses identical code;
-here we just wire stdout/log output and a run-record sink to the engine's
-event stream. The names re-exported below are part of the public surface
-imported by the regression tests.
+This module is a thin CLI front-end over :mod:`nightshift.runner_legacy` (and
+the modules Phase 3 split out of the old engine). The orchestration core lives
+there so the server reuses identical code; here we just wire stdout/log output
+and a run-record sink to its event stream. The names re-exported below are part
+of the public surface imported by the regression tests.
 """
 
 from __future__ import annotations
@@ -34,33 +34,6 @@ from pathlib import Path
 from typing import IO, TextIO
 
 from nightshift import playlists, repos
-from nightshift.engine import (
-    MIN_FREE_PCT,
-    SYMLINK_TARGETS,
-    Controller,
-    RunSummary,
-    TaskResult,
-    _attempt_repair,
-    _commit_dispatch,
-    _find_autosplit_tasks,
-    _write_failure_log,
-    acquire_lock,
-    build_claude_argv,
-    build_prompt,
-    build_task_list,
-    check_preconditions,
-    enough_free_disk,
-    extract_result_line,
-    list_queue,
-    recover_task,
-    resolve_task,
-    resolve_title,
-    run_queue,
-    run_task,
-    setup_worktree,
-    squash_to_main,
-    teardown_worktree,
-)
 from nightshift.events import (
     TASK_LOG,
     TASK_RESULT,
@@ -68,9 +41,36 @@ from nightshift.events import (
     Event,
     RunStore,
 )
+from nightshift.git.squash import squash_to_main
+from nightshift.git.store import commit_dispatch
+from nightshift.git.worktrees import SYMLINK_TARGETS, setup_worktree, teardown_worktree
+from nightshift.preflight import (
+    MIN_FREE_PCT,
+    acquire_lock,
+    check_preconditions,
+    enough_free_disk,
+)
+from nightshift.prompts import build_claude_argv, build_prompt, extract_result_line
+from nightshift.runner_legacy import (
+    Controller,
+    RunSummary,
+    TaskResult,
+    attempt_repair,
+    recover_task,
+    resolve_task,
+    run_queue,
+    run_task,
+    write_failure_log,
+)
 from nightshift.server.player import resolve_tasks_root
 from nightshift.slack import listener_for_queue
 from nightshift.spawn_daily import load_queue_config
+from nightshift.task_files import (
+    build_task_list,
+    find_autosplit_tasks,
+    list_queue,
+    resolve_title,
+)
 
 
 try:
@@ -86,10 +86,10 @@ __all__ = [
     "RunSummary",
     "TaskResult",
     "_Tee",
-    "_attempt_repair",
-    "_commit_dispatch",
-    "_find_autosplit_tasks",
-    "_write_failure_log",
+    "attempt_repair",
+    "commit_dispatch",
+    "find_autosplit_tasks",
+    "write_failure_log",
     "acquire_lock",
     "build_claude_argv",
     "build_prompt",

@@ -15,7 +15,8 @@ from typing import Any
 
 from nightshift.config.io import load_dotenv, load_json, manager_json_path, save_json
 from nightshift.config.meta import meta
-from nightshift.engine import WIP_REF_PREFIX, normalize_wip_prefix
+from nightshift.git.transport import WIP_REF_PREFIX, normalize_wip_prefix
+from nightshift.lifecycle import LandingMode
 
 
 @dataclass(frozen=True)
@@ -76,11 +77,11 @@ class OperatorConfig:
         env="NIGHTSHIFT_DEFAULT_MODEL",
         validate="model_id_or_keyword"))
 
-    landing_mode: str = field(default="none", metadata=meta(
+    landing_mode: LandingMode = field(default=LandingMode.NONE, metadata=meta(
         category="Landing & Git", label="Landing mode",
         desc="Remote policy: none (local only), push, or pr.",
         apply="restart", env="NIGHTSHIFT_LANDING_MODE",
-        options=["none", "push", "pr"]))
+        options=[mode.value for mode in LandingMode]))
     rendezvous_remote: str | None = field(default="origin", metadata=meta(
         category="Landing & Git", label="Rendezvous remote",
         desc="Git remote name for cross-machine landing; null disables.",
@@ -266,13 +267,13 @@ def load_manager_settings(workspace: Path) -> ManagerSettings:
         ),
     )
 
-    landing_mode = (
+    # Parsed once at the config boundary: an unknown mode fails the load loudly
+    # (ValueError) instead of silently degrading to "none".
+    landing_mode = LandingMode(
         os.environ.get("NIGHTSHIFT_LANDING_MODE")
         or data.get("landing_mode")
         or "none"
     )
-    if landing_mode not in ("none", "push", "pr"):
-        landing_mode = "none"
 
     env_rendezvous = os.environ.get("NIGHTSHIFT_RENDEZVOUS_REMOTE")
     if env_rendezvous:

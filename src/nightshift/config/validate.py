@@ -27,7 +27,7 @@ from nightshift.config.registry import (
     registry_by_key,
     specs_for_surface,
 )
-from nightshift.engine import normalize_wip_prefix
+from nightshift.git.transport import normalize_wip_prefix
 from nightshift.model_id import AGNOSTIC, is_qualified
 
 

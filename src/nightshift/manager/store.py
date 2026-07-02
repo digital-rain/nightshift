@@ -22,11 +22,39 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
+from nightshift.lifecycle import (
+    LEASE_ACTIVE_STATUSES,
+    LEASE_RELEASED_AT_STATUSES,
+    RUN_TERMINAL_STATUSES,
+    Outcome,
+)
 from nightshift.pg import PgPoolLike
 
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+# The run columns update_run may touch, derived from the shared models: every
+# Outcome field that is a run column (landable/branch_ref/head_sha are
+# transport-only, consumed by the submit handler) plus the manager-computed
+# land/progress columns. Unknown fields raise instead of being silently
+# dropped.
+RUN_UPDATABLE_FIELDS = frozenset(
+    set(Outcome.model_fields) - {"landable", "branch_ref", "head_sha"}
+) | {"phase", "commit_sha", "loc", "remote", "pushed"}
+
+
+def _check_run_fields(fields: dict[str, Any]) -> None:
+    unknown = set(fields) - RUN_UPDATABLE_FIELDS
+    if unknown:
+        raise ValueError(f"update_run: unknown field(s): {sorted(unknown)}")
+
+
+# SQL fragments derived from the lease vocabulary (values are today's strings;
+# StrEnum guarantees the rendering is byte-identical to the old literals).
+_LEASE_ACTIVE_SQL = ", ".join(f"'{s}'" for s in sorted(LEASE_ACTIVE_STATUSES))
+_LEASE_RELEASED_AT_SQL = ", ".join(f"'{s}'" for s in sorted(LEASE_RELEASED_AT_STATUSES))
 
 
 # --------------------------------------------------------------------------- #
@@ -289,7 +317,7 @@ class MemoryStore:
                 if (
                     lease["queue"] == qk
                     and lease["task"] == task
-                    and lease["status"] in ("leased", "submitted")
+                    and lease["status"] in LEASE_ACTIVE_STATUSES
                 ):
                     return None
             now = _now()
@@ -316,7 +344,7 @@ class MemoryStore:
             return [
                 dict(r)
                 for r in self._leases.values()
-                if r["status"] in ("leased", "submitted")
+                if r["status"] in LEASE_ACTIVE_STATUSES
             ]
 
     async def get_lease(self, lease_id: str) -> dict[str, Any] | None:
@@ -334,7 +362,7 @@ class MemoryStore:
             row["status"] = status
             if run_id is not None:
                 row["run_id"] = run_id
-            if status in ("released", "landed", "expired"):
+            if status in LEASE_RELEASED_AT_STATUSES:
                 row["released_at"] = _now()
 
     async def heartbeat_lease(self, lease_id: str, ttl_seconds: float) -> None:
@@ -512,14 +540,13 @@ class MemoryStore:
             return dict(row)
 
     async def update_run(self, run_id: str, **fields: Any) -> None:
+        _check_run_fields(fields)
         with self._lock:
             row = self._runs.get(run_id)
             if row is None:
                 return
-            for key, value in fields.items():
-                if key in row:
-                    row[key] = value
-            if fields.get("status") in ("completed", "error", "skipped", "aborted"):
+            row.update(fields)
+            if fields.get("status") in RUN_TERMINAL_STATUSES:
                 row["finished_at"] = row.get("finished_at") or _now()
 
     async def get_run(self, run_id: str) -> dict[str, Any] | None:
@@ -777,6 +804,10 @@ class PgStore:
         base_ref: str | None,
         ttl_seconds: float,
     ) -> dict[str, Any] | None:
+        # The ON CONFLICT predicate must match the partial unique index
+        # (leases_active_task_uniq) in the schema migration *verbatim* for
+        # index inference, so the dead 'submitted' status stays here until the
+        # schema itself changes (Phase 8/9).
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
@@ -796,7 +827,7 @@ class PgStore:
     async def active_leases(self) -> list[dict[str, Any]]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM nightshift.leases WHERE status IN ('leased', 'submitted')"
+                f"SELECT * FROM nightshift.leases WHERE status IN ({_LEASE_ACTIVE_SQL})"
             )
         return [_lease_row(r) for r in rows]
 
@@ -812,11 +843,11 @@ class PgStore:
     ) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(
-                """
+                f"""
                 UPDATE nightshift.leases
                 SET status = $2,
                     run_id = COALESCE($3, run_id),
-                    released_at = CASE WHEN $2 IN ('released', 'landed', 'expired')
+                    released_at = CASE WHEN $2 IN ({_LEASE_RELEASED_AT_SQL})
                                        THEN now() ELSE released_at END
                 WHERE id = $1::uuid
                 """,
@@ -989,23 +1020,14 @@ class PgStore:
     async def update_run(self, run_id: str, **fields: Any) -> None:
         if not fields:
             return
-        allowed = {
-            "status", "phase", "result_line", "commit_sha", "loc",
-            "failure_kind", "failure_reason", "model", "backend",
-            "turns", "input_tokens", "output_tokens", "cost_usd",
-            "remote", "pushed", "validate_cmd", "worktree",
-        }
+        _check_run_fields(fields)
         sets: list[str] = []
         values: list[Any] = []
-        for i, (key, value) in enumerate(
-            ((k, v) for k, v in fields.items() if k in allowed), start=2
-        ):
+        for i, (key, value) in enumerate(fields.items(), start=2):
             sets.append(f"{key} = ${i}")
             values.append(value)
-        if not sets:
-            return
         finish = ""
-        if fields.get("status") in ("completed", "error", "skipped", "aborted"):
+        if fields.get("status") in RUN_TERMINAL_STATUSES:
             finish = ", finished_at = COALESCE(finished_at, now())"
         async with self._pool.acquire() as conn:
             await conn.execute(

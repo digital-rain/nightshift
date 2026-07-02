@@ -66,7 +66,6 @@ from nightshift.events import (
 from nightshift.repos import DEFAULT_TASKS_REPO
 from nightshift.run_local import (
     _Tee,
-    _write_failure_log,
     acquire_lock,
     build_claude_argv,
     build_prompt,
@@ -81,6 +80,7 @@ from nightshift.run_local import (
     setup_worktree,
     squash_to_main,
     teardown_worktree,
+    write_failure_log,
 )
 from nightshift.spawn_daily import resolve_config
 
@@ -852,7 +852,7 @@ def _prep_preconditions(repo_root: Path, monkeypatch) -> None:
     """Satisfy every non-dirty-tree check so check_preconditions reaches (and
     passes) the dirty-tree gate: fake the claude binary + API key and a trivial
     `just validate` in the target repo."""
-    monkeypatch.setattr("nightshift.engine.shutil.which", lambda _name: "/bin/claude")
+    monkeypatch.setattr("nightshift.preflight.shutil.which", lambda _name: "/bin/claude")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     (repo_root / "justfile").write_text("validate:\n\t@true\n")
 
@@ -981,7 +981,7 @@ def test_write_failure_log_captures_error_and_diff(tmp_path: Path) -> None:
 
     worktree = setup_worktree(workspace, REPO, "10.hello")
 
-    log_path = _write_failure_log(
+    log_path = write_failure_log(
         workspace, REPO, worktree, "10.hello", "just validate failed: syntax error",
         validate_stderr="broken.py:1: SyntaxError: invalid syntax\n",
     )
@@ -1460,7 +1460,7 @@ def test_run_queue_follow_picks_up_midrun_addition(tmp_path: Path, monkeypatch) 
             (tr / "main" / "b.md").write_text("---\ntitle: B\n---\nDo b.\n")
         return TaskResult(task=task, title=task, success=True)
 
-    monkeypatch.setattr("nightshift.engine.run_task", fake_run_task)
+    monkeypatch.setattr("nightshift.runner_legacy.run_task", fake_run_task)
     run_queue(workspace, tasks_root, ["a"], follow_queue=True)
 
     assert calls == ["a", "b"]
@@ -1480,7 +1480,7 @@ def test_run_queue_oneshot_does_not_drain(tmp_path: Path, monkeypatch) -> None:
         calls.append(task)
         return TaskResult(task=task, title=task, success=True)
 
-    monkeypatch.setattr("nightshift.engine.run_task", fake_run_task)
+    monkeypatch.setattr("nightshift.runner_legacy.run_task", fake_run_task)
     run_queue(workspace, tasks_root, ["a"], follow_queue=False)
 
     assert calls == ["a"]
@@ -1503,7 +1503,7 @@ def test_run_queue_follow_attempts_each_task_once(tmp_path: Path, monkeypatch) -
         # should be retried within this run.
         return TaskResult(task=task, title=task, success=(task != "b"))
 
-    monkeypatch.setattr("nightshift.engine.run_task", fake_run_task)
+    monkeypatch.setattr("nightshift.runner_legacy.run_task", fake_run_task)
     run_queue(workspace, tasks_root, ["a", "b"], follow_queue=True)
 
     assert sorted(calls) == ["a", "b"]
@@ -1670,7 +1670,7 @@ def test_run_queue_skips_task_disabled_after_list_built(
     backend = _RecordingBackend()
     original = backends_mod.get_backend
     backends_mod.get_backend = lambda *_a, **_k: backend
-    monkeypatch.setattr("nightshift.engine.run_task", fake_run_task)
+    monkeypatch.setattr("nightshift.runner_legacy.run_task", fake_run_task)
     try:
         summary = run_queue(workspace, tasks_root, ["a", "b"], follow_queue=False)
     finally:
@@ -1859,7 +1859,7 @@ def test_run_queue_resorts_pending_by_priority_between_tasks(
             )
         return TaskResult(task=task, title=task, success=True)
 
-    monkeypatch.setattr("nightshift.engine.run_task", fake_run_task)
+    monkeypatch.setattr("nightshift.runner_legacy.run_task", fake_run_task)
     run_queue(workspace, tasks_root, ["a", "b", "c"], follow_queue=True)
 
     # a first (it was highest at play). After a, c (now P1) jumps ahead of b (P5).
@@ -1882,7 +1882,7 @@ def test_run_queue_oneshot_ignores_sort_mode(tmp_path: Path, monkeypatch) -> Non
         calls.append(task)
         return TaskResult(task=task, title=task, success=True)
 
-    monkeypatch.setattr("nightshift.engine.run_task", fake_run_task)
+    monkeypatch.setattr("nightshift.runner_legacy.run_task", fake_run_task)
     run_queue(workspace, tasks_root, ["a"], follow_queue=False)
 
     assert calls == ["a"]

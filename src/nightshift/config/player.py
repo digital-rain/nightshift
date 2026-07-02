@@ -15,7 +15,10 @@ from nightshift.config.io import load_json, player_json_path, save_json
 from nightshift.config.meta import meta
 
 
-_DURATION_RE = re.compile(r"(\d+)\s*([smh])", re.IGNORECASE)
+# Bounded quantifiers keep the scan linear on junk input (a long digit run
+# with no trailing unit would otherwise backtrack polynomially — ReDoS guard).
+# Nine digits of seconds is already ~31 years; real values are "30m"-sized.
+_DURATION_RE = re.compile(r"(\d{1,9})\s{0,10}([smh])", re.IGNORECASE)
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600}
 
 

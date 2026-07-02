@@ -18,7 +18,8 @@ from starlette.testclient import TestClient
 
 from _workspace import build_workspace, make_target_repo
 from nightshift.engine import setup_worktree
-from nightshift.manager.app import _jsonable, create_app, no_progress_streak
+from nightshift.manager.api_worker import jsonable, no_progress_streak
+from nightshift.manager.app import create_app
 from nightshift.manager.hub import Hub
 from nightshift.manager.landing import canonical_head
 from nightshift.manager.store import MemoryStore
@@ -202,7 +203,7 @@ def test_jsonable_coerces_decimal_cost() -> None:
     # endpoints must not 500 serializing it under the PgStore.
     from decimal import Decimal
 
-    out = _jsonable({"total_cost_usd": Decimal("0.1234"), "total_turns": 8})
+    out = jsonable({"total_cost_usd": Decimal("0.1234"), "total_turns": 8})
     assert isinstance(out["total_cost_usd"], float)
     assert round(out["total_cost_usd"], 4) == 0.1234
     assert out["total_turns"] == 8
@@ -579,6 +580,121 @@ def test_blocked_submit_records_reason_without_landing(tmp_path: Path) -> None:
         assert canonical_head(repo_root) == head_before
 
 
+# --------------------------------------------------------------------------- #
+# Submit fence: a submit is only honored while its lease is live and owned by
+# the submitting worker. Otherwise 409 with NO store or git writes (closes the
+# stale-worker double-land hole).
+# --------------------------------------------------------------------------- #
+
+
+def _poll_with_landable_branch(
+    client: TestClient, workspace: Path, task: str
+) -> dict[str, Any]:
+    """Checkin + poll ``task`` for w1, then leave a committed landable branch in
+    the target repo the way a co-located worker would."""
+    client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+    order = client.post(
+        "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+    ).json()["work"]
+    assert order is not None and order["task"] == task
+    wt = setup_worktree(workspace, order["repo"], task)
+    (wt / "GENERATED.txt").write_text("done\n")
+    subprocess.run(["git", "add", "-A"], cwd=wt, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "work"], cwd=wt, check=True, capture_output=True)
+    return order
+
+
+def _submit_completed(
+    client: TestClient, order: dict[str, Any], *, worker_id: str = "w1"
+):
+    return client.post(
+        f"/api/worker/runs/{order['run_id']}/submit",
+        json={
+            "worker_id": worker_id, "lease_id": order["lease_id"],
+            "task": order["task"], "queue": "main", "title": order["title"],
+            "status": "completed", "landable": True, "backend": "claude-code",
+        },
+    )
+
+
+def test_submit_with_expired_lease_rejected_without_writes(tmp_path: Path) -> None:
+    """An expired lease (the task may already be re-leased to another worker)
+    must reject the slow worker's eventual submit: 409, nothing lands, the run
+    and lease rows are untouched, and the brief stays in the queue."""
+    workspace = _seed(tmp_path, {"10.hello": "Do a thing."})
+    tasks_root = workspace / "nightshift-tasks"
+    repo_root = workspace / "longitude"
+    store = MemoryStore()
+    with _client(workspace, store) as client:
+        order = _poll_with_landable_branch(client, workspace, "10.hello")
+        head_before = canonical_head(repo_root)
+
+        # The lease TTL elapses and the reclaimer expires it.
+        asyncio.run(store.set_lease_status(order["lease_id"], "expired"))
+
+        r = _submit_completed(client, order)
+        assert r.status_code == 409
+
+        # No git writes: nothing landed, the branch is preserved.
+        assert canonical_head(repo_root) == head_before
+        # No store writes: the run is still running, the lease stays expired
+        # (not resurrected to "landed").
+        run = next(x for x in client.get("/api/runs").json() if x["id"] == order["run_id"])
+        assert run["status"] == "running"
+        lease = asyncio.run(store.get_lease(order["lease_id"]))
+        assert lease["status"] == "expired"
+        # The brief was not dropped.
+        assert (tasks_root / "main/10.hello.md").exists()
+
+
+def test_submit_with_cancelled_lease_rejected(tmp_path: Path) -> None:
+    """A transport stop cancels the lease; the stopped worker's eventual submit
+    must not land."""
+    workspace = _seed(tmp_path, {"10.hello": "Do a thing."})
+    repo_root = workspace / "longitude"
+    store = MemoryStore()
+    with _client(workspace, store) as client:
+        order = _poll_with_landable_branch(client, workspace, "10.hello")
+        head_before = canonical_head(repo_root)
+        asyncio.run(store.set_lease_status(order["lease_id"], "cancelled"))
+
+        assert _submit_completed(client, order).status_code == 409
+        assert canonical_head(repo_root) == head_before
+
+
+def test_submit_from_wrong_worker_rejected(tmp_path: Path) -> None:
+    """A submit must come from the worker holding the lease."""
+    workspace = _seed(tmp_path, {"10.hello": "Do a thing."})
+    repo_root = workspace / "longitude"
+    with _client(workspace) as client:
+        order = _poll_with_landable_branch(client, workspace, "10.hello")
+        head_before = canonical_head(repo_root)
+        client.post("/api/worker/checkin", json={"worker_id": "w2", "backend": "claude-code"})
+
+        assert _submit_completed(client, order, worker_id="w2").status_code == 409
+        assert canonical_head(repo_root) == head_before
+        run = next(x for x in client.get("/api/runs").json() if x["id"] == order["run_id"])
+        assert run["status"] == "running"
+
+
+def test_submit_with_unknown_lease_rejected(tmp_path: Path) -> None:
+    workspace = _seed(tmp_path, {"10.hello": "Do a thing."})
+    with _client(workspace) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        order = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        r = client.post(
+            f"/api/worker/runs/{order['run_id']}/submit",
+            json={
+                "worker_id": "w1", "lease_id": "no-such-lease", "task": "10.hello",
+                "queue": "main", "title": "hello", "status": "completed",
+                "landable": False,
+            },
+        )
+        assert r.status_code == 409
+
+
 def test_submit_adopts_agent_land_when_main_advanced(tmp_path: Path) -> None:
     """A worker that reports not-landable but main advanced during the run gets
     its commit recorded (agent self-landed on main)."""
@@ -845,6 +961,78 @@ def test_resolve_result_failure_reblocks_task(tmp_path: Path) -> None:
         assert run["status"] == "error"
         blocked = client.get("/api/blocked").json()
         assert any(b["task"] == "10.x" for b in blocked)
+
+
+def test_resolve_result_with_unresolvable_origin_rejected(tmp_path: Path) -> None:
+    """A stale resolve report (its origin run already landed via another route,
+    e.g. a re-lease) is rejected with 409 and NO writes: the resolve run, the
+    origin run, the task overlay, and the brief are all untouched."""
+    root = _seed(tmp_path, {"10.x": "do"})
+    tasks_root = root / "nightshift-tasks"
+    store = MemoryStore()
+    asyncio.run(store.create_run(
+        "o1", task="10.x", queue="main", worker_id="w1", backend="claude-code",
+        model="auto", title="X", repo="longitude",
+    ))
+    asyncio.run(store.update_run("o1", status="completed", commit_sha="abc123"))
+    asyncio.run(store.create_run(
+        "c1", task="10.x", queue="main", worker_id="manager:resolve",
+        backend="claude-code", model="auto", title="X", repo="longitude",
+    ))
+    app = create_app(root, store=store)
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/worker/runs/c1/resolve-result",
+            json={
+                "task": "10.x", "queue": "main", "origin_run_id": "o1",
+                "status": "completed", "landed": True, "sha": "deadbeef",
+            },
+        )
+        assert r.status_code == 409
+        runs = {x["id"]: x for x in client.get("/api/runs").json()}
+        assert runs["c1"]["status"] == "running"          # resolve run untouched
+        assert runs["o1"]["commit_sha"] == "abc123"       # origin not clobbered
+        assert (tasks_root / "main/10.x.md").exists()     # brief not dropped
+
+        # An origin run that no longer exists is equally unresolvable.
+        r2 = client.post(
+            "/api/worker/runs/c1/resolve-result",
+            json={
+                "task": "10.x", "queue": "main", "origin_run_id": "gone",
+                "status": "completed", "landed": True, "sha": "deadbeef",
+            },
+        )
+        assert r2.status_code == 409
+
+
+def test_resolve_result_updates_resolvable_origin(tmp_path: Path) -> None:
+    """The happy path still works: an origin run held in a resolvable state
+    (error/blocked) is completed alongside the resolve run."""
+    root = _seed(tmp_path, {"10.x": "do"})
+    store = MemoryStore()
+    asyncio.run(store.create_run(
+        "o1", task="10.x", queue="main", worker_id="w1", backend="claude-code",
+        model="auto", title="X", repo="longitude",
+    ))
+    asyncio.run(store.update_run("o1", status="error", failure_kind="merge_conflict"))
+    asyncio.run(store.create_run(
+        "c1", task="10.x", queue="main", worker_id="manager:resolve",
+        backend="claude-code", model="auto", title="X", repo="longitude",
+    ))
+    app = create_app(root, store=store)
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/worker/runs/c1/resolve-result",
+            json={
+                "task": "10.x", "queue": "main", "origin_run_id": "o1",
+                "status": "completed", "landed": True, "sha": "deadbeef",
+            },
+        )
+        assert r.status_code == 200 and r.json()["ok"] is True
+        runs = {x["id"]: x for x in client.get("/api/runs").json()}
+        assert runs["c1"]["status"] == "completed"
+        assert runs["o1"]["status"] == "completed"
+        assert runs["o1"]["commit_sha"] == "deadbeef"
 
 
 def test_conflict_auto_escalates_to_resolve(tmp_path: Path) -> None:

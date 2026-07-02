@@ -19,9 +19,10 @@ from nightshift.config.manager import (
     load_manager_settings,
     save_manager_settings,
 )
+from nightshift.lifecycle import LandingMode
 
 
-LANDING_MODES = ("none", "push", "pr")
+LANDING_MODES = tuple(mode.value for mode in LandingMode)
 
 
 @dataclass(frozen=True)
@@ -35,7 +36,7 @@ class ManagerConfig:
 
     host: str = "0.0.0.0"
     port: int = 8800
-    landing_mode: str = "none"
+    landing_mode: LandingMode = LandingMode.NONE
     default_model: str = "auto"
     shared_secret: str | None = None
     dsn: str | None = None
