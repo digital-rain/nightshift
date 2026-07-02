@@ -199,6 +199,20 @@ def land(
     # must drop exactly this (and nothing else, so an operator commit on main is
     # preserved). Captured as a full SHA after each squash attempt.
     orphan_squash: str | None = None
+    # Rescued-but-conflicting local commits a re-sync had to drop (preserved
+    # only in the reflog) — surfaced on the returned result's detail so the
+    # casualty is reported, not buried.
+    dropped_rescues: list[str] = []
+
+    def _noting_drops(result: LandingResult) -> LandingResult:
+        if dropped_rescues:
+            note = (
+                "origin re-sync dropped conflicting local commit(s): "
+                + ", ".join(sha[:12] for sha in dropped_rescues)
+                + " (preserved unreachable in the reflog for manual recovery)"
+            )
+            result.detail = f"{result.detail}\n{note}".strip()
+        return result
 
     with integrate_lock(workspace, repo):
         for attempt in range(max_push_retries + 1):
@@ -214,6 +228,7 @@ def land(
                         min_interval_seconds=git_refresh_seconds,
                         autostash=autostash,
                         drop_shas=drop,
+                        dropped_commits=dropped_rescues,
                     )
                 else:
                     sync_main_to_origin(
@@ -222,6 +237,7 @@ def land(
                         rendezvous_remote,
                         autostash=autostash,
                         drop_shas=drop,
+                        dropped_commits=dropped_rescues,
                     )
 
             # 2. Preview the squash against the fresh main. A genuine content
@@ -230,7 +246,7 @@ def land(
             conflicts = merge_tree_conflicts(repo_root, branch)
             if conflicts:
                 shown = "\n".join(f"    {p}" for p in conflicts[:20])
-                return LandingResult(
+                return _noting_drops(LandingResult(
                     landed=False,
                     conflict=True,
                     recoverable=False,
@@ -238,7 +254,7 @@ def land(
                         f"squash of '{branch}' conflicts with current main on "
                         f"{len(conflicts)} file(s):\n{shown}"
                     ),
-                )
+                ))
 
             # 3. Squash the branch onto fresh main (local authority).
             sha, squash_error, recoverable = squash_to_main(
@@ -246,12 +262,12 @@ def land(
             )
             if sha is None:
                 # squash_to_main reports a conflict as recoverable=False.
-                return LandingResult(
+                return _noting_drops(LandingResult(
                     landed=False,
                     detail=squash_error or "squash-merge to main failed",
                     recoverable=recoverable,
                     conflict=not recoverable,
-                )
+                ))
 
             # Record the full SHA of the squash we just made; if the push below
             # is rejected, the next re-sync drops exactly this commit (the next
@@ -280,7 +296,7 @@ def land(
                     continue
                 # Exhausted retries: leave the branch for a resolve and report a
                 # recoverable rejection (NOT a content conflict).
-                return LandingResult(
+                return _noting_drops(LandingResult(
                     landed=False,
                     recoverable=True,
                     conflict=False,
@@ -290,7 +306,7 @@ def land(
                         f"push to origin main rejected after {max_push_retries + 1} "
                         f"attempt(s) (origin keeps advancing):\n{push_detail}"
                     ),
-                )
+                ))
             elif landing_mode == "pr":
                 result.remote = "pr"
                 _open_pr(
@@ -312,7 +328,7 @@ def land(
     if cross_machine and rendezvous_remote and branch_ref:
         prune_rendezvous_branch(workspace, repo, rendezvous_remote, branch_ref)
 
-    return result
+    return _noting_drops(result)
 
 
 def _apply_remote_policy(

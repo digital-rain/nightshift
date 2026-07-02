@@ -1063,7 +1063,20 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             raise HTTPException(status_code=404, detail="unknown run")
         queue = _queue_from_label(body.queue)
         lease = await store.get_lease(body.lease_id)
-        base_ref = lease.get("base_ref") if lease else None
+        # Fence: a submit is only honored while its lease is live AND owned by
+        # the submitting worker. A reclaimed (expired), cancelled, or already
+        # consumed lease means the task may have been re-leased elsewhere —
+        # honoring the stale submit would double-land it. 409, no writes.
+        if (
+            lease is None
+            or lease.get("status") != "leased"
+            or lease.get("worker_id") != body.worker_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="stale submit: lease is not live for this worker",
+            )
+        base_ref = lease.get("base_ref")
         # The target repo the worker ran against is recorded on the run (and is
         # workspace-relative); landing materialises ``workspace / repo``.
         repo = run.get("repo")
@@ -1276,7 +1289,12 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         # A task may force PR mode with `make_pr: true`; otherwise the manager's
         # configured landing_mode applies. make_pr never forces squash/push.
         effective_mode = "pr" if meta.get("make_pr") else cfg.landing_mode
-        result = land(
+        # Landing shells out to git (and possibly the network) repeatedly; run
+        # it off the event loop so polls/heartbeats/SSE stay live. The lease
+        # fence above makes this safe: a task re-leased while a slow land runs
+        # gets its stale submit rejected, not raced.
+        result = await asyncio.to_thread(
+            land,
             workspace,
             repo,
             body.task,
@@ -1358,12 +1376,16 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             meta, body.task, resolve_config(workspace, tasks_root, tasks_rel)
         ):
             with contextlib.suppress(Exception):
-                drop_completed_task(tasks_root, body.task, tasks_rel, queue=queue)
+                await asyncio.to_thread(
+                    drop_completed_task, tasks_root, body.task, tasks_rel, queue=queue
+                )
 
         loc = None
         if result.sha:
             with contextlib.suppress(Exception):
-                loc = compute_code_loc(workspace / repo, result.sha)
+                loc = await asyncio.to_thread(
+                    compute_code_loc, workspace / repo, result.sha
+                )
         await store.update_run(
             run_id,
             status="completed",
@@ -1417,6 +1439,18 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         Otherwise: re-block the task so it stays resolvable."""
         store = _store()
         queue = _queue_from_label(body.queue)
+        # Fence (mirrors the submit fence): the origin run must still be waiting
+        # on a resolve. If it already reached a terminal outcome by another route
+        # (e.g. the task was re-leased and landed), this report is stale —
+        # honoring it would double-land / wrongly re-block the task. 409, no
+        # writes.
+        if body.origin_run_id:
+            origin = await store.get_run(body.origin_run_id)
+            if origin is None or origin.get("status") not in ("error", "blocked"):
+                raise HTTPException(
+                    status_code=409,
+                    detail="stale resolve result: origin run is not resolvable",
+                )
         telemetry = {
             "turns": body.turns,
             "input_tokens": body.input_tokens,
