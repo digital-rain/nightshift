@@ -1,10 +1,14 @@
-"""Phase 1 (typed vocabulary) verification tests.
+"""Phase 1 (typed vocabulary) + Phase 4 (pure transition core) tests.
 
 The unified ``Outcome`` model replaces the five hand-synced outcome shapes
 (``ExecuteOutcome``, the submit payload dict, ``SubmitBody``, the local-store
 finish dict, the ``worker_submit`` telemetry re-pack). These tests pin the
 wire contract: the submit payload a worker posts must carry exactly the same
 keys as before the unification.
+
+The Phase 4 half is the transition table: every submit outcome × policy
+context, every land-result kind, and deadline expiry, exercised purely — no
+store, no git, no HTTP.
 """
 
 from __future__ import annotations
@@ -15,12 +19,22 @@ from typing import Any
 from nightshift.lifecycle import (
     LEASE_ACTIVE_STATUSES,
     RUN_TERMINAL_STATUSES,
+    AttemptRef,
     FailureKind,
+    GitPhase,
     LandingMode,
+    LandResult,
     LeaseStatus,
     Outcome,
     RunStatus,
+    SubmitPolicy,
+    TaskHoldKind,
     Telemetry,
+    Transition,
+    on_deadline,
+    on_land_result,
+    on_split_result,
+    on_submit,
 )
 from nightshift.worker.config import WorkerConfig
 from nightshift.worker.local_store import LocalStore
@@ -182,3 +196,437 @@ def test_landing_mode_is_remote_is_exhaustive() -> None:
     assert LandingMode.PUSH.is_remote is True
     assert LandingMode.PR.is_remote is True
     assert LandingMode.NONE.is_remote is False
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4: the transition table (pure — no store, no git, no HTTP)
+# --------------------------------------------------------------------------- #
+
+
+REF = AttemptRef(run_id="r1", lease_id="l1", queue=None, task="10.demo")
+
+
+def _outcome(status: RunStatus, **kw: Any) -> Outcome:
+    return Outcome(status=status, model="m1", turns=3, **kw)
+
+
+def _kinds(t: Transition) -> list[str]:
+    return [ev.kind for ev in t.events]
+
+
+def test_on_submit_covers_every_run_status() -> None:
+    """Every RunStatus maps to a Transition or a GitPhase — nothing falls
+    through (the match is exhaustive by construction; this pins it)."""
+    for status in RunStatus:
+        computed = on_submit(REF, _outcome(status), SubmitPolicy())
+        assert isinstance(computed, Transition | GitPhase)
+
+
+# ---- blocked ---------------------------------------------------------------- #
+
+
+def test_blocked_holds_task_resolvable_and_arms_watch() -> None:
+    out = _outcome(RunStatus.BLOCKED, result_line="blocked: manual step",
+                   failure_reason="manual step")
+    t = on_submit(REF, out, SubmitPolicy())
+    assert isinstance(t, Transition)
+    assert t.run_fields["status"] == RunStatus.BLOCKED
+    assert t.run_fields["failure_kind"] == FailureKind.BLOCKED
+    assert t.run_fields["turns"] == 3
+    assert t.lease_status == LeaseStatus.RELEASED
+    assert t.effects.hold is not None
+    assert t.effects.hold.kind == TaskHoldKind.BLOCKED
+    assert t.effects.hold.reason == "manual step"
+    assert t.effects.hold.retry_eligible is True
+    assert t.effects.watch_armed is True
+    assert t.effects.pause_queue is None
+    assert _kinds(t) == ["task_blocked", "task_result"]
+    assert t.events[1].payload == {
+        "status": "blocked", "result_line": "blocked: manual step",
+    }
+    assert t.response == {"landed": False, "status": "blocked"}
+
+
+def test_blocked_second_failure_pauses_queue() -> None:
+    t = on_submit(REF, _outcome(RunStatus.BLOCKED), SubmitPolicy(watch_armed=True))
+    assert isinstance(t, Transition)
+    assert t.effects.pause_queue == "consecutive_failures"
+    assert _kinds(t) == ["queue_paused", "task_blocked", "task_result"]
+    assert t.events[0].payload == {
+        "reason": "consecutive_failures", "task": "10.demo",
+    }
+
+
+def test_blocked_already_paused_queue_does_not_re_pause() -> None:
+    t = on_submit(
+        REF, _outcome(RunStatus.BLOCKED),
+        SubmitPolicy(watch_armed=True, queue_paused=True),
+    )
+    assert isinstance(t, Transition)
+    assert t.effects.pause_queue is None
+    assert _kinds(t) == ["task_blocked", "task_result"]
+
+
+def test_blocked_on_retry_quarantines_and_pauses_retry_failed() -> None:
+    t = on_submit(REF, _outcome(RunStatus.BLOCKED), SubmitPolicy(was_retry=True))
+    assert isinstance(t, Transition)
+    assert t.effects.pause_queue == "retry_failed"
+    assert [f.key for f in t.effects.frontmatter] == ["quarantined"]
+    assert t.effects.frontmatter[0].reason_key == "quarantine_reason"
+    assert _kinds(t) == [
+        "task_quarantined", "queue_paused", "task_blocked", "task_result",
+    ]
+    assert t.events[0].payload["streak"] == 2
+    assert t.events[1].payload == {"reason": "retry_failed", "task": "10.demo"}
+
+
+# ---- error ------------------------------------------------------------------ #
+
+
+def test_error_marks_failed_and_arms_watch() -> None:
+    out = _outcome(RunStatus.ERROR, result_line="worker bailed",
+                   failure_kind=FailureKind.WORKER_ERROR)
+    t = on_submit(REF, out, SubmitPolicy())
+    assert isinstance(t, Transition)
+    assert t.run_fields["status"] == RunStatus.ERROR
+    assert t.lease_status == LeaseStatus.RELEASED
+    assert t.effects.hold is None
+    assert [(f.key, f.value, f.reason) for f in t.effects.frontmatter] == [
+        ("failed", True, "worker bailed"),
+    ]
+    assert t.effects.watch_armed is True
+    assert _kinds(t) == ["task_result"]
+    assert t.response == {"landed": False, "status": "error", "quarantined": False}
+
+
+def test_error_second_failure_pauses_queue() -> None:
+    t = on_submit(REF, _outcome(RunStatus.ERROR), SubmitPolicy(watch_armed=True))
+    assert isinstance(t, Transition)
+    assert t.effects.pause_queue == "consecutive_failures"
+    assert _kinds(t) == ["queue_paused", "task_result"]
+
+
+def test_error_validation_failure_blocks_without_arming_policy() -> None:
+    out = _outcome(
+        RunStatus.ERROR, result_line="validate failed",
+        failure_kind=FailureKind.VALIDATION_ERROR, failure_reason="exit 2",
+    )
+    t = on_submit(REF, out, SubmitPolicy(watch_armed=True, was_retry=True))
+    assert isinstance(t, Transition)
+    assert t.effects.hold is not None
+    assert t.effects.hold.reason == "validation failed: validate failed"
+    assert t.effects.hold.retry_eligible is False
+    assert t.effects.frontmatter == ()
+    assert t.effects.watch_armed is None
+    assert t.effects.pause_queue is None
+    assert _kinds(t) == ["task_blocked", "task_result"]
+    assert t.events[0].payload == {"reason": "validation_error", "detail": "exit 2"}
+    assert t.response["quarantined"] is False
+
+
+def test_error_worker_quarantine_flag_quarantines_immediately() -> None:
+    t = on_submit(REF, _outcome(RunStatus.ERROR), SubmitPolicy(worker_quarantine=True))
+    assert isinstance(t, Transition)
+    assert [f.key for f in t.effects.frontmatter] == ["quarantined"]
+    assert "worker on first failure (worker error)" in t.effects.frontmatter[0].reason
+    assert t.effects.watch_armed is None
+    assert _kinds(t) == ["task_quarantined", "task_result"]
+    assert t.events[0].payload["streak"] == 1
+    assert t.response["quarantined"] is True
+
+
+def test_error_streak_threshold_quarantines() -> None:
+    policy = SubmitPolicy(quarantine_threshold=3, prior_no_progress_streak=2)
+    t = on_submit(REF, _outcome(RunStatus.ERROR), policy)
+    assert isinstance(t, Transition)
+    assert [f.key for f in t.effects.frontmatter] == ["quarantined"]
+    assert "3 consecutive runs with no progress (worker error)" in (
+        t.effects.frontmatter[0].reason
+    )
+    assert _kinds(t) == ["task_quarantined", "task_result"]
+    assert t.events[0].payload["streak"] == 3
+    assert t.response["quarantined"] is True
+
+
+def test_error_below_streak_threshold_is_a_plain_failure() -> None:
+    policy = SubmitPolicy(quarantine_threshold=3, prior_no_progress_streak=1)
+    t = on_submit(REF, _outcome(RunStatus.ERROR), policy)
+    assert isinstance(t, Transition)
+    assert [f.key for f in t.effects.frontmatter] == ["failed"]
+    assert t.response["quarantined"] is False
+
+
+def test_error_threshold_quarantine_on_retry_pauses_retry_failed() -> None:
+    policy = SubmitPolicy(
+        quarantine_threshold=2, prior_no_progress_streak=1, was_retry=True,
+    )
+    t = on_submit(REF, _outcome(RunStatus.ERROR), policy)
+    assert isinstance(t, Transition)
+    assert t.effects.pause_queue == "retry_failed"
+    assert _kinds(t) == ["task_quarantined", "queue_paused", "task_result"]
+
+
+def test_error_on_retry_quarantines_and_pauses() -> None:
+    t = on_submit(REF, _outcome(RunStatus.ERROR), SubmitPolicy(was_retry=True))
+    assert isinstance(t, Transition)
+    assert [f.key for f in t.effects.frontmatter] == ["failed", "quarantined"]
+    assert t.effects.pause_queue == "retry_failed"
+    assert _kinds(t) == ["task_quarantined", "queue_paused", "task_result"]
+
+
+# ---- neutral (aborted / skipped / running) ----------------------------------- #
+
+
+def test_aborted_and_skipped_are_neutral() -> None:
+    for status in (RunStatus.ABORTED, RunStatus.SKIPPED, RunStatus.RUNNING):
+        t = on_submit(REF, _outcome(status, result_line="stopped"), SubmitPolicy(
+            watch_armed=True, was_retry=True, worker_quarantine=True,
+        ))
+        assert isinstance(t, Transition)
+        assert t.lease_status == LeaseStatus.RELEASED
+        assert t.effects.hold is None
+        assert t.effects.frontmatter == ()
+        assert t.effects.watch_armed is None
+        assert t.effects.pause_queue is None
+        assert _kinds(t) == ["task_result"]
+        assert t.response == {
+            "landed": False, "status": status, "quarantined": False,
+        }
+
+
+# ---- completed → git phase dispatch ------------------------------------------ #
+
+
+def test_completed_landable_requires_the_land_phase() -> None:
+    out = _outcome(RunStatus.COMPLETED, landable=True)
+    assert on_submit(REF, out, SubmitPolicy()) is GitPhase.LAND
+    # landable wins over split (a split run never submits landable=True).
+    assert on_submit(REF, out, SubmitPolicy(split=True)) is GitPhase.LAND
+
+
+def test_completed_split_requires_the_harvest_phase() -> None:
+    out = _outcome(RunStatus.COMPLETED, landable=False)
+    assert on_submit(REF, out, SubmitPolicy(split=True)) is GitPhase.HARVEST_SPLIT
+
+
+def test_completed_non_landable_requires_the_adopt_check() -> None:
+    out = _outcome(RunStatus.COMPLETED, landable=False)
+    assert on_submit(REF, out, SubmitPolicy()) is GitPhase.ADOPT_CHECK
+
+
+# ---- split harvest ------------------------------------------------------------ #
+
+
+def test_split_result_reports_subtasks_and_clears_hold() -> None:
+    out = _outcome(RunStatus.COMPLETED, landable=False)
+    t = on_split_result(REF, out, ["20.a", "21.b"])
+    assert t.run_fields["status"] == RunStatus.COMPLETED
+    assert t.run_fields["result_line"] == "decomposed into 2 subtask(s): 20.a, 21.b"
+    assert t.lease_status == LeaseStatus.RELEASED
+    assert t.effects.clear_hold is True
+    assert _kinds(t) == ["task_result", "queue_changed"]
+    assert t.events[0].payload["subtasks"] == ["20.a", "21.b"]
+    assert t.response == {
+        "landed": False, "status": "completed",
+        "split": True, "subtasks": ["20.a", "21.b"],
+    }
+
+
+def test_split_result_with_no_subtasks() -> None:
+    t = on_split_result(REF, _outcome(RunStatus.COMPLETED, landable=False), [])
+    assert t.run_fields["result_line"] == "decomposition run produced no subtasks"
+
+
+# ---- land results -------------------------------------------------------------- #
+
+
+def _no_change(**kw: Any) -> LandResult:
+    return LandResult(landed=False, nothing_to_land=True, **kw)
+
+
+def test_nothing_to_land_records_no_changes_and_counts_as_failure() -> None:
+    out = _outcome(RunStatus.COMPLETED, landable=False)
+    t = on_land_result(REF, out, _no_change(), SubmitPolicy())
+    assert t.run_fields["status"] == RunStatus.COMPLETED
+    assert t.run_fields["result_line"] == "no changes"
+    assert t.lease_status == LeaseStatus.RELEASED
+    assert [(f.key, f.reason) for f in t.effects.frontmatter] == [
+        ("failed", "no changes produced"),
+    ]
+    assert t.effects.watch_armed is True
+    assert _kinds(t) == ["task_result", "queue_changed"]
+    assert t.response == {
+        "landed": False, "status": "completed",
+        "no_changes": True, "quarantined": False,
+    }
+
+
+def test_nothing_to_land_keeps_the_workers_result_line() -> None:
+    out = _outcome(
+        RunStatus.COMPLETED, landable=False,
+        result_line="no changes produced (worker emitted output only)",
+    )
+    t = on_land_result(REF, out, _no_change(), SubmitPolicy())
+    assert t.run_fields["result_line"] == (
+        "no changes produced (worker emitted output only)"
+    )
+
+
+def test_nothing_to_land_hits_quarantine_threshold() -> None:
+    out = _outcome(RunStatus.COMPLETED, landable=False)
+    policy = SubmitPolicy(quarantine_threshold=2, prior_no_progress_streak=1)
+    t = on_land_result(REF, out, _no_change(), policy)
+    assert [f.key for f in t.effects.frontmatter] == ["quarantined"]
+    assert "2 consecutive runs with no progress (no changes produced)" in (
+        t.effects.frontmatter[0].reason
+    )
+    assert t.effects.watch_armed is None
+    assert _kinds(t) == ["task_quarantined", "task_result", "queue_changed"]
+    assert t.response["quarantined"] is True
+
+
+def test_nothing_to_land_worker_quarantine_is_immediate() -> None:
+    out = _outcome(RunStatus.COMPLETED, landable=False)
+    t = on_land_result(REF, out, _no_change(), SubmitPolicy(worker_quarantine=True))
+    assert t.events[0].payload["streak"] == 1
+    assert t.response["quarantined"] is True
+
+
+def test_nothing_to_land_on_retry_quarantines_and_pauses() -> None:
+    out = _outcome(RunStatus.COMPLETED, landable=False)
+    t = on_land_result(REF, out, _no_change(), SubmitPolicy(was_retry=True))
+    assert [f.key for f in t.effects.frontmatter] == ["failed", "quarantined"]
+    assert t.effects.pause_queue == "retry_failed"
+    assert _kinds(t) == [
+        "task_quarantined", "queue_paused", "task_result", "queue_changed",
+    ]
+
+
+def test_landed_clears_state_disarms_watch_and_drops_brief() -> None:
+    out = _outcome(RunStatus.COMPLETED, landable=True, result_line="did the thing")
+    land = LandResult(
+        landed=True, sha="abc123", remote="push", pushed=True, loc=42,
+    )
+    t = on_land_result(REF, out, land, SubmitPolicy(watch_armed=True))
+    assert t.run_fields["status"] == RunStatus.COMPLETED
+    assert t.run_fields["result_line"] == "did the thing"
+    assert t.run_fields["commit_sha"] == "abc123"
+    assert t.run_fields["loc"] == 42
+    assert t.run_fields["remote"] == "push"
+    assert t.run_fields["pushed"] is True
+    assert t.lease_status == LeaseStatus.LANDED
+    assert t.effects.clear_hold is True
+    assert t.effects.watch_armed is False
+    assert t.effects.drop_brief is True
+    assert _kinds(t) == ["task_result", "queue_changed"]
+    assert t.events[0].payload == {
+        "status": "completed", "commit_sha": "abc123",
+        "remote": "push", "pushed": True, "pr_url": None,
+    }
+    assert t.response == {
+        "landed": True, "sha": "abc123", "remote": "push",
+        "pushed": True, "pr_url": None,
+    }
+
+
+def test_landed_evergreen_keeps_the_brief() -> None:
+    out = _outcome(RunStatus.COMPLETED, landable=True)
+    t = on_land_result(
+        REF, out, LandResult(landed=True, sha="abc"), SubmitPolicy(evergreen=True)
+    )
+    assert t.effects.drop_brief is False
+
+
+def test_adopted_non_landable_records_agent_landed_on_main() -> None:
+    out = _outcome(RunStatus.COMPLETED, landable=False, result_line="no changes")
+    land = LandResult(
+        landed=True, sha="abc", detail="adopted agent land on main", adopted=True,
+    )
+    t = on_land_result(REF, out, land, SubmitPolicy())
+    assert t.run_fields["result_line"] == "agent landed on main"
+    assert t.response["landed"] is True
+
+
+def test_adopted_landable_keeps_the_workers_result_line() -> None:
+    out = _outcome(RunStatus.COMPLETED, landable=True, result_line="validated")
+    land = LandResult(
+        landed=True, sha="abc", detail="adopted agent land on main", adopted=True,
+    )
+    t = on_land_result(REF, out, land, SubmitPolicy())
+    assert t.run_fields["result_line"] == "validated"
+
+
+def test_land_conflict_blocks_for_resolve_and_arms_watch() -> None:
+    out = _outcome(RunStatus.COMPLETED, landable=True)
+    land = LandResult(landed=False, conflict=True, detail="squash conflicts\non x")
+    t = on_land_result(REF, out, land, SubmitPolicy())
+    assert t.run_fields["status"] == RunStatus.ERROR
+    assert t.run_fields["result_line"] == "squash conflicts"
+    assert t.run_fields["failure_kind"] == FailureKind.MERGE_CONFLICT
+    assert t.lease_status == LeaseStatus.RELEASED
+    assert t.effects.hold is not None
+    assert t.effects.hold.reason == "needs resolve: squash conflicts"
+    assert t.effects.hold.retry_eligible is False
+    assert t.effects.watch_armed is True
+    assert t.effects.start_resolve is False
+    assert _kinds(t) == ["task_blocked", "task_result"]
+    assert t.events[1].payload == {
+        "status": "error", "failure_kind": "merge_conflict",
+    }
+    assert t.response == {
+        "landed": False, "conflict": True,
+        "detail": "squash conflicts\non x", "resolving": False,
+    }
+
+
+def test_land_conflict_auto_resolve_starts_a_resolve() -> None:
+    out = _outcome(RunStatus.COMPLETED, landable=True)
+    land = LandResult(landed=False, conflict=True, detail="conflict")
+    t = on_land_result(REF, out, land, SubmitPolicy(auto_resolve=True))
+    assert t.effects.start_resolve is True
+    # PR mode lands via GitHub — never escalated to the local resolver.
+    t = on_land_result(
+        REF, out, land, SubmitPolicy(auto_resolve=True, pr_mode=True)
+    )
+    assert t.effects.start_resolve is False
+
+
+def test_land_recoverable_rejection_blocks_as_merge_rejected() -> None:
+    out = _outcome(RunStatus.COMPLETED, landable=True)
+    land = LandResult(landed=False, recoverable=True, detail="push rejected")
+    t = on_land_result(REF, out, land, SubmitPolicy(watch_armed=True))
+    assert t.run_fields["failure_kind"] == FailureKind.MERGE_REJECTED
+    assert t.effects.hold is not None
+    assert t.effects.pause_queue == "consecutive_failures"
+    assert _kinds(t) == ["queue_paused", "task_blocked", "task_result"]
+
+
+def test_land_unrecoverable_failure_releases_without_hold() -> None:
+    out = _outcome(RunStatus.COMPLETED, landable=True)
+    land = LandResult(landed=False, detail="head_sha mismatch")
+    t = on_land_result(REF, out, land, SubmitPolicy(watch_armed=True))
+    assert t.effects.hold is None
+    assert t.effects.watch_armed is None
+    assert t.effects.pause_queue is None
+    assert t.effects.start_resolve is False
+    assert _kinds(t) == ["task_result"]
+
+
+def test_land_failed_empty_detail_defaults_result_line() -> None:
+    out = _outcome(RunStatus.COMPLETED, landable=True)
+    t = on_land_result(REF, out, LandResult(landed=False), SubmitPolicy())
+    assert t.run_fields["result_line"] == "land failed"
+
+
+# ---- deadline ------------------------------------------------------------------ #
+
+
+def test_on_deadline_expires_the_lease_and_nothing_else() -> None:
+    t = on_deadline(REF)
+    assert t.lease_status == LeaseStatus.EXPIRED
+    assert t.run_fields == {}
+    assert t.events == ()
+    assert t.effects.hold is None
+    assert t.effects.clear_hold is False
+    assert t.effects.frontmatter == ()
+    assert t.response == {}

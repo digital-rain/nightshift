@@ -1,4 +1,4 @@
-"""Per-queue failure/retry state machine (pure, no I/O).
+"""Per-queue failure/retry state (pure, no I/O).
 
 Two-phase policy layered on top of the scheduler's normal dispatch:
 
@@ -6,16 +6,16 @@ Two-phase policy layered on top of the scheduler's normal dispatch:
   running normally. Two *unrelated* failures in a row -- no landed success
   in between -- pause the queue. A single failure followed by a success
   disarms the watch (the spec's "at least one completed task in between is
-  ok").
+  ok"). The fold itself lives in the transition table
+  (``lifecycle.on_submit``/``on_land_result``): a transition reads the armed
+  flag from ``SubmitPolicy`` and reports the new flag + any pause on its
+  effects; this module only holds the per-queue :class:`QueueFailureState`
+  the app wiring keeps between submits.
 * **Phase B (retry).** Once only failed/blocked-retryable tasks remain, the
-  manager (in ``app.py``) admits the earliest one back into dispatch. If it
-  fails again, ``app.py`` quarantines that task and pauses the queue with
-  reason ``"retry_failed"`` -- handled by the caller, not here, since it
-  needs the store and the quarantine helper.
-
-This module only tracks the phase-A watch; phase-B task selection is
-:func:`pick_retry`, a pure ordering helper over already-fetched retryable
-rows.
+  manager (in ``worker_poll``) admits the earliest one back into dispatch —
+  :func:`pick_retry`, a pure ordering helper over already-fetched retryable
+  rows. If it fails again, the submit transition quarantines that task and
+  pauses the queue with reason ``"retry_failed"``.
 """
 
 from __future__ import annotations
@@ -31,25 +31,6 @@ class QueueFailureState:
     tasks failed in a row" trigger."""
 
     watch_armed: bool = False
-
-
-def record_outcome(state: QueueFailureState, *, is_failure: bool | None) -> bool:
-    """Fold one task outcome into ``state``. Returns True iff this outcome is
-    the second consecutive failure (the caller should pause the queue).
-
-    ``is_failure``: True (worker error / honest block), False (a landed
-    success), or None (neutral -- no-change/aborted/skipped: neither arms nor
-    disarms, mirroring the existing no-progress-streak semantics).
-    """
-    if is_failure is None:
-        return False
-    if not is_failure:
-        state.watch_armed = False
-        return False
-    if state.watch_armed:
-        return True
-    state.watch_armed = True
-    return False
 
 
 def pick_retry(retryable: list[dict[str, Any]], *, order: list[str]) -> str | None:
@@ -68,4 +49,4 @@ def pick_retry(retryable: list[dict[str, Any]], *, order: list[str]) -> str | No
     return retryable[ranked[0]]["task"]
 
 
-__all__ = ["QueueFailureState", "record_outcome", "pick_retry"]
+__all__ = ["QueueFailureState", "pick_retry"]

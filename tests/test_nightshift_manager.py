@@ -14,6 +14,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import pytest
 from starlette.testclient import TestClient
 
 from _workspace import build_workspace, make_target_repo
@@ -734,6 +735,133 @@ def test_submit_adopts_agent_land_when_main_advanced(tmp_path: Path) -> None:
         assert run["status"] == "completed"
         assert run["commit_sha"] == canonical_head(repo_root)
         assert not (tasks_root / "main/10.hello.md").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4: a submit's store mutations happen via exactly one store call
+# (apply_transition). There is no window between "former write steps" for a
+# crash to leave partial state.
+# --------------------------------------------------------------------------- #
+
+
+# Everything a submit may legitimately touch while armed: the single write
+# step, reads, the worker-registry status write, and lifespan teardown.
+_ARMED_ALLOWED = frozenset({
+    "apply_transition",
+    "set_worker_status",
+    "close",
+    # reads
+    "get_run", "get_lease", "get_task_state", "get_worker",
+    "list_runs", "list_workers", "list_blocked", "active_leases",
+    "tasks_in_state", "retryable_tasks", "queue_dedication",
+    "events_since", "max_event_id", "run_events",
+    "stats_overall", "stats_by_worker", "stats_by_backend",
+    "stats_by_model", "stats_by_queue",
+})
+
+
+class _TransitionOnlyStore(MemoryStore):
+    """Deny-by-default once armed: any store method outside _ARMED_ALLOWED
+    raises, so every submit-path mutation of runs/leases/overlay/events must
+    ride the single apply_transition call — including write methods added to
+    the store in the future."""
+
+    armed = False
+    applies = 0
+
+    def __getattribute__(self, name: str) -> Any:
+        attr = super().__getattribute__(name)
+        if (
+            not name.startswith("_")
+            and callable(attr)
+            and name not in _ARMED_ALLOWED
+            and super().__getattribute__("armed")
+        ):
+            raise AssertionError(
+                f"submit called store.{name}(); "
+                "apply_transition is the single write step"
+            )
+        return attr
+
+    async def apply_transition(self, t: Any, **kw: Any) -> list[int] | None:
+        self.applies += 1
+        return await super().apply_transition(t, **kw)
+
+
+def test_submit_commits_through_exactly_one_store_write(tmp_path: Path) -> None:
+    """A blocked submit's run update, lease release, blocked overlay, and both
+    events all commit through one apply_transition call — no legacy writes."""
+    workspace = _seed(tmp_path, {"10.hello": "Do a thing."})
+    store = _TransitionOnlyStore()
+    with _client(workspace, store) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        order = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+
+        store.armed = True
+        r = client.post(
+            f"/api/worker/runs/{order['run_id']}/submit",
+            json={
+                "worker_id": "w1", "lease_id": order["lease_id"],
+                "task": "10.hello", "queue": "main", "title": "hello",
+                "status": "blocked", "landable": False,
+                "result_line": "blocked: needs credentials",
+                "failure_kind": "blocked", "failure_reason": "needs credentials",
+            },
+        )
+        assert r.status_code == 200
+        assert r.json() == {"landed": False, "status": "blocked"}
+        assert store.applies == 1
+
+        run = next(x for x in client.get("/api/runs").json() if x["id"] == order["run_id"])
+        assert run["status"] == "blocked"
+        assert run["finished_at"] is not None
+        lease = asyncio.run(store.get_lease(order["lease_id"]))
+        assert lease["status"] == "released"
+        hold = asyncio.run(store.get_task_state(None, "10.hello"))
+        assert hold["state"] == "blocked"
+        assert hold["blocked_reason"] == "needs credentials"
+        kinds = [e["kind"] for e in asyncio.run(store.run_events(order["run_id"]))]
+        assert "task_result" in kinds
+
+
+class _CrashAfterApplyStore(MemoryStore):
+    """Simulates the process dying immediately after the single write step."""
+
+    async def apply_transition(self, t: Any, **kw: Any) -> list[int] | None:
+        await super().apply_transition(t, **kw)
+        raise RuntimeError("simulated crash after the single write step")
+
+
+def test_crash_after_apply_leaves_consistent_state(tmp_path: Path) -> None:
+    """Killing the handler right after apply leaves run terminal + lease
+    released + events present together — never a partial subset, because
+    there is only one write step."""
+    workspace = _seed(tmp_path, {"10.hello": "Do a thing."})
+    store = _CrashAfterApplyStore()
+    with _client(workspace, store) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        order = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            client.post(
+                f"/api/worker/runs/{order['run_id']}/submit",
+                json={
+                    "worker_id": "w1", "lease_id": order["lease_id"],
+                    "task": "10.hello", "queue": "main", "title": "hello",
+                    "status": "error", "landable": False,
+                    "result_line": "worker bailed", "failure_kind": "worker_error",
+                },
+            )
+        run = asyncio.run(store.get_run(order["run_id"]))
+        assert run["status"] == "error"
+        assert run["finished_at"] is not None
+        lease = asyncio.run(store.get_lease(order["lease_id"]))
+        assert lease["status"] == "released"
+        kinds = [e["kind"] for e in asyncio.run(store.run_events(order["run_id"]))]
+        assert "task_result" in kinds
 
 
 def test_work_order_shape_carries_repo_task_path_and_base_ref(tmp_path: Path) -> None:

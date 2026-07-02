@@ -1,10 +1,15 @@
 """Worker-facing manager API — checkin / poll / heartbeat / run events /
 submit / resolve-result — plus the work-order assembly helpers.
 
-Split out of ``manager/app.py`` in Phase 3 of the rebuild-in-place migration;
-handler logic is unchanged. Endpoints are registered onto the shared FastAPI
-app by :func:`register_worker_api`; the app wiring (store, registry, event
-emitter, shared queue state) is injected by ``create_app``.
+Split out of ``manager/app.py`` in Phase 3 of the rebuild-in-place migration.
+Phase 4 rewrote ``worker_submit`` around the pure transition core: the handler
+parses the submit, computes a :class:`~nightshift.lifecycle.Transition` (running
+the git phase — land / adopt-check / split harvest — first when the outcome
+needs one), applies it atomically via ``store.apply_transition`` (the CAS is
+the stale-submit fence), then executes the non-store side effects the
+transition enumerates. Endpoints are registered onto the shared FastAPI app by
+:func:`register_worker_api`; the app wiring (store, registry, event emitter,
+SSE broadcaster, shared queue state) is injected by ``create_app``.
 """
 
 from __future__ import annotations
@@ -14,7 +19,7 @@ import contextlib
 from collections.abc import Awaitable, Callable
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, assert_never
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
@@ -26,19 +31,31 @@ from nightshift.events import new_run_id
 from nightshift.git.squash import compute_code_loc
 from nightshift.git.store import commit_tasks
 from nightshift.git.sync import maybe_sync_main_to_origin
-from nightshift.git.worktrees import has_commits
 from nightshift.lifecycle import (
     RUN_RESOLVABLE_STATUSES,
+    AttemptRef,
     FailureKind,
+    GitPhase,
     LandingMode,
+    LandResult,
     LeaseStatus,
     Outcome,
     RunStatus,
+    SubmitPolicy,
     TaskHoldKind,
+    Transition,
+    on_land_result,
+    on_split_result,
+    on_submit,
 )
 from nightshift.manager import failure_policy
 from nightshift.manager.config import ManagerConfig
-from nightshift.manager.landing import canonical_head, land, main_advanced_sha
+from nightshift.manager.landing import (
+    LandingResult,
+    adopt_or_nothing,
+    canonical_head,
+    land,
+)
 from nightshift.manager.registry import Registry
 from nightshift.manager.scheduler import (
     WorkerFilter,
@@ -67,6 +84,13 @@ from nightshift.task_files import (
     set_task_meta,
     task_is_evergreen,
 )
+
+
+# A submit is only honored while its lease is live AND owned by the submitting
+# worker. A reclaimed (expired), cancelled, or already consumed lease means the
+# task may have been re-leased elsewhere — honoring the stale submit would
+# double-land it. 409, no writes (enforced by apply_transition's CAS).
+_STALE_SUBMIT = "stale submit: lease is not live for this worker"
 
 
 # --------------------------------------------------------------------------- #
@@ -184,6 +208,13 @@ class StartResolveFn(Protocol):
     ) -> Awaitable[tuple[bool, str | None, str | None]]: ...
 
 
+class BroadcastFn(Protocol):
+    """``create_app``'s SSE fan-out: publish one already-persisted event to
+    every connected browser (no store write — the outbox half of ``_emit``)."""
+
+    def __call__(self, event: dict[str, Any]) -> Awaitable[None]: ...
+
+
 def register_worker_api(
     app: FastAPI,
     *,
@@ -200,10 +231,12 @@ def register_worker_api(
     _paused_queues: dict[str, str],
     _failure_state: Callable[[str], failure_policy.QueueFailureState],
     _start_resolve: StartResolveFn,
+    _broadcast: BroadcastFn,
 ) -> None:
     """Register the worker endpoints. Shared wiring (store/registry accessors,
-    the event emitter, queue-pause state, and the resolve spawner) is injected
-    by ``create_app`` under the same names the handler bodies always used."""
+    the event emitter, the SSE broadcaster, queue-pause state, and the resolve
+    spawner) is injected by ``create_app`` under the same names the handler
+    bodies always used."""
     def _set_frontmatter_flag(
         queue: str | None, task: str, key: str, value: bool,
         *, reason_key: str | None = None, reason: str | None = None,
@@ -232,115 +265,6 @@ def register_worker_api(
             return False
         meta = split_frontmatter(text)[0]
         return is_failed(meta)
-
-    async def _quarantine_if_looping(
-        queue: str | None, task: str, run_id: str, detail: str
-    ) -> bool:
-        """Quarantine a task that is stuck re-executing without progress.
-
-        Counts the most recent consecutive runs of ``task`` that landed nothing
-        (see :func:`no_progress_streak`); once that streak reaches the configured
-        ``quarantine_threshold`` the task is pinned to the ``quarantined`` state
-        **in frontmatter** (the single source of truth for quarantine).
-        """
-        if cfg.quarantine_threshold <= 0:
-            return False
-        runs = await _store().list_runs(queue=queue, limit=50)
-        streak = no_progress_streak(runs, task)
-        if streak < cfg.quarantine_threshold:
-            return False
-        reason = (
-            f"quarantined after {streak} consecutive runs with no progress "
-            f"({detail}); execution halted to protect budget — review the run "
-            f"logs and edit or delete the task to release it"
-        )
-        _set_frontmatter_flag(
-            queue, task, "quarantined", True,
-            reason_key="quarantine_reason", reason=reason,
-        )
-        await _emit(
-            "task_quarantined",
-            run_id=run_id,
-            queue=queue,
-            task=task,
-            payload={"reason": reason, "streak": streak},
-        )
-        return True
-
-    async def _quarantine_immediate(
-        queue: str | None, task: str, run_id: str, detail: str
-    ) -> bool:
-        """Quarantine a task on the first failure (worker quarantine mode)."""
-        reason = (
-            f"quarantined by worker on first failure ({detail}); "
-            f"review the run logs and edit or delete the task to release it"
-        )
-        _set_frontmatter_flag(
-            queue, task, "quarantined", True,
-            reason_key="quarantine_reason", reason=reason,
-        )
-        await _emit(
-            "task_quarantined",
-            run_id=run_id,
-            queue=queue,
-            task=task,
-            payload={"reason": reason, "streak": 1},
-        )
-        return True
-
-    async def _quarantine_retry_failure(
-        queue: str | None, task: str, run_id: str, detail: str
-    ) -> None:
-        """Phase B: the retried task failed again. Quarantine it (frontmatter)
-        and pause the queue."""
-        reason = (
-            f"quarantined after failing again on retry ({detail}); "
-            f"review the run logs and edit or delete the task to release it"
-        )
-        _set_frontmatter_flag(
-            queue, task, "quarantined", True,
-            reason_key="quarantine_reason", reason=reason,
-        )
-        await _emit(
-            "task_quarantined",
-            run_id=run_id,
-            queue=queue,
-            task=task,
-            payload={"reason": reason, "streak": 2},
-        )
-        label = queue_label(queue)
-        _paused_queues[label] = "retry_failed"
-        await _emit(
-            "queue_paused", queue=queue, payload={"reason": "retry_failed", "task": task},
-        )
-
-    async def _record_failure_outcome(
-        queue: str | None, task: str, *, state: TaskHoldKind,
-        blocked_reason: str, retry_eligible: bool
-    ) -> None:
-        """Mark a task failed (frontmatter) or blocked (DB overlay) and apply
-        the phase-A two-in-a-row pause."""
-        if state is TaskHoldKind.FAILED:
-            _set_frontmatter_flag(
-                queue, task, "failed", True,
-                reason_key="failed_reason", reason=blocked_reason,
-            )
-        else:
-            await _store().set_task_state(
-                queue, task, state, blocked_reason=blocked_reason,
-                retry_eligible=retry_eligible,
-            )
-        label = queue_label(queue)
-        should_pause = failure_policy.record_outcome(_failure_state(label), is_failure=True)
-        if should_pause and label not in _paused_queues:
-            _paused_queues[label] = "consecutive_failures"
-            await _emit(
-                "queue_paused", queue=queue,
-                payload={"reason": "consecutive_failures", "task": task},
-            )
-
-    def _record_success_outcome(queue: str | None) -> None:
-        failure_policy.record_outcome(_failure_state(queue_label(queue)), is_failure=False)
 
     # ----- worker auth (optional shared secret) ---------------------------- #
 
@@ -647,365 +571,149 @@ def register_worker_api(
             raise HTTPException(status_code=404, detail="unknown run")
         queue = _queue_from_label(body.queue)
         lease = await store.get_lease(body.lease_id)
-        # Fence: a submit is only honored while its lease is live AND owned by
-        # the submitting worker. A reclaimed (expired), cancelled, or already
-        # consumed lease means the task may have been re-leased elsewhere —
-        # honoring the stale submit would double-land it. 409, no writes.
+        # Advisory fast-fail on the same predicate the CAS below enforces, so a
+        # stale submit never reaches git work. The *authoritative* fence is
+        # apply_transition's CAS — a lease consumed between this read and the
+        # apply still yields 409 with no writes.
         if (
             lease is None
             or lease.get("status") != LeaseStatus.LEASED
             or lease.get("worker_id") != body.worker_id
         ):
-            raise HTTPException(
-                status_code=409,
-                detail="stale submit: lease is not live for this worker",
-            )
-        base_ref = lease.get("base_ref")
+            raise HTTPException(status_code=409, detail=_STALE_SUBMIT)
         # The target repo the worker ran against is recorded on the run (and is
         # workspace-relative); landing materialises ``workspace / repo``.
         repo = run.get("repo")
-
-        # Agent telemetry recorded on every outcome (a failed/no-change run still
-        # burned turns + tokens), so the per-task rollups stay accurate. The
-        # dict derives from the shared Telemetry model — no hand-synced re-pack.
-        telemetry = body.telemetry.model_dump()
-
-        # An honest block from the worker (no commits): record the outcome, hold
-        # the task in the DB ``blocked`` state with its reason, do NOT land and do
-        # NOT drop the brief, so a Resolve can pick it up later.
-        if body.status == RunStatus.BLOCKED:
-            reason = body.failure_reason or body.result_line or "blocked"
-            await store.update_run(
-                run_id,
-                status=RunStatus.BLOCKED,
-                result_line=body.result_line,
-                failure_kind=body.failure_kind or FailureKind.BLOCKED,
-                failure_reason=body.failure_reason,
-                model=body.model,
-                **telemetry,
-            )
-            await store.set_lease_status(body.lease_id, LeaseStatus.RELEASED)
-            was_retry = _task_is_failed_in_frontmatter(queue, body.task)
-            await _record_failure_outcome(
-                queue, body.task, state=TaskHoldKind.BLOCKED, blocked_reason=reason,
-                retry_eligible=True,
-            )
-            if was_retry:
-                await _quarantine_retry_failure(queue, body.task, run_id, reason)
-            await _registry().set_idle(body.worker_id)
-            await _emit(
-                "task_blocked", queue=queue, task=body.task, payload={"reason": reason},
-            )
-            await _emit(
-                "task_result", run_id=run_id, queue=queue, task=body.task,
-                payload={"status": "blocked", "result_line": body.result_line},
-            )
-            return JSONResponse({"landed": False, "status": "blocked"})
-
-        # A non-completed submit (worker failed/aborted before producing a branch)
-        # records the outcome and releases the lease without touching main.
-        if body.status != RunStatus.COMPLETED:
-            await store.update_run(
-                run_id,
-                status=body.status,
-                result_line=body.result_line,
-                failure_kind=body.failure_kind,
-                failure_reason=body.failure_reason,
-                model=body.model,
-                **telemetry,
-            )
-            await store.set_lease_status(body.lease_id, LeaseStatus.RELEASED)
-            # A worker *error* marks the task ``failed`` so it is excluded from
-            # immediate dispatch. The failure-policy state machine watches for
-            # two unrelated failures in a row and pauses the queue. Repeated
-            # errors on the *same* task still trigger the existing quarantine
-            # guard. Operator-driven stops (aborted) are intentional and never
-            # quarantine or count as failures.
-            quarantined = False
-            if body.status == RunStatus.ERROR:
-                was_retry = _task_is_failed_in_frontmatter(queue, body.task)
-                if body.failure_kind == FailureKind.VALIDATION_ERROR:
-                    # Validation failures mean the agent DID produce commits
-                    # but the validate command rejected them. The branch is
-                    # preserved and the work is recoverable — treat this as a
-                    # block (needs resolve) rather than a policy failure so it
-                    # doesn't arm the two-in-a-row watch.
-                    await store.set_task_state(
-                        queue, body.task, TaskHoldKind.BLOCKED,
-                        blocked_reason="validation failed: " + (
-                            body.result_line or "validate command returned non-zero"
-                        ),
-                    )
-                    await _emit(
-                        "task_blocked", queue=queue, task=body.task,
-                        payload={"reason": "validation_error",
-                                 "detail": body.failure_reason},
-                    )
-                elif body.quarantine:
-                    quarantined = await _quarantine_immediate(
-                        queue, body.task, run_id, "worker error"
-                    )
-                elif await _quarantine_if_looping(queue, body.task, run_id, "worker error"):
-                    quarantined = True
-                    if was_retry:
-                        label = queue_label(queue)
-                        _paused_queues[label] = "retry_failed"
-                        await _emit(
-                            "queue_paused", queue=queue,
-                            payload={"reason": "retry_failed", "task": body.task},
-                        )
-                else:
-                    reason = body.result_line or body.failure_reason or "worker error"
-                    await _record_failure_outcome(
-                        queue, body.task, state=TaskHoldKind.FAILED,
-                        blocked_reason=reason, retry_eligible=True,
-                    )
-                    if was_retry:
-                        await _quarantine_retry_failure(queue, body.task, run_id, reason)
-            await _registry().set_idle(body.worker_id)
-            await _emit(
-                "task_result",
-                run_id=run_id,
-                queue=queue,
-                task=body.task,
-                payload={"status": body.status, "result_line": body.result_line},
-            )
-            return JSONResponse(
-                {"landed": False, "status": body.status, "quarantined": quarantined}
-            )
-
-        # Completed but nothing to land (no commit): record success, no git.
-        # Unless the agent landed on main directly during the run — main advanced
-        # past the lease's base_ref while the task branch has nothing to squash.
-        if not body.landable:
-            # Split (decomposition) runs: harvest subtask briefs from the
-            # split output dir and enqueue them, then retire the parent.
-            split_meta = _task_meta(tasks_root, body.task, queue)
-            if split_meta.get("split"):
-                tasks_rel = playlists_mod.tasks_rel(queue)
-                created = harvest_split_output(
-                    workspace, tasks_root, repo, body.task, split_meta,
-                    queue=queue, tasks_rel=tasks_rel,
-                )
-                if created:
-                    result_line = (
-                        f"decomposed into {len(created)} subtask(s): "
-                        + ", ".join(created)
-                    )
-                else:
-                    result_line = "decomposition run produced no subtasks"
-                await store.update_run(
-                    run_id, status=RunStatus.COMPLETED,
-                    result_line=result_line, model=body.model,
-                    **telemetry,
-                )
-                await store.set_lease_status(body.lease_id, LeaseStatus.RELEASED)
-                await store.clear_task_state(queue, body.task)
-                await _registry().set_idle(body.worker_id)
-                await _emit(
-                    "task_result", run_id=run_id, queue=queue, task=body.task,
-                    payload={
-                        "status": "completed",
-                        "result_line": result_line,
-                        "subtasks": created,
-                    },
-                )
-                await _emit("queue_changed", queue=queue)
-                return JSONResponse({
-                    "landed": False, "status": "completed",
-                    "split": True, "subtasks": created,
-                })
-
-            repo_root = workspace / repo
-            if (
-                base_ref
-                and main_advanced_sha(repo_root, base_ref)
-                and not has_commits(workspace, repo, body.task, queue=queue)
-            ):
-                body = body.model_copy(update={
-                    "landable": True,
-                    "result_line": "agent landed on main",
-                })
-            else:
-                await store.update_run(
-                    run_id, status=RunStatus.COMPLETED,
-                    result_line=body.result_line or "no changes", model=body.model,
-                    **telemetry,
-                )
-                await store.set_lease_status(body.lease_id, LeaseStatus.RELEASED)
-                if body.quarantine:
-                    quarantined = await _quarantine_immediate(
-                        queue, body.task, run_id, "no changes produced"
-                    )
-                else:
-                    quarantined = await _quarantine_if_looping(
-                        queue, body.task, run_id, "no changes produced"
-                    )
-                if not quarantined:
-                    was_retry = _task_is_failed_in_frontmatter(queue, body.task)
-                    await _record_failure_outcome(
-                        queue, body.task, state=TaskHoldKind.FAILED,
-                        blocked_reason="no changes produced",
-                        retry_eligible=True,
-                    )
-                    if was_retry:
-                        await _quarantine_retry_failure(
-                            queue, body.task, run_id, "no changes produced"
-                        )
-                await _registry().set_idle(body.worker_id)
-                await _emit(
-                    "task_result", run_id=run_id, queue=queue, task=body.task,
-                    payload={"status": "completed", "result_line": body.result_line or "no changes"},
-                )
-                await _emit("queue_changed", queue=queue)
-                return JSONResponse(
-                    {"landed": False, "status": "completed", "no_changes": True,
-                     "quarantined": quarantined}
-                )
-
         tasks_rel = playlists_mod.tasks_rel(queue)
         meta = _task_meta(tasks_root, body.task, queue)
         # A task may force PR mode with `make_pr: true`; otherwise the manager's
         # configured landing_mode applies. make_pr never forces squash/push.
         effective_mode = LandingMode.PR if meta.get("make_pr") else cfg.landing_mode
-        # Landing shells out to git (and possibly the network) repeatedly; run
-        # it off the event loop so polls/heartbeats/SSE stay live. The lease
-        # fence above makes this safe: a task re-leased while a slow land runs
-        # gets its stale submit rejected, not raced.
-        result = await asyncio.to_thread(
-            land,
-            workspace,
-            repo,
-            body.task,
-            body.title,
-            queue=queue,
-            base_ref=base_ref,
-            landing_mode=effective_mode,
-            automerge=bool(meta.get("automerge", True)),
-            draft=bool(meta.get("draft", False)),
-            autostash=bool(
-                resolve_config(workspace, tasks_root, tasks_rel).get(
-                    "autostash_operator_work", True
-                )
+        label = queue_label(queue)
+        prior_streak = 0
+        if cfg.quarantine_threshold > 0 and body.status in (
+            RunStatus.ERROR, RunStatus.COMPLETED,
+        ):
+            # The current run is still ``running`` in this scan (neutral to the
+            # streak); the transition adds the current outcome itself.
+            prior_streak = no_progress_streak(
+                await store.list_runs(queue=queue, limit=50), body.task
+            )
+        policy = SubmitPolicy(
+            quarantine_threshold=cfg.quarantine_threshold,
+            prior_no_progress_streak=prior_streak,
+            worker_quarantine=body.quarantine,
+            was_retry=_task_is_failed_in_frontmatter(queue, body.task),
+            watch_armed=_failure_state(label).watch_armed,
+            queue_paused=label in _paused_queues,
+            split=bool(meta.get("split")),
+            evergreen=task_is_evergreen(
+                meta, body.task, resolve_config(workspace, tasks_root, tasks_rel)
             ),
-            branch_ref=body.branch_ref,
-            head_sha=body.head_sha,
-            rendezvous_remote=cfg.rendezvous_remote,
-            git_refresh_seconds=cfg.cadences.git_refresh_seconds,
+            auto_resolve=cfg.auto_resolve,
+            pr_mode=effective_mode is LandingMode.PR,
+        )
+        ref = AttemptRef(
+            run_id=run_id, lease_id=body.lease_id, queue=queue, task=body.task
         )
 
-        if not result.landed:
-            status = RunStatus.ERROR
-            failure_kind = (
-                FailureKind.MERGE_CONFLICT if result.conflict
-                else FailureKind.MERGE_REJECTED
-            )
-            await store.update_run(
-                run_id,
-                status=status,
-                result_line=result.detail.splitlines()[0][:200] if result.detail else "land failed",
-                failure_kind=failure_kind,
-                failure_reason=result.detail,
-                model=body.model,
-                **telemetry,
-            )
-            await store.set_lease_status(body.lease_id, LeaseStatus.RELEASED)
-            await _registry().set_idle(body.worker_id)
-            # The branch is preserved (squash_to_main / land only teardown after a
-            # confirmed land), so the conflict or rejection is resolvable. Hold the
-            # task blocked so it doesn't re-lease while a resolve is pending.
-            if result.conflict or result.recoverable:
-                land_reason = "needs resolve: " + (
-                    result.detail.splitlines()[0] if result.detail
-                    else failure_kind
-                )
-                await _record_failure_outcome(
-                    queue, body.task, state=TaskHoldKind.BLOCKED,
-                    blocked_reason=land_reason, retry_eligible=False,
-                )
-                await _emit(
-                    "task_blocked", queue=queue, task=body.task,
-                    payload={"reason": failure_kind, "detail": result.detail},
-                )
-            await _emit(
-                "task_result", run_id=run_id, queue=queue, task=body.task,
-                payload={"status": status, "failure_kind": failure_kind},
-            )
-            # Auto-escalate: when enabled, immediately spawn the out-of-process
-            # resolver instead of waiting for an operator to click Resolve. PR
-            # mode lands via GitHub, so it isn't escalated here.
-            resolving = False
-            if (
-                cfg.auto_resolve
-                and (result.conflict or result.recoverable)
-                and effective_mode is not LandingMode.PR
-            ):
-                resolving, _child, _err = await _start_resolve(
-                    run_id, task=body.task, queue=queue, repo=repo, title=body.title,
-                )
-            return JSONResponse(
-                {
-                    "landed": False,
-                    "conflict": result.conflict,
-                    "detail": result.detail,
-                    "resolving": resolving,
-                }
-            )
+        async def _git_phase(phase: GitPhase) -> Transition:
+            """Run the git/filesystem work a completed submit needs, then fold
+            its result into the land/split transition. Git work runs off the
+            event loop so polls/heartbeats/SSE stay live; the CAS makes a slow
+            land safe (a re-leased task's stale submit is rejected, not raced).
+            """
+            match phase:
+                case GitPhase.HARVEST_SPLIT:
+                    # Decomposition run: harvest subtask briefs from the split
+                    # output dir and enqueue them, then retire the parent.
+                    created = harvest_split_output(
+                        workspace, tasks_root, repo, body.task, meta,
+                        queue=queue, tasks_rel=tasks_rel,
+                    )
+                    return on_split_result(ref, body, created)
+                case GitPhase.LAND:
+                    result = await asyncio.to_thread(
+                        land,
+                        workspace, repo, body.task, body.title,
+                        queue=queue,
+                        base_ref=lease.get("base_ref"),
+                        landing_mode=effective_mode,
+                        automerge=bool(meta.get("automerge", True)),
+                        draft=bool(meta.get("draft", False)),
+                        autostash=bool(
+                            resolve_config(workspace, tasks_root, tasks_rel).get(
+                                "autostash_operator_work", True
+                            )
+                        ),
+                        branch_ref=body.branch_ref,
+                        head_sha=body.head_sha,
+                        rendezvous_remote=cfg.rendezvous_remote,
+                        git_refresh_seconds=cfg.cadences.git_refresh_seconds,
+                    )
+                case GitPhase.ADOPT_CHECK:
+                    # Nothing landable: the cheap adopt-or-nothing detection
+                    # (never an origin sync or squash attempt).
+                    result = await asyncio.to_thread(
+                        adopt_or_nothing,
+                        workspace, repo, body.task, body.title,
+                        queue=queue,
+                        base_ref=lease.get("base_ref"),
+                        landing_mode=effective_mode,
+                        automerge=bool(meta.get("automerge", True)),
+                        draft=bool(meta.get("draft", False)),
+                    )
+                case _:
+                    assert_never(phase)
+            loc = None
+            if result.landed and result.sha:
+                with contextlib.suppress(Exception):
+                    loc = await asyncio.to_thread(
+                        compute_code_loc, workspace / repo, result.sha
+                    )
+            return on_land_result(ref, body, _pure_land_result(result, loc), policy)
 
-        # Backstop the worker's queue removal: a completed regular task must
-        # leave the content store. Evergreen tasks keep their file and re-run.
-        if not task_is_evergreen(
-            meta, body.task, resolve_config(workspace, tasks_root, tasks_rel)
-        ):
+        computed = on_submit(ref, body, policy)
+        t = computed if isinstance(computed, Transition) else await _git_phase(computed)
+
+        event_ids = await store.apply_transition(
+            t, expected_status=LeaseStatus.LEASED, expected_worker_id=body.worker_id
+        )
+        if event_ids is None:
+            raise HTTPException(status_code=409, detail=_STALE_SUBMIT)
+
+        # Non-store side effects, post-commit, driven by the transition.
+        response = dict(t.response)
+        for flag in t.effects.frontmatter:
+            _set_frontmatter_flag(
+                queue, body.task, flag.key, flag.value,
+                reason_key=flag.reason_key, reason=flag.reason,
+            )
+        if t.effects.watch_armed is not None:
+            _failure_state(label).watch_armed = t.effects.watch_armed
+        if t.effects.pause_queue is not None:
+            _paused_queues[label] = t.effects.pause_queue
+        if t.effects.drop_brief:
+            # Backstop the worker's queue removal: a landed regular task must
+            # leave the content store (evergreen tasks keep their file).
             with contextlib.suppress(Exception):
                 await asyncio.to_thread(
                     drop_completed_task, tasks_root, body.task, tasks_rel, queue=queue
                 )
-
-        loc = None
-        if result.sha:
-            with contextlib.suppress(Exception):
-                loc = await asyncio.to_thread(
-                    compute_code_loc, workspace / repo, result.sha
-                )
-        await store.update_run(
-            run_id,
-            status=RunStatus.COMPLETED,
-            result_line=body.result_line or result.detail or "landed",
-            commit_sha=result.sha,
-            loc=loc,
-            model=body.model,
-            remote=result.remote,
-            pushed=result.pushed,
-            **telemetry,
-        )
-        await store.set_lease_status(body.lease_id, LeaseStatus.LANDED)
-        await store.clear_task_state(queue, body.task)
-        _record_success_outcome(queue)
         await _registry().set_idle(body.worker_id)
-        await _emit(
-            "task_result",
-            run_id=run_id,
-            queue=queue,
-            task=body.task,
-            payload={
-                "status": "completed",
-                "commit_sha": result.sha,
-                "remote": result.remote,
-                "pushed": result.pushed,
-                "pr_url": result.pr_url,
-            },
-        )
-        await _emit("queue_changed", queue=queue)
-        return JSONResponse(
-            {
-                "landed": True,
-                "sha": result.sha,
-                "remote": result.remote,
-                "pushed": result.pushed,
-                "pr_url": result.pr_url,
-            }
-        )
+        for event_id, ev in zip(event_ids, t.events, strict=True):
+            await _broadcast({
+                "id": event_id, "kind": ev.kind, "run_id": ev.run_id,
+                "queue": ev.queue, "task": ev.task, "payload": dict(ev.payload or {}),
+            })
+        if t.effects.start_resolve:
+            # Auto-escalate: immediately spawn the out-of-process resolver
+            # instead of waiting for an operator to click Resolve.
+            started, _child, _err = await _start_resolve(
+                run_id, task=body.task, queue=queue, repo=repo, title=body.title,
+            )
+            response["resolving"] = started
+        return JSONResponse(response)
 
     @app.post(
         "/api/worker/runs/{run_id}/resolve-result",
@@ -1124,6 +832,25 @@ def jsonable(row: dict[str, Any] | None) -> dict[str, Any]:
         else:
             out[key] = value
     return out
+
+
+def _pure_land_result(result: LandingResult, loc: int | None) -> LandResult:
+    """Map the git layer's :class:`LandingResult` (plus the computed LOC) to
+    the pure :class:`~nightshift.lifecycle.LandResult` consumed by
+    :func:`~nightshift.lifecycle.on_land_result`."""
+    return LandResult(
+        landed=result.landed,
+        sha=result.sha,
+        detail=result.detail,
+        conflict=result.conflict,
+        recoverable=result.recoverable,
+        remote=result.remote,
+        pushed=result.pushed,
+        pr_url=result.pr_url,
+        adopted=result.adopted,
+        nothing_to_land=result.nothing_to_land,
+        loc=loc,
+    )
 
 
 def no_progress_streak(runs: list[dict[str, Any]], task: str) -> int:

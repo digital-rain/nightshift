@@ -15,6 +15,7 @@ which is mounted. :func:`open_store` picks one from the environment.
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import uuid
@@ -27,6 +28,7 @@ from nightshift.lifecycle import (
     LEASE_RELEASED_AT_STATUSES,
     RUN_TERMINAL_STATUSES,
     Outcome,
+    Transition,
 )
 from nightshift.pg import PgPoolLike
 
@@ -49,6 +51,48 @@ def _check_run_fields(fields: dict[str, Any]) -> None:
     unknown = set(fields) - RUN_UPDATABLE_FIELDS
     if unknown:
         raise ValueError(f"update_run: unknown field(s): {sorted(unknown)}")
+
+
+def _apply_run_fields(row: dict[str, Any], fields: dict[str, Any]) -> None:
+    """Fold validated field updates into an in-memory run row, stamping
+    ``finished_at`` once when the run reaches a terminal status."""
+    row.update(fields)
+    if fields.get("status") in RUN_TERMINAL_STATUSES:
+        row["finished_at"] = row.get("finished_at") or _now()
+
+
+def _run_update_sql(fields: dict[str, Any]) -> tuple[str, list[Any]]:
+    """Assemble the run-row UPDATE for validated ``fields``: the SET clause
+    (values fill ``$2..$n``; ``$1`` is the run id) plus the one-shot
+    ``finished_at`` stamp when the run reaches a terminal status."""
+    sets: list[str] = []
+    values: list[Any] = []
+    for i, (key, value) in enumerate(fields.items(), start=2):
+        sets.append(f"{key} = ${i}")
+        values.append(value)
+    finish = ""
+    if fields.get("status") in RUN_TERMINAL_STATUSES:
+        finish = ", finished_at = COALESCE(finished_at, now())"
+    return (
+        f"UPDATE nightshift.runs SET {', '.join(sets)}{finish} WHERE id = $1",
+        values,
+    )
+
+
+# The task-overlay upsert shared by set_task_state and apply_transition (the
+# transactional hold write): $5 is the repo, which submit-path holds never
+# carry (repo pauses are set by the poll path only).
+_TASK_UPSERT_SQL = """
+    INSERT INTO nightshift.tasks
+        (queue, task, state, blocked_reason, repo, retry_eligible, updated_at)
+    VALUES ($1, $2, $3, $4, $5, $6, now())
+    ON CONFLICT (queue, task) DO UPDATE SET
+        state = EXCLUDED.state,
+        blocked_reason = EXCLUDED.blocked_reason,
+        repo = EXCLUDED.repo,
+        retry_eligible = EXCLUDED.retry_eligible,
+        updated_at = now()
+"""
 
 
 # SQL fragments derived from the lease vocabulary (values are today's strings;
@@ -112,6 +156,15 @@ class NightshiftStore(Protocol):
     ) -> None: ...
     async def heartbeat_lease(self, lease_id: str, ttl_seconds: float) -> None: ...
     async def reclaim_expired_leases(self) -> list[dict[str, Any]]: ...
+
+    # transitions (the one write path for lifecycle state changes)
+    async def apply_transition(
+        self,
+        t: Transition,
+        *,
+        expected_status: str,
+        expected_worker_id: str | None = None,
+    ) -> list[int] | None: ...
 
     # task state overlay
     async def set_task_state(
@@ -385,6 +438,65 @@ class MemoryStore:
                     reclaimed.append(dict(row))
             return reclaimed
 
+    # ---- transitions ------------------------------------------------------ #
+
+    async def apply_transition(
+        self,
+        t: Transition,
+        *,
+        expected_status: str,
+        expected_worker_id: str | None = None,
+    ) -> list[int] | None:
+        """Apply one lifecycle transition atomically (under the store lock).
+
+        CAS: the lease must exist in ``expected_status`` (and, when given,
+        belong to ``expected_worker_id`` — the submit fence); otherwise nothing
+        is written and ``None`` is returned. On success the lease, run row,
+        task overlay, and events all change together; the inserted event ids
+        are returned so the caller can broadcast exactly what committed.
+        """
+        # Validate before mutating so a bad field set can't leave partial state.
+        _check_run_fields(t.run_fields)
+        with self._lock:
+            lease = self._leases.get(t.ref.lease_id)
+            if lease is None or lease["status"] != expected_status:
+                return None
+            if expected_worker_id is not None and lease["worker_id"] != expected_worker_id:
+                return None
+            lease["status"] = t.lease_status
+            if t.lease_status in LEASE_RELEASED_AT_STATUSES:
+                lease["released_at"] = _now()
+            run = self._runs.get(t.ref.run_id)
+            if run is not None and t.run_fields:
+                _apply_run_fields(run, t.run_fields)
+            hold = t.effects.hold
+            if hold is not None:
+                self._tasks[(_qkey(t.ref.queue), t.ref.task)] = {
+                    "queue": _qkey(t.ref.queue),
+                    "task": t.ref.task,
+                    "state": hold.kind,
+                    "blocked_reason": hold.reason,
+                    "repo": None,
+                    "retry_eligible": hold.retry_eligible,
+                    "updated_at": _now(),
+                }
+            elif t.effects.clear_hold:
+                self._tasks.pop((_qkey(t.ref.queue), t.ref.task), None)
+            ids: list[int] = []
+            for ev in t.events:
+                self._event_seq += 1
+                self._events.append({
+                    "id": self._event_seq,
+                    "kind": ev.kind,
+                    "run_id": ev.run_id,
+                    "queue": ev.queue,
+                    "task": ev.task,
+                    "payload": dict(ev.payload or {}),
+                    "ts": _now(),
+                })
+                ids.append(self._event_seq)
+            return ids
+
     # ---- task state ------------------------------------------------------- #
 
     async def set_task_state(
@@ -545,9 +657,7 @@ class MemoryStore:
             row = self._runs.get(run_id)
             if row is None:
                 return
-            row.update(fields)
-            if fields.get("status") in RUN_TERMINAL_STATUSES:
-                row["finished_at"] = row.get("finished_at") or _now()
+            _apply_run_fields(row, fields)
 
     async def get_run(self, run_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -709,8 +819,6 @@ class PgStore:
         mcps: list[str] | None = None,
         meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        import json
-
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
@@ -878,6 +986,63 @@ class PgStore:
             )
         return [_lease_row(r) for r in rows]
 
+    async def apply_transition(
+        self,
+        t: Transition,
+        *,
+        expected_status: str,
+        expected_worker_id: str | None = None,
+    ) -> list[int] | None:
+        """Apply one lifecycle transition in a single transaction.
+
+        The CAS is the guarded lease UPDATE: it matches only while the lease is
+        in ``expected_status`` (and owned by ``expected_worker_id`` when given).
+        No match → rollback, no writes, ``None``. Events are inserted in the
+        same transaction (outbox); their ids come back for post-commit SSE.
+        """
+        _check_run_fields(t.run_fields)
+        async with self._pool.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                f"""
+                UPDATE nightshift.leases
+                SET status = $2,
+                    released_at = CASE WHEN $2 IN ({_LEASE_RELEASED_AT_SQL})
+                                       THEN now() ELSE released_at END
+                WHERE id = $1::uuid AND status = $3
+                  AND ($4::text IS NULL OR worker_id = $4)
+                RETURNING id
+                """,
+                t.ref.lease_id, t.lease_status, expected_status, expected_worker_id,
+            )
+            if row is None:
+                return None
+            if t.run_fields:
+                sql, values = _run_update_sql(t.run_fields)
+                await conn.execute(sql, t.ref.run_id, *values)
+            hold = t.effects.hold
+            if hold is not None:
+                await conn.execute(
+                    _TASK_UPSERT_SQL,
+                    _qkey(t.ref.queue), t.ref.task, hold.kind, hold.reason,
+                    None, hold.retry_eligible,
+                )
+            elif t.effects.clear_hold:
+                await conn.execute(
+                    "DELETE FROM nightshift.tasks WHERE queue = $1 AND task = $2",
+                    _qkey(t.ref.queue), t.ref.task,
+                )
+            ids: list[int] = []
+            for ev in t.events:
+                ids.append(await conn.fetchval(
+                    """
+                    INSERT INTO nightshift.events (kind, run_id, queue, task, payload)
+                    VALUES ($1, $2, $3, $4, $5::jsonb)
+                    RETURNING id
+                    """,
+                    ev.kind, ev.run_id, ev.queue, ev.task, json.dumps(ev.payload or {}),
+                ))
+            return ids
+
     async def set_task_state(
         self,
         queue: str | None,
@@ -890,16 +1055,7 @@ class PgStore:
     ) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(
-                """
-                INSERT INTO nightshift.tasks (queue, task, state, blocked_reason, repo, retry_eligible, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, now())
-                ON CONFLICT (queue, task) DO UPDATE SET
-                    state = EXCLUDED.state,
-                    blocked_reason = EXCLUDED.blocked_reason,
-                    repo = EXCLUDED.repo,
-                    retry_eligible = EXCLUDED.retry_eligible,
-                    updated_at = now()
-                """,
+                _TASK_UPSERT_SQL,
                 _qkey(queue), task, state, blocked_reason, repo, retry_eligible,
             )
 
@@ -1000,8 +1156,6 @@ class PgStore:
         repo: str | None = None,
         validate_cmd: str | None = None,
     ) -> dict[str, Any]:
-        import json
-
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
@@ -1021,19 +1175,9 @@ class PgStore:
         if not fields:
             return
         _check_run_fields(fields)
-        sets: list[str] = []
-        values: list[Any] = []
-        for i, (key, value) in enumerate(fields.items(), start=2):
-            sets.append(f"{key} = ${i}")
-            values.append(value)
-        finish = ""
-        if fields.get("status") in RUN_TERMINAL_STATUSES:
-            finish = ", finished_at = COALESCE(finished_at, now())"
+        sql, values = _run_update_sql(fields)
         async with self._pool.acquire() as conn:
-            await conn.execute(
-                f"UPDATE nightshift.runs SET {', '.join(sets)}{finish} WHERE id = $1",
-                run_id, *values,
-            )
+            await conn.execute(sql, run_id, *values)
 
     async def get_run(self, run_id: str) -> dict[str, Any] | None:
         async with self._pool.acquire() as conn:
@@ -1070,8 +1214,6 @@ class PgStore:
         task: str | None = None,
         payload: dict[str, Any] | None = None,
     ) -> int:
-        import json
-
         async with self._pool.acquire() as conn:
             return await conn.fetchval(
                 """
@@ -1131,8 +1273,6 @@ class PgStore:
 def _jsonish(value: Any) -> Any:
     """Decode a JSONB column that the driver may hand back as a string."""
     if isinstance(value, str):
-        import json
-
         try:
             return json.loads(value)
         except ValueError:

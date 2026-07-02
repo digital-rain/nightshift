@@ -27,7 +27,6 @@ from nightshift.git.transport import prepare_worktree_base, publish_task_branch
 from nightshift.git.worktrees import has_commits as worktree_has_commits
 from nightshift.git.worktrees import setup_worktree, teardown_worktree
 from nightshift.lifecycle import FailureKind, Outcome, RunStatus
-from nightshift.manager.landing import main_advanced_sha
 from nightshift.model_id import split_model
 from nightshift.preflight import (
     ensure_env_synced,
@@ -337,15 +336,12 @@ def execute_work_order(
             )
 
         if not has_commits:
-            base_ref = order.get("base_ref")
-            repo_root = workspace / repo
-            if base_ref and main_advanced_sha(repo_root, base_ref):
-                result_line = "agent landed on main (awaiting manager adopt)"
-            else:
-                result_line = "no changes produced (worker emitted output only)"
+            # Whether the agent actually landed on main directly is the
+            # manager's call (land()'s adopt phase) — the worker just reports
+            # a completed run with nothing on its branch.
             return Outcome(
                 status=RunStatus.COMPLETED,
-                result_line=result_line,
+                result_line="no changes produced (worker emitted output only)",
                 landable=False,
                 model=model,
                 backend=provider,

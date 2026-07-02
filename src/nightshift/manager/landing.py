@@ -49,6 +49,12 @@ class LandingResult:
     # Whether the configured remote step succeeded. ``None`` when no remote
     # action was attempted (``landing_mode=none``).
     pushed: bool | None = None
+    # The land was an adoption: an agent landed on main directly during the
+    # run and the manager adopted HEAD instead of squashing a branch.
+    adopted: bool = False
+    # Nothing to land: the task branch is empty and main did not advance
+    # (the completed run made no changes). Only adopt_or_nothing reports this.
+    nothing_to_land: bool = False
 
 
 def canonical_head(repo_root: Path) -> str | None:
@@ -381,12 +387,40 @@ def _adopt_agent_land_on_main(
         landed=True,
         sha=sha,
         detail="adopted agent land on main",
+        adopted=True,
     )
     _apply_remote_policy(
         workspace, repo, task, title, queue=queue,
         landing_mode=landing_mode, automerge=automerge, draft=draft, result=result,
     )
     return result
+
+
+def adopt_or_nothing(
+    workspace: Path,
+    repo: str,
+    task: str,
+    title: str,
+    *,
+    queue: str | None,
+    base_ref: str | None,
+    landing_mode: LandingMode | str = LandingMode.NONE,
+    automerge: bool = True,
+    draft: bool = False,
+) -> LandingResult:
+    """The completed-but-nothing-landable check: adopt an agent land on main,
+    or report ``nothing_to_land``.
+
+    This is :func:`land`'s adopt phase exposed on its own, so a submit with no
+    landable branch stays cheap (two rev-parses and a branch existence check —
+    never an origin sync or a squash attempt)."""
+    adopted = _adopt_agent_land_on_main(
+        workspace, repo, task, title, queue=queue, base_ref=base_ref,
+        landing_mode=LandingMode(landing_mode), automerge=automerge, draft=draft,
+    )
+    if adopted is not None:
+        return adopted
+    return LandingResult(landed=False, nothing_to_land=True)
 
 
 def _push_main(workspace: Path, repo: str, result: LandingResult) -> None:

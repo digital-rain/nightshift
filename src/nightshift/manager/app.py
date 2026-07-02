@@ -161,7 +161,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         event_id = await store.append_event(
             kind, run_id=run_id, queue=queue, task=task, payload=payload
         )
-        await app.state.hub.publish(
+        await _broadcast(
             {
                 "id": event_id,
                 "kind": kind,
@@ -171,6 +171,11 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                 "payload": payload or {},
             }
         )
+
+    async def _broadcast(event: dict[str, Any]) -> None:
+        """Fan an already-persisted event out to all browsers (the outbox half
+        of ``_emit`` — used for events committed inside ``apply_transition``)."""
+        await app.state.hub.publish(event)
 
     # ----- queue helpers --------------------------------------------------- #
 
@@ -316,6 +321,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         _paused_queues=_paused_queues,
         _failure_state=_failure_state,
         _start_resolve=_start_resolve,
+        _broadcast=_broadcast,
     )
     register_operator_api(
         app,

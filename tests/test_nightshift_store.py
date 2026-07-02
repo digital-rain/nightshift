@@ -1,8 +1,9 @@
-"""Tests for the nightshift manager store + schema (Phase 0).
+"""Tests for the nightshift manager store + schema (Phase 0 + Phase 4).
 
 The MemoryStore exercises the same async interface as the PgStore, so these
 verify the CRUD/lease/stats semantics without a live database. The migration
-test pins the schema shape the PgStore relies on.
+test pins the schema shape the PgStore relies on. The Phase 4 section covers
+``apply_transition``: the CAS fence and the all-or-nothing outbox write.
 """
 
 from __future__ import annotations
@@ -12,6 +13,16 @@ import asyncio
 import pytest
 
 from nightshift._paths import MIGRATIONS_DIR
+from nightshift.lifecycle import (
+    AttemptRef,
+    LeaseStatus,
+    RunStatus,
+    TaskEffects,
+    TaskHold,
+    TaskHoldKind,
+    Transition,
+    TransitionEvent,
+)
 from nightshift.manager.store import MemoryStore
 
 
@@ -306,6 +317,144 @@ def test_events_are_monotonic_and_cursorable() -> None:
     # Run-scoped lookup for late-join log backfill.
     run_events = _run(store.run_events("r1"))
     assert [e["kind"] for e in run_events] == ["task_started"]
+
+
+# --------------------------------------------------------------------------- #
+# apply_transition: CAS fence + all-or-nothing outbox (Phase 4)
+# --------------------------------------------------------------------------- #
+
+
+async def _leased_attempt(store: MemoryStore) -> AttemptRef:
+    """Acquire a lease + create its run, returning the attempt identity."""
+    lease = await store.acquire_lease(
+        task="t1", queue=None, worker_id="w1", model="auto",
+        base_ref="abc", ttl_seconds=60,
+    )
+    assert lease is not None
+    await store.create_run(
+        "r1", task="t1", queue=None, worker_id="w1",
+        backend="claude-code", model="auto",
+    )
+    await store.set_lease_status(lease["id"], "leased", run_id="r1")
+    return AttemptRef(run_id="r1", lease_id=lease["id"], queue=None, task="t1")
+
+
+def _error_transition(ref: AttemptRef) -> Transition:
+    return Transition(
+        ref=ref,
+        run_fields={"status": RunStatus.ERROR, "result_line": "boom"},
+        lease_status=LeaseStatus.RELEASED,
+        effects=TaskEffects(hold=TaskHold(TaskHoldKind.BLOCKED, "boom")),
+        events=(
+            TransitionEvent("task_blocked", queue=None, task="t1",
+                            payload={"reason": "boom"}),
+            TransitionEvent("task_result", run_id="r1", queue=None, task="t1",
+                            payload={"status": "error"}),
+        ),
+    )
+
+
+def test_apply_transition_writes_run_lease_overlay_and_events_together() -> None:
+    async def scenario() -> None:
+        store = MemoryStore()
+        ref = await _leased_attempt(store)
+        ids = await store.apply_transition(
+            _error_transition(ref),
+            expected_status="leased", expected_worker_id="w1",
+        )
+        assert ids is not None and len(ids) == 2
+        run = await store.get_run("r1")
+        assert run["status"] == "error"
+        assert run["result_line"] == "boom"
+        assert run["finished_at"] is not None
+        lease = await store.get_lease(ref.lease_id)
+        assert lease["status"] == "released"
+        assert lease["released_at"] is not None
+        hold = await store.get_task_state(None, "t1")
+        assert hold["state"] == "blocked"
+        assert hold["blocked_reason"] == "boom"
+        events = await store.events_since(0)
+        assert [e["id"] for e in events] == ids
+        assert [e["kind"] for e in events] == ["task_blocked", "task_result"]
+
+    _run(scenario())
+
+
+def test_apply_transition_cas_rejects_stale_or_foreign_lease() -> None:
+    async def scenario() -> None:
+        store = MemoryStore()
+        ref = await _leased_attempt(store)
+        # Wrong worker: the submit fence.
+        assert await store.apply_transition(
+            _error_transition(ref),
+            expected_status="leased", expected_worker_id="w2",
+        ) is None
+        # Reclaimed lease: the expected status no longer matches.
+        await store.set_lease_status(ref.lease_id, "expired")
+        assert await store.apply_transition(
+            _error_transition(ref),
+            expected_status="leased", expected_worker_id="w1",
+        ) is None
+        # Nothing was written by either rejected apply.
+        run = await store.get_run("r1")
+        assert run["status"] == "running"
+        assert await store.get_task_state(None, "t1") is None
+        assert await store.events_since(0) == []
+
+    _run(scenario())
+
+
+def test_apply_transition_concurrent_applies_one_wins() -> None:
+    async def scenario() -> None:
+        store = MemoryStore()
+        ref = await _leased_attempt(store)
+        landed = Transition(
+            ref=ref,
+            run_fields={"status": RunStatus.COMPLETED, "commit_sha": "abc"},
+            lease_status=LeaseStatus.LANDED,
+            effects=TaskEffects(clear_hold=True),
+            events=(TransitionEvent("task_result", run_id="r1", task="t1",
+                                    payload={"status": "completed"}),),
+        )
+        results = await asyncio.gather(
+            store.apply_transition(
+                landed, expected_status="leased", expected_worker_id="w1"
+            ),
+            store.apply_transition(
+                _error_transition(ref),
+                expected_status="leased", expected_worker_id="w1",
+            ),
+        )
+        wins = [r for r in results if r is not None]
+        assert len(wins) == 1
+        # Exactly one apply's events exist; the loser wrote nothing.
+        events = await store.events_since(0)
+        assert [e["id"] for e in events] == wins[0]
+
+    _run(scenario())
+
+
+def test_apply_transition_bad_run_fields_writes_nothing() -> None:
+    """Validation happens before any mutation — a malformed transition can't
+    leave partial state (the all-or-nothing guarantee)."""
+    async def scenario() -> None:
+        store = MemoryStore()
+        ref = await _leased_attempt(store)
+        bad = Transition(
+            ref=ref,
+            run_fields={"nonsense_field": 1},
+            lease_status=LeaseStatus.RELEASED,
+            events=(TransitionEvent("task_result", run_id="r1"),),
+        )
+        with pytest.raises(ValueError, match="nonsense_field"):
+            await store.apply_transition(
+                bad, expected_status="leased", expected_worker_id="w1"
+            )
+        lease = await store.get_lease(ref.lease_id)
+        assert lease["status"] == "leased"
+        assert await store.events_since(0) == []
+
+    _run(scenario())
 
 
 # --------------------------------------------------------------------------- #
