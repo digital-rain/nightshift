@@ -1,0 +1,190 @@
+@import 'tailwindcss';
+
+/*
+ * Tailwind 4 auto-detects content relative to this stylesheet's directory
+ * (src/), so classes used only in the Vite entry roots — manager/ and worker/,
+ * which are siblings of src/ — would be missed and their utilities dropped from
+ * the build. Register those dirs explicitly so every class is emitted.
+ */
+@source '../manager';
+@source '../worker';
+
+/*
+ * Nightshift design tokens — ported from the legacy hand-written style.css
+ * (:root / :root[data-theme="light"]). Tailwind 4 is CSS-first: tokens declared
+ * in @theme become both CSS custom properties (var(--color-bg)) and utility
+ * classes (bg-bg, text-text-dim, border-border, …).
+ *
+ * The legacy UI themes via a `data-theme` attribute on <html> (dark default,
+ * light opt-in). We preserve that exact contract so behavior and look match.
+ */
+
+@theme {
+  /* Dark palette is the default (legacy :root). */
+  --color-bg: #14161a;
+  --color-bg-elev: #1c1f26;
+  --color-bg-sunken: #0f1115;
+  --color-border: #2b2f38;
+  --color-text: #e6e8ec;
+  --color-text-dim: #9aa1ad;
+  --color-accent: #6ea8fe;
+  --color-accent-soft: #24344d;
+  --color-ok: #5bd18b;
+  --color-err: #f0786f;
+  --color-warn: #e6c068;
+  --color-running: #6ea8fe;
+
+  --shadow-ns: 0 1px 4px rgba(0, 0, 0, 0.4);
+
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+
+  --radius-ns: 8px;
+}
+
+/*
+ * Light theme override. Tailwind 4 reads @theme into :root; we re-point the
+ * same custom properties under the legacy [data-theme="light"] selector so the
+ * utility classes (bg-bg etc.) flip with the attribute, no JS re-render needed.
+ */
+:root[data-theme='light'] {
+  --color-bg: #f6f7f9;
+  --color-bg-elev: #ffffff;
+  --color-bg-sunken: #eceef1;
+  --color-border: #d8dce2;
+  --color-text: #1b1f27;
+  --color-text-dim: #5d6470;
+  --color-accent: #2f6fed;
+  --color-accent-soft: #dde8ff;
+  --color-ok: #1f9d57;
+  --color-err: #d23b30;
+  --color-warn: #b5860b;
+  --color-running: #2f6fed;
+  --shadow-ns: 0 1px 4px rgba(0, 0, 0, 0.12);
+  color-scheme: light;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+#root {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Tabular numerals for the dense stats tables, mirroring the legacy UI. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * Phase-stepper "active dot" pulse, ported from the legacy @keyframes pulse.
+ * Named ns-pulse so it doesn't collide with Tailwind's built-in opacity pulse;
+ * PhaseStepper applies it via animate-[ns-pulse_…].
+ */
+@keyframes ns-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 var(--color-accent-soft);
+  }
+  50% {
+    box-shadow: 0 0 0 5px var(--color-accent-soft);
+  }
+}
+
+/*
+ * Markdown brief preview, ported from the legacy .markdown-body spacing rules.
+ * The <Markdown> component emits a fixed, safe tag set into this container.
+ */
+.markdown-body > :first-child {
+  margin-top: 0;
+}
+.markdown-body > :last-child {
+  margin-bottom: 0;
+}
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {
+  margin: 14px 0 6px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.markdown-body h1 {
+  font-size: 18px;
+}
+.markdown-body h2 {
+  font-size: 16px;
+}
+.markdown-body h3 {
+  font-size: 14px;
+}
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {
+  font-size: 13px;
+}
+.markdown-body p {
+  margin: 6px 0;
+}
+.markdown-body ul,
+.markdown-body ol {
+  margin: 6px 0;
+  padding-left: 22px;
+}
+.markdown-body li {
+  margin: 2px 0;
+}
+.markdown-body a {
+  color: var(--color-accent);
+}
+.markdown-body code {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  background: var(--color-bg-sunken);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+.markdown-body pre {
+  background: var(--color-bg-sunken);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+.markdown-body pre code {
+  background: none;
+  border: none;
+  padding: 0;
+}
+.markdown-body blockquote {
+  margin: 8px 0;
+  padding-left: 12px;
+  border-left: 3px solid var(--color-border);
+  color: var(--color-text-dim);
+}
+.markdown-body hr {
+  border: none;
+  border-top: 1px solid var(--color-border);
+  margin: 12px 0;
+}

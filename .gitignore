@@ -22,6 +22,12 @@ var/
 wheels/
 share/python-wheels/
 *.egg-info/
+
+# The `lib/` Python-packaging rule above also matches the React UI's source
+# directory (assets/ui-react/src/lib). Un-ignore it — it holds tracked source
+# (cn.ts, format.ts, rowAdapters.tsx), not build artifacts.
+!src/nightshift/assets/ui-react/src/lib/
+!src/nightshift/assets/ui-react/src/lib/**
 .installed.cfg
 *.egg
 MANIFEST
