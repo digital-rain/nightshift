@@ -28,6 +28,7 @@ from pathlib import Path
 from nightshift import playlists as playlists_mod
 from nightshift.engine import resolve_task, sync_main_to_origin
 from nightshift.events import RUN_FINISHED, RUN_STARTED, Event
+from nightshift.lifecycle import FailureKind, LandingMode, RunStatus
 from nightshift.manager.landing import push_resolved_main
 from nightshift.spawn_daily import resolve_config
 from nightshift.worker.client import ManagerClient
@@ -56,7 +57,9 @@ def main(argv: list[str] | None = None) -> int:
     title = args.title or task
     run_id = args.run_id
     remote = args.rendezvous_remote or None
-    landing_mode = args.landing_mode
+    # Parsed once at the process boundary (the argv comes from the manager's
+    # already-validated config); an unknown mode fails loudly here.
+    landing_mode = LandingMode(args.landing_mode)
 
     secret = os.environ.get("NIGHTSHIFT_SHARED_SECRET") or None
     client = ManagerClient(args.manager_url, shared_secret=secret)
@@ -72,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Integrate origin/main first so the agent rebases onto the freshest merged
     # state, not a stale local main (best-effort: the land re-syncs anyway).
-    if remote and landing_mode in ("push", "pr"):
+    if remote and landing_mode.is_remote:
         try:
             sync_main_to_origin(workspace, repo, remote, reset_divergence=False)
         except Exception:  # noqa: BLE001 — a transient fetch failure is non-fatal
@@ -96,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
     # ``resolve_task`` squashed onto *local* main; for push mode we still have to
     # land that commit on origin/main (serialized, replaying past any origin
     # advance that happened during the agent run).
-    if landed and landing_mode == "push" and remote:
+    if landed and landing_mode is LandingMode.PUSH and remote:
         ok, info = push_resolved_main(
             workspace,
             repo,
@@ -111,17 +114,17 @@ def main(argv: list[str] | None = None) -> int:
             landed = False
             push_detail = info
 
-    remote_kind = "push" if (landing_mode == "push" and remote) else None
+    remote_kind = "push" if (landing_mode is LandingMode.PUSH and remote) else None
     payload = {
         "task": task,
         "queue": queue,
         "origin_run_id": args.origin_run_id,
-        "status": "completed" if landed else "error",
+        "status": RunStatus.COMPLETED if landed else RunStatus.ERROR,
         "landed": landed,
         "sha": sha if landed else None,
         "result_line": result.result_line
         or ("resolved: landed" if landed else "resolve failed"),
-        "failure_kind": None if landed else (result.failure_kind or "merge_conflict"),
+        "failure_kind": None if landed else (result.failure_kind or FailureKind.MERGE_CONFLICT),
         "failure_reason": None if landed else (result.error or push_detail or None),
         "loc": result.loc if landed else None,
         "remote": remote_kind if landed else None,

@@ -14,14 +14,22 @@ from typing import Any
 
 from nightshift import playlists
 from nightshift.engine import teardown_worktree, worktree_branch, worktree_dir
+from nightshift.lifecycle import Outcome, RunStatus
 from nightshift.model_id import provider_of
 from nightshift.worker.client import ManagerClient
 from nightshift.worker.config import WorkerConfig
-from nightshift.worker.execute import ExecuteOutcome, execute_work_order
+from nightshift.worker.execute import execute_work_order
 from nightshift.worker.local_store import LocalStore
 
 
 _LOG_FLUSH_LINES = 20
+
+# Outcome fields that stay off the worker's local JSONL history rows: they are
+# transport/diagnostic detail the local Now/History UI never shows. Keeps the
+# on-disk record keys identical to the pre-Outcome finish dict.
+_LOCAL_HISTORY_EXCLUDE = frozenset({
+    "landable", "branch_ref", "head_sha", "failure_reason", "validate_cmd",
+})
 
 
 class WorkerLoop:
@@ -96,11 +104,11 @@ class WorkerLoop:
         return True
 
     def _note_submit_outcome(self, queue_label: str, status: str) -> None:
-        if status == "completed":
+        if status == RunStatus.COMPLETED:
             self._queue_failures[queue_label] = 0
             self._backoff_queues.discard(queue_label)
             return
-        if status in ("error", "blocked"):
+        if status in (RunStatus.ERROR, RunStatus.BLOCKED):
             count = self._queue_failures.get(queue_label, 0) + 1
             self._queue_failures[queue_label] = count
             if count >= 2:
@@ -188,9 +196,11 @@ class WorkerLoop:
         while not stop.wait(self.heartbeat_seconds):
             self.client.heartbeat(self.cfg.worker_id, lease_id=lease_id)
 
-    def _submit(self, order: dict[str, Any], outcome: ExecuteOutcome) -> None:
+    def _submit(self, order: dict[str, Any], outcome: Outcome) -> None:
         run_id = order["run_id"]
         task = order["task"]
+        # The wire body is the lease/task envelope plus the unified Outcome,
+        # flat — the manager's SubmitBody embeds Outcome the same way.
         payload = {
             "worker_id": self.cfg.worker_id,
             "lease_id": order["lease_id"],
@@ -198,22 +208,8 @@ class WorkerLoop:
             "queue": order.get("queue", "main"),
             "repo": order.get("repo"),
             "title": order.get("title", task),
-            "status": outcome.status,
-            "result_line": outcome.result_line,
-            "backend": outcome.backend,
-            "model": outcome.resolved_model,
-            "landable": outcome.landable,
-            "branch_ref": outcome.branch_ref,
-            "head_sha": outcome.head_sha,
-            "failure_kind": outcome.failure_kind,
-            "failure_reason": outcome.failure_reason,
-            "turns": outcome.turns,
-            "input_tokens": outcome.input_tokens,
-            "output_tokens": outcome.output_tokens,
-            "cost_usd": outcome.cost_usd,
-            "validate_cmd": outcome.validate_cmd,
-            "worktree": outcome.worktree,
             "quarantine": self.cfg.quarantine,
+            **outcome.model_dump(),
         }
         result: dict[str, Any] = {}
         try:
@@ -228,6 +224,8 @@ class WorkerLoop:
                     order.get("queue") or "main"
                 )
                 teardown_worktree(self.cfg.workspace, repo, task, queue=queue_internal)
+        # The local history row derives from the same Outcome (minus the
+        # transport-only fields), plus the manager's land result.
         self.local.finish(
             {
                 "run_id": run_id,
@@ -235,19 +233,10 @@ class WorkerLoop:
                 "queue": order.get("queue", "main"),
                 "title": order.get("title", task),
                 "repo": order.get("repo", ""),
-                "model": outcome.resolved_model,
-                "backend": outcome.backend,
-                "status": outcome.status,
-                "failure_kind": outcome.failure_kind,
-                "result_line": outcome.result_line,
+                **outcome.model_dump(exclude=_LOCAL_HISTORY_EXCLUDE),
                 "commit_sha": result.get("sha"),
                 "landed": bool(result.get("landed")),
                 "quarantined": bool(result.get("quarantined")),
-                "turns": outcome.turns,
-                "input_tokens": outcome.input_tokens,
-                "output_tokens": outcome.output_tokens,
-                "cost_usd": outcome.cost_usd,
-                "worktree": outcome.worktree,
             }
         )
 

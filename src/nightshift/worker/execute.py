@@ -5,7 +5,7 @@ validate) but **stops before landing**: a successful run leaves a committed task
 branch for the manager to squash. The worker's single outward action is to
 submit; it never squashes to ``main`` itself.
 
-Outcomes:
+Outcomes (the unified :class:`nightshift.lifecycle.Outcome`):
 
 * ``completed`` + ``landable=True``  — validated commit(s) on the branch (kept).
 * ``completed`` + ``landable=False`` — worker produced no commit (nothing to land).
@@ -19,7 +19,6 @@ Outcomes:
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any
 
 from nightshift import playlists, repos
@@ -41,6 +40,7 @@ from nightshift.engine import (
     validate_cmd_from_blob,
     worker_env,
 )
+from nightshift.lifecycle import FailureKind, Outcome, RunStatus
 from nightshift.manager.landing import main_advanced_sha
 from nightshift.model_id import split_model
 from nightshift.worker.config import WorkerConfig
@@ -50,34 +50,6 @@ from nightshift.worker.config import WorkerConfig
 PhaseCb = Callable[[str], None]
 # Log callback: (line) -> None, streamed to the manager + local tail.
 LogCb = Callable[[str], None]
-
-
-@dataclass
-class ExecuteOutcome:
-    status: str  # completed | blocked | error
-    result_line: str
-    landable: bool
-    resolved_model: str
-    backend: str = ""
-    failure_kind: str | None = None
-    failure_reason: str | None = None
-    # Cross-machine landing (transport B): the WIP ref the worker published its
-    # validated branch to, and the branch tip SHA the manager re-verifies after
-    # fetching. Both None when co-located (no rendezvous remote configured).
-    branch_ref: str | None = None
-    head_sha: str | None = None
-    # Best-effort agent telemetry captured from the backend run (None when the
-    # backend can't report it); carried to the manager for per-task rollups.
-    turns: int | None = None
-    input_tokens: int | None = None
-    output_tokens: int | None = None
-    cost_usd: float | None = None
-    # Validate command the worker actually ran (None when skipped or not reached).
-    validate_cmd: str | None = None
-    # Env-preflight command run before the backend (None when disabled/not reached).
-    preflight_cmd: str | None = None
-    # The worktree directory the worker used for this task (str path).
-    worktree: str | None = None
 
 
 def _finish_landable(
@@ -93,9 +65,8 @@ def _finish_landable(
     on_log: LogCb,
     wip_ref_prefix: str | None = None,
     validate_cmd: str | None = None,
-    preflight_cmd: str | None = None,
     worktree: str | None = None,
-) -> ExecuteOutcome:
+) -> Outcome:
     """Finalize a validated (landable) run.
 
     Cross-machine (a rendezvous remote is configured): publish the task branch to
@@ -106,14 +77,13 @@ def _finish_landable(
     shared workspace — today's behavior.
     """
     if not cfg.rendezvous_remote:
-        return ExecuteOutcome(
-            status="completed",
+        return Outcome(
+            status=RunStatus.COMPLETED,
             result_line=result_line,
             landable=True,
-            resolved_model=model,
+            model=model,
             backend=backend,
             validate_cmd=validate_cmd,
-            preflight_cmd=preflight_cmd,
             worktree=worktree,
             **tele,
         )
@@ -128,30 +98,28 @@ def _finish_landable(
         )
     except RuntimeError as exc:
         on_log(f"  publish to rendezvous remote failed: {exc}\n")
-        return ExecuteOutcome(
-            status="error",
+        return Outcome(
+            status=RunStatus.ERROR,
             result_line="publish failed",
             landable=False,
-            resolved_model=model,
+            model=model,
             backend=backend,
-            failure_kind="publish_failed",
+            failure_kind=FailureKind.PUBLISH_FAILED,
             failure_reason=str(exc),
             validate_cmd=validate_cmd,
-            preflight_cmd=preflight_cmd,
             worktree=worktree,
             **tele,
         )
     on_log(f"  published {branch_ref} ({head_sha[:8]}) to {cfg.rendezvous_remote}\n")
-    return ExecuteOutcome(
-        status="completed",
+    return Outcome(
+        status=RunStatus.COMPLETED,
         result_line=result_line,
         landable=True,
-        resolved_model=model,
+        model=model,
         backend=backend,
         branch_ref=branch_ref,
         head_sha=head_sha,
         validate_cmd=validate_cmd,
-        preflight_cmd=preflight_cmd,
         worktree=worktree,
         **tele,
     )
@@ -163,7 +131,7 @@ def execute_work_order(
     *,
     on_phase: PhaseCb,
     on_log: LogCb,
-) -> ExecuteOutcome:
+) -> Outcome:
     """Run one work order to a landable (or failed) state. Never touches main."""
     from nightshift.backends import LAUNCH_FAILED, WorkerSpec, require_backend
     from nightshift.engine import worktree_dir
@@ -183,71 +151,61 @@ def execute_work_order(
     # every outcome carries it — even early failures that never cut the worktree.
     wt_path = str(worktree_dir(workspace, repo, task, queue))
 
-    model, model_error = cfg.resolve_model(config_blob.get("model"))
-    if model_error:
-        return ExecuteOutcome(
-            status="error",
-            result_line=model_error,
-            landable=False,
-            resolved_model=str(config_blob.get("model") or "auto"),
-            failure_kind="model_unavailable",
-            failure_reason=model_error,
-            worktree=wt_path,
-        )
-    assert model is not None
+    # Progress snapshot the ``fail`` closure reads: refined as resolution and
+    # execution advance so every failure carries whatever is known by then.
+    model = str(config_blob.get("model") or "auto")
+    provider = ""
+    tele: dict[str, Any] = {}
+    validate_ran: str | None = None
 
-    provider, bare_model = split_model(model)
-    if provider is None:
-        reason = f"model '{model}' is not provider-qualified (expected provider/model)"
-        return ExecuteOutcome(
-            status="error",
-            result_line=reason,
+    def fail(kind: FailureKind, reason: str | None, *, line: str | None = None) -> Outcome:
+        """The one failure constructor: status=error, nothing landable, and the
+        current model/backend/telemetry/worktree snapshot attached."""
+        return Outcome(
+            status=RunStatus.ERROR,
+            result_line=line if line is not None else (reason or ""),
             landable=False,
-            resolved_model=model,
-            failure_kind="model_unavailable",
+            model=model,
+            backend=provider,
+            failure_kind=kind,
             failure_reason=reason,
+            validate_cmd=validate_ran,
             worktree=wt_path,
+            **tele,
         )
+
+    resolved_model, model_error = cfg.resolve_model(config_blob.get("model"))
+    if model_error:
+        return fail(FailureKind.MODEL_UNAVAILABLE, model_error)
+    assert resolved_model is not None
+    model = resolved_model
+
+    provider_name, bare_model = split_model(model)
+    if provider_name is None:
+        return fail(
+            FailureKind.MODEL_UNAVAILABLE,
+            f"model '{model}' is not provider-qualified (expected provider/model)",
+        )
+    provider = provider_name
 
     # Defensive availability guard.
     if not repos.repo_available(workspace, repo):
-        reason = f"repo '{repo}' is not available in the workspace"
-        return ExecuteOutcome(
-            status="error",
-            result_line=reason,
-            landable=False,
-            resolved_model=model,
-            backend=provider,
-            failure_kind="repo_unavailable",
-            failure_reason=reason,
-            worktree=wt_path,
+        return fail(
+            FailureKind.REPO_UNAVAILABLE,
+            f"repo '{repo}' is not available in the workspace",
         )
 
     try:
         backend = require_backend(provider)
     except KeyError:
-        reason = f"unknown provider '{provider}' in model '{model}'"
-        return ExecuteOutcome(
-            status="error",
-            result_line=reason,
-            landable=False,
-            resolved_model=model,
-            backend=provider,
-            failure_kind="backend_unavailable",
-            failure_reason=reason,
-            worktree=wt_path,
+        return fail(
+            FailureKind.BACKEND_UNAVAILABLE,
+            f"unknown provider '{provider}' in model '{model}'",
         )
     if not backend.available(config_blob):
-        reason = f"backend '{provider}' is not available on this worker"
-        return ExecuteOutcome(
-            status="error",
-            result_line=reason,
-            landable=False,
-            resolved_model=model,
-            backend=provider,
-            failure_kind="backend_unavailable",
-            failure_reason=reason,
-            worktree=wt_path,
+        return fail(
+            FailureKind.BACKEND_UNAVAILABLE,
+            f"backend '{provider}' is not available on this worker",
         )
 
     on_phase("worker")
@@ -302,21 +260,11 @@ def execute_work_order(
             if pre.synced:
                 on_log("  preflight: environment synced to lockfile\n")
             if not pre.ok:
-                return ExecuteOutcome(
-                    status="error",
-                    result_line="preflight failed (environment not provisioned)",
-                    landable=False,
-                    resolved_model=model,
-                    backend=provider,
-                    failure_kind="preflight_failed",
-                    failure_reason=pre.detail or f"{preflight_display} failed",
-                    preflight_cmd=preflight_display,
-                    worktree=wt_path,
+                return fail(
+                    FailureKind.PREFLIGHT_FAILED,
+                    pre.detail or f"{preflight_display} failed",
+                    line="preflight failed (environment not provisioned)",
                 )
-
-        # The preflight command that actually ran (None when disabled), carried
-        # onto downstream outcomes for the manager's telemetry.
-        preflight_ran = preflight_display if preflight_argv is not None else None
 
         max_turns = config_blob.get("max_turns")
         spec = WorkerSpec(
@@ -340,29 +288,23 @@ def execute_work_order(
         }
 
         if result.returncode == LAUNCH_FAILED:
-            return ExecuteOutcome(
-                status="error",
-                result_line="worker executable not found",
-                landable=False,
-                resolved_model=model,
-                backend=provider,
-                failure_kind="worker_launch",
-                failure_reason=result.error,
-                worktree=wt_path,
-                **tele,
+            return fail(
+                FailureKind.WORKER_LAUNCH,
+                result.error,
+                line="worker executable not found",
             )
 
         has_commits = _worktree_has_commits(workspace, repo, task, queue=queue)
 
         blocked_reason = extract_blocked_reason("".join(captured))
         if blocked_reason and not has_commits:
-            return ExecuteOutcome(
-                status="blocked",
+            return Outcome(
+                status=RunStatus.BLOCKED,
                 result_line=f"blocked: {blocked_reason}",
                 landable=False,
-                resolved_model=model,
+                model=model,
                 backend=provider,
-                failure_kind="blocked",
+                failure_kind=FailureKind.BLOCKED,
                 failure_reason=blocked_reason,
                 worktree=wt_path,
                 **tele,
@@ -372,24 +314,16 @@ def execute_work_order(
             reason = (
                 result.error or f"worker [{provider}] exited {result.returncode}"
             )
-            return ExecuteOutcome(
-                status="error",
-                result_line=reason.splitlines()[0][:120],
-                landable=False,
-                resolved_model=model,
-                backend=provider,
-                failure_kind="worker_error",
-                failure_reason=reason,
-                worktree=wt_path,
-                **tele,
+            return fail(
+                FailureKind.WORKER_ERROR, reason, line=reason.splitlines()[0][:120]
             )
 
         if is_split:
-            return ExecuteOutcome(
-                status="completed",
+            return Outcome(
+                status=RunStatus.COMPLETED,
                 result_line="decomposition run",
                 landable=False,
-                resolved_model=model,
+                model=model,
                 backend=provider,
                 worktree=wt_path,
                 **tele,
@@ -399,20 +333,14 @@ def execute_work_order(
             base_ref = order.get("base_ref")
             repo_root = workspace / repo
             if base_ref and main_advanced_sha(repo_root, base_ref):
-                return ExecuteOutcome(
-                    status="completed",
-                    result_line="agent landed on main (awaiting manager adopt)",
-                    landable=False,
-                    resolved_model=model,
-                    backend=provider,
-                    worktree=wt_path,
-                    **tele,
-                )
-            return ExecuteOutcome(
-                status="completed",
-                result_line="no changes produced (worker emitted output only)",
+                result_line = "agent landed on main (awaiting manager adopt)"
+            else:
+                result_line = "no changes produced (worker emitted output only)"
+            return Outcome(
+                status=RunStatus.COMPLETED,
+                result_line=result_line,
                 landable=False,
-                resolved_model=model,
+                model=model,
                 backend=provider,
                 worktree=wt_path,
                 **tele,
@@ -432,11 +360,11 @@ def execute_work_order(
                 on_log=on_log,
                 wip_ref_prefix=config_blob.get("wip_ref_prefix"),
                 validate_cmd=None,
-                preflight_cmd=preflight_ran,
                 worktree=wt_path,
             )
         on_phase("validate")
         on_log(f"  running {validate_display}...\n")
+        validate_ran = validate_display
         validate = run_interruptible(
             validate_argv,
             cwd=wt_dir,
@@ -455,19 +383,7 @@ def execute_work_order(
             result_line = extract_result_line(
                 validate.stdout, validate.stderr,
             ) or "validate failed"
-            return ExecuteOutcome(
-                status="error",
-                result_line=result_line,
-                landable=False,
-                resolved_model=model,
-                backend=provider,
-                failure_kind="validation_error",
-                failure_reason=tail,
-                validate_cmd=validate_display,
-                preflight_cmd=preflight_ran,
-                worktree=wt_path,
-                **tele,
-            )
+            return fail(FailureKind.VALIDATION_ERROR, tail, line=result_line)
 
         preserve = True
         return _finish_landable(
@@ -482,7 +398,6 @@ def execute_work_order(
             on_log=on_log,
             wip_ref_prefix=config_blob.get("wip_ref_prefix"),
             validate_cmd=validate_display,
-            preflight_cmd=preflight_ran,
             worktree=wt_path,
         )
     finally:

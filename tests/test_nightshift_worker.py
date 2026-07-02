@@ -385,7 +385,7 @@ def test_execute_dispatches_by_model_provider(tmp_path: Path, monkeypatch) -> No
     assert seen["model"] == "gpt-oss:120b"      # bare model handed to the backend
     assert seen["timeout"] == 42.0
     assert outcome.backend == "ollama-cloud"     # provider recorded on the outcome
-    assert outcome.resolved_model == "ollama-cloud/gpt-oss:120b"
+    assert outcome.model == "ollama-cloud/gpt-oss:120b"
 
 
 # --------------------------------------------------------------------------- #

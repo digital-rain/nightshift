@@ -19,6 +19,7 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import assert_never
 
 from nightshift.engine import (
     _queue_slug,
@@ -34,6 +35,7 @@ from nightshift.engine import (
     worktree_branch,
     worktree_dir,
 )
+from nightshift.lifecycle import LandingMode
 
 
 @dataclass
@@ -116,7 +118,7 @@ def land(
     *,
     queue: str | None,
     base_ref: str | None = None,
-    landing_mode: str = "none",
+    landing_mode: LandingMode | str = LandingMode.NONE,
     automerge: bool = True,
     draft: bool = False,
     autostash: bool = True,
@@ -144,6 +146,9 @@ def land(
     """
     repo_root = workspace / repo
     branch = worktree_branch(task, queue)
+    # Callers inside the manager hand in a parsed LandingMode; the str form is
+    # accepted for direct/legacy callers and validated here (fail loudly).
+    mode = LandingMode(landing_mode)
 
     # Cross-machine obtain: detected by an absent worktree dir + a submitted
     # branch_ref (gating on the dir, not branch presence, forces a re-fetch +
@@ -179,7 +184,7 @@ def land(
 
     adopted = _adopt_agent_land_on_main(
         workspace, repo, task, title, queue=queue, base_ref=base_ref,
-        landing_mode=landing_mode, automerge=automerge, draft=draft,
+        landing_mode=mode, automerge=automerge, draft=draft,
     )
     if adopted is not None:
         return adopted
@@ -192,7 +197,7 @@ def land(
     # mode or an unconfigured remote stays purely local). The push target itself
     # defaults to ``origin`` so ``push`` mode works without a separate rendezvous
     # remote, matching the historical direct-push behavior.
-    do_sync = bool(rendezvous_remote) and landing_mode in ("push", "pr")
+    do_sync = bool(rendezvous_remote) and mode.is_remote
     push_remote = rendezvous_remote or "origin"
 
     # The squash commit a rejected push leaves on local main: the next re-sync
@@ -277,46 +282,50 @@ def land(
             result = LandingResult(landed=True, sha=sha, detail=squash_error)
 
             # 4. Apply the remote policy.
-            if landing_mode == "push":
-                result.remote = "push"
-                pushed, push_detail = _push_head_to_main(
-                    workspace, repo, push_remote
-                )
-                if pushed:
-                    result.pushed = True
+            match mode:
+                case LandingMode.PUSH:
+                    result.remote = "push"
+                    pushed, push_detail = _push_head_to_main(
+                        workspace, repo, push_remote
+                    )
+                    if pushed:
+                        result.pushed = True
+                        break
+                    # Non-fast-forward: origin advanced under us. The branch is
+                    # still intact (teardown happens only after a confirmed
+                    # push), so the next pass re-syncs (resetting local main to
+                    # origin, which drops this just-made squash) and
+                    # re-squashes onto the new tip. Retry only helps when we
+                    # actually re-sync; without a rendezvous remote a rejection
+                    # is terminal.
+                    result.pushed = False
+                    if do_sync and attempt < max_push_retries:
+                        continue
+                    # Exhausted retries: leave the branch for a resolve and
+                    # report a recoverable rejection (NOT a content conflict).
+                    return _noting_drops(LandingResult(
+                        landed=False,
+                        recoverable=True,
+                        conflict=False,
+                        remote="push",
+                        pushed=False,
+                        detail=(
+                            f"push to origin main rejected after {max_push_retries + 1} "
+                            f"attempt(s) (origin keeps advancing):\n{push_detail}"
+                        ),
+                    ))
+                case LandingMode.PR:
+                    result.remote = "pr"
+                    _open_pr(
+                        workspace, repo, task, title, queue=queue,
+                        automerge=automerge, draft=draft, result=result,
+                    )
                     break
-                # Non-fast-forward: origin advanced under us. The branch is still
-                # intact (teardown happens only after a confirmed push), so the
-                # next pass re-syncs (resetting local main to origin, which drops
-                # this just-made squash) and re-squashes onto the new tip. Retry
-                # only helps when we actually re-sync; without a rendezvous remote
-                # a rejection is terminal.
-                result.pushed = False
-                if do_sync and attempt < max_push_retries:
-                    continue
-                # Exhausted retries: leave the branch for a resolve and report a
-                # recoverable rejection (NOT a content conflict).
-                return _noting_drops(LandingResult(
-                    landed=False,
-                    recoverable=True,
-                    conflict=False,
-                    remote="push",
-                    pushed=False,
-                    detail=(
-                        f"push to origin main rejected after {max_push_retries + 1} "
-                        f"attempt(s) (origin keeps advancing):\n{push_detail}"
-                    ),
-                ))
-            elif landing_mode == "pr":
-                result.remote = "pr"
-                _open_pr(
-                    workspace, repo, task, title, queue=queue,
-                    automerge=automerge, draft=draft, result=result,
-                )
-                break
-            else:
-                # landing_mode == "none": the local squash is the whole land.
-                break
+                case LandingMode.NONE:
+                    # The local squash is the whole land.
+                    break
+                case _:
+                    assert_never(mode)
 
     # The branch has landed on canonical main; reclaim its worktree + branch
     # (mirrors the engine's post-squash teardown in the single-process path).
@@ -338,20 +347,25 @@ def _apply_remote_policy(
     title: str,
     *,
     queue: str | None,
-    landing_mode: str,
+    landing_mode: LandingMode,
     automerge: bool,
     draft: bool,
     result: LandingResult,
 ) -> None:
-    if landing_mode == "push":
-        result.remote = "push"
-        _push_main(workspace, repo, result)
-    elif landing_mode == "pr":
-        result.remote = "pr"
-        _open_pr(
-            workspace, repo, task, title,
-            queue=queue, automerge=automerge, draft=draft, result=result,
-        )
+    match landing_mode:
+        case LandingMode.PUSH:
+            result.remote = "push"
+            _push_main(workspace, repo, result)
+        case LandingMode.PR:
+            result.remote = "pr"
+            _open_pr(
+                workspace, repo, task, title,
+                queue=queue, automerge=automerge, draft=draft, result=result,
+            )
+        case LandingMode.NONE:
+            pass  # local-only: the squash already on main is the whole land
+        case _:
+            assert_never(landing_mode)
 
 
 def _adopt_agent_land_on_main(
@@ -362,7 +376,7 @@ def _adopt_agent_land_on_main(
     *,
     queue: str | None,
     base_ref: str | None,
-    landing_mode: str,
+    landing_mode: LandingMode,
     automerge: bool,
     draft: bool,
 ) -> LandingResult | None:

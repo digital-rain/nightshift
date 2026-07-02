@@ -62,6 +62,15 @@ from nightshift.engine import (
     task_is_evergreen,
 )
 from nightshift.events import new_run_id
+from nightshift.lifecycle import (
+    RUN_RESOLVABLE_STATUSES,
+    FailureKind,
+    LandingMode,
+    LeaseStatus,
+    Outcome,
+    RunStatus,
+    TaskHoldKind,
+)
 from nightshift.manager import failure_policy
 from nightshift.manager.config import ManagerConfig, load_manager_config
 from nightshift.manager.hub import Hub
@@ -133,36 +142,20 @@ class RunEventsBody(BaseModel):
     events: list[dict[str, Any]]
 
 
-class SubmitBody(BaseModel):
+class SubmitBody(Outcome):
+    """The worker's submit body: the unified :class:`Outcome` embedded flat
+    (same wire keys as ever) plus the lease/task envelope."""
+
     worker_id: str
     lease_id: str
     task: str
     queue: str | None = None
     title: str
-    status: str = "completed"
-    result_line: str = ""
-    backend: str | None = None
-    model: str | None = None
-    # False when the worker completed but produced no commit to land (e.g. a
-    # non-agentic backend, or an agentic one that decided nothing was needed).
+    # Wire-compat defaults kept from the pre-Outcome SubmitBody: a bare submit
+    # is a completed, landable run with an optional backend.
+    status: RunStatus = RunStatus.COMPLETED
     landable: bool = True
-    # Cross-machine landing (transport B): the WIP ref the worker published and
-    # the branch tip SHA the manager fetches + verifies before squashing. Both
-    # None for a co-located worker that shares the manager's workspace.
-    branch_ref: str | None = None
-    head_sha: str | None = None
-    failure_kind: str | None = None
-    failure_reason: str | None = None
-    # Best-effort agent telemetry (None when the backend can't report it).
-    turns: int | None = None
-    input_tokens: int | None = None
-    output_tokens: int | None = None
-    cost_usd: float | None = None
-    # The validate command the worker actually ran (None when validation was
-    # skipped or never reached).
-    validate_cmd: str | None = None
-    # The worktree directory the worker used for this task.
-    worktree: str | None = None
+    backend: str | None = None  # type: ignore[assignment]
     # Worker-side quarantine flag: when the worker has quarantine mode enabled,
     # it sets this to True so the manager quarantines on the first failure
     # instead of waiting for the streak threshold.
@@ -385,7 +378,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         remote = cfg.rendezvous_remote
         if not interval or interval <= 0 or not remote:
             return
-        if cfg.landing_mode not in ("push", "pr"):
+        if not cfg.landing_mode.is_remote:
             return
         while True:
             seen: set[str] = set()
@@ -591,11 +584,12 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         )
 
     async def _record_failure_outcome(
-        queue: str | None, task: str, *, state: str, blocked_reason: str, retry_eligible: bool
+        queue: str | None, task: str, *, state: TaskHoldKind,
+        blocked_reason: str, retry_eligible: bool
     ) -> None:
         """Mark a task failed (frontmatter) or blocked (DB overlay) and apply
         the phase-A two-in-a-row pause."""
-        if state == "failed":
+        if state is TaskHoldKind.FAILED:
             _set_frontmatter_flag(
                 queue, task, "failed", True,
                 reason_key="failed_reason", reason=blocked_reason,
@@ -756,9 +750,9 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         )
         if not started:
             await store.update_run(
-                child_run_id, status="error",
+                child_run_id, status=RunStatus.ERROR,
                 result_line="failed to launch resolver process",
-                failure_kind="worker_launch",
+                failure_kind=FailureKind.WORKER_LAUNCH,
             )
             return False, child_run_id, "failed to launch resolver process"
         await _emit(
@@ -826,9 +820,9 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             tasks_rel = playlists_mod.tasks_rel(q)
             for row in frontmatter_held_tasks(tasks_root, tasks_rel):
                 key = (_queue_from_label(row["queue"]), row["task"])
-                if row["state"] == "quarantined":
+                if row["state"] == TaskHoldKind.QUARANTINED:
                     quarantined.add(key)
-                elif row["state"] == "failed":
+                elif row["state"] == TaskHoldKind.FAILED:
                     failed.add(key)
 
         # Mark tasks blocked when no live worker can ever currently serve them:
@@ -848,9 +842,9 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             if (cand.queue, cand.task) in quarantined:
                 continue
             existing = await store.get_task_state(cand.queue, cand.task)
-            if not existing or existing.get("state") != "blocked":
+            if not existing or existing.get("state") != TaskHoldKind.BLOCKED:
                 await store.set_task_state(
-                    cand.queue, cand.task, "blocked", blocked_reason=reason
+                    cand.queue, cand.task, TaskHoldKind.BLOCKED, blocked_reason=reason
                 )
                 await _emit(
                     "task_blocked",
@@ -871,9 +865,9 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                     continue
                 if cand.repo_error is not None:
                     existing = await store.get_task_state(cand.queue, cand.task)
-                    if not existing or existing.get("state") != "blocked":
+                    if not existing or existing.get("state") != TaskHoldKind.BLOCKED:
                         await store.set_task_state(
-                            cand.queue, cand.task, "blocked",
+                            cand.queue, cand.task, TaskHoldKind.BLOCKED,
                             blocked_reason=cand.repo_error,
                         )
                         await _emit(
@@ -885,9 +879,10 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                     repo_excluded.add(key)
                 elif cand.repo and not repos.repo_available(workspace, cand.repo):
                     existing = await store.get_task_state(cand.queue, cand.task)
-                    if not existing or existing.get("state") != "repo_unavailable":
+                    if not existing or existing.get("state") != TaskHoldKind.REPO_UNAVAILABLE:
                         await store.set_task_state(
-                            cand.queue, cand.task, "repo_unavailable", repo=cand.repo
+                            cand.queue, cand.task, TaskHoldKind.REPO_UNAVAILABLE,
+                            repo=cand.repo,
                         )
                     repo_excluded.add(key)
                     if cand.queue not in app.state.repo_warnings:
@@ -958,7 +953,9 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         # dispatch is clean, and pin the target repo's HEAD as base_ref.
         repo = chosen.repo
         prior = await store.get_task_state(chosen.queue, chosen.task)
-        if prior and prior.get("state") in ("repo_unavailable", "blocked"):
+        if prior and prior.get("state") in (
+            TaskHoldKind.REPO_UNAVAILABLE, TaskHoldKind.BLOCKED,
+        ):
             await store.clear_task_state(chosen.queue, chosen.task)
         # Origin-aware dispatch: for any remote-landing mode (push or pr), resync
         # local main to origin/main before pinning base_ref so the worker starts
@@ -967,8 +964,8 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         # failure must not fail the poll — base_ref then pins the local HEAD and
         # the land re-syncs anyway. See remote-landing.md.
         poll_meta = _task_meta(tasks_root, chosen.task, chosen.queue)
-        effective_mode = "pr" if poll_meta.get("make_pr") else cfg.landing_mode
-        if effective_mode in ("push", "pr") and cfg.rendezvous_remote:
+        effective_mode = LandingMode.PR if poll_meta.get("make_pr") else cfg.landing_mode
+        if effective_mode.is_remote and cfg.rendezvous_remote:
             with contextlib.suppress(Exception):
                 await asyncio.to_thread(
                     maybe_sync_main_to_origin,
@@ -1009,7 +1006,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             repo=repo,
             validate_cmd=planned_validate or None,
         )
-        await store.set_lease_status(lease["id"], "leased", run_id=run_id)
+        await store.set_lease_status(lease["id"], LeaseStatus.LEASED, run_id=run_id)
         await _registry().set_busy(
             body.worker_id, task=chosen.task, queue=chosen.queue, run_id=run_id
         )
@@ -1069,7 +1066,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         # honoring the stale submit would double-land it. 409, no writes.
         if (
             lease is None
-            or lease.get("status") != "leased"
+            or lease.get("status") != LeaseStatus.LEASED
             or lease.get("worker_id") != body.worker_id
         ):
             raise HTTPException(
@@ -1082,34 +1079,29 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         repo = run.get("repo")
 
         # Agent telemetry recorded on every outcome (a failed/no-change run still
-        # burned turns + tokens), so the per-task rollups stay accurate.
-        telemetry = {
-            "turns": body.turns,
-            "input_tokens": body.input_tokens,
-            "output_tokens": body.output_tokens,
-            "cost_usd": body.cost_usd,
-            "validate_cmd": body.validate_cmd,
-            "worktree": body.worktree,
-        }
+        # burned turns + tokens), so the per-task rollups stay accurate. The
+        # dict derives from the shared Telemetry model — no hand-synced re-pack.
+        telemetry = body.telemetry.model_dump()
 
         # An honest block from the worker (no commits): record the outcome, hold
         # the task in the DB ``blocked`` state with its reason, do NOT land and do
         # NOT drop the brief, so a Resolve can pick it up later.
-        if body.status == "blocked":
+        if body.status == RunStatus.BLOCKED:
             reason = body.failure_reason or body.result_line or "blocked"
             await store.update_run(
                 run_id,
-                status="blocked",
+                status=RunStatus.BLOCKED,
                 result_line=body.result_line,
-                failure_kind=body.failure_kind or "blocked",
+                failure_kind=body.failure_kind or FailureKind.BLOCKED,
                 failure_reason=body.failure_reason,
                 model=body.model,
                 **telemetry,
             )
-            await store.set_lease_status(body.lease_id, "released")
+            await store.set_lease_status(body.lease_id, LeaseStatus.RELEASED)
             was_retry = _task_is_failed_in_frontmatter(queue, body.task)
             await _record_failure_outcome(
-                queue, body.task, state="blocked", blocked_reason=reason, retry_eligible=True,
+                queue, body.task, state=TaskHoldKind.BLOCKED, blocked_reason=reason,
+                retry_eligible=True,
             )
             if was_retry:
                 await _quarantine_retry_failure(queue, body.task, run_id, reason)
@@ -1125,7 +1117,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
 
         # A non-completed submit (worker failed/aborted before producing a branch)
         # records the outcome and releases the lease without touching main.
-        if body.status != "completed":
+        if body.status != RunStatus.COMPLETED:
             await store.update_run(
                 run_id,
                 status=body.status,
@@ -1135,7 +1127,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                 model=body.model,
                 **telemetry,
             )
-            await store.set_lease_status(body.lease_id, "released")
+            await store.set_lease_status(body.lease_id, LeaseStatus.RELEASED)
             # A worker *error* marks the task ``failed`` so it is excluded from
             # immediate dispatch. The failure-policy state machine watches for
             # two unrelated failures in a row and pauses the queue. Repeated
@@ -1143,16 +1135,16 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             # guard. Operator-driven stops (aborted) are intentional and never
             # quarantine or count as failures.
             quarantined = False
-            if body.status == "error":
+            if body.status == RunStatus.ERROR:
                 was_retry = _task_is_failed_in_frontmatter(queue, body.task)
-                if body.failure_kind == "validation_error":
+                if body.failure_kind == FailureKind.VALIDATION_ERROR:
                     # Validation failures mean the agent DID produce commits
                     # but the validate command rejected them. The branch is
                     # preserved and the work is recoverable — treat this as a
                     # block (needs resolve) rather than a policy failure so it
                     # doesn't arm the two-in-a-row watch.
                     await store.set_task_state(
-                        queue, body.task, "blocked",
+                        queue, body.task, TaskHoldKind.BLOCKED,
                         blocked_reason="validation failed: " + (
                             body.result_line or "validate command returned non-zero"
                         ),
@@ -1178,7 +1170,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                 else:
                     reason = body.result_line or body.failure_reason or "worker error"
                     await _record_failure_outcome(
-                        queue, body.task, state="failed",
+                        queue, body.task, state=TaskHoldKind.FAILED,
                         blocked_reason=reason, retry_eligible=True,
                     )
                     if was_retry:
@@ -1216,11 +1208,11 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                 else:
                     result_line = "decomposition run produced no subtasks"
                 await store.update_run(
-                    run_id, status="completed",
+                    run_id, status=RunStatus.COMPLETED,
                     result_line=result_line, model=body.model,
                     **telemetry,
                 )
-                await store.set_lease_status(body.lease_id, "released")
+                await store.set_lease_status(body.lease_id, LeaseStatus.RELEASED)
                 await store.clear_task_state(queue, body.task)
                 await _registry().set_idle(body.worker_id)
                 await _emit(
@@ -1249,11 +1241,11 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                 })
             else:
                 await store.update_run(
-                    run_id, status="completed",
+                    run_id, status=RunStatus.COMPLETED,
                     result_line=body.result_line or "no changes", model=body.model,
                     **telemetry,
                 )
-                await store.set_lease_status(body.lease_id, "released")
+                await store.set_lease_status(body.lease_id, LeaseStatus.RELEASED)
                 if body.quarantine:
                     quarantined = await _quarantine_immediate(
                         queue, body.task, run_id, "no changes produced"
@@ -1265,7 +1257,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                 if not quarantined:
                     was_retry = _task_is_failed_in_frontmatter(queue, body.task)
                     await _record_failure_outcome(
-                        queue, body.task, state="failed",
+                        queue, body.task, state=TaskHoldKind.FAILED,
                         blocked_reason="no changes produced",
                         retry_eligible=True,
                     )
@@ -1288,7 +1280,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         meta = _task_meta(tasks_root, body.task, queue)
         # A task may force PR mode with `make_pr: true`; otherwise the manager's
         # configured landing_mode applies. make_pr never forces squash/push.
-        effective_mode = "pr" if meta.get("make_pr") else cfg.landing_mode
+        effective_mode = LandingMode.PR if meta.get("make_pr") else cfg.landing_mode
         # Landing shells out to git (and possibly the network) repeatedly; run
         # it off the event loop so polls/heartbeats/SSE stay live. The lease
         # fence above makes this safe: a task re-leased while a slow land runs
@@ -1316,8 +1308,11 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         )
 
         if not result.landed:
-            status = "error"
-            failure_kind = "merge_conflict" if result.conflict else "merge_rejected"
+            status = RunStatus.ERROR
+            failure_kind = (
+                FailureKind.MERGE_CONFLICT if result.conflict
+                else FailureKind.MERGE_REJECTED
+            )
             await store.update_run(
                 run_id,
                 status=status,
@@ -1327,7 +1322,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                 model=body.model,
                 **telemetry,
             )
-            await store.set_lease_status(body.lease_id, "released")
+            await store.set_lease_status(body.lease_id, LeaseStatus.RELEASED)
             await _registry().set_idle(body.worker_id)
             # The branch is preserved (squash_to_main / land only teardown after a
             # confirmed land), so the conflict or rejection is resolvable. Hold the
@@ -1338,7 +1333,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                     else failure_kind
                 )
                 await _record_failure_outcome(
-                    queue, body.task, state="blocked",
+                    queue, body.task, state=TaskHoldKind.BLOCKED,
                     blocked_reason=land_reason, retry_eligible=False,
                 )
                 await _emit(
@@ -1356,7 +1351,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             if (
                 cfg.auto_resolve
                 and (result.conflict or result.recoverable)
-                and effective_mode != "pr"
+                and effective_mode is not LandingMode.PR
             ):
                 resolving, _child, _err = await _start_resolve(
                     run_id, task=body.task, queue=queue, repo=repo, title=body.title,
@@ -1388,7 +1383,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                 )
         await store.update_run(
             run_id,
-            status="completed",
+            status=RunStatus.COMPLETED,
             result_line=body.result_line or result.detail or "landed",
             commit_sha=result.sha,
             loc=loc,
@@ -1397,7 +1392,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             pushed=result.pushed,
             **telemetry,
         )
-        await store.set_lease_status(body.lease_id, "landed")
+        await store.set_lease_status(body.lease_id, LeaseStatus.LANDED)
         await store.clear_task_state(queue, body.task)
         _record_success_outcome(queue)
         await _registry().set_idle(body.worker_id)
@@ -1446,7 +1441,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         # writes.
         if body.origin_run_id:
             origin = await store.get_run(body.origin_run_id)
-            if origin is None or origin.get("status") not in ("error", "blocked"):
+            if origin is None or origin.get("status") not in RUN_RESOLVABLE_STATUSES:
                 raise HTTPException(
                     status_code=409,
                     detail="stale resolve result: origin run is not resolvable",
@@ -1457,10 +1452,10 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             "output_tokens": body.output_tokens,
             "cost_usd": body.cost_usd,
         }
-        if body.landed and body.status == "completed":
+        if body.landed and body.status == RunStatus.COMPLETED:
             await store.update_run(
                 run_id,
-                status="completed",
+                status=RunStatus.COMPLETED,
                 result_line=body.result_line or "resolved: landed",
                 commit_sha=body.sha,
                 loc=body.loc,
@@ -1472,7 +1467,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                 with contextlib.suppress(Exception):
                     await store.update_run(
                         body.origin_run_id,
-                        status="completed",
+                        status=RunStatus.COMPLETED,
                         result_line=body.result_line or "resolved",
                         commit_sha=body.sha,
                     )
@@ -1495,9 +1490,9 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         else:
             await store.update_run(
                 run_id,
-                status="error",
+                status=RunStatus.ERROR,
                 result_line=body.result_line or "resolve failed",
-                failure_kind=body.failure_kind or "merge_conflict",
+                failure_kind=body.failure_kind or FailureKind.MERGE_CONFLICT,
                 failure_reason=body.failure_reason,
                 **telemetry,
             )
@@ -1505,7 +1500,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                 body.result_line or body.failure_reason or "resolve failed"
             )
             await store.set_task_state(
-                queue, body.task, "blocked", blocked_reason=reason,
+                queue, body.task, TaskHoldKind.BLOCKED, blocked_reason=reason,
             )
             await _emit(
                 "task_blocked", queue=queue, task=body.task,
@@ -1710,7 +1705,9 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         target = _resolve_queue(queue)
         store = _store()
         prior = await store.get_task_state(target, task)
-        if not prior or prior.get("state") not in ("blocked", "repo_unavailable"):
+        if not prior or prior.get("state") not in (
+            TaskHoldKind.BLOCKED, TaskHoldKind.REPO_UNAVAILABLE,
+        ):
             return JSONResponse(
                 {"error": "task is not currently blocked"}, status_code=404,
             )
@@ -1937,14 +1934,14 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             store = _store()
             for le in await store.active_leases():
                 if le.get("queue", "main") == key:
-                    await store.set_lease_status(le["id"], "cancelled")
+                    await store.set_lease_status(le["id"], LeaseStatus.CANCELLED)
                     await _emit("run_finished", run_id=le.get("run_id"), queue=target)
             _paused_queues.pop(key, None)
         elif req.action == "skip":
             store = _store()
             for le in await store.active_leases():
                 if le.get("queue", "main") == key:
-                    await store.set_lease_status(le["id"], "cancelled")
+                    await store.set_lease_status(le["id"], LeaseStatus.CANCELLED)
                     await _emit("run_finished", run_id=le.get("run_id"), queue=target)
         elif req.action == "select":
             _queue_cursors[key] = req.task
@@ -2128,7 +2125,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         scratch on the next poll."""
         store = _store()
         resumed: list[dict[str, Any]] = []
-        for row in await store.tasks_in_state("repo_unavailable"):
+        for row in await store.tasks_in_state(TaskHoldKind.REPO_UNAVAILABLE):
             repo = row.get("repo")
             if repo and repos.repo_available(workspace, repo):
                 queue = _queue_from_label(row.get("queue"))
@@ -2342,9 +2339,11 @@ def no_progress_streak(runs: list[dict[str, Any]], task: str) -> int:
         if run.get("task") != task:
             continue
         status = run.get("status")
-        if status == "completed" and run.get("commit_sha"):
+        if status == RunStatus.COMPLETED and run.get("commit_sha"):
             break
-        if status == "error" or (status == "completed" and not run.get("commit_sha")):
+        if status == RunStatus.ERROR or (
+            status == RunStatus.COMPLETED and not run.get("commit_sha")
+        ):
             streak += 1
     return streak
 

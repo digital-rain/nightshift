@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from nightshift._paths import MIGRATIONS_DIR
 from nightshift.manager.store import MemoryStore
 
@@ -258,6 +260,33 @@ def test_turns_and_tokens_roll_up_per_model_backend_queue() -> None:
     # main queue key is "" (the playlist is "alpha").
     assert by_queue[""]["total_turns"] == 10
     assert by_queue["alpha"]["total_turns"] == 1
+
+
+def test_blocked_run_gets_finished_at() -> None:
+    """`blocked` is a terminal run status: the run is over (the *task* is what
+    stays held), so it must get finished_at like every other terminal status.
+    Pre-Phase-1 this drifted: blocked runs kept finished_at = NULL forever."""
+    store = MemoryStore()
+    _run(store.create_run(
+        "r1", task="t1", queue=None, worker_id="w1",
+        backend="claude-code", model="auto",
+    ))
+    _run(store.update_run("r1", status="blocked", result_line="blocked: needs creds"))
+    run = _run(store.get_run("r1"))
+    assert run["status"] == "blocked"
+    assert run["finished_at"] is not None
+
+
+def test_update_run_raises_on_unknown_fields() -> None:
+    """The updatable-field set derives from the Outcome/Telemetry models;
+    unknown fields raise instead of being silently dropped."""
+    store = MemoryStore()
+    _run(store.create_run(
+        "r1", task="t1", queue=None, worker_id="w1",
+        backend="claude-code", model="auto",
+    ))
+    with pytest.raises(ValueError, match="nonsense_field"):
+        _run(store.update_run("r1", nonsense_field=1))
 
 
 # --------------------------------------------------------------------------- #
