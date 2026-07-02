@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +20,7 @@ from starlette.testclient import TestClient
 
 from _workspace import build_workspace, make_target_repo
 from nightshift.engine import setup_worktree
-from nightshift.manager.api_worker import jsonable, no_progress_streak
+from nightshift.manager.api_worker import jsonable
 from nightshift.manager.app import create_app
 from nightshift.manager.hub import Hub
 from nightshift.manager.landing import canonical_head
@@ -110,7 +111,8 @@ def test_pinned_model_without_backend_is_blocked(tmp_path: Path) -> None:
 
 def test_run_events_and_failed_submit_release(tmp_path: Path) -> None:
     root = _seed(tmp_path, {"10.hello": "Do a thing."})
-    with _client(root) as client:
+    store = MemoryStore()
+    with _client(root, store) as client:
         client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
         order = client.post(
             "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
@@ -145,7 +147,9 @@ def test_run_events_and_failed_submit_release(tmp_path: Path) -> None:
         # The task is now in "failed" state -- it won't dispatch again
         # immediately. But since it's the only task and phase B admits it,
         # the next poll *does* get it (phase B: no ready tasks left, earliest
-        # failed task admitted).
+        # failed task admitted) once its retry backoff elapses (Phase 5:
+        # a failed task backs off instead of re-leasing instantly).
+        _clear_backoff(store, "10.hello")
         again = client.post(
             "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
         ).json()["work"]
@@ -256,19 +260,10 @@ def test_submit_records_turns_tokens_for_rollups(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_no_progress_streak_counts_until_a_landed_commit() -> None:
-    # Newest-first, as list_runs returns. A landed commit resets the count;
-    # aborted/blocked are neutral; no-commit completions and errors count.
-    runs = [
-        {"task": "t", "status": "completed", "commit_sha": None},   # +1
-        {"task": "t", "status": "error", "commit_sha": None},        # +1
-        {"task": "t", "status": "aborted", "commit_sha": None},      # neutral
-        {"task": "other", "status": "completed", "commit_sha": None},  # skipped
-        {"task": "t", "status": "completed", "commit_sha": "abc123"},   # reset/stop
-        {"task": "t", "status": "completed", "commit_sha": None},     # not reached
-    ]
-    assert no_progress_streak(runs, "t") == 2
-    assert no_progress_streak([], "t") == 0
+def _clear_backoff(store: MemoryStore, task: str, queue: str | None = None) -> None:
+    """Release a task's retry backoff so a test can re-dispatch it without
+    waiting out next_eligible_at (Phase 5: failed tasks back off)."""
+    asyncio.run(store.clear_task_backoff(queue, task))
 
 
 def _poll_and_submit_no_change(client: TestClient, task: str) -> dict[str, Any]:
@@ -295,7 +290,8 @@ def _poll_and_submit_no_change(client: TestClient, task: str) -> dict[str, Any]:
 
 def test_repeated_no_change_quarantines_and_halts_dispatch(tmp_path: Path) -> None:
     root = _seed(tmp_path, {"10.loop": "Move a setting that's already moved."})
-    with _client(root) as client:
+    store = MemoryStore()
+    with _client(root, store) as client:
         client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
 
         # First no-change run: under threshold (default 2), still runnable.
@@ -303,6 +299,7 @@ def test_repeated_no_change_quarantines_and_halts_dispatch(tmp_path: Path) -> No
         assert first["quarantined"] is False
 
         # Second no-change run in a row hits the threshold → quarantined.
+        _clear_backoff(store, "10.loop")
         second = _poll_and_submit_no_change(client, "10.loop")
         assert second["quarantined"] is True
 
@@ -319,12 +316,14 @@ def test_repeated_no_change_quarantines_and_halts_dispatch(tmp_path: Path) -> No
 
 def test_patch_quarantined_false_releases_task_for_dispatch(tmp_path: Path) -> None:
     root = _seed(tmp_path, {"10.loop": "Move a setting that's already moved."})
-    with _client(root) as client:
+    store = MemoryStore()
+    with _client(root, store) as client:
         client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
 
         # Drive two no-change runs to trigger quarantine (threshold=2).
         # The first no-change also sets failed=true in frontmatter.
         _poll_and_submit_no_change(client, "10.loop")
+        _clear_backoff(store, "10.loop")
         second = _poll_and_submit_no_change(client, "10.loop")
         assert second["quarantined"] is True
 
@@ -357,13 +356,15 @@ def test_quarantine_threshold_zero_disables_the_guard(tmp_path: Path) -> None:
     root = _seed(tmp_path, {"10.loop": "Idempotent task."})
     os.environ["NIGHTSHIFT_QUARANTINE_THRESHOLD"] = "0"
     try:
-        with _client(root) as client:
+        store = MemoryStore()
+        with _client(root, store) as client:
             client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
             # First no-change submit: quarantine guard disabled (threshold=0),
             # but failure policy marks task as failed.
             out = _poll_and_submit_no_change(client, "10.loop")
             assert out["quarantined"] is False
             # Phase B retries the task (only failed task in queue).
+            _clear_backoff(store, "10.loop")
             out = _poll_and_submit_no_change(client, "10.loop")
             assert out["quarantined"] is False
             # Retry failure quarantines the task and pauses the queue.
@@ -371,6 +372,168 @@ def test_quarantine_threshold_zero_disables_the_guard(tmp_path: Path) -> None:
             assert state["queues"]["main"]["pause_reason"] == "retry_failed"
     finally:
         del os.environ["NIGHTSHIFT_QUARANTINE_THRESHOLD"]
+
+
+def test_interleaved_runs_no_longer_mask_a_no_progress_streak(tmp_path: Path) -> None:
+    """Window-eviction regression (Phase 5 deliberate fix): pre-phase the
+    streak was scanned over the queue's 50 most recent runs, so a busy
+    neighbor task could evict an older failure from the window and a looping
+    task never reached the threshold. The persisted per-task counter cannot
+    be masked by other tasks' runs — this quarantines; the scanner did not."""
+    root = _seed(tmp_path, {
+        "10.loop": "Move a setting that's already moved.",
+        "11.noise": "Busy neighbor.",
+    })
+    store = MemoryStore()
+    with _client(root, store) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+
+        # First failure: counter = 1 (threshold is 2).
+        first = _poll_and_submit_no_change(client, "10.loop")
+        assert first["quarantined"] is False
+
+        # 55 interleaved runs of the neighbor — enough to evict 10.loop's
+        # failure from the old scan window. Aborts are neutral to every
+        # policy, so the neighbor stays pending throughout.
+        for _ in range(55):
+            order = client.post(
+                "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+            ).json()["work"]
+            assert order is not None and order["task"] == "11.noise"
+            client.post(
+                f"/api/worker/runs/{order['run_id']}/submit",
+                json={
+                    "worker_id": "w1", "lease_id": order["lease_id"],
+                    "task": "11.noise", "queue": "main", "title": "noise",
+                    "status": "aborted", "landable": False,
+                },
+            )
+
+        # The operator re-readies the looping task (clears failed + backoff;
+        # the counter survives, exactly like the run history used to).
+        r = client.patch("/api/tasks/10.loop", json={"failed": False})
+        assert r.status_code == 200
+
+        # Its second consecutive no-progress run reaches the threshold.
+        second = _poll_and_submit_no_change(client, "10.loop")
+        assert second["quarantined"] is True
+        state = asyncio.run(store.get_task_state(None, "10.loop"))
+        assert state["attempts_without_progress"] == 2
+        blocked = {b["task"]: b for b in client.get("/api/blocked").json()}
+        assert "2 consecutive runs with no progress" in (
+            blocked["10.loop"]["blocked_reason"]
+        )
+
+
+def test_backoff_excludes_failed_task_until_eligible(tmp_path: Path) -> None:
+    """Phase 5 deliberate fix: an errored task backs off (next_eligible_at)
+    instead of re-leasing immediately, and dispatch honors the backoff."""
+    root = _seed(tmp_path, {"10.flaky": "Fails once."})
+    store = MemoryStore()
+    with _client(root, store) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        order = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        client.post(
+            f"/api/worker/runs/{order['run_id']}/submit",
+            json={
+                "worker_id": "w1", "lease_id": order["lease_id"],
+                "task": "10.flaky", "queue": "main", "title": "flaky",
+                "status": "error", "result_line": "worker bailed",
+                "failure_kind": "worker_error",
+            },
+        )
+        state = asyncio.run(store.get_task_state(None, "10.flaky"))
+        assert state["attempts_without_progress"] == 1
+        assert state["next_eligible_at"] is not None
+
+        # An immediate poll offers nothing: phase B would admit the failed
+        # task, but its backoff hasn't elapsed.
+        assert client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"] is None
+
+        # Simulate the backoff elapsing (inject a past timestamp).
+        with store._lock:
+            store._tasks[("", "10.flaky")]["next_eligible_at"] = (
+                datetime.now(UTC) - timedelta(seconds=1)
+            )
+        again = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        assert again is not None and again["task"] == "10.flaky"
+
+
+def test_environment_failure_cools_worker_not_task(tmp_path: Path) -> None:
+    """Phase 5 deliberate fix: an environment failure never counts against
+    the task — the submitting worker gets a scoped cooldown while another
+    worker picks the task right up."""
+    root = _seed(tmp_path, {"10.envy": "Needs a healthy box."})
+    store = MemoryStore()
+    with _client(root, store) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        client.post("/api/worker/checkin", json={"worker_id": "w2", "backend": "claude-code"})
+        order = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        assert order is not None and order["task"] == "10.envy"
+        r = client.post(
+            f"/api/worker/runs/{order['run_id']}/submit",
+            json={
+                "worker_id": "w1", "lease_id": order["lease_id"],
+                "task": "10.envy", "queue": "main", "title": "envy",
+                "status": "error", "result_line": "model quota exhausted",
+                "failure_kind": "model_unavailable",
+            },
+        )
+        assert r.json() == {"landed": False, "status": "error", "quarantined": False}
+
+        # No task blame: no counter row, no failed flag, no backoff.
+        assert asyncio.run(store.get_task_state(None, "10.envy")) is None
+        blocked = client.get("/api/blocked").json()
+        assert all(b["task"] != "10.envy" for b in blocked)
+
+        # The submitting worker is cooled down for this queue...
+        assert client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"] is None
+        # ...but a healthy worker takes the task immediately.
+        other = client.post(
+            "/api/worker/poll", json={"worker_id": "w2", "backend": "claude-code"}
+        ).json()["work"]
+        assert other is not None and other["task"] == "10.envy"
+
+
+def test_land_resets_the_retry_counter(tmp_path: Path) -> None:
+    """Per greenfield: a land resets attempts_without_progress (here: the
+    counter row is deleted outright — reset is free)."""
+    workspace = _seed(tmp_path, {"10.hello": "Do a thing."})
+    store = MemoryStore()
+    with _client(workspace, store) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        # One failure first, so there is a nonzero counter to reset.
+        order = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        client.post(
+            f"/api/worker/runs/{order['run_id']}/submit",
+            json={
+                "worker_id": "w1", "lease_id": order["lease_id"],
+                "task": "10.hello", "queue": "main", "title": "hello",
+                "status": "error", "result_line": "worker bailed",
+                "failure_kind": "worker_error",
+            },
+        )
+        state = asyncio.run(store.get_task_state(None, "10.hello"))
+        assert state["attempts_without_progress"] == 1
+
+        # Release it for retry, then land for real.
+        client.patch("/api/tasks/10.hello", json={"failed": False})
+        order = _poll_with_landable_branch(client, workspace, "10.hello")
+        r = _submit_completed(client, order)
+        assert r.json()["landed"] is True
+        assert asyncio.run(store.get_task_state(None, "10.hello")) is None
 
 
 def test_run_log_reconstructed_from_task_log_events(tmp_path: Path) -> None:
@@ -1422,7 +1585,8 @@ def test_validation_error_blocks_task_not_failed(tmp_path: Path) -> None:
 
 def test_full_failure_lifecycle_drain_then_retry_then_quarantine(tmp_path: Path) -> None:
     root = _seed(tmp_path, {"10.a": "A.", "20.b": "B."})
-    with _client(root) as client:
+    store = MemoryStore()
+    with _client(root, store) as client:
         client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
 
         # Phase A: 10.a fails (armed), 20.b is still ready and dispatches fine.
@@ -1453,8 +1617,10 @@ def test_full_failure_lifecycle_drain_then_retry_then_quarantine(tmp_path: Path)
             "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
         ).json()["work"] is None
 
-        # Operator presses Play -> phase B: only failed tasks remain, earliest retries.
+        # Operator presses Play -> phase B: only failed tasks remain, earliest
+        # retries (once its backoff elapses).
         client.post("/api/transport", json={"action": "play", "queue": None})
+        _clear_backoff(store, "10.a")
         retry = client.post(
             "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
         ).json()["work"]
@@ -1482,6 +1648,7 @@ def test_full_failure_lifecycle_drain_then_retry_then_quarantine(tmp_path: Path)
 
         # Play again -> phase B resumes with the next failed task (20.b).
         client.post("/api/transport", json={"action": "play", "queue": None})
+        _clear_backoff(store, "20.b")
         retry2 = client.post(
             "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
         ).json()["work"]
@@ -1492,11 +1659,13 @@ def test_unrelated_save_does_not_clear_quarantine(tmp_path: Path) -> None:
     """Regression: saving an unrelated field (title) must not accidentally clear
     system-set quarantine or failed state (the original divergent-state bug)."""
     root = _seed(tmp_path, {"10.loop": "Move a setting that's already moved."})
-    with _client(root) as client:
+    store = MemoryStore()
+    with _client(root, store) as client:
         client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
 
         # Drive two no-change runs to trigger quarantine.
         _poll_and_submit_no_change(client, "10.loop")
+        _clear_backoff(store, "10.loop")
         second = _poll_and_submit_no_change(client, "10.loop")
         assert second["quarantined"] is True
 

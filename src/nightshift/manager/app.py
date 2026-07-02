@@ -140,6 +140,10 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
     # {run_id: {"proc", "repo", "task", "queue", "origin_run_id"}}. Used to cap
     # concurrency per repo and to reap finished jobs.
     app.state.resolves = {}
+    # Environment-failure cooldowns: (worker_id, queue label) -> expiry. A
+    # cooled-down worker isn't offered that queue until expiry; other workers
+    # still are. In-memory this phase (Phase 7 moves durable state in).
+    app.state.worker_cooldowns = {}
     app.state.store = store  # may be None until lifespan opens one
 
     def _store() -> NightshiftStore:

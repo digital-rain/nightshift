@@ -16,6 +16,7 @@ from nightshift._paths import MIGRATIONS_DIR
 from nightshift.lifecycle import (
     AttemptRef,
     LeaseStatus,
+    Progress,
     RunStatus,
     TaskEffects,
     TaskHold,
@@ -29,6 +30,9 @@ from nightshift.manager.store import MemoryStore
 MIGRATION = MIGRATIONS_DIR / "20260730000001_nightshift_schema.sql"
 CAPABILITY_MIGRATION = (
     MIGRATIONS_DIR / "20260730000002_nightshift_capability_routing.sql"
+)
+RETRY_COUNTERS_MIGRATION = (
+    MIGRATIONS_DIR / "20260731000002_nightshift_retry_counters.sql"
 )
 
 
@@ -458,6 +462,180 @@ def test_apply_transition_bad_run_fields_writes_nothing() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# retry counters + backoff (Phase 5)
+# --------------------------------------------------------------------------- #
+
+
+def _counted_error(ref: AttemptRef, *, backoff: float | None = 60.0) -> Transition:
+    """A plain worker error: counts toward the task, backs the retry off."""
+    return Transition(
+        ref=ref,
+        run_fields={"status": RunStatus.ERROR, "result_line": "boom"},
+        lease_status=LeaseStatus.RELEASED,
+        effects=TaskEffects(progress=Progress.INCREMENT, next_eligible_in=backoff),
+    )
+
+
+def test_increment_creates_a_pure_counter_row_invisible_to_views() -> None:
+    async def scenario() -> None:
+        store = MemoryStore()
+        ref = await _leased_attempt(store)
+        await store.apply_transition(
+            _counted_error(ref), expected_status="leased", expected_worker_id="w1"
+        )
+        row = await store.get_task_state(None, "t1")
+        assert row["attempts_without_progress"] == 1
+        assert row["next_eligible_at"] is not None
+        assert row["state"] is None
+        # A counter-only row is not a hold: every state view ignores it.
+        assert await store.list_blocked() == []
+        assert await store.tasks_in_state("blocked") == []
+        assert await store.retryable_tasks(None) == []
+        assert [r["task"] for r in await store.tasks_backing_off()] == ["t1"]
+
+    _run(scenario())
+
+
+def test_increment_without_backoff_clears_a_stale_one() -> None:
+    async def scenario() -> None:
+        store = MemoryStore()
+        ref = await _leased_attempt(store)
+        await store.apply_transition(
+            _counted_error(ref), expected_status="leased", expected_worker_id="w1"
+        )
+        # Re-lease and fail again, this time without backoff (e.g. a
+        # quarantining outcome): the counter grows, the stale backoff goes.
+        await store.set_lease_status(ref.lease_id, "leased")
+        await store.apply_transition(
+            _counted_error(ref, backoff=None),
+            expected_status="leased", expected_worker_id="w1",
+        )
+        row = await store.get_task_state(None, "t1")
+        assert row["attempts_without_progress"] == 2
+        assert row["next_eligible_at"] is None
+
+    _run(scenario())
+
+
+def test_hold_write_preserves_the_counter_and_backoff() -> None:
+    async def scenario() -> None:
+        store = MemoryStore()
+        ref = await _leased_attempt(store)
+        await store.apply_transition(
+            _counted_error(ref), expected_status="leased", expected_worker_id="w1"
+        )
+        # A later hold (transactional) and an operator upsert both leave the
+        # retry fields alone.
+        await store.set_lease_status(ref.lease_id, "leased")
+        await store.apply_transition(
+            _error_transition(ref), expected_status="leased", expected_worker_id="w1"
+        )
+        row = await store.get_task_state(None, "t1")
+        assert row["state"] == "blocked"
+        assert row["attempts_without_progress"] == 1
+        assert row["next_eligible_at"] is not None
+        await store.set_task_state(None, "t1", "repo_unavailable", repo="r")
+        row = await store.get_task_state(None, "t1")
+        assert row["attempts_without_progress"] == 1
+        assert row["next_eligible_at"] is not None
+
+    _run(scenario())
+
+
+def test_landed_reset_deletes_the_counter_row() -> None:
+    async def scenario() -> None:
+        store = MemoryStore()
+        ref = await _leased_attempt(store)
+        await store.apply_transition(
+            _counted_error(ref), expected_status="leased", expected_worker_id="w1"
+        )
+        await store.set_lease_status(ref.lease_id, "leased")
+        landed = Transition(
+            ref=ref,
+            run_fields={"status": RunStatus.COMPLETED, "commit_sha": "abc"},
+            lease_status=LeaseStatus.LANDED,
+            effects=TaskEffects(clear_hold=True, progress=Progress.RESET),
+        )
+        await store.apply_transition(
+            landed, expected_status="leased", expected_worker_id="w1"
+        )
+        assert await store.get_task_state(None, "t1") is None
+
+    _run(scenario())
+
+
+def test_clear_hold_demotes_but_keeps_a_nonzero_counter() -> None:
+    async def scenario() -> None:
+        store = MemoryStore()
+        ref = await _leased_attempt(store)
+        await store.apply_transition(
+            _counted_error(ref), expected_status="leased", expected_worker_id="w1"
+        )
+        await store.set_task_state(None, "t1", "blocked", blocked_reason="x")
+        # A hold-clear without progress (e.g. a split parent's overlay clear)
+        # must not erase retry state.
+        await store.set_lease_status(ref.lease_id, "leased")
+        cleared = Transition(
+            ref=ref,
+            run_fields={},
+            lease_status=LeaseStatus.RELEASED,
+            effects=TaskEffects(clear_hold=True),
+        )
+        await store.apply_transition(
+            cleared, expected_status="leased", expected_worker_id="w1"
+        )
+        row = await store.get_task_state(None, "t1")
+        assert row["state"] is None
+        assert row["blocked_reason"] is None
+        assert row["attempts_without_progress"] == 1
+        assert await store.list_blocked() == []
+
+    _run(scenario())
+
+
+def test_clear_task_state_demotes_or_resets() -> None:
+    async def scenario() -> None:
+        store = MemoryStore()
+        ref = await _leased_attempt(store)
+        await store.apply_transition(
+            _counted_error(ref), expected_status="leased", expected_worker_id="w1"
+        )
+        await store.set_task_state(None, "t1", "blocked", blocked_reason="x")
+        # Default clear: the hold and backoff go (explicit release =
+        # dispatchable now), the counter survives.
+        await store.clear_task_state(None, "t1")
+        row = await store.get_task_state(None, "t1")
+        assert row["state"] is None
+        assert row["next_eligible_at"] is None
+        assert row["attempts_without_progress"] == 1
+        # reset_progress (a landed resolve): the row is gone entirely.
+        await store.clear_task_state(None, "t1", reset_progress=True)
+        assert await store.get_task_state(None, "t1") is None
+        # Clearing a clean hold still deletes the row (pre-phase behavior).
+        await store.set_task_state(None, "t2", "blocked", blocked_reason="y")
+        await store.clear_task_state(None, "t2")
+        assert await store.get_task_state(None, "t2") is None
+
+    _run(scenario())
+
+
+def test_clear_task_backoff_only_touches_the_backoff() -> None:
+    async def scenario() -> None:
+        store = MemoryStore()
+        ref = await _leased_attempt(store)
+        await store.apply_transition(
+            _counted_error(ref), expected_status="leased", expected_worker_id="w1"
+        )
+        await store.clear_task_backoff(None, "t1")
+        row = await store.get_task_state(None, "t1")
+        assert row["next_eligible_at"] is None
+        assert row["attempts_without_progress"] == 1
+        assert await store.tasks_backing_off() == []
+
+    _run(scenario())
+
+
+# --------------------------------------------------------------------------- #
 # migration shape
 # --------------------------------------------------------------------------- #
 
@@ -487,6 +665,26 @@ def test_migration_has_up_and_down_sections() -> None:
     assert "-- migrate:up" in sql
     assert "-- migrate:down" in sql
     assert sql.index("-- migrate:up") < sql.index("-- migrate:down")
+
+
+def test_retry_counters_migration_shape() -> None:
+    sql = RETRY_COUNTERS_MIGRATION.read_text()
+    assert "-- migrate:up" in sql and "-- migrate:down" in sql
+    assert sql.index("-- migrate:up") < sql.index("-- migrate:down")
+    # The two Phase 5 columns, idempotently added and reversibly dropped.
+    assert "ADD COLUMN IF NOT EXISTS attempts_without_progress" in sql
+    assert "ADD COLUMN IF NOT EXISTS next_eligible_at" in sql
+    assert "DROP COLUMN IF EXISTS attempts_without_progress" in sql
+    assert "DROP COLUMN IF EXISTS next_eligible_at" in sql
+    # Pure counter rows have no hold: state becomes nullable (and the down
+    # section removes those rows before restoring NOT NULL).
+    assert "ALTER COLUMN state DROP NOT NULL" in sql
+    assert "ALTER COLUMN state SET NOT NULL" in sql
+    assert "DELETE FROM nightshift.tasks WHERE state IS NULL;" in sql
+    # The one-shot backfill reconstructs the streak scan's semantics and
+    # never overwrites a live nonzero counter (idempotent re-runs).
+    assert "commit_sha IS NULL" in sql
+    assert "attempts_without_progress = 0" in sql
 
 
 def test_capability_migration_adds_columns_and_queue_routing() -> None:

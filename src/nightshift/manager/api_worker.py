@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol, assert_never
@@ -40,6 +41,7 @@ from nightshift.lifecycle import (
     LandResult,
     LeaseStatus,
     Outcome,
+    RetryPolicy,
     RunStatus,
     SubmitPolicy,
     TaskHoldKind,
@@ -91,6 +93,26 @@ from nightshift.task_files import (
 # task may have been re-leased elsewhere — honoring the stale submit would
 # double-land it. 409, no writes (enforced by apply_transition's CAS).
 _STALE_SUBMIT = "stale submit: lease is not live for this worker"
+
+# How long an environment failure cools the submitting worker down for its
+# queue (Phase 5): long enough that a broken box stops eating the queue,
+# short enough that a transient outage self-heals without operator action.
+WORKER_COOLDOWN_SECONDS = 300.0
+
+
+def _cooldown_exclusions(
+    cooldowns: dict[tuple[str, str], datetime], worker_id: str
+) -> set[str]:
+    """Reap expired worker cooldowns and return the queue labels this worker
+    is currently cooled down for (other workers keep seeing those queues)."""
+    now = datetime.now(UTC)
+    excluded: set[str] = set()
+    for (wid, label), expiry in list(cooldowns.items()):
+        if expiry <= now:
+            cooldowns.pop((wid, label), None)
+        elif wid == worker_id:
+            excluded.add(label)
+    return excluded
 
 
 # --------------------------------------------------------------------------- #
@@ -150,7 +172,8 @@ class SubmitBody(Outcome):
     backend: str | None = None  # type: ignore[assignment]
     # Worker-side quarantine flag: when the worker has quarantine mode enabled,
     # it sets this to True so the manager quarantines on the first failure
-    # instead of waiting for the streak threshold.
+    # instead of waiting for the counter threshold
+    # (RetryPolicy.immediate_quarantine).
     quarantine: bool = False
 
 
@@ -312,6 +335,9 @@ def register_worker_api(
         # Queues paused via the transport controls or locally backed-off by this
         # worker are excluded from dispatch.
         exclude = set(body.exclude_queues or [])
+        # Environment-failure cooldowns: a worker that just env-failed in a
+        # queue isn't offered that queue until the cooldown expires.
+        exclude |= _cooldown_exclusions(app.state.worker_cooldowns, body.worker_id)
         candidates_by_queue = {
             q: build_candidates(tasks_root, q, default_model=cfg.default_model)
             for q in _all_queues()
@@ -414,6 +440,13 @@ def register_worker_api(
         blocked |= repo_excluded
         blocked |= quarantined
         blocked |= failed
+        # Retry backoff (Phase 5): a task whose next_eligible_at hasn't
+        # elapsed is not dispatchable — by any worker, on any path.
+        backing_off = {
+            (_queue_from_label(b["queue"]), b["task"])
+            for b in await store.tasks_backing_off()
+        }
+        blocked |= backing_off
 
         # Phase B: once a queue has no active leases and no ready (non-failed)
         # candidate left, let its earliest failed/blocked-retryable task back
@@ -432,7 +465,12 @@ def register_worker_api(
             tasks_rel = playlists_mod.tasks_rel(q)
             fm_failed = failed_tasks(tasks_root, tasks_rel)
             db_retryable = await store.retryable_tasks(q)
-            retryable = [*fm_failed, *db_retryable]
+            # Backoff applies to the retry path too: a failed task isn't
+            # retryable until its next_eligible_at elapses.
+            retryable = [
+                r for r in [*fm_failed, *db_retryable]
+                if (q, r["task"]) not in backing_off
+            ]
             if not retryable:
                 continue
             order_list = load_queue_config(tasks_root, tasks_rel).get("order") or []
@@ -590,19 +628,18 @@ def register_worker_api(
         # configured landing_mode applies. make_pr never forces squash/push.
         effective_mode = LandingMode.PR if meta.get("make_pr") else cfg.landing_mode
         label = queue_label(queue)
-        prior_streak = 0
-        if cfg.quarantine_threshold > 0 and body.status in (
-            RunStatus.ERROR, RunStatus.COMPLETED,
-        ):
-            # The current run is still ``running`` in this scan (neutral to the
-            # streak); the transition adds the current outcome itself.
-            prior_streak = no_progress_streak(
-                await store.list_runs(queue=queue, limit=50), body.task
-            )
+        # The persisted counter replaces the run-history streak scan: the task
+        # row carries attempts_without_progress *before* this outcome; the
+        # transition's Progress op adds the current outcome itself.
+        task_row = await store.get_task_state(queue, body.task)
         policy = SubmitPolicy(
-            quarantine_threshold=cfg.quarantine_threshold,
-            prior_no_progress_streak=prior_streak,
-            worker_quarantine=body.quarantine,
+            retry=RetryPolicy(
+                quarantine_after=cfg.quarantine_threshold,
+                immediate_quarantine=body.quarantine,
+            ),
+            attempts_without_progress=(
+                int(task_row["attempts_without_progress"]) if task_row else 0
+            ),
             was_retry=_task_is_failed_in_frontmatter(queue, body.task),
             watch_armed=_failure_state(label).watch_armed,
             queue_paused=label in _paused_queues,
@@ -693,6 +730,10 @@ def register_worker_api(
             _failure_state(label).watch_armed = t.effects.watch_armed
         if t.effects.pause_queue is not None:
             _paused_queues[label] = t.effects.pause_queue
+        if t.effects.worker_cooldown:
+            app.state.worker_cooldowns[(body.worker_id, label)] = (
+                datetime.now(UTC) + timedelta(seconds=WORKER_COOLDOWN_SECONDS)
+            )
         if t.effects.drop_brief:
             # Backstop the worker's queue removal: a landed regular task must
             # leave the content store (evergreen tasks keep their file).
@@ -766,7 +807,8 @@ def register_worker_api(
                         result_line=body.result_line or "resolved",
                         commit_sha=body.sha,
                     )
-            await store.clear_task_state(queue, body.task)
+            # A landed resolve is real progress — the retry counter resets.
+            await store.clear_task_state(queue, body.task, reset_progress=True)
             tasks_rel = playlists_mod.tasks_rel(queue)
             meta = _task_meta(tasks_root, body.task, queue)
             if not task_is_evergreen(
@@ -851,33 +893,6 @@ def _pure_land_result(result: LandingResult, loc: int | None) -> LandResult:
         nothing_to_land=result.nothing_to_land,
         loc=loc,
     )
-
-
-def no_progress_streak(runs: list[dict[str, Any]], task: str) -> int:
-    """Most-recent consecutive runs of ``task`` that made no progress.
-
-    ``runs`` is in the order :meth:`NightshiftStore.list_runs` returns them
-    (newest first). The scan stops at the first run that *landed* (a completed
-    run carrying a ``commit_sha``), so real progress resets the count. A
-    completed run with no commit ("worker emitted output only") or a worker
-    ``error`` is a no-progress run and increments the streak. Operator-driven
-    outcomes (``aborted``/``skipped``) and explicit holds (``blocked``) are
-    neutral — they neither count nor reset — so a manual stop in the middle of a
-    loop neither masks nor amplifies it. Pure given its inputs (unit-testable
-    without a store).
-    """
-    streak = 0
-    for run in runs:
-        if run.get("task") != task:
-            continue
-        status = run.get("status")
-        if status == RunStatus.COMPLETED and run.get("commit_sha"):
-            break
-        if status == RunStatus.ERROR or (
-            status == RunStatus.COMPLETED and not run.get("commit_sha")
-        ):
-            streak += 1
-    return streak
 
 
 def _task_meta(tasks_root: Path, task: str, queue: str | None) -> dict[str, Any]:

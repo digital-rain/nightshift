@@ -23,6 +23,15 @@ applied by ``NightshiftStore.apply_transition`` (CAS on the lease, single
 transaction, events as a transactional outbox). Nothing here imports the
 store, git, or HTTP; every policy input the old handler read from the store or
 config arrives via :class:`SubmitPolicy`.
+
+Phase 5 makes retry data instead of history scans (greenfield §"Retry &
+quarantine policy"): :class:`RetryPolicy` classifies failures
+(:meth:`RetryPolicy.on_failure`), the persisted ``attempts_without_progress``
+counter replaces the 50-run streak scan (transitions carry a
+:class:`Progress` op that the store applies transactionally), ``RETRY``
+failures set a backoff (``next_eligible_at``) that dispatch honors, and
+environment failures cool the submitting worker down instead of counting
+against the task.
 """
 
 from __future__ import annotations
@@ -208,21 +217,104 @@ class AttemptRef:
     task: str
 
 
+class RetryAction(StrEnum):
+    """What a failure kind means for the task (greenfield §"Retry &
+    quarantine policy"): retry it (counted, backed off), retry it elsewhere
+    (an environment kind — the box is at fault, so the task stays untouched
+    and the worker cools down), hold it for a resolve/operator, or
+    quarantine."""
+
+    RETRY = "retry"
+    RETRY_ELSEWHERE = "retry_elsewhere"
+    HOLD = "hold"
+    QUARANTINE = "quarantine"
+
+
+@dataclass(frozen=True)
+class Backoff:
+    """Exponential retry backoff: the n-th consecutive no-progress attempt
+    delays the next dispatch by ``base * 2**(n-1)`` seconds, capped."""
+
+    base_seconds: float = 60.0
+    cap_seconds: float = 3600.0
+
+    def delay(self, attempts: int) -> float:
+        """Seconds until a task is eligible again after ``attempts``
+        consecutive no-progress attempts (>= 1). The exponent is clamped so a
+        huge counter (quarantine disabled, hot-failing task) can't overflow —
+        it just returns the cap."""
+        return min(self.base_seconds * 2.0 ** min(attempts - 1, 63), self.cap_seconds)
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """The declarative retry/quarantine policy (greenfield §"Retry &
+    quarantine policy"). ``quarantine_after`` is wired from
+    ``cfg.quarantine_threshold`` (0 disables the threshold guard);
+    ``immediate_quarantine`` is the worker's quarantine mode (quarantine on
+    the first counted failure)."""
+
+    quarantine_after: int = 0
+    immediate_quarantine: bool = False
+    backoff: Backoff = Backoff()
+
+    def on_failure(self, kind: FailureKind) -> RetryAction:
+        match kind:
+            case (
+                FailureKind.MODEL_UNAVAILABLE
+                | FailureKind.BACKEND_UNAVAILABLE
+                | FailureKind.REPO_UNAVAILABLE
+                | FailureKind.PREFLIGHT_FAILED
+                | FailureKind.WORKTREE_FAILED
+                | FailureKind.WORKER_LAUNCH
+                | FailureKind.PUBLISH_FAILED
+            ):
+                # Environment: the box is at fault, not the task — never
+                # counted, never held; the transition cools the worker down.
+                return RetryAction.RETRY_ELSEWHERE
+            case FailureKind.WORKER_ERROR:
+                if self.immediate_quarantine:
+                    return RetryAction.QUARANTINE
+                return RetryAction.RETRY
+            case FailureKind.VALIDATION_ERROR:
+                # The agent DID produce commits; the branch is preserved and
+                # recoverable — hold for resolve rather than spin retries.
+                return RetryAction.HOLD
+            case FailureKind.BLOCKED:
+                return RetryAction.HOLD
+            case FailureKind.MERGE_CONFLICT | FailureKind.MERGE_REJECTED:
+                # Integration: goes to resolve, not retry.
+                return RetryAction.HOLD
+            case FailureKind.REPO_CONFIG | FailureKind.DISK | FailureKind.ABORTED:
+                # Legacy single-process runner kinds (retired in Phase 9);
+                # never submitted to the manager — held for the operator.
+                return RetryAction.HOLD
+            case _:
+                assert_never(kind)
+
+
+# The kinds the classifier routes RETRY_ELSEWHERE (the worker/box is at fault;
+# the work never really started). Derived from the classifier so the taxonomy
+# lives in exactly one place; the policy knobs don't affect this axis.
+ENVIRONMENT_FAILURE_KINDS = frozenset(
+    kind for kind in FailureKind
+    if RetryPolicy().on_failure(kind) is RetryAction.RETRY_ELSEWHERE
+)
+
+
 @dataclass(frozen=True)
 class SubmitPolicy:
     """Everything the old ``worker_submit`` cascade read from config, the
     store, frontmatter, or ``app.state`` — computed by the caller, consumed by
     the pure transition functions.
 
-    ``prior_no_progress_streak`` is the streak over *previous* runs (the
-    current run is still ``running`` when the caller scans); the transition
-    adds the current no-progress outcome itself. Phase 5 replaces the scan
-    with a counter — keep this input isolated.
+    ``attempts_without_progress`` is the persisted counter *before* this
+    outcome (read from the task row); the transition's :class:`Progress` op
+    adds the current outcome itself.
     """
 
-    quarantine_threshold: int = 0
-    prior_no_progress_streak: int = 0
-    worker_quarantine: bool = False       # the worker's immediate-quarantine flag
+    retry: RetryPolicy = RetryPolicy()
+    attempts_without_progress: int = 0
     was_retry: bool = False               # task was `failed: true` in frontmatter
     watch_armed: bool = False             # phase-A two-in-a-row watch state
     queue_paused: bool = False            # queue already paused (any reason)
@@ -253,14 +345,35 @@ class FrontmatterFlag:
     reason: str | None = None
 
 
+class Progress(Enum):
+    """The transition's effect on the task's ``attempts_without_progress``
+    counter, applied by the store inside the transaction. A land (or adopted
+    agent land) resets it; task-category failures and no-change runs
+    increment it; environment failures, aborts, and blocks are neutral."""
+
+    NONE = auto()
+    INCREMENT = auto()
+    RESET = auto()
+
+
 @dataclass(frozen=True)
 class TaskEffects:
     """The task-level consequences of a transition. ``hold``/``clear_hold``
-    ride the transaction; everything else executes after a successful apply,
-    in field order below."""
+    and the ``progress`` counter op ride the transaction; everything else
+    executes after a successful apply, in field order below."""
 
     hold: TaskHold | None = None
     clear_hold: bool = False
+    # attempts_without_progress counter op (transactional, see Progress).
+    progress: Progress = Progress.NONE
+    # Retry backoff in seconds for a RETRY-classified failure: the store
+    # stamps ``next_eligible_at = now + next_eligible_in`` alongside an
+    # INCREMENT (None clears any stale backoff). Dispatch skips tasks whose
+    # next_eligible_at hasn't elapsed.
+    next_eligible_in: float | None = None
+    # Environment failure: cool the *submitting* worker down (post-commit,
+    # in-memory this phase) instead of counting against the task.
+    worker_cooldown: bool = False
     frontmatter: tuple[FrontmatterFlag, ...] = ()
     # New phase-A watch state (None = leave unchanged).
     watch_armed: bool | None = None
@@ -382,29 +495,20 @@ def _immediate_quarantine(
     )
 
 
-def _hits_quarantine_threshold(policy: SubmitPolicy) -> bool:
-    """Whether this no-progress outcome reaches the streak threshold (the
-    current run counts as +1 on top of the prior streak)."""
-    return (
-        policy.quarantine_threshold > 0
-        and policy.prior_no_progress_streak + 1 >= policy.quarantine_threshold
-    )
-
-
 def _looping_quarantine(
-    ref: AttemptRef, policy: SubmitPolicy, detail: str
+    ref: AttemptRef, attempts: int, detail: str
 ) -> tuple[FrontmatterFlag, tuple[TransitionEvent, ...]]:
-    """Quarantine a task stuck re-executing without progress."""
-    streak = policy.prior_no_progress_streak + 1
+    """Quarantine a task stuck re-executing without progress. ``attempts`` is
+    the counter value including the current outcome."""
     reason = (
-        f"quarantined after {streak} consecutive runs with no progress "
+        f"quarantined after {attempts} consecutive runs with no progress "
         f"({detail}); execution halted to protect budget — review the run "
         f"logs and edit or delete the task to release it"
     )
     return FrontmatterFlag("quarantined", True, "quarantine_reason", reason), (
         TransitionEvent(
             "task_quarantined", run_id=ref.run_id, queue=ref.queue, task=ref.task,
-            payload={"reason": reason, "streak": streak},
+            payload={"reason": reason, "streak": attempts},
         ),
     )
 
@@ -416,27 +520,35 @@ def _failure_ladder(
     quarantine_detail: str,
     failure_reason: str,
     retry_pause_after_quarantine: bool,
-) -> tuple[bool, list[FrontmatterFlag], list[TransitionEvent], str | None, bool | None]:
+) -> tuple[
+    bool, list[FrontmatterFlag], list[TransitionEvent],
+    str | None, bool | None, float | None,
+]:
     """The no-progress failure ladder shared by worker errors and no-change
-    completions: worker-quarantine → streak-threshold quarantine → failed
-    flag + watch arm (+ retry quarantine when the failed run was a retry).
+    completions: worker-quarantine → counter-threshold quarantine → failed
+    flag + watch arm + retry backoff (+ retry quarantine when the failed run
+    was a retry). Every rung counts the outcome (the caller sets
+    ``Progress.INCREMENT``); the threshold decision consumes the persisted
+    counter via :class:`RetryPolicy` instead of the retired 50-run scan, so
+    interleaved other-task runs can no longer mask a streak.
 
     ``retry_pause_after_quarantine`` preserves a pre-Phase-4 placement
     asymmetry: a threshold-quarantined *error* on a retried task still pauses
     the queue with ``retry_failed``, while a threshold-quarantined no-change
     completion does not.
 
-    Returns ``(quarantined, frontmatter, events, pause, watch)``.
+    Returns ``(quarantined, frontmatter, events, pause, watch, backoff)``.
     """
     frontmatter: list[FrontmatterFlag] = []
     events: list[TransitionEvent] = []
-    if policy.worker_quarantine:
+    attempts = policy.attempts_without_progress + 1
+    if policy.retry.immediate_quarantine:
         flag, evs = _immediate_quarantine(ref, quarantine_detail)
         frontmatter.append(flag)
         events += evs
-        return True, frontmatter, events, None, None
-    if _hits_quarantine_threshold(policy):
-        flag, evs = _looping_quarantine(ref, policy, quarantine_detail)
+        return True, frontmatter, events, None, None, None
+    if policy.retry.quarantine_after > 0 and attempts >= policy.retry.quarantine_after:
+        flag, evs = _looping_quarantine(ref, attempts, quarantine_detail)
         frontmatter.append(flag)
         events += evs
         pause: str | None = None
@@ -446,7 +558,7 @@ def _failure_ladder(
                 "queue_paused", queue=ref.queue,
                 payload={"reason": "retry_failed", "task": ref.task},
             ))
-        return True, frontmatter, events, pause, None
+        return True, frontmatter, events, pause, None, None
     frontmatter.append(
         FrontmatterFlag("failed", True, "failed_reason", failure_reason)
     )
@@ -457,7 +569,7 @@ def _failure_ladder(
         frontmatter.append(flag)
         events += retry_events
         pause = "retry_failed"
-    return False, frontmatter, events, pause, True
+    return False, frontmatter, events, pause, True, policy.retry.backoff.delay(attempts)
 
 
 def _blocked_transition(
@@ -502,57 +614,102 @@ def _blocked_transition(
     )
 
 
+def _error_run_fields(outcome: Outcome) -> dict[str, Any]:
+    return dict(
+        status=outcome.status,
+        result_line=outcome.result_line,
+        failure_kind=outcome.failure_kind,
+        failure_reason=outcome.failure_reason,
+        **_base_run_fields(outcome),
+    )
+
+
+def _environment_failure_transition(
+    ref: AttemptRef, outcome: Outcome
+) -> Transition:
+    """An environment failure (the box is at fault, not the task): record it
+    and release, but stay neutral to the task — no counter increment, no
+    failed flag, no watch — and cool the submitting worker down so a broken
+    box stops eating the queue while other workers retry the task."""
+    return Transition(
+        ref=ref,
+        run_fields=_error_run_fields(outcome),
+        lease_status=LeaseStatus.RELEASED,
+        effects=TaskEffects(worker_cooldown=True),
+        events=(TransitionEvent(
+            "task_result", run_id=ref.run_id, queue=ref.queue, task=ref.task,
+            payload={"status": outcome.status, "result_line": outcome.result_line},
+        ),),
+        response={"landed": False, "status": outcome.status, "quarantined": False},
+    )
+
+
+def _hold_reason(kind: FailureKind, outcome: Outcome) -> str:
+    """Operator-visible reason for a HOLD-classified error. Validation keeps
+    its historical wording (wire compat); every other kind is prefixed with
+    the kind so the hold says what actually happened (Phase 6 routes the
+    MERGE_* kinds here)."""
+    if kind is FailureKind.VALIDATION_ERROR:
+        return "validation failed: " + (
+            outcome.result_line or "validate command returned non-zero"
+        )
+    detail = outcome.result_line or outcome.failure_reason
+    return f"{kind}: {detail}" if detail else str(kind)
+
+
 def _error_transition(
     ref: AttemptRef, outcome: Outcome, policy: SubmitPolicy
 ) -> Transition:
-    """A worker error: validation failures block (recoverable branch), the
-    quarantine ladder guards re-execution loops, everything else marks the
-    task failed and arms the failure watch. Aborts/skips are neutral and go
-    through :func:`_neutral_transition` instead."""
+    """A worker error, routed by :meth:`RetryPolicy.on_failure`: environment
+    kinds cool the worker down (neutral to the task), HOLD kinds (validation,
+    merge, legacy) block resolvable, and the rest climb the quarantine
+    ladder. Aborts/skips are neutral and go through
+    :func:`_neutral_transition` instead."""
+    kind = outcome.failure_kind or FailureKind.WORKER_ERROR
+    action = policy.retry.on_failure(kind)
     events: list[TransitionEvent] = []
     frontmatter: list[FrontmatterFlag] = []
     hold: TaskHold | None = None
     pause: str | None = None
     watch: bool | None = None
+    backoff: float | None = None
     quarantined = False
-    if outcome.failure_kind == FailureKind.VALIDATION_ERROR:
-        # The agent DID produce commits; the branch is preserved and the work
-        # is recoverable — block (needs resolve) rather than arm the policy.
-        hold = TaskHold(
-            TaskHoldKind.BLOCKED,
-            "validation failed: " + (
-                outcome.result_line or "validate command returned non-zero"
-            ),
-        )
-        events.append(TransitionEvent(
-            "task_blocked", queue=ref.queue, task=ref.task,
-            payload={"reason": "validation_error", "detail": outcome.failure_reason},
-        ))
-    else:
-        quarantined, frontmatter, events, pause, watch = _failure_ladder(
-            ref, policy,
-            quarantine_detail="worker error",
-            failure_reason=(
-                outcome.result_line or outcome.failure_reason or "worker error"
-            ),
-            retry_pause_after_quarantine=True,
-        )
+    match action:
+        case RetryAction.RETRY_ELSEWHERE:
+            return _environment_failure_transition(ref, outcome)
+        case RetryAction.HOLD:
+            # The work is preserved and recoverable (a validation failure
+            # keeps its branch; merge kinds go to resolve) — block (needs
+            # resolve) rather than arm the policy. The counter still counts
+            # the no-progress run.
+            hold = TaskHold(TaskHoldKind.BLOCKED, _hold_reason(kind, outcome))
+            events.append(TransitionEvent(
+                "task_blocked", queue=ref.queue, task=ref.task,
+                payload={"reason": str(kind), "detail": outcome.failure_reason},
+            ))
+        case RetryAction.RETRY | RetryAction.QUARANTINE:
+            quarantined, frontmatter, events, pause, watch, backoff = _failure_ladder(
+                ref, policy,
+                quarantine_detail="worker error",
+                failure_reason=(
+                    outcome.result_line or outcome.failure_reason or "worker error"
+                ),
+                retry_pause_after_quarantine=True,
+            )
+        case _:
+            assert_never(action)
     events.append(TransitionEvent(
         "task_result", run_id=ref.run_id, queue=ref.queue, task=ref.task,
         payload={"status": outcome.status, "result_line": outcome.result_line},
     ))
     return Transition(
         ref=ref,
-        run_fields=dict(
-            status=outcome.status,
-            result_line=outcome.result_line,
-            failure_kind=outcome.failure_kind,
-            failure_reason=outcome.failure_reason,
-            **_base_run_fields(outcome),
-        ),
+        run_fields=_error_run_fields(outcome),
         lease_status=LeaseStatus.RELEASED,
         effects=TaskEffects(
             hold=hold,
+            progress=Progress.INCREMENT,
+            next_eligible_in=backoff,
             frontmatter=tuple(frontmatter),
             pause_queue=pause,
             watch_armed=watch,
@@ -626,7 +783,8 @@ def on_split_result(
             **_base_run_fields(outcome),
         ),
         lease_status=LeaseStatus.RELEASED,
-        effects=TaskEffects(clear_hold=True),
+        # The parent is consumed by the split; its counter dies with it.
+        effects=TaskEffects(clear_hold=True, progress=Progress.RESET),
         events=(
             TransitionEvent(
                 "task_result", run_id=ref.run_id, queue=ref.queue, task=ref.task,
@@ -649,9 +807,9 @@ def _no_change_transition(
     ref: AttemptRef, outcome: Outcome, policy: SubmitPolicy
 ) -> Transition:
     """Completed but nothing landed and main didn't advance: record success
-    with no commit; the run still counts toward the quarantine streak."""
+    with no commit; the run still counts toward the quarantine counter."""
     result_line = outcome.result_line or "no changes"
-    quarantined, frontmatter, events, pause, watch = _failure_ladder(
+    quarantined, frontmatter, events, pause, watch, backoff = _failure_ladder(
         ref, policy,
         quarantine_detail="no changes produced",
         failure_reason="no changes produced",
@@ -671,6 +829,8 @@ def _no_change_transition(
         ),
         lease_status=LeaseStatus.RELEASED,
         effects=TaskEffects(
+            progress=Progress.INCREMENT,
+            next_eligible_in=backoff,
             frontmatter=tuple(frontmatter),
             pause_queue=pause,
             watch_armed=watch,
@@ -708,6 +868,7 @@ def _landed_transition(
         lease_status=LeaseStatus.LANDED,
         effects=TaskEffects(
             clear_hold=True,
+            progress=Progress.RESET,
             watch_armed=False,
             drop_brief=not policy.evergreen,
         ),

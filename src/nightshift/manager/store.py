@@ -21,13 +21,14 @@ import threading
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, Protocol, assert_never
 
 from nightshift.lifecycle import (
     LEASE_ACTIVE_STATUSES,
     LEASE_RELEASED_AT_STATUSES,
     RUN_TERMINAL_STATUSES,
     Outcome,
+    Progress,
     Transition,
 )
 from nightshift.pg import PgPoolLike
@@ -81,7 +82,9 @@ def _run_update_sql(fields: dict[str, Any]) -> tuple[str, list[Any]]:
 
 # The task-overlay upsert shared by set_task_state and apply_transition (the
 # transactional hold write): $5 is the repo, which submit-path holds never
-# carry (repo pauses are set by the poll path only).
+# carry (repo pauses are set by the poll path only). Deliberately silent on
+# the Phase 5 retry columns so a hold write never clobbers the persisted
+# counter/backoff.
 _TASK_UPSERT_SQL = """
     INSERT INTO nightshift.tasks
         (queue, task, state, blocked_reason, repo, retry_eligible, updated_at)
@@ -93,6 +96,67 @@ _TASK_UPSERT_SQL = """
         retry_eligible = EXCLUDED.retry_eligible,
         updated_at = now()
 """
+
+# Phase 5: the counter op a transition carries (TaskEffects.progress), applied
+# in the same transaction as the lease CAS. INCREMENT upserts so a task with
+# no overlay row gains a pure counter row (state NULL = no hold); the backoff
+# stamp is NULL when the transition carries none (make_interval is strict).
+_TASK_INCREMENT_SQL = """
+    INSERT INTO nightshift.tasks
+        (queue, task, state, blocked_reason, repo, retry_eligible,
+         attempts_without_progress, next_eligible_at, updated_at)
+    VALUES ($1, $2, NULL, NULL, NULL, false, 1,
+            now() + make_interval(secs => $3), now())
+    ON CONFLICT (queue, task) DO UPDATE SET
+        attempts_without_progress = nightshift.tasks.attempts_without_progress + 1,
+        next_eligible_at = now() + make_interval(secs => $3),
+        updated_at = now()
+"""
+
+_TASK_RESET_SQL = """
+    UPDATE nightshift.tasks
+    SET attempts_without_progress = 0, next_eligible_at = NULL, updated_at = now()
+    WHERE queue = $1 AND task = $2
+"""
+
+# Row-lifecycle invariant: a tasks row exists iff it carries a hold (state is
+# non-NULL) or retry state (a nonzero counter / a pending backoff). Clearing a
+# hold deletes the row only when it is otherwise clean; a dirty row is demoted
+# to a pure counter row instead (state NULL), invisible to every state view.
+_TASK_DELETE_IF_CLEAN_SQL = """
+    DELETE FROM nightshift.tasks
+    WHERE queue = $1 AND task = $2
+      AND attempts_without_progress = 0 AND next_eligible_at IS NULL
+"""
+
+_TASK_DEMOTE_SQL = """
+    UPDATE nightshift.tasks
+    SET state = NULL, blocked_reason = NULL, repo = NULL,
+        retry_eligible = false, updated_at = now()
+    WHERE queue = $1 AND task = $2
+"""
+
+# clear_task_state's explicit-release variants: unlike the transition pair
+# above, a release means "dispatchable now", so the delete ignores a pending
+# backoff and the demote clears it (the counter alone keeps the row alive).
+_TASK_RELEASE_DELETE_SQL = """
+    DELETE FROM nightshift.tasks
+    WHERE queue = $1 AND task = $2 AND attempts_without_progress = 0
+"""
+
+_TASK_RELEASE_DEMOTE_SQL = """
+    UPDATE nightshift.tasks
+    SET state = NULL, blocked_reason = NULL, repo = NULL,
+        retry_eligible = false, next_eligible_at = NULL, updated_at = now()
+    WHERE queue = $1 AND task = $2
+"""
+
+# The pre-Phase-5 row shape, projected by the wire-facing views (list_blocked
+# feeds /api/blocked verbatim) so the new columns never leak into responses.
+_TASK_VIEW_COLUMNS = (
+    "queue", "task", "state", "blocked_reason", "repo", "retry_eligible",
+    "updated_at",
+)
 
 
 # SQL fragments derived from the lease vocabulary (values are today's strings;
@@ -181,7 +245,12 @@ class NightshiftStore(Protocol):
     async def list_blocked(self) -> list[dict[str, Any]]: ...
     async def tasks_in_state(self, state: str) -> list[dict[str, Any]]: ...
     async def retryable_tasks(self, queue: str | None) -> list[dict[str, Any]]: ...
-    async def clear_task_state(self, queue: str | None, task: str) -> None: ...
+    async def clear_task_state(
+        self, queue: str | None, task: str, *, reset_progress: bool = False
+    ) -> None: ...
+    # retry backoff (Phase 5)
+    async def tasks_backing_off(self) -> list[dict[str, Any]]: ...
+    async def clear_task_backoff(self, queue: str | None, task: str) -> None: ...
 
     # queue dedication (manager-side queue -> worker binding)
     async def queue_dedication(self) -> dict[str, list[str]]: ...
@@ -469,19 +538,39 @@ class MemoryStore:
             run = self._runs.get(t.ref.run_id)
             if run is not None and t.run_fields:
                 _apply_run_fields(run, t.run_fields)
+            key = (_qkey(t.ref.queue), t.ref.task)
             hold = t.effects.hold
             if hold is not None:
-                self._tasks[(_qkey(t.ref.queue), t.ref.task)] = {
-                    "queue": _qkey(t.ref.queue),
+                prior = self._tasks.get(key)
+                self._tasks[key] = {
+                    "queue": key[0],
                     "task": t.ref.task,
                     "state": hold.kind,
                     "blocked_reason": hold.reason,
                     "repo": None,
                     "retry_eligible": hold.retry_eligible,
+                    # A hold write never clobbers the retry counter/backoff.
+                    "attempts_without_progress": (
+                        prior["attempts_without_progress"] if prior else 0
+                    ),
+                    "next_eligible_at": prior["next_eligible_at"] if prior else None,
                     "updated_at": _now(),
                 }
-            elif t.effects.clear_hold:
-                self._tasks.pop((_qkey(t.ref.queue), t.ref.task), None)
+            self._apply_progress(key, t.effects.progress, t.effects.next_eligible_in)
+            if hold is None and t.effects.clear_hold:
+                row = self._tasks.get(key)
+                if row is not None:
+                    if (
+                        row["attempts_without_progress"] == 0
+                        and row["next_eligible_at"] is None
+                    ):
+                        self._tasks.pop(key)
+                    else:
+                        # Demote to a pure counter row (state NULL = no hold).
+                        row.update(
+                            state=None, blocked_reason=None, repo=None,
+                            retry_eligible=False, updated_at=_now(),
+                        )
             ids: list[int] = []
             for ev in t.events:
                 self._event_seq += 1
@@ -499,6 +588,48 @@ class MemoryStore:
 
     # ---- task state ------------------------------------------------------- #
 
+    def _apply_progress(
+        self,
+        key: tuple[str, str],
+        progress: Progress,
+        next_eligible_in: float | None,
+    ) -> None:
+        """Apply a transition's counter op (caller holds the lock). Mirrors
+        the PG ``_TASK_INCREMENT_SQL`` / ``_TASK_RESET_SQL`` statements."""
+        match progress:
+            case Progress.NONE:
+                return
+            case Progress.INCREMENT:
+                row = self._tasks.get(key)
+                if row is None:
+                    row = {
+                        "queue": key[0],
+                        "task": key[1],
+                        "state": None,
+                        "blocked_reason": None,
+                        "repo": None,
+                        "retry_eligible": False,
+                        "attempts_without_progress": 0,
+                        "next_eligible_at": None,
+                        "updated_at": _now(),
+                    }
+                    self._tasks[key] = row
+                row["attempts_without_progress"] += 1
+                row["next_eligible_at"] = (
+                    _now() + timedelta(seconds=next_eligible_in)
+                    if next_eligible_in is not None
+                    else None
+                )
+                row["updated_at"] = _now()
+            case Progress.RESET:
+                row = self._tasks.get(key)
+                if row is not None:
+                    row["attempts_without_progress"] = 0
+                    row["next_eligible_at"] = None
+                    row["updated_at"] = _now()
+            case _:
+                assert_never(progress)
+
     async def set_task_state(
         self,
         queue: str | None,
@@ -510,13 +641,20 @@ class MemoryStore:
         retry_eligible: bool = False,
     ) -> None:
         with self._lock:
-            self._tasks[(_qkey(queue), task)] = {
-                "queue": _qkey(queue),
+            key = (_qkey(queue), task)
+            prior = self._tasks.get(key)
+            self._tasks[key] = {
+                "queue": key[0],
                 "task": task,
                 "state": state,
                 "blocked_reason": blocked_reason,
                 "repo": repo,
                 "retry_eligible": retry_eligible,
+                # Preserved on upsert, like _TASK_UPSERT_SQL's ON CONFLICT.
+                "attempts_without_progress": (
+                    prior["attempts_without_progress"] if prior else 0
+                ),
+                "next_eligible_at": prior["next_eligible_at"] if prior else None,
                 "updated_at": _now(),
             }
 
@@ -527,7 +665,11 @@ class MemoryStore:
 
     async def list_blocked(self) -> list[dict[str, Any]]:
         with self._lock:
-            return [dict(r) for r in self._tasks.values() if r["state"] == "blocked"]
+            return [
+                {k: r[k] for k in _TASK_VIEW_COLUMNS}
+                for r in self._tasks.values()
+                if r["state"] == "blocked"
+            ]
 
     async def tasks_in_state(self, state: str) -> list[dict[str, Any]]:
         with self._lock:
@@ -556,9 +698,45 @@ class MemoryStore:
                 and (r["state"] == "failed" or (r["state"] == "blocked" and r.get("retry_eligible")))
             ]
 
-    async def clear_task_state(self, queue: str | None, task: str) -> None:
+    async def clear_task_state(
+        self, queue: str | None, task: str, *, reset_progress: bool = False
+    ) -> None:
+        """Clear a task's hold. ``reset_progress`` (a landed resolve — real
+        progress) also zeroes the retry counter, deleting the row outright;
+        otherwise the counter survives on a demoted row while the backoff is
+        cleared (an explicit release means "dispatchable now")."""
         with self._lock:
-            self._tasks.pop((_qkey(queue), task), None)
+            key = (_qkey(queue), task)
+            row = self._tasks.get(key)
+            if row is None:
+                return
+            if reset_progress or row["attempts_without_progress"] == 0:
+                self._tasks.pop(key)
+            else:
+                row.update(
+                    state=None, blocked_reason=None, repo=None,
+                    retry_eligible=False, next_eligible_at=None,
+                    updated_at=_now(),
+                )
+
+    async def tasks_backing_off(self) -> list[dict[str, Any]]:
+        with self._lock:
+            now = _now()
+            return [
+                {
+                    "queue": r["queue"], "task": r["task"],
+                    "next_eligible_at": r["next_eligible_at"],
+                }
+                for r in self._tasks.values()
+                if r["next_eligible_at"] is not None and r["next_eligible_at"] > now
+            ]
+
+    async def clear_task_backoff(self, queue: str | None, task: str) -> None:
+        with self._lock:
+            row = self._tasks.get((_qkey(queue), task))
+            if row is not None and row["next_eligible_at"] is not None:
+                row["next_eligible_at"] = None
+                row["updated_at"] = _now()
 
     # ---- queue dedication ------------------------------------------------- #
 
@@ -1019,18 +1197,27 @@ class PgStore:
             if t.run_fields:
                 sql, values = _run_update_sql(t.run_fields)
                 await conn.execute(sql, t.ref.run_id, *values)
+            qk, task = _qkey(t.ref.queue), t.ref.task
             hold = t.effects.hold
             if hold is not None:
                 await conn.execute(
                     _TASK_UPSERT_SQL,
-                    _qkey(t.ref.queue), t.ref.task, hold.kind, hold.reason,
-                    None, hold.retry_eligible,
+                    qk, task, hold.kind, hold.reason, None, hold.retry_eligible,
                 )
-            elif t.effects.clear_hold:
-                await conn.execute(
-                    "DELETE FROM nightshift.tasks WHERE queue = $1 AND task = $2",
-                    _qkey(t.ref.queue), t.ref.task,
-                )
+            match t.effects.progress:
+                case Progress.INCREMENT:
+                    await conn.execute(
+                        _TASK_INCREMENT_SQL, qk, task, t.effects.next_eligible_in
+                    )
+                case Progress.RESET:
+                    await conn.execute(_TASK_RESET_SQL, qk, task)
+                case Progress.NONE:
+                    pass
+                case _:
+                    assert_never(t.effects.progress)
+            if hold is None and t.effects.clear_hold:
+                await conn.execute(_TASK_DELETE_IF_CLEAN_SQL, qk, task)
+                await conn.execute(_TASK_DEMOTE_SQL, qk, task)
             ids: list[int] = []
             for ev in t.events:
                 ids.append(await conn.fetchval(
@@ -1069,7 +1256,10 @@ class PgStore:
 
     async def list_blocked(self) -> list[dict[str, Any]]:
         async with self._pool.acquire() as conn:
-            rows = await conn.fetch("SELECT * FROM nightshift.tasks WHERE state = 'blocked'")
+            rows = await conn.fetch(
+                f"SELECT {', '.join(_TASK_VIEW_COLUMNS)} "
+                "FROM nightshift.tasks WHERE state = 'blocked'"
+            )
         return [dict(r) for r in rows]
 
     async def tasks_in_state(self, state: str) -> list[dict[str, Any]]:
@@ -1091,10 +1281,41 @@ class PgStore:
             )
         return [dict(r) for r in rows]
 
-    async def clear_task_state(self, queue: str | None, task: str) -> None:
+    async def clear_task_state(
+        self, queue: str | None, task: str, *, reset_progress: bool = False
+    ) -> None:
+        """Clear a task's hold. ``reset_progress`` (a landed resolve — real
+        progress) also zeroes the retry counter, deleting the row outright;
+        otherwise the counter survives on a demoted row while the backoff is
+        cleared (an explicit release means "dispatchable now")."""
+        async with self._pool.acquire() as conn, conn.transaction():
+            if reset_progress:
+                await conn.execute(
+                    "DELETE FROM nightshift.tasks WHERE queue = $1 AND task = $2",
+                    _qkey(queue), task,
+                )
+                return
+            await conn.execute(_TASK_RELEASE_DELETE_SQL, _qkey(queue), task)
+            await conn.execute(_TASK_RELEASE_DEMOTE_SQL, _qkey(queue), task)
+
+    async def tasks_backing_off(self) -> list[dict[str, Any]]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT queue, task, next_eligible_at FROM nightshift.tasks
+                WHERE next_eligible_at IS NOT NULL AND next_eligible_at > now()
+                """
+            )
+        return [dict(r) for r in rows]
+
+    async def clear_task_backoff(self, queue: str | None, task: str) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(
-                "DELETE FROM nightshift.tasks WHERE queue = $1 AND task = $2",
+                """
+                UPDATE nightshift.tasks
+                SET next_eligible_at = NULL, updated_at = now()
+                WHERE queue = $1 AND task = $2 AND next_eligible_at IS NOT NULL
+                """,
                 _qkey(queue), task,
             )
 

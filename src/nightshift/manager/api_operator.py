@@ -436,12 +436,16 @@ def register_operator_api(
         label = queue_label(target)
         if "quarantined" in changes and not updated.get("quarantined"):
             _queue_failure_state.pop(label, None)
+            # An operator release means "dispatchable now": drop any pending
+            # retry backoff (the counter survives, as the streak history did).
+            await _store().clear_task_backoff(target, task)
             await _emit(
                 "task_released", queue=target, task=task,
                 payload={"prior_state": "quarantined"},
             )
         if "failed" in changes and not updated.get("failed"):
             _queue_failure_state.pop(label, None)
+            await _store().clear_task_backoff(target, task)
             await _emit(
                 "task_released", queue=target, task=task,
                 payload={"prior_state": "failed"},

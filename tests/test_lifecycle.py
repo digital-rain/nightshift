@@ -17,15 +17,20 @@ from pathlib import Path
 from typing import Any
 
 from nightshift.lifecycle import (
+    ENVIRONMENT_FAILURE_KINDS,
     LEASE_ACTIVE_STATUSES,
     RUN_TERMINAL_STATUSES,
     AttemptRef,
+    Backoff,
     FailureKind,
     GitPhase,
     LandingMode,
     LandResult,
     LeaseStatus,
     Outcome,
+    Progress,
+    RetryAction,
+    RetryPolicy,
     RunStatus,
     SubmitPolicy,
     TaskHoldKind,
@@ -319,13 +324,46 @@ def test_error_validation_failure_blocks_without_arming_policy() -> None:
     assert t.effects.frontmatter == ()
     assert t.effects.watch_armed is None
     assert t.effects.pause_queue is None
+    # HOLD still counts the no-progress attempt (no backoff — the hold itself
+    # keeps the task out of dispatch until resolved).
+    assert t.effects.progress is Progress.INCREMENT
+    assert t.effects.next_eligible_in is None
     assert _kinds(t) == ["task_blocked", "task_result"]
     assert t.events[0].payload == {"reason": "validation_error", "detail": "exit 2"}
     assert t.response["quarantined"] is False
 
 
+def test_error_non_validation_hold_kind_gets_a_kind_derived_reason() -> None:
+    # Only VALIDATION_ERROR keeps the historical "validation failed:" wording;
+    # every other HOLD kind (Phase 6 routes MERGE_* here) must say what it is.
+    out = _outcome(
+        RunStatus.ERROR, result_line="rebase stopped",
+        failure_kind=FailureKind.MERGE_CONFLICT, failure_reason="conflict in a.py",
+    )
+    t = on_submit(REF, out, SubmitPolicy())
+    assert isinstance(t, Transition)
+    assert t.effects.hold is not None
+    assert t.effects.hold.reason == "merge_conflict: rebase stopped"
+    assert t.effects.progress is Progress.INCREMENT
+    assert t.effects.next_eligible_in is None
+    assert _kinds(t) == ["task_blocked", "task_result"]
+    assert t.events[0].payload == {
+        "reason": "merge_conflict", "detail": "conflict in a.py",
+    }
+    # No detail at all: the reason is just the kind.
+    bare = on_submit(
+        REF, _outcome(RunStatus.ERROR, failure_kind=FailureKind.DISK), SubmitPolicy()
+    )
+    assert isinstance(bare, Transition)
+    assert bare.effects.hold is not None
+    assert bare.effects.hold.reason == "disk"
+
+
 def test_error_worker_quarantine_flag_quarantines_immediately() -> None:
-    t = on_submit(REF, _outcome(RunStatus.ERROR), SubmitPolicy(worker_quarantine=True))
+    t = on_submit(
+        REF, _outcome(RunStatus.ERROR),
+        SubmitPolicy(retry=RetryPolicy(immediate_quarantine=True)),
+    )
     assert isinstance(t, Transition)
     assert [f.key for f in t.effects.frontmatter] == ["quarantined"]
     assert "worker on first failure (worker error)" in t.effects.frontmatter[0].reason
@@ -335,8 +373,10 @@ def test_error_worker_quarantine_flag_quarantines_immediately() -> None:
     assert t.response["quarantined"] is True
 
 
-def test_error_streak_threshold_quarantines() -> None:
-    policy = SubmitPolicy(quarantine_threshold=3, prior_no_progress_streak=2)
+def test_error_counter_threshold_quarantines() -> None:
+    policy = SubmitPolicy(
+        retry=RetryPolicy(quarantine_after=3), attempts_without_progress=2,
+    )
     t = on_submit(REF, _outcome(RunStatus.ERROR), policy)
     assert isinstance(t, Transition)
     assert [f.key for f in t.effects.frontmatter] == ["quarantined"]
@@ -345,20 +385,30 @@ def test_error_streak_threshold_quarantines() -> None:
     )
     assert _kinds(t) == ["task_quarantined", "task_result"]
     assert t.events[0].payload["streak"] == 3
+    # The quarantined outcome still counts (the counter reaches the threshold
+    # value); the hold itself keeps the task out of dispatch, not backoff.
+    assert t.effects.progress is Progress.INCREMENT
+    assert t.effects.next_eligible_in is None
     assert t.response["quarantined"] is True
 
 
-def test_error_below_streak_threshold_is_a_plain_failure() -> None:
-    policy = SubmitPolicy(quarantine_threshold=3, prior_no_progress_streak=1)
+def test_error_below_counter_threshold_is_a_plain_failure_with_backoff() -> None:
+    policy = SubmitPolicy(
+        retry=RetryPolicy(quarantine_after=3), attempts_without_progress=1,
+    )
     t = on_submit(REF, _outcome(RunStatus.ERROR), policy)
     assert isinstance(t, Transition)
     assert [f.key for f in t.effects.frontmatter] == ["failed"]
+    assert t.effects.progress is Progress.INCREMENT
+    # Second consecutive no-progress attempt -> base * 2.
+    assert t.effects.next_eligible_in == 120.0
     assert t.response["quarantined"] is False
 
 
 def test_error_threshold_quarantine_on_retry_pauses_retry_failed() -> None:
     policy = SubmitPolicy(
-        quarantine_threshold=2, prior_no_progress_streak=1, was_retry=True,
+        retry=RetryPolicy(quarantine_after=2), attempts_without_progress=1,
+        was_retry=True,
     )
     t = on_submit(REF, _outcome(RunStatus.ERROR), policy)
     assert isinstance(t, Transition)
@@ -380,7 +430,8 @@ def test_error_on_retry_quarantines_and_pauses() -> None:
 def test_aborted_and_skipped_are_neutral() -> None:
     for status in (RunStatus.ABORTED, RunStatus.SKIPPED, RunStatus.RUNNING):
         t = on_submit(REF, _outcome(status, result_line="stopped"), SubmitPolicy(
-            watch_armed=True, was_retry=True, worker_quarantine=True,
+            watch_armed=True, was_retry=True,
+            retry=RetryPolicy(immediate_quarantine=True),
         ))
         assert isinstance(t, Transition)
         assert t.lease_status == LeaseStatus.RELEASED
@@ -388,6 +439,7 @@ def test_aborted_and_skipped_are_neutral() -> None:
         assert t.effects.frontmatter == ()
         assert t.effects.watch_armed is None
         assert t.effects.pause_queue is None
+        assert t.effects.progress is Progress.NONE
         assert _kinds(t) == ["task_result"]
         assert t.response == {
             "landed": False, "status": status, "quarantined": False,
@@ -424,6 +476,7 @@ def test_split_result_reports_subtasks_and_clears_hold() -> None:
     assert t.run_fields["result_line"] == "decomposed into 2 subtask(s): 20.a, 21.b"
     assert t.lease_status == LeaseStatus.RELEASED
     assert t.effects.clear_hold is True
+    assert t.effects.progress is Progress.RESET
     assert _kinds(t) == ["task_result", "queue_changed"]
     assert t.events[0].payload["subtasks"] == ["20.a", "21.b"]
     assert t.response == {
@@ -454,6 +507,9 @@ def test_nothing_to_land_records_no_changes_and_counts_as_failure() -> None:
         ("failed", "no changes produced"),
     ]
     assert t.effects.watch_armed is True
+    # A no-change run counts toward the counter and earns a backoff.
+    assert t.effects.progress is Progress.INCREMENT
+    assert t.effects.next_eligible_in == 60.0
     assert _kinds(t) == ["task_result", "queue_changed"]
     assert t.response == {
         "landed": False, "status": "completed",
@@ -474,7 +530,9 @@ def test_nothing_to_land_keeps_the_workers_result_line() -> None:
 
 def test_nothing_to_land_hits_quarantine_threshold() -> None:
     out = _outcome(RunStatus.COMPLETED, landable=False)
-    policy = SubmitPolicy(quarantine_threshold=2, prior_no_progress_streak=1)
+    policy = SubmitPolicy(
+        retry=RetryPolicy(quarantine_after=2), attempts_without_progress=1,
+    )
     t = on_land_result(REF, out, _no_change(), policy)
     assert [f.key for f in t.effects.frontmatter] == ["quarantined"]
     assert "2 consecutive runs with no progress (no changes produced)" in (
@@ -487,7 +545,10 @@ def test_nothing_to_land_hits_quarantine_threshold() -> None:
 
 def test_nothing_to_land_worker_quarantine_is_immediate() -> None:
     out = _outcome(RunStatus.COMPLETED, landable=False)
-    t = on_land_result(REF, out, _no_change(), SubmitPolicy(worker_quarantine=True))
+    t = on_land_result(
+        REF, out, _no_change(),
+        SubmitPolicy(retry=RetryPolicy(immediate_quarantine=True)),
+    )
     assert t.events[0].payload["streak"] == 1
     assert t.response["quarantined"] is True
 
@@ -516,6 +577,7 @@ def test_landed_clears_state_disarms_watch_and_drops_brief() -> None:
     assert t.run_fields["pushed"] is True
     assert t.lease_status == LeaseStatus.LANDED
     assert t.effects.clear_hold is True
+    assert t.effects.progress is Progress.RESET
     assert t.effects.watch_armed is False
     assert t.effects.drop_brief is True
     assert _kinds(t) == ["task_result", "queue_changed"]
@@ -630,3 +692,98 @@ def test_on_deadline_expires_the_lease_and_nothing_else() -> None:
     assert t.effects.clear_hold is False
     assert t.effects.frontmatter == ()
     assert t.response == {}
+
+
+# ---- Phase 5: RetryPolicy / backoff / environment failures --------------------- #
+
+
+def test_retry_policy_classifies_every_failure_kind() -> None:
+    policy = RetryPolicy()
+    expected = {
+        # environment: retried elsewhere, never counted against the task.
+        FailureKind.MODEL_UNAVAILABLE: RetryAction.RETRY_ELSEWHERE,
+        FailureKind.BACKEND_UNAVAILABLE: RetryAction.RETRY_ELSEWHERE,
+        FailureKind.REPO_UNAVAILABLE: RetryAction.RETRY_ELSEWHERE,
+        FailureKind.PREFLIGHT_FAILED: RetryAction.RETRY_ELSEWHERE,
+        FailureKind.WORKTREE_FAILED: RetryAction.RETRY_ELSEWHERE,
+        FailureKind.WORKER_LAUNCH: RetryAction.RETRY_ELSEWHERE,
+        FailureKind.PUBLISH_FAILED: RetryAction.RETRY_ELSEWHERE,
+        # task: retried under the counter threshold.
+        FailureKind.WORKER_ERROR: RetryAction.RETRY,
+        # recoverable/holdable: an operator or resolve owns the next step.
+        FailureKind.VALIDATION_ERROR: RetryAction.HOLD,
+        FailureKind.BLOCKED: RetryAction.HOLD,
+        FailureKind.MERGE_CONFLICT: RetryAction.HOLD,
+        FailureKind.MERGE_REJECTED: RetryAction.HOLD,
+        FailureKind.REPO_CONFIG: RetryAction.HOLD,
+        FailureKind.DISK: RetryAction.HOLD,
+        FailureKind.ABORTED: RetryAction.HOLD,
+    }
+    assert {k: policy.on_failure(k) for k in FailureKind} == expected
+    # The module-level frozenset is derived from this classification.
+    assert ENVIRONMENT_FAILURE_KINDS == {
+        k for k, action in expected.items()
+        if action is RetryAction.RETRY_ELSEWHERE
+    }
+
+
+def test_retry_policy_immediate_quarantine_only_escalates_task_failures() -> None:
+    policy = RetryPolicy(immediate_quarantine=True)
+    assert policy.on_failure(FailureKind.WORKER_ERROR) is RetryAction.QUARANTINE
+    # Environment failures are never the task's fault, even in quarantine mode.
+    for kind in ENVIRONMENT_FAILURE_KINDS:
+        assert policy.on_failure(kind) is RetryAction.RETRY_ELSEWHERE
+
+
+def test_backoff_doubles_from_base_and_caps() -> None:
+    backoff = Backoff(base_seconds=60.0, cap_seconds=3600.0)
+    assert [backoff.delay(n) for n in (1, 2, 3, 4)] == [60.0, 120.0, 240.0, 480.0]
+    assert backoff.delay(10) == 3600.0
+    # A huge counter (quarantine disabled, hot-failing task) must not
+    # overflow the exponent — it just returns the cap.
+    assert backoff.delay(10_000) == 3600.0
+
+
+def test_environment_failure_is_neutral_to_the_task_and_cools_the_worker() -> None:
+    for kind in sorted(ENVIRONMENT_FAILURE_KINDS):
+        out = _outcome(
+            RunStatus.ERROR, result_line="box broke", failure_kind=kind,
+        )
+        # Even a threshold-ready counter or quarantine-mode worker must not
+        # blame the task for its environment.
+        t = on_submit(REF, out, SubmitPolicy(
+            retry=RetryPolicy(quarantine_after=2, immediate_quarantine=True),
+            attempts_without_progress=5,
+            watch_armed=True,
+            was_retry=True,
+        ))
+        assert isinstance(t, Transition)
+        assert t.run_fields["failure_kind"] == kind
+        assert t.lease_status == LeaseStatus.RELEASED
+        assert t.effects.hold is None
+        assert t.effects.frontmatter == ()
+        assert t.effects.progress is Progress.NONE
+        assert t.effects.next_eligible_in is None
+        assert t.effects.worker_cooldown is True
+        assert t.effects.watch_armed is None
+        assert t.effects.pause_queue is None
+        assert _kinds(t) == ["task_result"]
+        assert t.response == {
+            "landed": False, "status": "error", "quarantined": False,
+        }
+
+
+def test_task_failures_do_not_cool_the_worker() -> None:
+    t = on_submit(REF, _outcome(RunStatus.ERROR), SubmitPolicy())
+    assert isinstance(t, Transition)
+    assert t.effects.worker_cooldown is False
+
+
+def test_error_backoff_grows_with_the_persisted_counter() -> None:
+    t1 = on_submit(REF, _outcome(RunStatus.ERROR), SubmitPolicy())
+    t3 = on_submit(
+        REF, _outcome(RunStatus.ERROR), SubmitPolicy(attempts_without_progress=2)
+    )
+    assert isinstance(t1, Transition) and isinstance(t3, Transition)
+    assert t1.effects.next_eligible_in == 60.0
+    assert t3.effects.next_eligible_in == 240.0
