@@ -62,7 +62,9 @@ class ReplayResult:
     detail: str = ""
 
 
-def replay_commit(git: GitRunner, base: str, sha: str) -> ReplayResult:
+def replay_commit(
+    git: GitRunner, base: str, sha: str, *, extra_trailer: str | None = None
+) -> ReplayResult:
     """THE plumbing cherry-pick: replay one commit onto ``base`` (three-way,
     merge base = the commit's parent) without touching any checkout.
 
@@ -74,6 +76,11 @@ def replay_commit(git: GitRunner, base: str, sha: str) -> ReplayResult:
     * conflicting or unreplayable → ``sha=None`` with an accurate ``detail``;
       nothing was created that needs unwinding (the source commit stays
       reachable from its original ref/reflog).
+
+    ``extra_trailer`` (a full ``Key: value`` line) is appended to the replayed
+    commit's message as a trailer block when not already present — the land
+    idempotency trailer of the resolve path. The redundant path returns
+    ``base`` untouched and cannot carry it.
     """
     parent = git.out("rev-parse", f"{sha}^")
     if parent is None:
@@ -88,6 +95,8 @@ def replay_commit(git: GitRunner, base: str, sha: str) -> ReplayResult:
     if tree == git.out("rev-parse", f"{base}^{{tree}}"):
         return ReplayResult(sha=base)
     message = git.out("log", "-1", "--format=%B", sha) or f"replay of {sha[:12]}"
+    if extra_trailer and extra_trailer not in message:
+        message = f"{message.rstrip()}\n\n{extra_trailer}"
     commit = git.run("commit-tree", tree, "-p", base, "-m", message)
     if not commit.ok:
         return ReplayResult(sha=None, detail=f"commit failed:\n{commit.detail}")

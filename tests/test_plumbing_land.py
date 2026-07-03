@@ -33,12 +33,14 @@ from nightshift.git import transport as transport_mod
 from nightshift.git.landing import (
     ProduceResult,
     RepoContext,
+    attempt_trailer_line,
     integrate_and_push,
     push_main,
     squash_produce,
 )
 from nightshift.git.locks import repo_lock
-from nightshift.git.runner import GitResult
+from nightshift.git.refs import replay_commit
+from nightshift.git.runner import GitResult, GitRunner
 from nightshift.lifecycle import LandingMode, LandKind, LandOutcome
 from nightshift.manager import landing as manager_landing_mod
 from nightshift.manager.landing import adopt_or_nothing, canonical_head, land
@@ -295,6 +297,44 @@ def test_cas_rejection_reproduces_from_the_moved_tip(tmp_path: Path) -> None:
     assert "task: add new file" in log
     assert (repo_root / "new.txt").exists()
     assert (repo_root / "operator.txt").exists()
+
+
+# --------------------------------------------------------------------------- #
+# replay_commit: the land idempotency trailer on the resolve (cherry) path
+# --------------------------------------------------------------------------- #
+
+
+def test_replay_commit_appends_the_trailer_exactly_once(tmp_path: Path) -> None:
+    """``replay_commit(..., extra_trailer=...)`` stamps the land idempotency
+    trailer on the replayed commit as a git-parseable trailer — and never
+    duplicates it when the source message already carries it (a resolve
+    re-run replaying its own earlier product)."""
+    workspace, repo, repo_root = _init_repo(tmp_path)
+    _make_branch_commit(workspace, repo, "10.x", path="r.txt", content="resolved\n")
+    git = GitRunner(repo_root)
+    base = canonical_head(repo_root)
+    source = git.out("rev-parse", worktree_branch("10.x"))
+    assert source is not None
+    trailer = attempt_trailer_line("attempt-1")
+
+    replayed = replay_commit(git, base, source, extra_trailer=trailer)
+    assert replayed.sha not in (None, base)
+    message = git.out("log", "-1", "--format=%B", replayed.sha) or ""
+    assert "work 10.x" in message          # the original message survives
+    assert message.count(trailer) == 1
+    # git's own trailer parser sees it (a real trailer block, not body text).
+    parsed = git.out(
+        "log", "-1", "--format=%(trailers:key=Nightshift-Attempt,valueonly)",
+        replayed.sha,
+    )
+    assert (parsed or "").strip() == "attempt-1"
+
+    # Replaying a commit that ALREADY carries the trailer must not stack a
+    # second copy.
+    again = replay_commit(git, base, replayed.sha, extra_trailer=trailer)
+    assert again.sha not in (None, base)
+    message2 = git.out("log", "-1", "--format=%B", again.sha) or ""
+    assert message2.count(trailer) == 1
 
 
 # --------------------------------------------------------------------------- #

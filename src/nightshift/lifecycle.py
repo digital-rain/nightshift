@@ -32,6 +32,13 @@ counter replaces the 50-run streak scan (transitions carry a
 failures set a backoff (``next_eligible_at``) that dispatch honors, and
 environment failures cool the submitting worker down instead of counting
 against the task.
+
+Phase 8 merges lease + run into one *attempt* (greenfield §"The Attempt"):
+:class:`AttemptState` is the single stored lifecycle column, transitions CAS
+on it, and the legacy pair survives only as (a) the ``RunStatus`` wire
+vocabulary on :class:`Outcome`/submits and (b) the :func:`fold_legacy` /
+:func:`split_state` table functions that pin migration
+``20260731000004_nightshift_attempts.sql``'s CASE expressions.
 """
 
 from __future__ import annotations
@@ -44,7 +51,11 @@ from pydantic import BaseModel
 
 
 class RunStatus(StrEnum):
-    """A run's lifecycle status (``runs.status`` column / event payloads)."""
+    """The WIRE outcome vocabulary: what a worker's submit (``SubmitBody`` /
+    :class:`Outcome`) reports, and the ``status`` field the ``/api/runs*``
+    views project. Since Phase 8 the STORED lifecycle column is
+    :class:`AttemptState`; ``RunStatus`` survives because the worker wire
+    format and the run views are byte-compat surfaces."""
 
     RUNNING = "running"
     COMPLETED = "completed"
@@ -54,41 +65,59 @@ class RunStatus(StrEnum):
     ABORTED = "aborted"
 
 
-# Terminal run statuses — every run reaching one of these gets ``finished_at``.
-# ``blocked`` IS terminal: the *run* is over (the task is what stays held), so
-# it finishes like any other outcome. Pre-Phase-1 it was missing from the
-# hand-written tuples and blocked runs kept ``finished_at = NULL`` forever — a
-# deliberate behavior fix.
-RUN_TERMINAL_STATUSES = frozenset(RunStatus) - {RunStatus.RUNNING}
+class AttemptState(StrEnum):
+    """The single stored lifecycle column (``attempts.state``), replacing the
+    ``RunStatus`` × ``LeaseStatus`` pair (greenfield §"Typed vocabulary").
+    Values are wire-safe lowercase strings.
 
-# Statuses an origin run may be in for an out-of-process resolve result to be
-# honored (the resolve-result fence added in Phase 0).
-RUN_RESOLVABLE_STATUSES = frozenset({RunStatus.ERROR, RunStatus.BLOCKED})
+    CLAIMED and SUBMITTED are unreachable today — dispatch creates the
+    attempt already running (the poll handler builds the work order in the
+    same request) and submit handling is synchronous — but they stay in the
+    enum per the greenfield spec so the vocabulary doesn't fork.
 
+    SKIPPED is a documented compat extension: today's ``skipped`` run status
+    (a neutral worker submit) has no greenfield equivalent but must keep its
+    wire projection.
+    """
 
-class LeaseStatus(StrEnum):
-    """A lease's status (``leases.status`` column). The historical
-    ``'submitted'`` status was never written by any code path and is dropped
-    from the vocabulary (and from both stores' active filters)."""
-
-    LEASED = "leased"
-    RELEASED = "released"
+    CLAIMED = "claimed"
+    RUNNING = "running"
+    SUBMITTED = "submitted"
+    LANDING = "landing"
+    RESOLVING = "resolving"
+    # terminal
     LANDED = "landed"
+    NO_CHANGE = "no_change"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+    CONFLICT = "conflict"
     EXPIRED = "expired"
-    CANCELLED = "cancelled"
+    ABORTED = "aborted"
+    SKIPPED = "skipped"
 
 
-# The one live lease status: a task with a lease in this set cannot be
-# re-leased.
-LEASE_ACTIVE_STATUSES = frozenset({LeaseStatus.LEASED})
-
-# Statuses that stamp ``released_at`` when set. ``cancelled`` deliberately
-# stays out to preserve today's store behavior exactly (operator stop/skip has
-# never written released_at).
-LEASE_RELEASED_AT_STATUSES = frozenset({
-    LeaseStatus.RELEASED, LeaseStatus.LANDED, LeaseStatus.EXPIRED,
+# Terminal attempt states — every attempt reaching one of these gets
+# ``finished_at`` (invariant 4), stamped by the store's applier and by
+# ``update_attempt``.
+ATTEMPT_TERMINAL_STATES = frozenset({
+    AttemptState.LANDED, AttemptState.NO_CHANGE, AttemptState.BLOCKED,
+    AttemptState.FAILED, AttemptState.CONFLICT, AttemptState.EXPIRED,
+    AttemptState.ABORTED, AttemptState.SKIPPED,
 })
 
+# The live states: a task with an attempt in this set cannot be re-leased
+# (the partial unique index ``attempts_live_task_uniq`` — keep this frozenset
+# and the index predicate in ``20260731000004_nightshift_attempts.sql``
+# byte-identical). RESOLVING is deliberately NOT live: resolve children never
+# held leases, and including them would newly block dispatch of the task they
+# are repairing.
+ATTEMPT_LIVE_STATES = frozenset({AttemptState.RUNNING, AttemptState.LANDING})
+
+# States an origin attempt may be in for an out-of-process resolve result to
+# be honored (the resolve-result fence added in Phase 0).
+ATTEMPT_RESOLVABLE_STATES = frozenset({
+    AttemptState.FAILED, AttemptState.CONFLICT, AttemptState.BLOCKED,
+})
 
 class TaskHoldKind(StrEnum):
     """Why a task is held out of dispatch (the ``tasks`` overlay ``state``
@@ -123,6 +152,156 @@ class FailureKind(StrEnum):
     REPO_CONFIG = "repo_config"
     DISK = "disk"
     ABORTED = "aborted"
+
+
+# The merge-shaped failure kinds: an error outcome carrying one of these
+# stores as CONFLICT (needs resolve), every other error as FAILED. The fold /
+# split table functions below and the migration CASE rely on this being the
+# ONLY route to CONFLICT.
+MERGE_FAILURE_KINDS = frozenset({
+    FailureKind.MERGE_CONFLICT, FailureKind.MERGE_REJECTED,
+})
+
+
+def error_state_for(kind: FailureKind | None) -> AttemptState:
+    """The stored state for an ``error`` outcome: merge-shaped failures are
+    CONFLICT (resolve owns the next step), everything else FAILED."""
+    if kind in MERGE_FAILURE_KINDS:
+        return AttemptState.CONFLICT
+    return AttemptState.FAILED
+
+
+def run_status_of(state: AttemptState | str) -> str:
+    """Project an attempt state to the ``status`` string the ``/api/runs*``
+    views (and the SSE ``runs`` snapshot) serve. All values are the
+    pre-Phase-8 wire vocabulary (``aborted`` included — neutral submits
+    already produced it) except ``expired``, the one new wire value: before
+    this phase a run whose lease expired stayed ``running`` forever, and the
+    Phase 8 zombie fix makes the projection truthful.
+    """
+    match AttemptState(state):
+        case (
+            AttemptState.CLAIMED
+            | AttemptState.RUNNING
+            | AttemptState.SUBMITTED
+            | AttemptState.LANDING
+            | AttemptState.RESOLVING
+        ):
+            return "running"
+        case AttemptState.LANDED | AttemptState.NO_CHANGE:
+            return "completed"
+        case AttemptState.BLOCKED:
+            return "blocked"
+        case AttemptState.FAILED | AttemptState.CONFLICT:
+            return "error"
+        case AttemptState.SKIPPED:
+            return "skipped"
+        case AttemptState.ABORTED:
+            return "aborted"
+        case AttemptState.EXPIRED:
+            return "expired"
+        case _:
+            assert_never(state)
+
+
+# Sentinel worker_id for resolve children (they never held leases; the fold
+# maps their lease-less running rows to RESOLVING).
+RESOLVE_WORKER_ID = "manager:resolve"
+
+
+def fold_legacy(
+    lease_status: str | None,
+    run_status: str,
+    *,
+    phase: str | None = None,
+    failure_kind: str | None = None,
+    worker_id: str | None = None,
+) -> AttemptState:
+    """The forward data-migration fold: today's (lease.status × run.status ×
+    phase × failure_kind) → :class:`AttemptState`. This function IS the
+    semantics of the CASE expression in
+    ``20260731000004_nightshift_attempts.sql`` (up) — keep them in lockstep;
+    the round-trip tests in ``test_lifecycle.py`` pin both directions.
+
+    Zombie combos canonicalize (the Phase 8 behavior fixes):
+
+    - a cancelled lease left its run ``running`` forever → ABORTED;
+    - an expired lease left its run ``running`` forever → EXPIRED;
+    - a released lease with a ``running`` run (the degenerate neutral submit)
+      and orphaned lease-less running rows → ABORTED;
+    - lease-less running rows for ``manager:resolve`` → RESOLVING.
+    """
+    if lease_status == "cancelled":
+        return AttemptState.ABORTED
+    if lease_status == "expired":
+        return AttemptState.EXPIRED
+    if lease_status == "landed":
+        return AttemptState.LANDED
+    if lease_status == "leased" and run_status == "running":
+        return AttemptState.LANDING if phase == "landing" else AttemptState.RUNNING
+    # Released / lease-less (and the leased-but-run-terminal zombie): fold by
+    # the run status alone.
+    match RunStatus(run_status):
+        case RunStatus.COMPLETED:
+            return AttemptState.NO_CHANGE
+        case RunStatus.BLOCKED:
+            return AttemptState.BLOCKED
+        case RunStatus.ERROR:
+            return error_state_for(
+                FailureKind(failure_kind) if failure_kind else None
+            )
+        case RunStatus.ABORTED:
+            return AttemptState.ABORTED
+        case RunStatus.SKIPPED:
+            return AttemptState.SKIPPED
+        case RunStatus.RUNNING:
+            if lease_status is None and worker_id == RESOLVE_WORKER_ID:
+                return AttemptState.RESOLVING
+            return AttemptState.ABORTED
+        case _:
+            assert_never(run_status)
+
+
+def split_state(state: AttemptState) -> tuple[str | None, str]:
+    """The backward data-migration split: state → (lease_status | None,
+    run_status). This function IS the semantics of the CASE expressions in
+    ``20260731000004_nightshift_attempts.sql`` (down). ``None`` means no
+    lease row is recreated (resolve children never held one).
+
+    Round-trip laws (pinned in ``test_lifecycle.py``): ``fold(split(s)) == s``
+    for every storable state; ``split(fold(combo)) == combo`` for every
+    non-degenerate legacy combo (ABORTED canonicalizes released/cancelled
+    aborts to ``(cancelled, aborted)`` — documented in :func:`fold_legacy`).
+    """
+    match state:
+        case AttemptState.RUNNING | AttemptState.LANDING:
+            # LANDING is distinguished on refold by the row's phase column
+            # ("landing"), which both directions copy verbatim.
+            return ("leased", "running")
+        case AttemptState.LANDED:
+            return ("landed", "completed")
+        case AttemptState.NO_CHANGE:
+            return ("released", "completed")
+        case AttemptState.BLOCKED:
+            return ("released", "blocked")
+        case AttemptState.FAILED | AttemptState.CONFLICT:
+            # CONFLICT is distinguished on refold by failure_kind (always a
+            # merge kind — see error_state_for), copied verbatim.
+            return ("released", "error")
+        case AttemptState.SKIPPED:
+            return ("released", "skipped")
+        case AttemptState.ABORTED:
+            return ("cancelled", "aborted")
+        case AttemptState.EXPIRED:
+            return ("expired", "running")
+        case AttemptState.RESOLVING:
+            return (None, "running")
+        case AttemptState.CLAIMED | AttemptState.SUBMITTED:
+            # Unreachable today (see AttemptState) — never stored, so the
+            # down-migration never sees them.
+            raise ValueError(f"{state} is never stored; nothing to split")
+        case _:
+            assert_never(state)
 
 
 class LandingMode(StrEnum):
@@ -207,12 +386,11 @@ class Outcome(Telemetry):
 
 @dataclass(frozen=True)
 class AttemptRef:
-    """Identity of one execution in today's storage vocabulary: the run row,
-    its lease, and the (queue, task) it belongs to. Phase 8 merges these into
-    a single attempt id."""
+    """Identity of one attempt: its id (the former run id — the work order's
+    ``lease_id`` and ``run_id`` both carry it for wire compat) and the
+    (queue, task) it belongs to."""
 
-    run_id: str
-    lease_id: str
+    id: str
     queue: str | None
     task: str
 
@@ -397,14 +575,16 @@ class TransitionEvent:
 
 @dataclass(frozen=True)
 class Transition:
-    """One atomic state change, as a value. ``run_fields`` feed the run-row
-    update, ``lease_status`` is the lease's new status (the CAS target),
-    ``events`` are inserted in order in the same transaction, and ``response``
-    is the exact submit HTTP body for this outcome."""
+    """One atomic state change, as a value. ``state`` is the attempt's new
+    state (the store CASes ``attempts.state`` from the caller's expected
+    state to it), ``fields`` feed the attempt-row update (never ``state`` —
+    the state IS the status), ``events`` are inserted in order in the same
+    transaction, and ``response`` is the exact submit HTTP body for this
+    outcome."""
 
     ref: AttemptRef
-    run_fields: dict[str, Any]
-    lease_status: LeaseStatus
+    fields: dict[str, Any]
+    state: AttemptState
     effects: TaskEffects = field(default_factory=TaskEffects)
     events: tuple[TransitionEvent, ...] = ()
     response: dict[str, Any] = field(default_factory=dict)
@@ -517,7 +697,7 @@ def _retry_quarantine(
     )
     return FrontmatterFlag("quarantined", True, "quarantine_reason", reason), (
         TransitionEvent(
-            "task_quarantined", run_id=ref.run_id, queue=ref.queue, task=ref.task,
+            "task_quarantined", run_id=ref.id, queue=ref.queue, task=ref.task,
             payload={"reason": reason, "streak": 2},
         ),
         TransitionEvent(
@@ -537,7 +717,7 @@ def _immediate_quarantine(
     )
     return FrontmatterFlag("quarantined", True, "quarantine_reason", reason), (
         TransitionEvent(
-            "task_quarantined", run_id=ref.run_id, queue=ref.queue, task=ref.task,
+            "task_quarantined", run_id=ref.id, queue=ref.queue, task=ref.task,
             payload={"reason": reason, "streak": 1},
         ),
     )
@@ -555,7 +735,7 @@ def _looping_quarantine(
     )
     return FrontmatterFlag("quarantined", True, "quarantine_reason", reason), (
         TransitionEvent(
-            "task_quarantined", run_id=ref.run_id, queue=ref.queue, task=ref.task,
+            "task_quarantined", run_id=ref.id, queue=ref.queue, task=ref.task,
             payload={"reason": reason, "streak": attempts},
         ),
     )
@@ -638,19 +818,18 @@ def _blocked_transition(
         "task_blocked", queue=ref.queue, task=ref.task, payload={"reason": reason},
     ))
     events.append(TransitionEvent(
-        "task_result", run_id=ref.run_id, queue=ref.queue, task=ref.task,
+        "task_result", run_id=ref.id, queue=ref.queue, task=ref.task,
         payload={"status": "blocked", "result_line": outcome.result_line},
     ))
     return Transition(
         ref=ref,
-        run_fields=dict(
-            status=RunStatus.BLOCKED,
+        fields=dict(
             result_line=outcome.result_line,
             failure_kind=outcome.failure_kind or FailureKind.BLOCKED,
             failure_reason=outcome.failure_reason,
             **_base_run_fields(outcome),
         ),
-        lease_status=LeaseStatus.RELEASED,
+        state=AttemptState.BLOCKED,
         effects=TaskEffects(
             hold=TaskHold(TaskHoldKind.BLOCKED, reason, retry_eligible=True),
             frontmatter=tuple(frontmatter),
@@ -662,9 +841,8 @@ def _blocked_transition(
     )
 
 
-def _error_run_fields(outcome: Outcome) -> dict[str, Any]:
+def _error_fields(outcome: Outcome) -> dict[str, Any]:
     return dict(
-        status=outcome.status,
         result_line=outcome.result_line,
         failure_kind=outcome.failure_kind,
         failure_reason=outcome.failure_reason,
@@ -681,11 +859,11 @@ def _environment_failure_transition(
     box stops eating the queue while other workers retry the task."""
     return Transition(
         ref=ref,
-        run_fields=_error_run_fields(outcome),
-        lease_status=LeaseStatus.RELEASED,
+        fields=_error_fields(outcome),
+        state=error_state_for(outcome.failure_kind),
         effects=TaskEffects(worker_cooldown=True),
         events=(TransitionEvent(
-            "task_result", run_id=ref.run_id, queue=ref.queue, task=ref.task,
+            "task_result", run_id=ref.id, queue=ref.queue, task=ref.task,
             payload={"status": outcome.status, "result_line": outcome.result_line},
         ),),
         response={"landed": False, "status": outcome.status, "quarantined": False},
@@ -747,13 +925,13 @@ def _error_transition(
         case _:
             assert_never(action)
     events.append(TransitionEvent(
-        "task_result", run_id=ref.run_id, queue=ref.queue, task=ref.task,
+        "task_result", run_id=ref.id, queue=ref.queue, task=ref.task,
         payload={"status": outcome.status, "result_line": outcome.result_line},
     ))
     return Transition(
         ref=ref,
-        run_fields=_error_run_fields(outcome),
-        lease_status=LeaseStatus.RELEASED,
+        fields=_error_fields(outcome),
+        state=error_state_for(kind),
         effects=TaskEffects(
             hold=hold,
             progress=Progress.INCREMENT,
@@ -769,19 +947,26 @@ def _error_transition(
 
 def _neutral_transition(ref: AttemptRef, outcome: Outcome) -> Transition:
     """Operator-driven or indeterminate outcomes (aborted/skipped/running):
-    record and release, no policy action."""
+    record and release, no policy action. A ``running`` submit is degenerate
+    (no real worker sends it); pre-Phase-8 it left the row ``running`` with a
+    released lease forever — the deliberate fix stores it as ABORTED (the
+    HTTP response still echoes the wire status verbatim)."""
+    state = (
+        AttemptState.SKIPPED
+        if outcome.status is RunStatus.SKIPPED
+        else AttemptState.ABORTED
+    )
     return Transition(
         ref=ref,
-        run_fields=dict(
-            status=outcome.status,
+        fields=dict(
             result_line=outcome.result_line,
             failure_kind=outcome.failure_kind,
             failure_reason=outcome.failure_reason,
             **_base_run_fields(outcome),
         ),
-        lease_status=LeaseStatus.RELEASED,
+        state=state,
         events=(TransitionEvent(
-            "task_result", run_id=ref.run_id, queue=ref.queue, task=ref.task,
+            "task_result", run_id=ref.id, queue=ref.queue, task=ref.task,
             payload={"status": outcome.status, "result_line": outcome.result_line},
         ),),
         response={"landed": False, "status": outcome.status, "quarantined": False},
@@ -825,17 +1010,16 @@ def on_split_result(
         result_line = "decomposition run produced no subtasks"
     return Transition(
         ref=ref,
-        run_fields=dict(
-            status=RunStatus.COMPLETED,
+        fields=dict(
             result_line=result_line,
             **_base_run_fields(outcome),
         ),
-        lease_status=LeaseStatus.RELEASED,
+        state=AttemptState.NO_CHANGE,
         # The parent is consumed by the split; its counter dies with it.
         effects=TaskEffects(clear_hold=True, progress=Progress.RESET),
         events=(
             TransitionEvent(
-                "task_result", run_id=ref.run_id, queue=ref.queue, task=ref.task,
+                "task_result", run_id=ref.id, queue=ref.queue, task=ref.task,
                 payload={
                     "status": "completed",
                     "result_line": result_line,
@@ -864,18 +1048,17 @@ def _no_change_transition(
         retry_pause_after_quarantine=False,
     )
     events.append(TransitionEvent(
-        "task_result", run_id=ref.run_id, queue=ref.queue, task=ref.task,
+        "task_result", run_id=ref.id, queue=ref.queue, task=ref.task,
         payload={"status": "completed", "result_line": result_line},
     ))
     events.append(TransitionEvent("queue_changed", queue=ref.queue))
     return Transition(
         ref=ref,
-        run_fields=dict(
-            status=RunStatus.COMPLETED,
+        fields=dict(
             result_line=result_line,
             **_base_run_fields(outcome),
         ),
-        lease_status=LeaseStatus.RELEASED,
+        state=AttemptState.NO_CHANGE,
         effects=TaskEffects(
             progress=Progress.INCREMENT,
             next_eligible_in=backoff,
@@ -905,8 +1088,7 @@ def _landed_transition(
         result_line = outcome.result_line or land.detail or "landed"
     return Transition(
         ref=ref,
-        run_fields=dict(
-            status=RunStatus.COMPLETED,
+        fields=dict(
             result_line=result_line,
             commit_sha=land.sha,
             loc=land.loc,
@@ -914,7 +1096,7 @@ def _landed_transition(
             pushed=land.pushed,
             **_base_run_fields(outcome),
         ),
-        lease_status=LeaseStatus.LANDED,
+        state=AttemptState.LANDED,
         effects=TaskEffects(
             clear_hold=True,
             progress=Progress.RESET,
@@ -923,7 +1105,7 @@ def _landed_transition(
         ),
         events=(
             TransitionEvent(
-                "task_result", run_id=ref.run_id, queue=ref.queue, task=ref.task,
+                "task_result", run_id=ref.id, queue=ref.queue, task=ref.task,
                 payload={
                     "status": "completed",
                     "commit_sha": land.sha,
@@ -968,13 +1150,12 @@ def _land_failed_transition(
             payload={"reason": failure_kind, "detail": land.detail},
         ))
     events.append(TransitionEvent(
-        "task_result", run_id=ref.run_id, queue=ref.queue, task=ref.task,
+        "task_result", run_id=ref.id, queue=ref.queue, task=ref.task,
         payload={"status": RunStatus.ERROR, "failure_kind": failure_kind},
     ))
     return Transition(
         ref=ref,
-        run_fields=dict(
-            status=RunStatus.ERROR,
+        fields=dict(
             result_line=(
                 land.detail.splitlines()[0][:200] if land.detail else "land failed"
             ),
@@ -982,7 +1163,7 @@ def _land_failed_transition(
             failure_reason=land.detail,
             **_base_run_fields(outcome),
         ),
-        lease_status=LeaseStatus.RELEASED,
+        state=error_state_for(failure_kind),
         effects=TaskEffects(
             hold=hold,
             pause_queue=pause,
@@ -1018,24 +1199,21 @@ def on_land_result(
 
 
 def on_land_interrupted(ref: AttemptRef) -> Transition:
-    """A ``LANDING`` run found at manager startup with its lease still live:
-    the previous process died (or was restarted) mid-land, and without the
-    Phase 8 land trailer there is no way to verify whether the squash reached
-    canonical main. The conservative resolution: error the run
-    (``merge_rejected``), release the lease, and hold the task blocked for a
-    resolve — the branch is preserved, nothing is double-landed, and the
-    operator (or auto-resolve via the Resolve button) recovers it. Phase 8's
-    trailer upgrades this to a true idempotent re-enqueue."""
+    """A ``LANDING`` attempt found at manager startup whose land can neither
+    be verified (no ``Nightshift-Attempt`` trailer on main) nor re-enqueued
+    (no surviving branch): the conservative park. CONFLICT (``merge_rejected``)
+    with the task held blocked for a resolve — the branch (if any) is
+    preserved, nothing is double-landed, and the operator (or auto-resolve via
+    the Resolve button) recovers it. CAS: expected LANDING."""
     detail = "manager restarted mid-land; task branch preserved for resolve"
     return Transition(
         ref=ref,
-        run_fields=dict(
-            status=RunStatus.ERROR,
+        fields=dict(
             result_line=detail,
             failure_kind=FailureKind.MERGE_REJECTED,
             failure_reason=detail,
         ),
-        lease_status=LeaseStatus.RELEASED,
+        state=AttemptState.CONFLICT,
         effects=TaskEffects(
             hold=TaskHold(
                 TaskHoldKind.BLOCKED, f"needs resolve: {detail}",
@@ -1048,7 +1226,7 @@ def on_land_interrupted(ref: AttemptRef) -> Transition:
                 payload={"reason": FailureKind.MERGE_REJECTED, "detail": detail},
             ),
             TransitionEvent(
-                "task_result", run_id=ref.run_id, queue=ref.queue, task=ref.task,
+                "task_result", run_id=ref.id, queue=ref.queue, task=ref.task,
                 payload={
                     "status": RunStatus.ERROR,
                     "failure_kind": FailureKind.MERGE_REJECTED,
@@ -1058,13 +1236,77 @@ def on_land_interrupted(ref: AttemptRef) -> Transition:
     )
 
 
-def on_deadline(ref: AttemptRef) -> Transition:
-    """Deadline expiry as a transition: the lease flips to ``expired``
-    (stamping ``released_at``). Today's reclaim touches nothing else — the run
-    row, the task overlay, and the event log are untouched — so the transition
-    carries no other effects. Phase 7's reconciler consumes this per lease."""
+def on_land_recovered(
+    ref: AttemptRef, sha: str, *, note: str | None = None
+) -> Transition:
+    """Startup recovery verified a mid-land attempt DID reach canonical main
+    (its ``Nightshift-Attempt`` trailer is on a main commit): complete it as
+    landed without re-running any git work. Mirrors the success effects of
+    :func:`on_land_result` (clear holds, reset the counter, disarm the
+    watch). ``note`` appends an operator-facing caveat to the result line
+    (the PR-mode "trailer proves the squash, not the PR" case). CAS:
+    expected LANDING."""
+    result_line = "recovered: landed (manager restarted mid-land)" + (note or "")
     return Transition(
         ref=ref,
-        run_fields={},
-        lease_status=LeaseStatus.EXPIRED,
+        fields=dict(result_line=result_line, commit_sha=sha),
+        state=AttemptState.LANDED,
+        effects=TaskEffects(
+            clear_hold=True,
+            progress=Progress.RESET,
+            watch_armed=False,
+        ),
+        events=(
+            TransitionEvent(
+                "task_result", run_id=ref.id, queue=ref.queue, task=ref.task,
+                payload={
+                    "status": "completed",
+                    "commit_sha": sha,
+                    "result_line": result_line,
+                },
+            ),
+            TransitionEvent("queue_changed", queue=ref.queue),
+        ),
+    )
+
+
+def on_land_enqueued(
+    ref: AttemptRef, *, branch_ref: str | None, head_sha: str | None
+) -> Transition:
+    """Entering the land phase: RUNNING → LANDING with the WIP ref/tip
+    persisted for a restart re-enqueue. A CAS (expected RUNNING) so a stale
+    submit can't enqueue a land for an attempt another actor already moved.
+    No events — the land's completion transition reports the outcome."""
+    return Transition(
+        ref=ref,
+        fields={"phase": "landing", "branch_ref": branch_ref, "head_sha": head_sha},
+        state=AttemptState.LANDING,
+    )
+
+
+def on_operator_stop(ref: AttemptRef) -> Transition:
+    """Operator stop/skip: abort a live attempt. Pre-Phase-8 the stop only
+    cancelled the lease and the run row stayed ``running`` forever — the
+    deliberate fix stores ABORTED (with ``finished_at``). The handler applies
+    it CAS RUNNING first, then LANDING (a stop cancels mid-land too, exactly
+    as today), and keeps emitting ``run_finished`` itself."""
+    return Transition(
+        ref=ref,
+        fields={},
+        state=AttemptState.ABORTED,
+    )
+
+
+def on_deadline(ref: AttemptRef) -> Transition:
+    """Deadline expiry as a transition: RUNNING → EXPIRED. Pre-Phase-8 the
+    reclaim expired only the lease and the run row stayed ``running`` with
+    ``finished_at = NULL`` forever — the deliberate fix makes EXPIRED a
+    terminal attempt state (the applier stamps ``finished_at``); ``/api/runs``
+    projects the new ``expired`` status. The task overlay and event log stay
+    untouched, as today. LANDING attempts are structurally exempt (a
+    different state)."""
+    return Transition(
+        ref=ref,
+        fields={},
+        state=AttemptState.EXPIRED,
     )

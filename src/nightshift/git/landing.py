@@ -52,6 +52,42 @@ from nightshift.git.worktrees import queue_slug
 from nightshift.lifecycle import LandingMode, LandKind, LandOutcome
 
 
+# Land idempotency trailer (Phase 8): every manager-produced land commit
+# carries `Nightshift-Attempt: <attempt id>` so startup recovery can tell a
+# completed land from an interrupted one by scanning main. Direct/legacy
+# callers pass no attempt_id and get no trailer — only manager lands are
+# recovery-eligible.
+ATTEMPT_TRAILER = "Nightshift-Attempt"
+
+
+def attempt_trailer_line(attempt_id: str) -> str:
+    return f"{ATTEMPT_TRAILER}: {attempt_id}"
+
+
+def find_landed_attempt(
+    repo_root: Path, attempt_id: str, *, limit: int = 500
+) -> str | None:
+    """Scan the last ``limit`` commits of canonical ``main`` for the land
+    idempotency trailer of ``attempt_id``; return the carrying commit's sha
+    (None when absent). Bounded so recovery stays cheap on old repos; a land
+    older than the window has long been observed by other paths."""
+    tip = main_sha(repo_root)
+    if tip is None:
+        return None
+    res = GitRunner(repo_root).run(
+        "log", "-n", str(limit),
+        f"--format=%H%x09%(trailers:key={ATTEMPT_TRAILER},valueonly,separator=%x2C)",
+        tip,
+    )
+    if not res.ok:
+        return None
+    for line in res.stdout.splitlines():
+        sha, _, values = line.partition("\t")
+        if attempt_id in (v.strip() for v in values.split(",")):
+            return sha
+    return None
+
+
 @dataclass(frozen=True)
 class PrSpec:
     """What PR mode needs beyond the commit itself."""
@@ -148,10 +184,12 @@ def _merge_tree(
 
 
 def squash_produce(
-    repo_root: Path, branch: str, title: str
+    repo_root: Path, branch: str, title: str, attempt_id: str | None = None
 ) -> Callable[[str], ProduceResult]:
     """The normal-land producer: squash ``branch`` onto the base as one
-    commit object (``task: <title>``, the historical squash subject)."""
+    commit object (``task: <title>``, the historical squash subject).
+    ``attempt_id`` appends the land idempotency trailer as a proper git
+    trailer block (blank line before it)."""
 
     def produce(base: str) -> ProduceResult:
         git = GitRunner(repo_root)
@@ -187,7 +225,10 @@ def squash_produce(
                     "nothing to commit"
                 ),
             ))
-        commit = git.run("commit-tree", tree, "-p", base, "-m", f"task: {title}")
+        message = f"task: {title}"
+        if attempt_id:
+            message += f"\n\n{attempt_trailer_line(attempt_id)}"
+        commit = git.run("commit-tree", tree, "-p", base, "-m", message)
         if not commit.ok:
             return ProduceResult(failure=LandOutcome(
                 kind=LandKind.CONFLICT,
@@ -199,13 +240,17 @@ def squash_produce(
     return produce
 
 
-def cherry_produce(repo_root: Path, resolved_sha: str) -> Callable[[str], ProduceResult]:
+def cherry_produce(
+    repo_root: Path, resolved_sha: str, attempt_id: str | None = None
+) -> Callable[[str], ProduceResult]:
     """The resolve producer: replay the already-validated resolved commit onto
     the base via :func:`~nightshift.git.refs.replay_commit` (the shared
     plumbing cherry-pick). Redundant content (the rescue already replayed it
     onto the fresh tip) collapses to the base itself instead of an empty
-    commit. Only a real merge conflict is worded as one; other failures
-    (unknown commit, no parent) carry their own accurate detail."""
+    commit — that path can't carry the idempotency trailer, which is fine:
+    redundant means the content already landed. Only a real merge conflict is
+    worded as one; other failures (unknown commit, no parent) carry their own
+    accurate detail."""
 
     def produce(base: str) -> ProduceResult:
         git = GitRunner(repo_root)
@@ -220,7 +265,10 @@ def cherry_produce(repo_root: Path, resolved_sha: str) -> Callable[[str], Produc
             )
         if full == base:
             return ProduceResult(sha=full)
-        replayed = replay_commit(git, base, full)
+        replayed = replay_commit(
+            git, base, full,
+            extra_trailer=attempt_trailer_line(attempt_id) if attempt_id else None,
+        )
         if replayed.sha is None:
             if replayed.conflict:
                 return failure(

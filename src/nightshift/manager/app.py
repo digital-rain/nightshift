@@ -38,7 +38,7 @@ from nightshift._paths import UI_DIR
 from nightshift.events import new_run_id
 from nightshift.git.executor import ExecutorPool
 from nightshift.git.sync import SyncThrottle, sync_main_locked
-from nightshift.lifecycle import FailureKind, RunStatus
+from nightshift.lifecycle import RESOLVE_WORKER_ID, AttemptState, FailureKind
 from nightshift.manager import failure_policy
 from nightshift.manager.api_operator import register_operator_api
 from nightshift.manager.api_worker import register_worker_api
@@ -320,23 +320,29 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
             return False, None, "a resolve is already running for this repo"
         store = _store()
         child_run_id = new_run_id()
-        await store.create_run(
+        # Resolve children are RESOLVING attempts: never live (they must not
+        # block re-dispatch of the task they repair) and deadline-less (the
+        # subprocess reaper owns their lifetime, not the TTL sweep).
+        await store.create_attempt(
             child_run_id,
             task=task,
             queue=queue,
-            worker_id="manager:resolve",
+            worker_id=RESOLVE_WORKER_ID,
             backend=cfg.raw.get("resolve_backend"),
             model=cfg.raw.get("resolve_model"),
+            base_ref=None,
+            ttl_seconds=0,
             title=title,
             repo=repo,
+            state=AttemptState.RESOLVING,
         )
         started = app.state.spawn_resolve(
             child_run_id, task=task, queue=queue, repo=repo,
             title=title, origin_run_id=origin_run_id,
         )
         if not started:
-            await store.update_run(
-                child_run_id, status=RunStatus.ERROR,
+            await store.update_attempt(
+                child_run_id, state=AttemptState.FAILED,
                 result_line="failed to launch resolver process",
                 failure_kind=FailureKind.WORKER_LAUNCH,
             )
@@ -365,6 +371,8 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         executors=executors,
         resolves=app.state.resolves,
         repo_warnings=app.state.repo_warnings,
+        sync_throttle=sync_throttle,
+        tasks_repo=tasks_repo,
     )
 
     register_worker_api(

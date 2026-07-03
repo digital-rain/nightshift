@@ -1,9 +1,11 @@
-"""Tests for the nightshift manager store + schema (Phase 0 + Phase 4).
+"""Tests for the nightshift manager store + schema (Phase 0/4/8).
 
 The MemoryStore exercises the same async interface as the PgStore, so these
-verify the CRUD/lease/stats semantics without a live database. The migration
-test pins the schema shape the PgStore relies on. The Phase 4 section covers
-``apply_transition``: the CAS fence and the all-or-nothing outbox write.
+verify the CRUD/attempt/stats semantics without a live database. The migration
+tests pin the schema shape the PgStore relies on. The Phase 4 section covers
+``apply_transition``: the CAS fence and the all-or-nothing outbox write. The
+Phase 8 section tests the lifecycle invariants (greenfield §"Invariants" 1–4)
+directly against the merged ``attempts`` surface.
 """
 
 from __future__ import annotations
@@ -14,15 +16,17 @@ import pytest
 
 from nightshift._paths import MIGRATIONS_DIR
 from nightshift.lifecycle import (
+    ATTEMPT_TERMINAL_STATES,
     AttemptRef,
-    LeaseStatus,
+    AttemptState,
     Progress,
-    RunStatus,
     TaskEffects,
     TaskHold,
     TaskHoldKind,
     Transition,
     TransitionEvent,
+    on_deadline,
+    on_operator_stop,
 )
 from nightshift.manager.store import MemoryStore
 
@@ -34,6 +38,7 @@ CAPABILITY_MIGRATION = (
 RETRY_COUNTERS_MIGRATION = (
     MIGRATIONS_DIR / "20260731000002_nightshift_retry_counters.sql"
 )
+ATTEMPTS_MIGRATION = MIGRATIONS_DIR / "20260731000004_nightshift_attempts.sql"
 
 
 def _run(coro):
@@ -82,14 +87,15 @@ def test_queue_dedication_round_trip() -> None:
     assert _run(store.queue_dedication()) == {}
 
 
-def test_create_run_records_required_mcps() -> None:
+def test_create_attempt_records_required_mcps() -> None:
     store = MemoryStore()
-    _run(store.create_run(
+    _run(store.create_attempt(
         "r1", task="t1", queue=None, worker_id="w1",
-        backend="cursor", model="auto", required_mcps=["slack", "github"],
+        backend="cursor", model="auto", base_ref=None, ttl_seconds=60,
+        required_mcps=["slack", "github"],
     ))
-    run = _run(store.get_run("r1"))
-    assert run["required_mcps"] == ["slack", "github"]
+    attempt = _run(store.get_attempt("r1"))
+    assert attempt["required_mcps"] == ["slack", "github"]
 
 
 def test_worker_status_and_stale_expiry() -> None:
@@ -104,59 +110,57 @@ def test_worker_status_and_stale_expiry() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# leases
+# attempts: invariant 1 (one live attempt per task) + deadline expiry
 # --------------------------------------------------------------------------- #
 
 
-def test_lease_is_exclusive_per_task() -> None:
+def _attempt(store: MemoryStore, attempt_id: str, task: str = "t1", **kw):
+    kw.setdefault("queue", None)
+    kw.setdefault("worker_id", "w1")
+    kw.setdefault("backend", "claude-code")
+    kw.setdefault("model", "auto")
+    kw.setdefault("base_ref", "abc")
+    kw.setdefault("ttl_seconds", 60)
+    return store.create_attempt(attempt_id, task=task, **kw)
+
+
+def test_invariant_1_one_live_attempt_per_task() -> None:
+    """Greenfield invariant 1: at most one attempt per (queue, task) is in a
+    live state — the second create_attempt is refused while the first is
+    RUNNING or LANDING, and allowed again once it is terminal."""
     store = MemoryStore()
-    _run(store.register_worker("w1", backend="claude-code", queues=None, priorities=None))
-    first = _run(
-        store.acquire_lease(
-            task="t1", queue=None, worker_id="w1", model="auto",
-            base_ref="abc", ttl_seconds=60,
-        )
-    )
+    first = _run(_attempt(store, "r1"))
     assert first is not None
-    # A second active lease on the same (queue, task) is refused.
-    second = _run(
-        store.acquire_lease(
-            task="t1", queue=None, worker_id="w1", model="auto",
-            base_ref="abc", ttl_seconds=60,
-        )
-    )
-    assert second is None
-    # Releasing frees it for a fresh lease.
-    _run(store.set_lease_status(first["id"], "released"))
-    third = _run(
-        store.acquire_lease(
-            task="t1", queue=None, worker_id="w1", model="auto",
-            base_ref="abc", ttl_seconds=60,
-        )
-    )
+    assert _run(_attempt(store, "r2")) is None
+    # Still refused mid-land (LANDING is live).
+    _run(store.update_attempt("r1", state=AttemptState.LANDING))
+    assert _run(_attempt(store, "r2")) is None
+    # Terminal frees the task for a fresh attempt.
+    _run(store.update_attempt("r1", state=AttemptState.FAILED))
+    third = _run(_attempt(store, "r3"))
     assert third is not None
+    # A RESOLVING child is NOT live: it never blocks dispatch of its task.
+    _run(store.update_attempt("r3", state=AttemptState.CONFLICT))
+    child = _run(_attempt(store, "r4", state="resolving", worker_id="manager:resolve"))
+    assert child is not None
+    assert child["deadline_at"] is None
+    assert _run(_attempt(store, "r5")) is not None
 
 
-def test_expired_leases_are_reclaimed() -> None:
+def test_deadline_expiry_via_on_deadline_transition() -> None:
+    """Phase 8: expiry is the on_deadline transition (RUNNING → EXPIRED, a
+    terminal state with finished_at), replacing reclaim_expired_leases."""
     store = MemoryStore()
-    _run(store.register_worker("w1", backend="claude-code", queues=None, priorities=None))
-    lease = _run(
-        store.acquire_lease(
-            task="t1", queue=None, worker_id="w1", model="auto",
-            base_ref="abc", ttl_seconds=-1,  # already expired
-        )
-    )
-    assert lease is not None
-    reclaimed = _run(store.reclaim_expired_leases())
-    assert [r["task"] for r in reclaimed] == ["t1"]
-    # Reclaimed → task is leasable again.
-    again = _run(
-        store.acquire_lease(
-            task="t1", queue=None, worker_id="w1", model="auto",
-            base_ref="abc", ttl_seconds=60,
-        )
-    )
-    assert again is not None
+    _run(_attempt(store, "r1", ttl_seconds=-1))  # already overdue
+    ref = AttemptRef(id="r1", queue=None, task="t1")
+    assert _run(store.apply_transition(
+        on_deadline(ref), expected_status=AttemptState.RUNNING,
+    )) is not None
+    row = _run(store.get_attempt("r1"))
+    assert row["state"] == "expired"
+    assert row["finished_at"] is not None
+    # Expired → the task is dispatchable again.
+    assert _run(_attempt(store, "r2")) is not None
 
 
 # --------------------------------------------------------------------------- #
@@ -199,22 +203,21 @@ def test_retryable_tasks_scoped_to_queue() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# runs + stats
+# attempts + stats
 # --------------------------------------------------------------------------- #
 
 
-def test_runs_and_stats_by_backend() -> None:
+def test_attempts_and_stats_by_backend() -> None:
     store = MemoryStore()
-    _run(store.create_run(
-        "r1", task="t1", queue=None, worker_id="w1",
-        backend="claude-code", model="claude-opus-4-8",
+    _run(_attempt(store, "r1", backend="claude-code", model="claude-opus-4-8"))
+    _run(store.update_attempt(
+        "r1", state=AttemptState.LANDED, loc=42, commit_sha="deadbeef",
     ))
-    _run(store.update_run("r1", status="completed", loc=42, commit_sha="deadbeef"))
-    _run(store.create_run(
-        "r2", task="t2", queue=None, worker_id="w2",
-        backend="ollama", model="llama3.1",
+    _run(_attempt(store, "r2", task="t2", worker_id="w2",
+                  backend="ollama", model="llama3.1"))
+    _run(store.update_attempt(
+        "r2", state=AttemptState.FAILED, failure_kind="validation_error",
     ))
-    _run(store.update_run("r2", status="error", failure_kind="validation_error"))
 
     overall = _run(store.stats_overall())
     assert overall["total_runs"] == 2
@@ -230,31 +233,24 @@ def test_runs_and_stats_by_backend() -> None:
 
 def test_turns_and_tokens_roll_up_per_model_backend_queue() -> None:
     store = MemoryStore()
-    # Two runs on the same model/backend (one completed, one errored) + a third
-    # in a playlist queue on a different backend.
-    _run(store.create_run(
-        "r1", task="t1", queue=None, worker_id="w1",
-        backend="claude-code", model="claude-opus-4-8",
-    ))
-    _run(store.update_run(
-        "r1", status="completed", loc=10,
+    # Two attempts on the same model/backend (one landed, one failed) + a
+    # third in a playlist queue on a different backend.
+    _run(_attempt(store, "r1", backend="claude-code", model="claude-opus-4-8"))
+    _run(store.update_attempt(
+        "r1", state=AttemptState.LANDED, loc=10,
         turns=7, input_tokens=1000, output_tokens=200, cost_usd=0.05,
     ))
-    _run(store.create_run(
-        "r2", task="t2", queue=None, worker_id="w1",
-        backend="claude-code", model="claude-opus-4-8",
-    ))
-    # A failed run still burned turns + tokens — it must count in the rollups.
-    _run(store.update_run(
-        "r2", status="error", failure_kind="validation_error",
+    _run(_attempt(store, "r2", task="t2", backend="claude-code",
+                  model="claude-opus-4-8"))
+    # A failed attempt still burned turns + tokens — it counts in the rollups.
+    _run(store.update_attempt(
+        "r2", state=AttemptState.FAILED, failure_kind="validation_error",
         turns=3, input_tokens=500, output_tokens=100, cost_usd=0.02,
     ))
-    _run(store.create_run(
-        "r3", task="t3", queue="alpha", worker_id="w2",
-        backend="ollama", model="llama3.1",
-    ))
-    _run(store.update_run(
-        "r3", status="completed", loc=5,
+    _run(_attempt(store, "r3", task="t3", queue="alpha", worker_id="w2",
+                  backend="ollama", model="llama3.1"))
+    _run(store.update_attempt(
+        "r3", state=AttemptState.NO_CHANGE, loc=5,
         turns=1, input_tokens=300, output_tokens=80, cost_usd=None,
     ))
 
@@ -277,31 +273,27 @@ def test_turns_and_tokens_roll_up_per_model_backend_queue() -> None:
     assert by_queue["alpha"]["total_turns"] == 1
 
 
-def test_blocked_run_gets_finished_at() -> None:
-    """`blocked` is a terminal run status: the run is over (the *task* is what
-    stays held), so it must get finished_at like every other terminal status.
+def test_blocked_attempt_gets_finished_at() -> None:
+    """`blocked` is a terminal state: the attempt is over (the *task* is what
+    stays held), so it must get finished_at like every other terminal state.
     Pre-Phase-1 this drifted: blocked runs kept finished_at = NULL forever."""
     store = MemoryStore()
-    _run(store.create_run(
-        "r1", task="t1", queue=None, worker_id="w1",
-        backend="claude-code", model="auto",
+    _run(_attempt(store, "r1"))
+    _run(store.update_attempt(
+        "r1", state=AttemptState.BLOCKED, result_line="blocked: needs creds",
     ))
-    _run(store.update_run("r1", status="blocked", result_line="blocked: needs creds"))
-    run = _run(store.get_run("r1"))
-    assert run["status"] == "blocked"
-    assert run["finished_at"] is not None
+    row = _run(store.get_attempt("r1"))
+    assert row["state"] == "blocked"
+    assert row["finished_at"] is not None
 
 
-def test_update_run_raises_on_unknown_fields() -> None:
+def test_update_attempt_raises_on_unknown_fields() -> None:
     """The updatable-field set derives from the Outcome/Telemetry models;
     unknown fields raise instead of being silently dropped."""
     store = MemoryStore()
-    _run(store.create_run(
-        "r1", task="t1", queue=None, worker_id="w1",
-        backend="claude-code", model="auto",
-    ))
+    _run(_attempt(store, "r1"))
     with pytest.raises(ValueError, match="nonsense_field"):
-        _run(store.update_run("r1", nonsense_field=1))
+        _run(store.update_attempt("r1", nonsense_field=1))
 
 
 # --------------------------------------------------------------------------- #
@@ -328,26 +320,21 @@ def test_events_are_monotonic_and_cursorable() -> None:
 # --------------------------------------------------------------------------- #
 
 
-async def _leased_attempt(store: MemoryStore) -> AttemptRef:
-    """Acquire a lease + create its run, returning the attempt identity."""
-    lease = await store.acquire_lease(
-        task="t1", queue=None, worker_id="w1", model="auto",
-        base_ref="abc", ttl_seconds=60,
-    )
-    assert lease is not None
-    await store.create_run(
+async def _live_attempt(store: MemoryStore) -> AttemptRef:
+    """Create one running attempt, returning its identity."""
+    row = await store.create_attempt(
         "r1", task="t1", queue=None, worker_id="w1",
-        backend="claude-code", model="auto",
+        backend="claude-code", model="auto", base_ref="abc", ttl_seconds=60,
     )
-    await store.set_lease_status(lease["id"], "leased", run_id="r1")
-    return AttemptRef(run_id="r1", lease_id=lease["id"], queue=None, task="t1")
+    assert row is not None
+    return AttemptRef(id="r1", queue=None, task="t1")
 
 
 def _error_transition(ref: AttemptRef) -> Transition:
     return Transition(
         ref=ref,
-        run_fields={"status": RunStatus.ERROR, "result_line": "boom"},
-        lease_status=LeaseStatus.RELEASED,
+        fields={"result_line": "boom"},
+        state=AttemptState.FAILED,
         effects=TaskEffects(hold=TaskHold(TaskHoldKind.BLOCKED, "boom")),
         events=(
             TransitionEvent("task_blocked", queue=None, task="t1",
@@ -358,22 +345,22 @@ def _error_transition(ref: AttemptRef) -> Transition:
     )
 
 
-def test_apply_transition_writes_run_lease_overlay_and_events_together() -> None:
+def test_apply_transition_writes_attempt_overlay_and_events_together() -> None:
+    """Greenfield invariant 3: state and events change together (the success
+    half — the failure halves are the CAS and bad-fields tests below)."""
     async def scenario() -> None:
         store = MemoryStore()
-        ref = await _leased_attempt(store)
+        ref = await _live_attempt(store)
         ids = await store.apply_transition(
             _error_transition(ref),
-            expected_status="leased", expected_worker_id="w1",
+            expected_status=AttemptState.RUNNING, expected_worker_id="w1",
         )
         assert ids is not None and len(ids) == 2
-        run = await store.get_run("r1")
-        assert run["status"] == "error"
-        assert run["result_line"] == "boom"
-        assert run["finished_at"] is not None
-        lease = await store.get_lease(ref.lease_id)
-        assert lease["status"] == "released"
-        assert lease["released_at"] is not None
+        row = await store.get_attempt("r1")
+        assert row["state"] == "failed"
+        assert row["result_line"] == "boom"
+        assert row["finished_at"] is not None
+        assert row["released_at"] is not None
         hold = await store.get_task_state(None, "t1")
         assert hold["state"] == "blocked"
         assert hold["blocked_reason"] == "boom"
@@ -384,24 +371,28 @@ def test_apply_transition_writes_run_lease_overlay_and_events_together() -> None
     _run(scenario())
 
 
-def test_apply_transition_cas_rejects_stale_or_foreign_lease() -> None:
+def test_invariant_2_submit_for_non_live_attempt_writes_nothing() -> None:
+    """Greenfield invariant 2: an apply whose CAS misses (wrong worker or a
+    state that already moved) writes nothing — no attempt fields, no overlay,
+    no events."""
     async def scenario() -> None:
         store = MemoryStore()
-        ref = await _leased_attempt(store)
+        ref = await _live_attempt(store)
         # Wrong worker: the submit fence.
         assert await store.apply_transition(
             _error_transition(ref),
-            expected_status="leased", expected_worker_id="w2",
+            expected_status=AttemptState.RUNNING, expected_worker_id="w2",
         ) is None
-        # Reclaimed lease: the expected status no longer matches.
-        await store.set_lease_status(ref.lease_id, "expired")
+        # Expired attempt: the expected state no longer matches.
+        await store.update_attempt("r1", state=AttemptState.EXPIRED)
         assert await store.apply_transition(
             _error_transition(ref),
-            expected_status="leased", expected_worker_id="w1",
+            expected_status=AttemptState.RUNNING, expected_worker_id="w1",
         ) is None
         # Nothing was written by either rejected apply.
-        run = await store.get_run("r1")
-        assert run["status"] == "running"
+        row = await store.get_attempt("r1")
+        assert row["state"] == "expired"
+        assert row["result_line"] is None
         assert await store.get_task_state(None, "t1") is None
         assert await store.events_since(0) == []
 
@@ -411,22 +402,23 @@ def test_apply_transition_cas_rejects_stale_or_foreign_lease() -> None:
 def test_apply_transition_concurrent_applies_one_wins() -> None:
     async def scenario() -> None:
         store = MemoryStore()
-        ref = await _leased_attempt(store)
+        ref = await _live_attempt(store)
         landed = Transition(
             ref=ref,
-            run_fields={"status": RunStatus.COMPLETED, "commit_sha": "abc"},
-            lease_status=LeaseStatus.LANDED,
+            fields={"commit_sha": "abc"},
+            state=AttemptState.LANDED,
             effects=TaskEffects(clear_hold=True),
             events=(TransitionEvent("task_result", run_id="r1", task="t1",
                                     payload={"status": "completed"}),),
         )
         results = await asyncio.gather(
             store.apply_transition(
-                landed, expected_status="leased", expected_worker_id="w1"
+                landed,
+                expected_status=AttemptState.RUNNING, expected_worker_id="w1",
             ),
             store.apply_transition(
                 _error_transition(ref),
-                expected_status="leased", expected_worker_id="w1",
+                expected_status=AttemptState.RUNNING, expected_worker_id="w1",
             ),
         )
         wins = [r for r in results if r is not None]
@@ -438,25 +430,82 @@ def test_apply_transition_concurrent_applies_one_wins() -> None:
     _run(scenario())
 
 
-def test_apply_transition_bad_run_fields_writes_nothing() -> None:
-    """Validation happens before any mutation — a malformed transition can't
-    leave partial state (the all-or-nothing guarantee)."""
+def test_invariant_3_bad_fields_write_neither_state_nor_events() -> None:
+    """Greenfield invariant 3, failure half: validation happens before any
+    mutation — a malformed transition can't leave partial state."""
     async def scenario() -> None:
         store = MemoryStore()
-        ref = await _leased_attempt(store)
+        ref = await _live_attempt(store)
         bad = Transition(
             ref=ref,
-            run_fields={"nonsense_field": 1},
-            lease_status=LeaseStatus.RELEASED,
+            fields={"nonsense_field": 1},
+            state=AttemptState.FAILED,
             events=(TransitionEvent("task_result", run_id="r1"),),
         )
         with pytest.raises(ValueError, match="nonsense_field"):
             await store.apply_transition(
-                bad, expected_status="leased", expected_worker_id="w1"
+                bad,
+                expected_status=AttemptState.RUNNING, expected_worker_id="w1",
             )
-        lease = await store.get_lease(ref.lease_id)
-        assert lease["status"] == "leased"
+        row = await store.get_attempt("r1")
+        assert row["state"] == "running"
         assert await store.events_since(0) == []
+
+    _run(scenario())
+
+
+def test_invariant_4_every_terminal_attempt_has_finished_at() -> None:
+    """Greenfield invariant 4: every terminal state stamps finished_at — via
+    apply_transition AND via the direct update_attempt path (the resolve
+    writer); non-terminal states leave it NULL."""
+    async def scenario() -> None:
+        store = MemoryStore()
+        # apply_transition path: one attempt per terminal state.
+        for n, state in enumerate(sorted(ATTEMPT_TERMINAL_STATES)):
+            rid = f"rt{n}"
+            await store.create_attempt(
+                rid, task=f"t{n}", queue=None, worker_id="w1",
+                backend="b", model="m", base_ref=None, ttl_seconds=60,
+            )
+            applied = await store.apply_transition(
+                Transition(
+                    ref=AttemptRef(id=rid, queue=None, task=f"t{n}"),
+                    fields={},
+                    state=AttemptState(state),
+                ),
+                expected_status=AttemptState.RUNNING,
+            )
+            assert applied is not None
+            row = await store.get_attempt(rid)
+            assert row["finished_at"] is not None, state
+            assert row["released_at"] is not None, state
+        # update_attempt path (the resolve-result direct write).
+        await store.create_attempt(
+            "ru", task="tu", queue=None, worker_id="w1",
+            backend="b", model="m", base_ref=None, ttl_seconds=60,
+        )
+        row = await store.get_attempt("ru")
+        assert row["finished_at"] is None  # live → NULL
+        await store.update_attempt("ru", state=AttemptState.LANDING)
+        assert (await store.get_attempt("ru"))["finished_at"] is None
+        await store.update_attempt("ru", state=AttemptState.LANDED)
+        assert (await store.get_attempt("ru"))["finished_at"] is not None
+
+    _run(scenario())
+
+
+def test_operator_stop_transition_aborts_a_live_attempt() -> None:
+    """Phase 8 behavior fix: stop/skip applies on_operator_stop (ABORTED with
+    finished_at) instead of cancelling a lease around a zombie row."""
+    async def scenario() -> None:
+        store = MemoryStore()
+        ref = await _live_attempt(store)
+        assert await store.apply_transition(
+            on_operator_stop(ref), expected_status=AttemptState.RUNNING,
+        ) is not None
+        row = await store.get_attempt("r1")
+        assert row["state"] == "aborted"
+        assert row["finished_at"] is not None
 
     _run(scenario())
 
@@ -470,8 +519,8 @@ def _counted_error(ref: AttemptRef, *, backoff: float | None = 60.0) -> Transiti
     """A plain worker error: counts toward the task, backs the retry off."""
     return Transition(
         ref=ref,
-        run_fields={"status": RunStatus.ERROR, "result_line": "boom"},
-        lease_status=LeaseStatus.RELEASED,
+        fields={"result_line": "boom"},
+        state=AttemptState.FAILED,
         effects=TaskEffects(progress=Progress.INCREMENT, next_eligible_in=backoff),
     )
 
@@ -479,9 +528,10 @@ def _counted_error(ref: AttemptRef, *, backoff: float | None = 60.0) -> Transiti
 def test_increment_creates_a_pure_counter_row_invisible_to_views() -> None:
     async def scenario() -> None:
         store = MemoryStore()
-        ref = await _leased_attempt(store)
+        ref = await _live_attempt(store)
         await store.apply_transition(
-            _counted_error(ref), expected_status="leased", expected_worker_id="w1"
+            _counted_error(ref),
+            expected_status=AttemptState.RUNNING, expected_worker_id="w1",
         )
         row = await store.get_task_state(None, "t1")
         assert row["attempts_without_progress"] == 1
@@ -499,16 +549,17 @@ def test_increment_creates_a_pure_counter_row_invisible_to_views() -> None:
 def test_increment_without_backoff_clears_a_stale_one() -> None:
     async def scenario() -> None:
         store = MemoryStore()
-        ref = await _leased_attempt(store)
+        ref = await _live_attempt(store)
         await store.apply_transition(
-            _counted_error(ref), expected_status="leased", expected_worker_id="w1"
+            _counted_error(ref),
+            expected_status=AttemptState.RUNNING, expected_worker_id="w1",
         )
-        # Re-lease and fail again, this time without backoff (e.g. a
+        # Revive and fail again, this time without backoff (e.g. a
         # quarantining outcome): the counter grows, the stale backoff goes.
-        await store.set_lease_status(ref.lease_id, "leased")
+        await store.update_attempt("r1", state=AttemptState.RUNNING)
         await store.apply_transition(
             _counted_error(ref, backoff=None),
-            expected_status="leased", expected_worker_id="w1",
+            expected_status=AttemptState.RUNNING, expected_worker_id="w1",
         )
         row = await store.get_task_state(None, "t1")
         assert row["attempts_without_progress"] == 2
@@ -520,15 +571,17 @@ def test_increment_without_backoff_clears_a_stale_one() -> None:
 def test_hold_write_preserves_the_counter_and_backoff() -> None:
     async def scenario() -> None:
         store = MemoryStore()
-        ref = await _leased_attempt(store)
+        ref = await _live_attempt(store)
         await store.apply_transition(
-            _counted_error(ref), expected_status="leased", expected_worker_id="w1"
+            _counted_error(ref),
+            expected_status=AttemptState.RUNNING, expected_worker_id="w1",
         )
         # A later hold (transactional) and an operator upsert both leave the
         # retry fields alone.
-        await store.set_lease_status(ref.lease_id, "leased")
+        await store.update_attempt("r1", state=AttemptState.RUNNING)
         await store.apply_transition(
-            _error_transition(ref), expected_status="leased", expected_worker_id="w1"
+            _error_transition(ref),
+            expected_status=AttemptState.RUNNING, expected_worker_id="w1",
         )
         row = await store.get_task_state(None, "t1")
         assert row["state"] == "blocked"
@@ -545,19 +598,20 @@ def test_hold_write_preserves_the_counter_and_backoff() -> None:
 def test_landed_reset_deletes_the_counter_row() -> None:
     async def scenario() -> None:
         store = MemoryStore()
-        ref = await _leased_attempt(store)
+        ref = await _live_attempt(store)
         await store.apply_transition(
-            _counted_error(ref), expected_status="leased", expected_worker_id="w1"
+            _counted_error(ref),
+            expected_status=AttemptState.RUNNING, expected_worker_id="w1",
         )
-        await store.set_lease_status(ref.lease_id, "leased")
+        await store.update_attempt("r1", state=AttemptState.RUNNING)
         landed = Transition(
             ref=ref,
-            run_fields={"status": RunStatus.COMPLETED, "commit_sha": "abc"},
-            lease_status=LeaseStatus.LANDED,
+            fields={"commit_sha": "abc"},
+            state=AttemptState.LANDED,
             effects=TaskEffects(clear_hold=True, progress=Progress.RESET),
         )
         await store.apply_transition(
-            landed, expected_status="leased", expected_worker_id="w1"
+            landed, expected_status=AttemptState.RUNNING, expected_worker_id="w1"
         )
         assert await store.get_task_state(None, "t1") is None
 
@@ -567,22 +621,23 @@ def test_landed_reset_deletes_the_counter_row() -> None:
 def test_clear_hold_demotes_but_keeps_a_nonzero_counter() -> None:
     async def scenario() -> None:
         store = MemoryStore()
-        ref = await _leased_attempt(store)
+        ref = await _live_attempt(store)
         await store.apply_transition(
-            _counted_error(ref), expected_status="leased", expected_worker_id="w1"
+            _counted_error(ref),
+            expected_status=AttemptState.RUNNING, expected_worker_id="w1",
         )
         await store.set_task_state(None, "t1", "blocked", blocked_reason="x")
         # A hold-clear without progress (e.g. a split parent's overlay clear)
         # must not erase retry state.
-        await store.set_lease_status(ref.lease_id, "leased")
+        await store.update_attempt("r1", state=AttemptState.RUNNING)
         cleared = Transition(
             ref=ref,
-            run_fields={},
-            lease_status=LeaseStatus.RELEASED,
+            fields={},
+            state=AttemptState.NO_CHANGE,
             effects=TaskEffects(clear_hold=True),
         )
         await store.apply_transition(
-            cleared, expected_status="leased", expected_worker_id="w1"
+            cleared, expected_status=AttemptState.RUNNING, expected_worker_id="w1"
         )
         row = await store.get_task_state(None, "t1")
         assert row["state"] is None
@@ -596,9 +651,10 @@ def test_clear_hold_demotes_but_keeps_a_nonzero_counter() -> None:
 def test_clear_task_state_demotes_or_resets() -> None:
     async def scenario() -> None:
         store = MemoryStore()
-        ref = await _leased_attempt(store)
+        ref = await _live_attempt(store)
         await store.apply_transition(
-            _counted_error(ref), expected_status="leased", expected_worker_id="w1"
+            _counted_error(ref),
+            expected_status=AttemptState.RUNNING, expected_worker_id="w1",
         )
         await store.set_task_state(None, "t1", "blocked", blocked_reason="x")
         # Default clear: the hold and backoff go (explicit release =
@@ -622,9 +678,10 @@ def test_clear_task_state_demotes_or_resets() -> None:
 def test_clear_task_backoff_only_touches_the_backoff() -> None:
     async def scenario() -> None:
         store = MemoryStore()
-        ref = await _leased_attempt(store)
+        ref = await _live_attempt(store)
         await store.apply_transition(
-            _counted_error(ref), expected_status="leased", expected_worker_id="w1"
+            _counted_error(ref),
+            expected_status=AttemptState.RUNNING, expected_worker_id="w1",
         )
         await store.clear_task_backoff(None, "t1")
         row = await store.get_task_state(None, "t1")
@@ -685,6 +742,46 @@ def test_retry_counters_migration_shape() -> None:
     # never overwrites a live nonzero counter (idempotent re-runs).
     assert "commit_sha IS NULL" in sql
     assert "attempts_without_progress = 0" in sql
+
+
+def test_attempts_migration_shape() -> None:
+    """Phase 8: the lease+run merge. The fold/split CASE semantics are pinned
+    by the fold_legacy/split_state round-trip tests in test_lifecycle.py; this
+    pins the file's structure (tables, indexes, views, both directions)."""
+    sql = ATTEMPTS_MIGRATION.read_text()
+    assert "-- migrate:up" in sql and "-- migrate:down" in sql
+    up = sql[sql.index("-- migrate:up"):sql.index("-- migrate:down")]
+    down = sql[sql.index("-- migrate:down"):]
+    # up: the attempts table with the single state column and the live-set
+    # partial unique index (invariant 1 at the DB layer).
+    assert "CREATE TABLE IF NOT EXISTS nightshift.attempts" in up
+    assert "state          text NOT NULL" in up
+    assert "attempts_live_task_uniq" in up
+    assert "WHERE state IN ('landing', 'running')" in up
+    # up: the fold copies runs (with their latest lease) and lease-only rows,
+    # then drops the source tables.
+    assert "LEFT JOIN latest_lease" in up
+    assert "DROP TABLE nightshift.runs;" in up
+    assert "DROP TABLE nightshift.leases;" in up
+    # The five stats views are recreated over attempts in up and over runs in
+    # down, with the state-vocabulary buckets.
+    for view in (
+        "stats_overall", "stats_by_worker", "stats_by_backend",
+        "stats_by_model", "stats_by_queue",
+    ):
+        assert f"CREATE VIEW nightshift.{view}" in up
+        assert f"CREATE VIEW nightshift.{view}" in down
+    assert "state IN ('landed', 'no_change')" in up
+    assert "state IN ('failed', 'conflict')" in up
+    # down: leases + runs come back via the split CASE; attempts goes away.
+    assert "CREATE TABLE IF NOT EXISTS nightshift.leases" in down
+    assert "CREATE TABLE IF NOT EXISTS nightshift.runs" in down
+    assert "DROP TABLE nightshift.attempts;" in down
+    # Idempotence guards on both data moves.
+    assert "to_regclass('nightshift.runs')" in up
+    assert "to_regclass('nightshift.attempts')" in down
+    # The internal-only landing re-enqueue columns exist (never projected).
+    assert "branch_ref" in up and "head_sha" in up
 
 
 def test_capability_migration_adds_columns_and_queue_routing() -> None:

@@ -13,6 +13,7 @@ import os
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -20,6 +21,7 @@ from starlette.testclient import TestClient
 
 from _workspace import build_workspace, make_target_repo
 from nightshift.engine import setup_worktree
+from nightshift.lifecycle import AttemptState
 from nightshift.manager.api_worker import jsonable
 from nightshift.manager.app import create_app
 from nightshift.manager.hub import Hub
@@ -807,20 +809,21 @@ def test_submit_with_expired_lease_rejected_without_writes(tmp_path: Path) -> No
         order = _poll_with_landable_branch(client, workspace, "10.hello")
         head_before = canonical_head(repo_root)
 
-        # The lease TTL elapses and the reclaimer expires it.
-        asyncio.run(store.set_lease_status(order["lease_id"], "expired"))
+        # The attempt's TTL elapses and the reconciler expires it.
+        asyncio.run(store.update_attempt(order["lease_id"], state=AttemptState.EXPIRED))
 
         r = _submit_completed(client, order)
         assert r.status_code == 409
 
         # No git writes: nothing landed, the branch is preserved.
         assert canonical_head(repo_root) == head_before
-        # No store writes: the run is still running, the lease stays expired
-        # (not resurrected to "landed").
+        # No store writes: the attempt stays expired (not resurrected to
+        # landed). Phase 8 behavior fix: /api/runs truthfully projects
+        # "expired" instead of the pre-phase zombie "running".
         run = next(x for x in client.get("/api/runs").json() if x["id"] == order["run_id"])
-        assert run["status"] == "running"
-        lease = asyncio.run(store.get_lease(order["lease_id"]))
-        assert lease["status"] == "expired"
+        assert run["status"] == "expired"
+        attempt = asyncio.run(store.get_attempt(order["lease_id"]))
+        assert attempt["state"] == "expired"
         # The brief was not dropped.
         assert (tasks_root / "main/10.hello.md").exists()
 
@@ -834,7 +837,8 @@ def test_submit_with_cancelled_lease_rejected(tmp_path: Path) -> None:
     with _client(workspace, store) as client:
         order = _poll_with_landable_branch(client, workspace, "10.hello")
         head_before = canonical_head(repo_root)
-        asyncio.run(store.set_lease_status(order["lease_id"], "cancelled"))
+        # A transport stop aborts the attempt (the Phase 8 stop fix).
+        asyncio.run(store.update_attempt(order["lease_id"], state=AttemptState.ABORTED))
 
         assert _submit_completed(client, order).status_code == 409
         assert canonical_head(repo_root) == head_before
@@ -928,8 +932,8 @@ _ARMED_ALLOWED = frozenset({
     "set_worker_status",
     "close",
     # reads
-    "get_run", "get_lease", "get_task_state", "get_worker",
-    "list_runs", "list_workers", "list_blocked", "active_leases",
+    "get_attempt", "get_task_state", "get_worker",
+    "list_attempts", "list_workers", "list_blocked", "live_attempts",
     "tasks_in_state", "retryable_tasks", "queue_dedication",
     "events_since", "max_event_id", "run_events",
     "stats_overall", "stats_by_worker", "stats_by_backend",
@@ -997,8 +1001,9 @@ def test_submit_commits_through_exactly_one_store_write(tmp_path: Path) -> None:
         run = next(x for x in client.get("/api/runs").json() if x["id"] == order["run_id"])
         assert run["status"] == "blocked"
         assert run["finished_at"] is not None
-        lease = asyncio.run(store.get_lease(order["lease_id"]))
-        assert lease["status"] == "released"
+        attempt = asyncio.run(store.get_attempt(order["lease_id"]))
+        assert attempt["state"] == "blocked"
+        assert attempt["released_at"] is not None
         hold = asyncio.run(store.get_task_state(None, "10.hello"))
         assert hold["state"] == "blocked"
         assert hold["blocked_reason"] == "needs credentials"
@@ -1035,11 +1040,10 @@ def test_crash_after_apply_leaves_consistent_state(tmp_path: Path) -> None:
                     "result_line": "worker bailed", "failure_kind": "worker_error",
                 },
             )
-        run = asyncio.run(store.get_run(order["run_id"]))
-        assert run["status"] == "error"
-        assert run["finished_at"] is not None
-        lease = asyncio.run(store.get_lease(order["lease_id"]))
-        assert lease["status"] == "released"
+        attempt = asyncio.run(store.get_attempt(order["run_id"]))
+        assert attempt["state"] == "failed"
+        assert attempt["finished_at"] is not None
+        assert attempt["released_at"] is not None
         kinds = [e["kind"] for e in asyncio.run(store.run_events(order["run_id"]))]
         assert "task_result" in kinds
 
@@ -1199,9 +1203,9 @@ def test_poll_syncs_origin_before_pinning_base_ref(tmp_path: Path) -> None:
 def test_resolve_endpoint_spawns_and_caps(tmp_path: Path) -> None:
     root = _seed(tmp_path, {"10.x": "do a thing"})
     store = MemoryStore()
-    asyncio.run(store.create_run(
+    asyncio.run(store.create_attempt(
         "r1", task="10.x", queue="main", worker_id="w1", backend="claude-code",
-        model="auto", title="X", repo="longitude",
+        model="auto", base_ref=None, ttl_seconds=60, title="X", repo="longitude",
     ))
     app = create_app(root, store=store)
     calls = _stub_spawn(app)
@@ -1230,9 +1234,10 @@ def test_resolve_endpoint_unknown_run_404(tmp_path: Path) -> None:
 def test_resolve_result_completes_task(tmp_path: Path) -> None:
     root = _seed(tmp_path, {"10.x": "do"})
     store = MemoryStore()
-    asyncio.run(store.create_run(
+    asyncio.run(store.create_attempt(
         "c1", task="10.x", queue="main", worker_id="manager:resolve",
-        backend="claude-code", model="auto", title="X", repo="longitude",
+        backend="claude-code", model="auto", base_ref=None, ttl_seconds=0,
+        title="X", repo="longitude", state="resolving",
     ))
     app = create_app(root, store=store)
     with TestClient(app) as client:
@@ -1253,9 +1258,10 @@ def test_resolve_result_completes_task(tmp_path: Path) -> None:
 def test_resolve_result_failure_reblocks_task(tmp_path: Path) -> None:
     root = _seed(tmp_path, {"10.x": "do"})
     store = MemoryStore()
-    asyncio.run(store.create_run(
+    asyncio.run(store.create_attempt(
         "c1", task="10.x", queue="main", worker_id="manager:resolve",
-        backend="claude-code", model="auto", title="X", repo="longitude",
+        backend="claude-code", model="auto", base_ref=None, ttl_seconds=0,
+        title="X", repo="longitude", state="resolving",
     ))
     app = create_app(root, store=store)
     with TestClient(app) as client:
@@ -1281,14 +1287,17 @@ def test_resolve_result_with_unresolvable_origin_rejected(tmp_path: Path) -> Non
     root = _seed(tmp_path, {"10.x": "do"})
     tasks_root = root / "nightshift-tasks"
     store = MemoryStore()
-    asyncio.run(store.create_run(
+    asyncio.run(store.create_attempt(
         "o1", task="10.x", queue="main", worker_id="w1", backend="claude-code",
-        model="auto", title="X", repo="longitude",
+        model="auto", base_ref=None, ttl_seconds=60, title="X", repo="longitude",
     ))
-    asyncio.run(store.update_run("o1", status="completed", commit_sha="abc123"))
-    asyncio.run(store.create_run(
+    asyncio.run(store.update_attempt(
+        "o1", state=AttemptState.LANDED, commit_sha="abc123",
+    ))
+    asyncio.run(store.create_attempt(
         "c1", task="10.x", queue="main", worker_id="manager:resolve",
-        backend="claude-code", model="auto", title="X", repo="longitude",
+        backend="claude-code", model="auto", base_ref=None, ttl_seconds=0,
+        title="X", repo="longitude", state="resolving",
     ))
     app = create_app(root, store=store)
     with TestClient(app) as client:
@@ -1321,14 +1330,17 @@ def test_resolve_result_updates_resolvable_origin(tmp_path: Path) -> None:
     (error/blocked) is completed alongside the resolve run."""
     root = _seed(tmp_path, {"10.x": "do"})
     store = MemoryStore()
-    asyncio.run(store.create_run(
+    asyncio.run(store.create_attempt(
         "o1", task="10.x", queue="main", worker_id="w1", backend="claude-code",
-        model="auto", title="X", repo="longitude",
+        model="auto", base_ref=None, ttl_seconds=60, title="X", repo="longitude",
     ))
-    asyncio.run(store.update_run("o1", status="error", failure_kind="merge_conflict"))
-    asyncio.run(store.create_run(
+    asyncio.run(store.update_attempt(
+        "o1", state=AttemptState.CONFLICT, failure_kind="merge_conflict",
+    ))
+    asyncio.run(store.create_attempt(
         "c1", task="10.x", queue="main", worker_id="manager:resolve",
-        backend="claude-code", model="auto", title="X", repo="longitude",
+        backend="claude-code", model="auto", base_ref=None, ttl_seconds=0,
+        title="X", repo="longitude", state="resolving",
     ))
     app = create_app(root, store=store)
     with TestClient(app) as client:
@@ -1862,3 +1874,146 @@ def test_open_store_no_dsn_is_memory(monkeypatch) -> None:
     monkeypatch.delenv("NIGHTSHIFT_PG_DSN", raising=False)
     store = asyncio.run(open_store())
     assert isinstance(store, MemoryStore)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 8 API snapshots: /api/runs, /api/leases, and the SSE snapshot frame
+# keep their pre-attempts shapes byte-for-byte (views over the merged table).
+# --------------------------------------------------------------------------- #
+
+
+# The exact pre-Phase-8 run-row wire keys (order included: JSON objects keep
+# insertion order and the previous rows were column-ordered).
+RUN_WIRE_KEYS = [
+    "id", "task", "queue", "worker_id", "backend", "model", "repo",
+    "required_mcps", "status", "phase", "result_line", "commit_sha", "loc",
+    "remote", "pushed", "turns", "input_tokens", "output_tokens", "cost_usd",
+    "failure_kind", "failure_reason", "validate_cmd", "worktree", "title",
+    "body", "started_at", "finished_at",
+]
+
+# The exact pre-Phase-8 lease-row wire keys.
+LEASE_WIRE_KEYS = [
+    "id", "task", "queue", "worker_id", "run_id", "status", "model",
+    "base_ref", "acquired_at", "heartbeat_at", "expires_at", "released_at",
+]
+
+
+def _seed_every_state(store: MemoryStore) -> dict[str, str]:
+    """One attempt per storable state (distinct tasks — invariant 1 allows a
+    single live attempt per task). Returns {state: attempt id}."""
+    scenarios: list[tuple[str, AttemptState | None, dict[str, Any]]] = [
+        ("running", None, {}),
+        ("landing", AttemptState.LANDING, {"phase": "landing"}),
+        ("resolving", None, {}),  # created with state="resolving" below
+        ("landed", AttemptState.LANDED, {"commit_sha": "abc123", "loc": 3}),
+        ("no_change", AttemptState.NO_CHANGE, {"result_line": "no changes"}),
+        ("blocked", AttemptState.BLOCKED, {"failure_kind": "blocked"}),
+        ("failed", AttemptState.FAILED, {"failure_kind": "worker_error"}),
+        ("conflict", AttemptState.CONFLICT, {"failure_kind": "merge_conflict"}),
+        ("skipped", AttemptState.SKIPPED, {}),
+        ("aborted", AttemptState.ABORTED, {}),
+        ("expired", AttemptState.EXPIRED, {}),
+    ]
+
+    async def seed() -> dict[str, str]:
+        ids: dict[str, str] = {}
+        for n, (name, state, fields) in enumerate(scenarios):
+            rid = f"r-{name}"
+            row = await store.create_attempt(
+                rid, task=f"{n}.task-{name}", queue=None, worker_id="w1",
+                backend="claude-code", model="auto", base_ref="base",
+                ttl_seconds=600, title=name,
+                state="resolving" if name == "resolving" else "running",
+            )
+            assert row is not None
+            updates: dict[str, Any] = dict(fields)
+            if state is not None:
+                updates["state"] = state
+            if updates:
+                await store.update_attempt(rid, **updates)
+            ids[name] = rid
+        return ids
+
+    return asyncio.run(seed())
+
+
+def test_api_runs_snapshot_keys_and_status_projection(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {})
+    store = MemoryStore()
+    with _client(root, store) as client:
+        # Seed after lifespan startup: a pre-seeded LANDING attempt would be
+        # parked by the manager's own interrupted-land recovery.
+        ids = _seed_every_state(store)
+        rows = {r["id"]: r for r in client.get("/api/runs").json()}
+        assert set(ids.values()) <= set(rows)
+        expected_status = {
+            "running": "running", "landing": "running", "resolving": "running",
+            "landed": "completed", "no_change": "completed",
+            "blocked": "blocked", "failed": "error", "conflict": "error",
+            "skipped": "skipped", "aborted": "aborted", "expired": "expired",
+        }
+        for name, rid in ids.items():
+            row = rows[rid]
+            # EXACT key set and order — the pre-Phase-8 run row shape; none of
+            # the internal attempt columns (state, base_ref, acquired_at,
+            # heartbeat_at, deadline_at, released_at, branch_ref, head_sha)
+            # may ever leak onto the wire.
+            assert list(row) == RUN_WIRE_KEYS, name
+            assert row["status"] == expected_status[name], name
+        # phase passes through (worker-reported or the manager's "landing").
+        assert rows[ids["landing"]]["phase"] == "landing"
+        # Terminal scenarios carry finished_at; live ones don't.
+        assert rows[ids["landed"]]["finished_at"] is not None
+        assert rows[ids["expired"]]["finished_at"] is not None
+        assert rows[ids["running"]]["finished_at"] is None
+        assert rows[ids["landed"]]["commit_sha"] == "abc123"
+
+        # The ?queue= filter (the endpoint's only filter param) still shapes
+        # identically; the seeded attempts live in the default ("main") queue.
+        filtered = client.get("/api/runs?queue=main").json()
+        assert filtered and all(list(r) == RUN_WIRE_KEYS for r in filtered)
+
+
+def test_api_leases_snapshot_live_only_with_lease_keys(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {})
+    store = MemoryStore()
+    with _client(root, store) as client:
+        ids = _seed_every_state(store)
+        leases = client.get("/api/leases").json()
+        # Live attempts only: RUNNING + LANDING (RESOLVING never held a lease).
+        assert {le["id"] for le in leases} == {ids["running"], ids["landing"]}
+        for le in leases:
+            assert list(le) == LEASE_WIRE_KEYS
+            assert le["status"] == "leased"
+            assert le["run_id"] == le["id"]
+            assert le["expires_at"] is not None
+            assert le["released_at"] is None
+
+
+def test_sse_snapshot_frame_carries_the_same_run_and_lease_shapes(
+    tmp_path: Path,
+) -> None:
+    root = _seed(tmp_path, {})
+    store = MemoryStore()
+    with _client(root, store) as client:
+        ids = _seed_every_state(store)
+        # The endpoint ends its stream once the (fake) server reports shutdown;
+        # with should_exit already True we get exactly the snapshot frame and a
+        # clean close (TestClient cannot abort an endless SSE response).
+        client.app.state.uvicorn_server = SimpleNamespace(should_exit=True)
+        frame: dict[str, Any] | None = None
+        with client.stream("GET", "/api/events") as resp:
+            for line in resp.iter_lines():
+                if line.startswith("data: "):
+                    frame = json.loads(line[len("data: "):])
+                    break
+        assert frame is not None and frame["type"] == "snapshot"
+        assert {r["id"] for r in frame["runs"]} >= set(ids.values())
+        for row in frame["runs"]:
+            assert list(row) == RUN_WIRE_KEYS
+        assert {le["id"] for le in frame["leases"]} == {
+            ids["running"], ids["landing"],
+        }
+        for le in frame["leases"]:
+            assert list(le) == LEASE_WIRE_KEYS

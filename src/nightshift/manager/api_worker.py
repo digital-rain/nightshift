@@ -11,15 +11,17 @@ GitPhase`, and branches:
   exactly as Phase 4 did;
 * adopt-check / split harvest — bounded git jobs on the per-repo executor,
   awaited inline (the response reports their result);
-* land — mark the run ``phase="landing"``, enqueue the serialized land job,
-  and return ``{"queued": true}`` immediately so heartbeats and polls keep
-  flowing during a slow land. The job's completion applies the same
+* land — CAS the attempt RUNNING → LANDING (``on_land_enqueued``, persisting
+  ``branch_ref``/``head_sha`` for restart recovery), enqueue the serialized
+  land job, and return ``{"queued": true}`` immediately so heartbeats and
+  polls keep flowing during a slow land. The job's completion applies the same
   ``on_land_result`` transition via ``store.apply_transition``, whose CAS
-  (lease still LEASED, still this worker's) is the stale-result fence; a
+  (attempt still LANDING, still this worker's) is the stale-result fence; a
   refused result is logged and traced on the run's event log.
 
-``worker_poll`` is a read-only hot path (candidates → pick → lease → return);
-lease reclaim, stale-worker reaping, and hold writes live in the reconciler.
+``worker_poll`` is a read-only hot path (candidates → pick → create the
+attempt → return); deadline expiry, stale-worker reaping, and hold writes
+live in the reconciler.
 Endpoints are registered onto the shared FastAPI app by
 :func:`register_worker_api`; the app wiring (store, registry, event emitter,
 SSE broadcaster, executor pool, sync throttle) is injected by ``create_app``.
@@ -50,21 +52,23 @@ from nightshift.git.squash import compute_code_loc
 from nightshift.git.store import commit_tasks
 from nightshift.git.sync import SyncThrottle, sync_main_locked
 from nightshift.lifecycle import (
+    ATTEMPT_RESOLVABLE_STATES,
     LAND_SUCCESS_KINDS,
-    RUN_RESOLVABLE_STATUSES,
+    MERGE_FAILURE_KINDS,
     AttemptRef,
+    AttemptState,
     FailureKind,
     GitPhase,
     LandingMode,
     LandKind,
     LandOutcome,
-    LeaseStatus,
     Outcome,
     RetryPolicy,
     RunStatus,
     SubmitPolicy,
     TaskHoldKind,
     Transition,
+    on_land_enqueued,
     on_land_result,
     on_split_result,
     on_submit,
@@ -103,10 +107,11 @@ from nightshift.task_files import (
 )
 
 
-# A submit is only honored while its lease is live AND owned by the submitting
-# worker. A reclaimed (expired), cancelled, or already consumed lease means the
-# task may have been re-leased elsewhere — honoring the stale submit would
-# double-land it. 409, no writes (enforced by apply_transition's CAS).
+# A submit is only honored while its attempt is RUNNING AND owned by the
+# submitting worker. An expired, aborted, or already consumed attempt means
+# the task may have been re-dispatched elsewhere — honoring the stale submit
+# would double-land it. 409, no writes (enforced by apply_transition's CAS).
+# The wording is the pre-Phase-8 wire detail, kept byte-identical.
 _STALE_SUBMIT = "stale submit: lease is not live for this worker"
 
 _log = logging.getLogger("nightshift.manager.api_worker")
@@ -397,7 +402,7 @@ def register_worker_api(
                 ):
                     repo_excluded.add((cand.queue, cand.task))
 
-        active = await store.active_leases()
+        active = await store.live_attempts()
         leased = {(_queue_from_label(le["queue"]), le["task"]) for le in active}
         blocked_rows = await store.list_blocked()
         blocked = {(_queue_from_label(b["queue"]), b["task"]) for b in blocked_rows}
@@ -496,38 +501,34 @@ def register_worker_api(
                     throttle=_sync_throttle,
                 )))
         base_ref = canonical_head(workspace / repo)
-        lease = await store.acquire_lease(
-            task=chosen.task,
-            queue=chosen.queue,
-            worker_id=body.worker_id,
-            model=chosen.model,
-            base_ref=base_ref,
-            ttl_seconds=cfg.cadences.lease_ttl_seconds,
-        )
-        if lease is None:
-            # Lost a race for this task; let the worker poll again shortly.
-            return JSONResponse({"work": None}, status_code=200)
-
+        # Phase 8: the acquire_lease + create_run + set_lease_status triplet is
+        # ONE create_attempt (the row IS the lease and the run). The work order
+        # keeps both lease_id and run_id keys for wire compat — both carry the
+        # attempt id.
         run_id = new_run_id()
         order = build_work_order(
             workspace, tasks_root, chosen.task, chosen.queue, repo,
-            lease["id"], run_id, base_ref, cfg,
+            run_id, run_id, base_ref, cfg,
         )
         planned_validate = order["config"].get("validate_cmd") or None
-        await store.create_run(
+        attempt = await store.create_attempt(
             run_id,
             task=chosen.task,
             queue=chosen.queue,
             worker_id=body.worker_id,
             backend=provider_of(order["config"]["model"]) or body.backend,
             model=order["config"]["model"],
+            base_ref=base_ref,
+            ttl_seconds=cfg.cadences.lease_ttl_seconds,
             title=order["title"],
             body=order["body"],
             required_mcps=list(chosen.required_mcps),
             repo=repo,
             validate_cmd=planned_validate or None,
         )
-        await store.set_lease_status(lease["id"], LeaseStatus.LEASED, run_id=run_id)
+        if attempt is None:
+            # Lost a race for this task; let the worker poll again shortly.
+            return JSONResponse({"work": None}, status_code=200)
         await _registry().set_busy(
             body.worker_id, task=chosen.task, queue=chosen.queue, run_id=run_id
         )
@@ -536,7 +537,7 @@ def register_worker_api(
             run_id=run_id,
             queue=chosen.queue,
             task=chosen.task,
-            payload={"worker_id": body.worker_id, "lease_id": lease["id"]},
+            payload={"worker_id": body.worker_id, "lease_id": run_id},
         )
         await _emit(
             "run_started",
@@ -551,13 +552,13 @@ def register_worker_api(
     async def worker_heartbeat(body: HeartbeatBody) -> JSONResponse:
         await _registry().heartbeat(body.worker_id)
         if body.lease_id:
-            await _store().heartbeat_lease(body.lease_id, cfg.cadences.lease_ttl_seconds)
+            await _store().heartbeat_attempt(body.lease_id, cfg.cadences.lease_ttl_seconds)
         return JSONResponse({"ok": True})
 
     @app.post("/api/worker/runs/{run_id}/events", dependencies=[Depends(_require_secret)])
     async def worker_run_events(run_id: str, body: RunEventsBody) -> JSONResponse:
         store = _store()
-        run = await store.get_run(run_id)
+        run = await store.get_attempt(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="unknown run")
         for ev in body.events:
@@ -570,29 +571,30 @@ def register_worker_api(
                 payload=ev,
             )
             if kind == "task_status" and ev.get("phase"):
-                await store.update_run(run_id, phase=ev["phase"])
+                await store.update_attempt(run_id, phase=ev["phase"])
         return JSONResponse({"ok": True})
 
     @app.post("/api/worker/runs/{run_id}/submit", dependencies=[Depends(_require_secret)])
     async def worker_submit(run_id: str, body: SubmitBody) -> JSONResponse:
         store = _store()
-        run = await store.get_run(run_id)
+        run = await store.get_attempt(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="unknown run")
         queue = _queue_from_label(body.queue)
-        lease = await store.get_lease(body.lease_id)
-        # Advisory fast-fail on the same predicate the CAS below enforces, so a
-        # stale submit never reaches git work. The *authoritative* fence is
-        # apply_transition's CAS — a lease consumed between this read and the
-        # apply still yields 409 with no writes.
+        # body.lease_id carries the attempt id (the work order hands the same
+        # value out under both keys). Advisory fast-fail on the same predicate
+        # the CAS below enforces, so a stale submit never reaches git work. The
+        # *authoritative* fence is apply_transition's CAS — an attempt consumed
+        # between this read and the apply still yields 409 with no writes.
+        lease = await store.get_attempt(body.lease_id)
         if (
             lease is None
-            or lease.get("status") != LeaseStatus.LEASED
+            or lease.get("state") != AttemptState.RUNNING
             or lease.get("worker_id") != body.worker_id
         ):
             raise HTTPException(status_code=409, detail=_STALE_SUBMIT)
-        # The target repo the worker ran against is recorded on the run (and is
-        # workspace-relative); landing materialises ``workspace / repo``.
+        # The target repo the worker ran against is recorded on the attempt
+        # (workspace-relative); landing materialises ``workspace / repo``.
         repo = run.get("repo")
         tasks_rel = playlists_mod.tasks_rel(queue)
         meta = task_meta(tasks_root, body.task, queue)
@@ -622,22 +624,26 @@ def register_worker_api(
             auto_resolve=cfg.auto_resolve,
             pr_mode=effective_mode is LandingMode.PR,
         )
-        ref = AttemptRef(
-            run_id=run_id, lease_id=body.lease_id, queue=queue, task=body.task
-        )
+        ref = AttemptRef(id=run_id, queue=queue, task=body.task)
 
-        async def _finish(t: Transition, *, set_idle: bool) -> dict[str, Any] | None:
+        async def _finish(
+            t: Transition,
+            *,
+            set_idle: bool,
+            expected: AttemptState = AttemptState.RUNNING,
+        ) -> dict[str, Any] | None:
             """Apply the transition and run its post-commit side effects.
 
-            The CAS (lease still LEASED, still this worker's) is the
-            authoritative fence: a lease consumed while a queued land ran means
-            the result is stale — return ``None``, write nothing. Content-store
-            mutations (frontmatter flags, brief drop) route through the
-            tasks-repo executor. ``set_idle`` is false on the deferred land
-            path, where the worker went idle at enqueue time.
+            The CAS (attempt still in ``expected`` state, still this worker's)
+            is the authoritative fence: an attempt consumed while a queued land
+            ran means the result is stale — return ``None``, write nothing.
+            Content-store mutations (frontmatter flags, brief drop) route
+            through the tasks-repo executor. ``set_idle`` is false on the
+            deferred land path, where the worker went idle at enqueue time
+            (that path expects LANDING — the state on_land_enqueued set).
             """
             event_ids = await store.apply_transition(
-                t, expected_status=LeaseStatus.LEASED, expected_worker_id=body.worker_id
+                t, expected_status=expected, expected_worker_id=body.worker_id
             )
             if event_ids is None:
                 return None
@@ -734,12 +740,24 @@ def register_worker_api(
                 ))
                 t = on_land_result(ref, body, await _with_loc(result), policy)
             case GitPhase.LAND:
-                # Async land (Phase 7): mark the run's phase, enqueue the
-                # serialized land job, and return immediately — heartbeats and
-                # polls keep flowing while a slow land runs. The result arrives
-                # as the same on_land_result transition the synchronous path
-                # applied, CAS-fenced against a lease consumed mid-land.
-                await store.update_run(run_id, phase="landing")
+                # Async land (Phase 7): move the attempt to LANDING, enqueue
+                # the serialized land job, and return immediately — heartbeats
+                # and polls keep flowing while a slow land runs. Phase 8 made
+                # entering LANDING a CAS from RUNNING (on_land_enqueued, which
+                # also persists branch_ref/head_sha for restart re-enqueue) so
+                # a stale submit can't enqueue a land. The result arrives as
+                # the same on_land_result transition the synchronous path
+                # applied, CAS-fenced (expected LANDING) against an attempt
+                # consumed mid-land.
+                enqueued = await store.apply_transition(
+                    on_land_enqueued(
+                        ref, branch_ref=body.branch_ref, head_sha=body.head_sha
+                    ),
+                    expected_status=AttemptState.RUNNING,
+                    expected_worker_id=body.worker_id,
+                )
+                if enqueued is None:
+                    raise HTTPException(status_code=409, detail=_STALE_SUBMIT)
                 land_future = _executors.submit(repo, partial(
                     land_locked,
                     workspace, repo, body.task, body.title,
@@ -753,6 +771,7 @@ def register_worker_api(
                     rendezvous_remote=cfg.rendezvous_remote,
                     git_refresh_seconds=cfg.cadences.git_refresh_seconds,
                     throttle=_sync_throttle,
+                    attempt_id=run_id,
                 ))
 
                 async def _complete_land() -> None:
@@ -769,11 +788,13 @@ def register_worker_api(
                     else:
                         result = await _with_loc(result)
                     applied = await _finish(
-                        on_land_result(ref, body, result, policy), set_idle=False
+                        on_land_result(ref, body, result, policy),
+                        set_idle=False,
+                        expected=AttemptState.LANDING,
                     )
                     if applied is None:
-                        # The lease was consumed (cancelled/expired) while the
-                        # land job ran and the CAS refused the result. The git
+                        # The attempt was consumed (aborted) while the land
+                        # job ran and the CAS refused the result. The git
                         # work may already be on origin — never let that vanish
                         # silently: leave an operator-visible trace on the run
                         # (task_log rides the existing wire kind).
@@ -838,8 +859,8 @@ def register_worker_api(
         # honoring it would double-land / wrongly re-block the task. 409, no
         # writes.
         if body.origin_run_id:
-            origin = await store.get_run(body.origin_run_id)
-            if origin is None or origin.get("status") not in RUN_RESOLVABLE_STATUSES:
+            origin = await store.get_attempt(body.origin_run_id)
+            if origin is None or origin.get("state") not in ATTEMPT_RESOLVABLE_STATES:
                 raise HTTPException(
                     status_code=409,
                     detail="stale resolve result: origin run is not resolvable",
@@ -861,7 +882,7 @@ def register_worker_api(
             and cfg.landing_mode is LandingMode.PUSH
             and cfg.rendezvous_remote
         ):
-            run = await store.get_run(run_id)
+            run = await store.get_attempt(run_id)
             repo = (run or {}).get("repo")
             if repo:
                 ok, info = await asyncio.wrap_future(_executors.submit(
@@ -870,6 +891,9 @@ def register_worker_api(
                         workspace, repo, cfg.rendezvous_remote, sha,
                         max_retries=cfg.max_push_retries,
                         throttle=_sync_throttle,
+                        # The resolve child's id stamps the idempotency trailer
+                        # on the replayed commit.
+                        attempt_id=run_id,
                     ),
                 ))
                 if ok:
@@ -883,9 +907,12 @@ def register_worker_api(
                     failure_kind = failure_kind or FailureKind.MERGE_CONFLICT
                     failure_reason = failure_reason or info
         if landed:
-            await store.update_run(
+            # A landed resolve stores LANDED on both the child and the origin
+            # (pre-Phase-8: status=completed + commit_sha — same "completed"
+            # wire projection, now with the truthful landed state).
+            await store.update_attempt(
                 run_id,
-                status=RunStatus.COMPLETED,
+                state=AttemptState.LANDED,
                 result_line=result_line or "resolved: landed",
                 commit_sha=sha,
                 loc=body.loc,
@@ -895,9 +922,9 @@ def register_worker_api(
             )
             if body.origin_run_id:
                 with contextlib.suppress(Exception):
-                    await store.update_run(
+                    await store.update_attempt(
                         body.origin_run_id,
-                        status=RunStatus.COMPLETED,
+                        state=AttemptState.LANDED,
                         result_line=result_line or "resolved",
                         commit_sha=sha,
                     )
@@ -922,11 +949,21 @@ def register_worker_api(
             )
             await _emit("queue_changed", queue=queue)
         else:
-            await store.update_run(
+            # The stored state follows the failure kind (CONFLICT for merge
+            # kinds — the default — FAILED otherwise), matching the fold the
+            # migration applies to legacy error rows. The kind is stored as it
+            # arrived on the wire, exactly as before.
+            effective_kind = failure_kind or FailureKind.MERGE_CONFLICT
+            state = (
+                AttemptState.CONFLICT
+                if effective_kind in MERGE_FAILURE_KINDS
+                else AttemptState.FAILED
+            )
+            await store.update_attempt(
                 run_id,
-                status=RunStatus.ERROR,
+                state=state,
                 result_line=result_line or "resolve failed",
-                failure_kind=failure_kind or FailureKind.MERGE_CONFLICT,
+                failure_kind=effective_kind,
                 failure_reason=failure_reason,
                 **telemetry,
             )

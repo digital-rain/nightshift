@@ -18,15 +18,13 @@ from __future__ import annotations
 import json
 import os
 import threading
-import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, assert_never
 
 from nightshift.lifecycle import (
-    LEASE_ACTIVE_STATUSES,
-    LEASE_RELEASED_AT_STATUSES,
-    RUN_TERMINAL_STATUSES,
+    ATTEMPT_LIVE_STATES,
+    ATTEMPT_TERMINAL_STATES,
     Outcome,
     Progress,
     Transition,
@@ -38,46 +36,51 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-# The run columns update_run may touch, derived from the shared models: every
-# Outcome field that is a run column (landable/branch_ref/head_sha are
+# The attempt columns update_attempt may touch, derived from the shared
+# models: every Outcome field that is an attempt column (landable is
 # transport-only, consumed by the submit handler) plus the manager-computed
-# land/progress columns. Unknown fields raise instead of being silently
-# dropped.
-RUN_UPDATABLE_FIELDS = frozenset(
-    set(Outcome.model_fields) - {"landable", "branch_ref", "head_sha"}
-) | {"phase", "commit_sha", "loc", "remote", "pushed"}
+# state/land/progress columns. Unknown fields raise instead of being silently
+# dropped. ``state`` is updatable here (the direct-write resolve path);
+# transitions carry it separately (Transition.state) and their ``fields``
+# must not.
+ATTEMPT_UPDATABLE_FIELDS = frozenset(
+    set(Outcome.model_fields) - {"landable", "status"}
+) | {"state", "phase", "commit_sha", "loc", "remote", "pushed"}
 
 
-def _check_run_fields(fields: dict[str, Any]) -> None:
-    unknown = set(fields) - RUN_UPDATABLE_FIELDS
+def _check_attempt_fields(fields: dict[str, Any], *, allow_state: bool) -> None:
+    allowed = ATTEMPT_UPDATABLE_FIELDS if allow_state else (
+        ATTEMPT_UPDATABLE_FIELDS - {"state"}
+    )
+    unknown = set(fields) - allowed
     if unknown:
-        raise ValueError(f"update_run: unknown field(s): {sorted(unknown)}")
+        raise ValueError(f"update_attempt: unknown field(s): {sorted(unknown)}")
 
 
-def _apply_run_fields(row: dict[str, Any], fields: dict[str, Any]) -> None:
-    """Fold validated field updates into an in-memory run row, stamping
-    ``finished_at`` once when the run reaches a terminal status."""
-    row.update(fields)
-    if fields.get("status") in RUN_TERMINAL_STATUSES:
-        row["finished_at"] = row.get("finished_at") or _now()
+def _stamp_terminal(row: dict[str, Any]) -> None:
+    """Terminal ⇒ finished (invariant 4): stamp ``finished_at`` and
+    ``released_at`` once when an in-memory attempt reaches a terminal state."""
+    if row["state"] in ATTEMPT_TERMINAL_STATES:
+        now = _now()
+        row["finished_at"] = row.get("finished_at") or now
+        row["released_at"] = row.get("released_at") or now
 
 
-def _run_update_sql(fields: dict[str, Any]) -> tuple[str, list[Any]]:
-    """Assemble the run-row UPDATE for validated ``fields``: the SET clause
-    (values fill ``$2..$n``; ``$1`` is the run id) plus the one-shot
-    ``finished_at`` stamp when the run reaches a terminal status."""
+def _attempt_set_sql(
+    fields: dict[str, Any], new_state: Any, *, start: int
+) -> tuple[str, list[Any]]:
+    """Assemble the attempt-row SET clause for validated ``fields`` (values
+    fill ``$start..``), with the one-shot ``finished_at``/``released_at``
+    stamps when ``new_state`` is terminal (invariant 4)."""
     sets: list[str] = []
     values: list[Any] = []
-    for i, (key, value) in enumerate(fields.items(), start=2):
+    for i, (key, value) in enumerate(fields.items(), start=start):
         sets.append(f"{key} = ${i}")
         values.append(value)
-    finish = ""
-    if fields.get("status") in RUN_TERMINAL_STATUSES:
-        finish = ", finished_at = COALESCE(finished_at, now())"
-    return (
-        f"UPDATE nightshift.runs SET {', '.join(sets)}{finish} WHERE id = $1",
-        values,
-    )
+    if new_state in ATTEMPT_TERMINAL_STATES:
+        sets.append("finished_at = COALESCE(finished_at, now())")
+        sets.append("released_at = COALESCE(released_at, now())")
+    return ", ".join(sets), values
 
 
 # The task-overlay upsert shared by set_task_state and apply_transition (the
@@ -159,10 +162,12 @@ _TASK_VIEW_COLUMNS = (
 )
 
 
-# SQL fragments derived from the lease vocabulary (values are today's strings;
-# StrEnum guarantees the rendering is byte-identical to the old literals).
-_LEASE_ACTIVE_SQL = ", ".join(f"'{s}'" for s in sorted(LEASE_ACTIVE_STATUSES))
-_LEASE_RELEASED_AT_SQL = ", ".join(f"'{s}'" for s in sorted(LEASE_RELEASED_AT_STATUSES))
+# SQL fragments derived from the attempt vocabulary (StrEnum guarantees the
+# rendering is byte-identical to the migration's literals). The live fragment
+# must match the ``attempts_live_task_uniq`` partial-index predicate verbatim
+# for ON CONFLICT index inference.
+_ATTEMPT_LIVE_SQL = ", ".join(f"'{s}'" for s in sorted(ATTEMPT_LIVE_STATES))
+_ATTEMPT_TERMINAL_SQL = ", ".join(f"'{s}'" for s in sorted(ATTEMPT_TERMINAL_STATES))
 
 # Row-lifecycle invariant for the durable transport state (Phase 7): a
 # queue_state row exists only while it carries a pause or a non-default mode.
@@ -209,27 +214,32 @@ class NightshiftStore(Protocol):
     async def get_worker(self, worker_id: str) -> dict[str, Any] | None: ...
     async def expire_stale_workers(self, ttl_seconds: float) -> list[str]: ...
 
-    # leases
-    async def acquire_lease(
+    # attempts (Phase 8: the merged lease+run entity)
+    async def create_attempt(
         self,
+        attempt_id: str,
         *,
         task: str,
         queue: str | None,
-        worker_id: str,
+        worker_id: str | None,
+        backend: str | None,
         model: str | None,
         base_ref: str | None,
         ttl_seconds: float,
+        title: str | None = None,
+        body: str | None = None,
+        required_mcps: list[str] | None = None,
+        repo: str | None = None,
+        validate_cmd: str | None = None,
+        state: str = "running",
     ) -> dict[str, Any] | None: ...
-    async def active_leases(self) -> list[dict[str, Any]]: ...
-    async def get_lease(self, lease_id: str) -> dict[str, Any] | None: ...
-    async def set_lease_status(
-        self, lease_id: str, status: str, *, run_id: str | None = None
-    ) -> None: ...
-    async def heartbeat_lease(self, lease_id: str, ttl_seconds: float) -> None: ...
-    # No production caller since Phase 7: the reconciler expires deadlines per
-    # lease via on_deadline transitions (CAS-fenced, mid-land exempt) instead
-    # of this bulk sweep. Kept for store-level tests; Phase 9 retires it.
-    async def reclaim_expired_leases(self) -> list[dict[str, Any]]: ...
+    async def get_attempt(self, attempt_id: str) -> dict[str, Any] | None: ...
+    async def update_attempt(self, attempt_id: str, **fields: Any) -> None: ...
+    async def live_attempts(self) -> list[dict[str, Any]]: ...
+    async def list_attempts(
+        self, *, limit: int = 200, queue: str | None = None, worker_id: str | None = None
+    ) -> list[dict[str, Any]]: ...
+    async def heartbeat_attempt(self, attempt_id: str, ttl_seconds: float) -> None: ...
 
     # transitions (the one write path for lifecycle state changes)
     async def apply_transition(
@@ -278,28 +288,6 @@ class NightshiftStore(Protocol):
     # queue rename (migrate every row keyed on a queue name)
     async def rename_queue(self, old: str, new: str) -> None: ...
 
-    # runs
-    async def create_run(
-        self,
-        run_id: str,
-        *,
-        task: str,
-        queue: str | None,
-        worker_id: str | None,
-        backend: str | None,
-        model: str | None,
-        title: str | None = None,
-        body: str | None = None,
-        required_mcps: list[str] | None = None,
-        repo: str | None = None,
-        validate_cmd: str | None = None,
-    ) -> dict[str, Any]: ...
-    async def update_run(self, run_id: str, **fields: Any) -> None: ...
-    async def get_run(self, run_id: str) -> dict[str, Any] | None: ...
-    async def list_runs(
-        self, *, limit: int = 200, queue: str | None = None, worker_id: str | None = None
-    ) -> list[dict[str, Any]]: ...
-
     # events
     async def append_event(
         self,
@@ -342,9 +330,8 @@ class MemoryStore:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._workers: dict[str, dict[str, Any]] = {}
-        self._leases: dict[str, dict[str, Any]] = {}
+        self._attempts: dict[str, dict[str, Any]] = {}
         self._tasks: dict[tuple[str, str], dict[str, Any]] = {}
-        self._runs: dict[str, dict[str, Any]] = {}
         self._events: list[dict[str, Any]] = []
         self._event_seq = 0
         # queue label -> bound worker ids (manager-side dedication)
@@ -441,91 +428,144 @@ class MemoryStore:
                 self._workers[wid]["status"] = "offline"
             return stale
 
-    # ---- leases ----------------------------------------------------------- #
+    # ---- attempts ---------------------------------------------------------- #
 
-    async def acquire_lease(
+    async def create_attempt(
         self,
+        attempt_id: str,
         *,
         task: str,
         queue: str | None,
-        worker_id: str,
+        worker_id: str | None,
+        backend: str | None,
         model: str | None,
         base_ref: str | None,
         ttl_seconds: float,
+        title: str | None = None,
+        body: str | None = None,
+        required_mcps: list[str] | None = None,
+        repo: str | None = None,
+        validate_cmd: str | None = None,
+        state: str = "running",
     ) -> dict[str, Any] | None:
+        """Create one attempt row. When ``state`` is live, refuses (returns
+        ``None``) while another live attempt exists for (queue, task) —
+        mirroring the PG partial unique index (invariant 1). Resolve children
+        pass ``state="resolving"`` (not live; no deadline)."""
         with self._lock:
             qk = _qkey(queue)
-            for lease in self._leases.values():
-                if (
-                    lease["queue"] == qk
-                    and lease["task"] == task
-                    and lease["status"] in LEASE_ACTIVE_STATUSES
-                ):
-                    return None
+            if state in ATTEMPT_LIVE_STATES:
+                for row in self._attempts.values():
+                    if (
+                        row["queue"] == qk
+                        and row["task"] == task
+                        and row["state"] in ATTEMPT_LIVE_STATES
+                    ):
+                        return None
             now = _now()
-            lease_id = str(uuid.uuid4())
             row = {
-                "id": lease_id,
+                "id": attempt_id,
                 "task": task,
                 "queue": qk,
                 "worker_id": worker_id,
-                "run_id": None,
-                "status": "leased",
+                "backend": backend,
                 "model": model,
+                "repo": repo,
+                "required_mcps": required_mcps or [],
+                "state": state,
+                "phase": None,
+                "result_line": None,
+                "commit_sha": None,
+                "loc": None,
+                "remote": None,
+                "pushed": None,
+                "turns": None,
+                "input_tokens": None,
+                "output_tokens": None,
+                "cost_usd": None,
+                "failure_kind": None,
+                "failure_reason": None,
+                "validate_cmd": validate_cmd,
+                "worktree": None,
+                "title": title,
+                "body": body,
+                "started_at": now,
+                "finished_at": None,
+                # lease-side columns
                 "base_ref": base_ref,
                 "acquired_at": now,
                 "heartbeat_at": now,
-                "expires_at": now + timedelta(seconds=ttl_seconds),
+                "deadline_at": (
+                    now + timedelta(seconds=ttl_seconds)
+                    if state in ATTEMPT_LIVE_STATES
+                    else None
+                ),
                 "released_at": None,
+                "branch_ref": None,
+                "head_sha": None,
             }
-            self._leases[lease_id] = row
+            self._attempts[attempt_id] = row
             return dict(row)
 
-    async def active_leases(self) -> list[dict[str, Any]]:
+    async def get_attempt(self, attempt_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._attempts.get(attempt_id)
+            return dict(row) if row else None
+
+    async def update_attempt(self, attempt_id: str, **fields: Any) -> None:
+        _check_attempt_fields(fields, allow_state=True)
+        with self._lock:
+            row = self._attempts.get(attempt_id)
+            if row is None:
+                return
+            if fields.get("state") in ATTEMPT_LIVE_STATES:
+                # Mirror PG's attempts_live_task_uniq partial index: setting a
+                # live state must not create a second live attempt for the
+                # task (invariant 1). Same-row moves (an already-live row
+                # going RUNNING→LANDING) pass — the check excludes the row
+                # being updated.
+                for other_id, other in self._attempts.items():
+                    if (
+                        other_id != attempt_id
+                        and other["queue"] == row["queue"]
+                        and other["task"] == row["task"]
+                        and other["state"] in ATTEMPT_LIVE_STATES
+                    ):
+                        raise ValueError(
+                            "update_attempt: a live attempt already exists "
+                            f"for ({row['queue']!r}, {row['task']!r})"
+                        )
+            row.update(fields)
+            _stamp_terminal(row)
+
+    async def live_attempts(self) -> list[dict[str, Any]]:
         with self._lock:
             return [
                 dict(r)
-                for r in self._leases.values()
-                if r["status"] in LEASE_ACTIVE_STATUSES
+                for r in self._attempts.values()
+                if r["state"] in ATTEMPT_LIVE_STATES
             ]
 
-    async def get_lease(self, lease_id: str) -> dict[str, Any] | None:
+    async def list_attempts(
+        self, *, limit: int = 200, queue: str | None = None, worker_id: str | None = None
+    ) -> list[dict[str, Any]]:
         with self._lock:
-            row = self._leases.get(lease_id)
-            return dict(row) if row else None
+            rows = list(self._attempts.values())
+        if queue is not None:
+            rows = [r for r in rows if r["queue"] == _qkey(queue)]
+        if worker_id is not None:
+            rows = [r for r in rows if r["worker_id"] == worker_id]
+        rows.sort(key=lambda r: r["started_at"], reverse=True)
+        return [dict(r) for r in rows[:limit]]
 
-    async def set_lease_status(
-        self, lease_id: str, status: str, *, run_id: str | None = None
-    ) -> None:
+    async def heartbeat_attempt(self, attempt_id: str, ttl_seconds: float) -> None:
         with self._lock:
-            row = self._leases.get(lease_id)
-            if row is None:
-                return
-            row["status"] = status
-            if run_id is not None:
-                row["run_id"] = run_id
-            if status in LEASE_RELEASED_AT_STATUSES:
-                row["released_at"] = _now()
-
-    async def heartbeat_lease(self, lease_id: str, ttl_seconds: float) -> None:
-        with self._lock:
-            row = self._leases.get(lease_id)
-            if row is None:
+            row = self._attempts.get(attempt_id)
+            if row is None or row["state"] not in ATTEMPT_LIVE_STATES:
                 return
             now = _now()
             row["heartbeat_at"] = now
-            row["expires_at"] = now + timedelta(seconds=ttl_seconds)
-
-    async def reclaim_expired_leases(self) -> list[dict[str, Any]]:
-        with self._lock:
-            now = _now()
-            reclaimed: list[dict[str, Any]] = []
-            for row in self._leases.values():
-                if row["status"] == "leased" and row["expires_at"] and row["expires_at"] < now:
-                    row["status"] = "expired"
-                    row["released_at"] = now
-                    reclaimed.append(dict(row))
-            return reclaimed
+            row["deadline_at"] = now + timedelta(seconds=ttl_seconds)
 
     # ---- transitions ------------------------------------------------------ #
 
@@ -538,26 +578,25 @@ class MemoryStore:
     ) -> list[int] | None:
         """Apply one lifecycle transition atomically (under the store lock).
 
-        CAS: the lease must exist in ``expected_status`` (and, when given,
+        CAS: the attempt must exist in ``expected_status`` (and, when given,
         belong to ``expected_worker_id`` — the submit fence); otherwise nothing
-        is written and ``None`` is returned. On success the lease, run row,
-        task overlay, and events all change together; the inserted event ids
-        are returned so the caller can broadcast exactly what committed.
+        is written and ``None`` is returned (invariant 2). On success the
+        attempt row, task overlay, and events all change together (invariant
+        3); the inserted event ids are returned so the caller can broadcast
+        exactly what committed.
         """
         # Validate before mutating so a bad field set can't leave partial state.
-        _check_run_fields(t.run_fields)
+        _check_attempt_fields(t.fields, allow_state=False)
         with self._lock:
-            lease = self._leases.get(t.ref.lease_id)
-            if lease is None or lease["status"] != expected_status:
+            row = self._attempts.get(t.ref.id)
+            if row is None or row["state"] != expected_status:
                 return None
-            if expected_worker_id is not None and lease["worker_id"] != expected_worker_id:
+            if expected_worker_id is not None and row["worker_id"] != expected_worker_id:
                 return None
-            lease["status"] = t.lease_status
-            if t.lease_status in LEASE_RELEASED_AT_STATUSES:
-                lease["released_at"] = _now()
-            run = self._runs.get(t.ref.run_id)
-            if run is not None and t.run_fields:
-                _apply_run_fields(run, t.run_fields)
+            row["state"] = t.state
+            if t.fields:
+                row.update(t.fields)
+            _stamp_terminal(row)
             key = (_qkey(t.ref.queue), t.ref.task)
             hold = t.effects.hold
             if hold is not None:
@@ -578,16 +617,16 @@ class MemoryStore:
                 }
             self._apply_progress(key, t.effects.progress, t.effects.next_eligible_in)
             if hold is None and t.effects.clear_hold:
-                row = self._tasks.get(key)
-                if row is not None:
+                task_row = self._tasks.get(key)
+                if task_row is not None:
                     if (
-                        row["attempts_without_progress"] == 0
-                        and row["next_eligible_at"] is None
+                        task_row["attempts_without_progress"] == 0
+                        and task_row["next_eligible_at"] is None
                     ):
                         self._tasks.pop(key)
                     else:
                         # Demote to a pure counter row (state NULL = no hold).
-                        row.update(
+                        task_row.update(
                             state=None, blocked_reason=None, repo=None,
                             retry_eligible=False, updated_at=_now(),
                         )
@@ -821,12 +860,9 @@ class MemoryStore:
             return
         with self._lock:
             ok, nk = _qkey(old), _qkey(new)
-            for lease in self._leases.values():
-                if lease["queue"] == ok:
-                    lease["queue"] = nk
-            for run in self._runs.values():
-                if run["queue"] == ok:
-                    run["queue"] = nk
+            for attempt in self._attempts.values():
+                if attempt["queue"] == ok:
+                    attempt["queue"] = nk
             for event in self._events:
                 if event.get("queue") == old:
                     event["queue"] = new
@@ -838,81 +874,6 @@ class MemoryStore:
                 self._dedication[new] = self._dedication.pop(old)
             if old in self._queue_state:
                 self._queue_state[new] = self._queue_state.pop(old)
-
-    # ---- runs ------------------------------------------------------------- #
-
-    async def create_run(
-        self,
-        run_id: str,
-        *,
-        task: str,
-        queue: str | None,
-        worker_id: str | None,
-        backend: str | None,
-        model: str | None,
-        title: str | None = None,
-        body: str | None = None,
-        required_mcps: list[str] | None = None,
-        repo: str | None = None,
-        validate_cmd: str | None = None,
-    ) -> dict[str, Any]:
-        with self._lock:
-            row = {
-                "id": run_id,
-                "task": task,
-                "queue": _qkey(queue),
-                "worker_id": worker_id,
-                "backend": backend,
-                "model": model,
-                "repo": repo,
-                "required_mcps": required_mcps or [],
-                "status": "running",
-                "phase": None,
-                "result_line": None,
-                "commit_sha": None,
-                "loc": None,
-                "remote": None,
-                "pushed": None,
-                "turns": None,
-                "input_tokens": None,
-                "output_tokens": None,
-                "cost_usd": None,
-                "failure_kind": None,
-                "failure_reason": None,
-                "validate_cmd": validate_cmd,
-                "worktree": None,
-                "title": title,
-                "body": body,
-                "started_at": _now(),
-                "finished_at": None,
-            }
-            self._runs[run_id] = row
-            return dict(row)
-
-    async def update_run(self, run_id: str, **fields: Any) -> None:
-        _check_run_fields(fields)
-        with self._lock:
-            row = self._runs.get(run_id)
-            if row is None:
-                return
-            _apply_run_fields(row, fields)
-
-    async def get_run(self, run_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._runs.get(run_id)
-            return dict(row) if row else None
-
-    async def list_runs(
-        self, *, limit: int = 200, queue: str | None = None, worker_id: str | None = None
-    ) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = list(self._runs.values())
-        if queue is not None:
-            rows = [r for r in rows if r["queue"] == _qkey(queue)]
-        if worker_id is not None:
-            rows = [r for r in rows if r["worker_id"] == worker_id]
-        rows.sort(key=lambda r: r["started_at"], reverse=True)
-        return [dict(r) for r in rows[:limit]]
 
     # ---- events ----------------------------------------------------------- #
 
@@ -955,32 +916,40 @@ class MemoryStore:
 
     async def stats_overall(self) -> dict[str, Any]:
         with self._lock:
-            runs = list(self._runs.values())
+            runs = list(self._attempts.values())
         return _aggregate(runs)
 
     async def stats_by_worker(self) -> list[dict[str, Any]]:
         with self._lock:
-            runs = list(self._runs.values())
+            runs = list(self._attempts.values())
         return _group_stats(runs, "worker_id")
 
     async def stats_by_backend(self) -> list[dict[str, Any]]:
         with self._lock:
-            runs = list(self._runs.values())
+            runs = list(self._attempts.values())
         return _group_stats(runs, "backend")
 
     async def stats_by_model(self) -> list[dict[str, Any]]:
         with self._lock:
-            runs = list(self._runs.values())
+            runs = list(self._attempts.values())
         return _group_stats(runs, "model")
 
     async def stats_by_queue(self) -> list[dict[str, Any]]:
         with self._lock:
-            runs = list(self._runs.values())
+            runs = list(self._attempts.values())
         return _group_stats(runs, "queue")
 
 
+# Stats bucket sets over attempt states — the wire-status projection applied
+# to aggregation (keep in lockstep with the recreated SQL stats views in
+# migration 20260731000004). "expired" is deliberately unbucketed, exactly as
+# the zombie expired runs never were pre-phase.
+_STATS_COMPLETED = frozenset({"landed", "no_change"})
+_STATS_ERRORED = frozenset({"failed", "conflict"})
+
+
 def _aggregate(runs: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    completed = [r for r in runs if r["status"] == "completed"]
+    completed = [r for r in runs if r["state"] in _STATS_COMPLETED]
     durations = [
         (r["finished_at"] - r["started_at"]).total_seconds()
         for r in runs
@@ -995,9 +964,9 @@ def _aggregate(runs: Sequence[dict[str, Any]]) -> dict[str, Any]:
     return {
         "total_runs": len(runs),
         "completed": len(completed),
-        "errored": sum(1 for r in runs if r["status"] == "error"),
-        "aborted": sum(1 for r in runs if r["status"] == "aborted"),
-        "skipped": sum(1 for r in runs if r["status"] == "skipped"),
+        "errored": sum(1 for r in runs if r["state"] in _STATS_ERRORED),
+        "aborted": sum(1 for r in runs if r["state"] == "aborted"),
+        "skipped": sum(1 for r in runs if r["state"] == "skipped"),
         "total_loc": sum(int(r["loc"] or 0) for r in completed),
         "avg_seconds": (sum(durations) / len(durations)) if durations else 0.0,
         "total_turns": sum(turn_vals),
@@ -1140,89 +1109,107 @@ class PgStore:
             )
         return [r["id"] for r in rows]
 
-    async def acquire_lease(
+    async def create_attempt(
         self,
+        attempt_id: str,
         *,
         task: str,
         queue: str | None,
-        worker_id: str,
+        worker_id: str | None,
+        backend: str | None,
         model: str | None,
         base_ref: str | None,
         ttl_seconds: float,
+        title: str | None = None,
+        body: str | None = None,
+        required_mcps: list[str] | None = None,
+        repo: str | None = None,
+        validate_cmd: str | None = None,
+        state: str = "running",
     ) -> dict[str, Any] | None:
         # The ON CONFLICT predicate must match the partial unique index
-        # (leases_active_task_uniq) in the schema migration *verbatim* for
-        # index inference, so the dead 'submitted' status stays here until the
-        # schema itself changes (Phase 8/9).
+        # (attempts_live_task_uniq) in migration 20260731000004 *verbatim*
+        # for index inference (invariant 1: one live attempt per task).
+        # A non-live attempt (resolve child) never trips it and carries no
+        # deadline.
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                """
-                INSERT INTO nightshift.leases
-                    (task, queue, worker_id, model, base_ref, status,
-                     acquired_at, heartbeat_at, expires_at)
-                VALUES ($1, $2, $3, $4, $5, 'leased', now(), now(),
-                        now() + ($6 || ' seconds')::interval)
-                ON CONFLICT (queue, task) WHERE status IN ('leased', 'submitted')
+                f"""
+                INSERT INTO nightshift.attempts
+                    (id, task, queue, worker_id, backend, model, repo,
+                     required_mcps, validate_cmd, state, title, body,
+                     base_ref, started_at, acquired_at, heartbeat_at, deadline_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11,
+                        $12, $13, now(), now(), now(),
+                        CASE WHEN $10 IN ({_ATTEMPT_LIVE_SQL})
+                             THEN now() + ($14 || ' seconds')::interval END)
+                ON CONFLICT (queue, task) WHERE state IN ({_ATTEMPT_LIVE_SQL})
                 DO NOTHING
                 RETURNING *
                 """,
-                task, _qkey(queue), worker_id, model, base_ref, str(int(ttl_seconds)),
+                attempt_id, task, _qkey(queue), worker_id, backend, model, repo,
+                json.dumps(required_mcps or []), validate_cmd, state, title, body,
+                base_ref, str(int(ttl_seconds)),
             )
-        return _lease_row(row) if row else None
+        return _attempt_row(row) if row else None
 
-    async def active_leases(self) -> list[dict[str, Any]]:
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                f"SELECT * FROM nightshift.leases WHERE status IN ({_LEASE_ACTIVE_SQL})"
-            )
-        return [_lease_row(r) for r in rows]
-
-    async def get_lease(self, lease_id: str) -> dict[str, Any] | None:
+    async def get_attempt(self, attempt_id: str) -> dict[str, Any] | None:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT * FROM nightshift.leases WHERE id = $1::uuid", lease_id
+                "SELECT * FROM nightshift.attempts WHERE id = $1", attempt_id
             )
-        return _lease_row(row) if row else None
+        return _attempt_row(row) if row else None
 
-    async def set_lease_status(
-        self, lease_id: str, status: str, *, run_id: str | None = None
-    ) -> None:
+    async def update_attempt(self, attempt_id: str, **fields: Any) -> None:
+        if not fields:
+            return
+        _check_attempt_fields(fields, allow_state=True)
+        sets, values = _attempt_set_sql(fields, fields.get("state"), start=2)
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                f"UPDATE nightshift.attempts SET {sets} WHERE id = $1",
+                attempt_id, *values,
+            )
+
+    async def live_attempts(self) -> list[dict[str, Any]]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT * FROM nightshift.attempts WHERE state IN ({_ATTEMPT_LIVE_SQL})"
+            )
+        return [_attempt_row(r) for r in rows]
+
+    async def list_attempts(
+        self, *, limit: int = 200, queue: str | None = None, worker_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if queue is not None:
+            values.append(_qkey(queue))
+            clauses.append(f"queue = ${len(values)}")
+        if worker_id is not None:
+            values.append(worker_id)
+            clauses.append(f"worker_id = ${len(values)}")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        values.append(limit)
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT * FROM nightshift.attempts {where} "
+                f"ORDER BY started_at DESC LIMIT ${len(values)}",
+                *values,
+            )
+        return [_attempt_row(r) for r in rows]
+
+    async def heartbeat_attempt(self, attempt_id: str, ttl_seconds: float) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(
                 f"""
-                UPDATE nightshift.leases
-                SET status = $2,
-                    run_id = COALESCE($3, run_id),
-                    released_at = CASE WHEN $2 IN ({_LEASE_RELEASED_AT_SQL})
-                                       THEN now() ELSE released_at END
-                WHERE id = $1::uuid
-                """,
-                lease_id, status, run_id,
-            )
-
-    async def heartbeat_lease(self, lease_id: str, ttl_seconds: float) -> None:
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE nightshift.leases
+                UPDATE nightshift.attempts
                 SET heartbeat_at = now(),
-                    expires_at = now() + ($2 || ' seconds')::interval
-                WHERE id = $1::uuid
+                    deadline_at = now() + ($2 || ' seconds')::interval
+                WHERE id = $1 AND state IN ({_ATTEMPT_LIVE_SQL})
                 """,
-                lease_id, str(int(ttl_seconds)),
+                attempt_id, str(int(ttl_seconds)),
             )
-
-    async def reclaim_expired_leases(self) -> list[dict[str, Any]]:
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                UPDATE nightshift.leases
-                SET status = 'expired', released_at = now()
-                WHERE status = 'leased' AND expires_at IS NOT NULL AND expires_at < now()
-                RETURNING *
-                """
-            )
-        return [_lease_row(r) for r in rows]
 
     async def apply_transition(
         self,
@@ -1233,30 +1220,28 @@ class PgStore:
     ) -> list[int] | None:
         """Apply one lifecycle transition in a single transaction.
 
-        The CAS is the guarded lease UPDATE: it matches only while the lease is
-        in ``expected_status`` (and owned by ``expected_worker_id`` when given).
-        No match → rollback, no writes, ``None``. Events are inserted in the
-        same transaction (outbox); their ids come back for post-commit SSE.
+        The CAS is the guarded attempt UPDATE: it matches only while the
+        attempt is in ``expected_status`` (and owned by ``expected_worker_id``
+        when given). No match → rollback, no writes, ``None`` (invariant 2).
+        Events are inserted in the same transaction (outbox, invariant 3);
+        their ids come back for post-commit SSE.
         """
-        _check_run_fields(t.run_fields)
+        _check_attempt_fields(t.fields, allow_state=False)
+        sets, values = _attempt_set_sql(t.fields, t.state, start=5)
+        extra = f", {sets}" if sets else ""
         async with self._pool.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
                 f"""
-                UPDATE nightshift.leases
-                SET status = $2,
-                    released_at = CASE WHEN $2 IN ({_LEASE_RELEASED_AT_SQL})
-                                       THEN now() ELSE released_at END
-                WHERE id = $1::uuid AND status = $3
+                UPDATE nightshift.attempts
+                SET state = $2{extra}
+                WHERE id = $1 AND state = $3
                   AND ($4::text IS NULL OR worker_id = $4)
                 RETURNING id
                 """,
-                t.ref.lease_id, t.lease_status, expected_status, expected_worker_id,
+                t.ref.id, t.state, expected_status, expected_worker_id, *values,
             )
             if row is None:
                 return None
-            if t.run_fields:
-                sql, values = _run_update_sql(t.run_fields)
-                await conn.execute(sql, t.ref.run_id, *values)
             qk, task = _qkey(t.ref.queue), t.ref.task
             hold = t.effects.hold
             if hold is not None:
@@ -1453,81 +1438,17 @@ class PgStore:
     async def rename_queue(self, old: str, new: str) -> None:
         """Repoint every queue-keyed row from ``old`` to ``new`` (playlists only;
         the main queue is never renamed). Playlist queue keys equal the playlist
-        name across runs/leases/tasks/events/queue_routing/queue_state, so one
+        name across attempts/tasks/events/queue_routing/queue_state, so one
         value maps them all."""
         if not old or old == new:
             return
         async with self._pool.acquire() as conn:
-            for table in ("runs", "leases", "tasks", "events", "queue_routing",
+            for table in ("attempts", "tasks", "events", "queue_routing",
                           "queue_state"):
                 await conn.execute(
                     f"UPDATE nightshift.{table} SET queue = $2 WHERE queue = $1",
                     old, new,
                 )
-
-    async def create_run(
-        self,
-        run_id: str,
-        *,
-        task: str,
-        queue: str | None,
-        worker_id: str | None,
-        backend: str | None,
-        model: str | None,
-        title: str | None = None,
-        body: str | None = None,
-        required_mcps: list[str] | None = None,
-        repo: str | None = None,
-        validate_cmd: str | None = None,
-    ) -> dict[str, Any]:
-        async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO nightshift.runs
-                    (id, task, queue, worker_id, backend, model, repo, required_mcps,
-                     validate_cmd, status, title, body, started_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9,
-                        'running', $10, $11, now())
-                RETURNING *
-                """,
-                run_id, task, _qkey(queue), worker_id, backend, model, repo,
-                json.dumps(required_mcps or []), validate_cmd, title, body,
-            )
-        return _run_row(row)
-
-    async def update_run(self, run_id: str, **fields: Any) -> None:
-        if not fields:
-            return
-        _check_run_fields(fields)
-        sql, values = _run_update_sql(fields)
-        async with self._pool.acquire() as conn:
-            await conn.execute(sql, run_id, *values)
-
-    async def get_run(self, run_id: str) -> dict[str, Any] | None:
-        async with self._pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT * FROM nightshift.runs WHERE id = $1", run_id)
-        return _run_row(row) if row else None
-
-    async def list_runs(
-        self, *, limit: int = 200, queue: str | None = None, worker_id: str | None = None
-    ) -> list[dict[str, Any]]:
-        clauses: list[str] = []
-        values: list[Any] = []
-        if queue is not None:
-            values.append(_qkey(queue))
-            clauses.append(f"queue = ${len(values)}")
-        if worker_id is not None:
-            values.append(worker_id)
-            clauses.append(f"worker_id = ${len(values)}")
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        values.append(limit)
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                f"SELECT * FROM nightshift.runs {where} "
-                f"ORDER BY started_at DESC LIMIT ${len(values)}",
-                *values,
-            )
-        return [_run_row(r) for r in rows]
 
     async def append_event(
         self,
@@ -1614,17 +1535,10 @@ def _worker_row(row: Any) -> dict[str, Any]:
     return d
 
 
-def _run_row(row: Any) -> dict[str, Any]:
+def _attempt_row(row: Any) -> dict[str, Any]:
     d = dict(row)
     if "required_mcps" in d:
         d["required_mcps"] = _jsonish(d.get("required_mcps")) or []
-    return d
-
-
-def _lease_row(row: Any) -> dict[str, Any]:
-    d = dict(row)
-    if d.get("id") is not None:
-        d["id"] = str(d["id"])
     return d
 
 

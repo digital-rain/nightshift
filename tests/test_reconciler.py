@@ -20,7 +20,7 @@ from starlette.testclient import TestClient
 
 from _workspace import build_workspace
 from nightshift.engine import setup_worktree
-from nightshift.lifecycle import LandKind, LandOutcome
+from nightshift.lifecycle import AttemptState, LandKind, LandOutcome
 from nightshift.manager.app import create_app
 from nightshift.manager.scheduler import (
     UNROUTABLE_REASON_PREFIXES,
@@ -127,10 +127,10 @@ def test_heartbeats_and_polls_flow_while_a_slow_land_runs(
             x for x in client.get("/api/runs").json() if x["id"] == order["run_id"]
         )
         assert run["status"] == "completed" and run["commit_sha"] == "deadbeef"
-        lease = asyncio.run(
-            client.app.state.store.get_lease(order["lease_id"])
+        attempt = asyncio.run(
+            client.app.state.store.get_attempt(order["lease_id"])
         )
-        assert lease["status"] == "landed"
+        assert attempt["state"] == "landed"
         # The brief drop (a tasks-repo executor job) also went through.
         assert not (workspace / "nightshift-tasks/main/10.hello.md").exists()
 
@@ -149,14 +149,15 @@ def _gated_land(monkeypatch) -> tuple[threading.Event, threading.Event]:
     return entered, gate
 
 
-def test_mid_land_lease_is_exempt_from_deadline_expiry(
+def test_mid_land_attempt_is_exempt_from_deadline_expiry(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """Nothing heartbeats a lease once the worker went idle at enqueue, so
+    """Nothing heartbeats an attempt once the worker went idle at enqueue, so
     queue-wait + a slow land can outlive the TTL — with the push possibly
-    already on origin. The reconciler must not expire a mid-land lease (that
+    already on origin. The reconciler must not expire a LANDING attempt (that
     would make the deferred CAS drop the completed land and re-dispatch the
-    task); the startup parking pass, not deadline expiry, recovers these."""
+    task); since Phase 8 the exemption is structural — expiry only CASes
+    RUNNING attempts. The startup recovery pass owns mid-land casualties."""
     workspace = build_workspace(tmp_path, tasks={"10.hello": "Do a thing."})
     land_entered, land_gate = _gated_land(monkeypatch)
     store = MemoryStore()
@@ -175,10 +176,10 @@ def test_mid_land_lease_is_exempt_from_deadline_expiry(
         assert land_entered.wait(10)
 
         # The TTL elapses while the land job is parked; the tick must skip it.
-        asyncio.run(store.heartbeat_lease(order["lease_id"], -60))
+        asyncio.run(store.heartbeat_attempt(order["lease_id"], -60))
         _reconcile(client)
-        lease = asyncio.run(store.get_lease(order["lease_id"]))
-        assert lease["status"] == "leased"
+        attempt = asyncio.run(store.get_attempt(order["lease_id"]))
+        assert attempt["state"] == "landing"
 
         # And the land result still applies once the job finishes.
         land_gate.set()
@@ -187,14 +188,14 @@ def test_mid_land_lease_is_exempt_from_deadline_expiry(
             x for x in client.get("/api/runs").json() if x["id"] == order["run_id"]
         )
         assert run["status"] == "completed" and run["commit_sha"] == "deadbeef"
-        lease = asyncio.run(store.get_lease(order["lease_id"]))
-        assert lease["status"] == "landed"
+        attempt = asyncio.run(store.get_attempt(order["lease_id"]))
+        assert attempt["state"] == "landed"
 
 
 def test_discarded_land_result_leaves_an_operator_visible_trace(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """When a lease IS consumed mid-land (operator stop/skip), the deferred
+    """When an attempt IS consumed mid-land (operator stop/skip), the deferred
     CAS refuses the result — correctly — but the discard must not be silent:
     the run's event log records what was thrown away (existing task_log wire
     kind, no new vocabulary)."""
@@ -213,16 +214,18 @@ def test_discarded_land_result_leaves_an_operator_visible_trace(
             },
         )
         assert land_entered.wait(10)
-        # An operator stop cancels the lease while the land job is parked.
-        asyncio.run(store.set_lease_status(order["lease_id"], "cancelled"))
+        # An operator stop aborts the attempt while the land job is parked
+        # (the Phase 8 stop fix: ABORTED, terminal, instead of a cancelled
+        # lease around a zombie row).
+        asyncio.run(store.update_attempt(order["lease_id"], state=AttemptState.ABORTED))
         land_gate.set()
         _drain_git(client)
 
-        # The CAS refused the stale result: nothing was written to the run...
+        # The CAS refused the stale result: the abort stands, nothing landed...
         run = next(
             x for x in client.get("/api/runs").json() if x["id"] == order["run_id"]
         )
-        assert run["status"] == "running"
+        assert run["status"] == "aborted"
         assert run["commit_sha"] is None
         # ...but the discard is on the record, with the land kind and sha.
         logs = [
@@ -265,30 +268,27 @@ def test_paused_queue_stays_paused_across_manager_restart(tmp_path: Path) -> Non
 
 
 def test_restart_parks_mid_land_run_for_resolve(tmp_path: Path) -> None:
-    """A run stuck in phase="landing" with a live lease is a previous process's
-    abandoned executor job. Without the Phase 8 land trailer we cannot verify
-    whether its squash reached main, so the startup pass parks it: run errored
-    (merge_rejected), lease released, task blocked for resolve — never lost,
-    never double-landed."""
+    """A LANDING attempt found at startup is a previous process's abandoned
+    executor job. With no `Nightshift-Attempt` trailer on main AND no surviving
+    task branch to re-enqueue from, the recovery ladder bottoms out at the
+    conservative park: attempt CONFLICT (merge_rejected), task blocked for
+    resolve — never lost, never double-landed."""
     workspace = build_workspace(tmp_path, tasks={"10.hello": "Do a thing."})
     store = MemoryStore()
 
-    async def _seed_mid_land() -> tuple[str, str]:
+    async def _seed_mid_land() -> str:
         run_id = "run-mid-land"
-        lease = await store.acquire_lease(
-            task="10.hello", queue=None, worker_id="w1",
-            model="auto", base_ref=None, ttl_seconds=600,
-        )
-        await store.create_run(
+        await store.create_attempt(
             run_id, task="10.hello", queue=None, worker_id="w1",
-            backend="claude-code", model="auto", title="hello",
-            repo="longitude",
+            backend="claude-code", model="auto", base_ref=None,
+            ttl_seconds=600, title="hello", repo="longitude",
         )
-        await store.set_lease_status(lease["id"], "leased", run_id=run_id)
-        await store.update_run(run_id, phase="landing")
-        return run_id, lease["id"]
+        await store.update_attempt(
+            run_id, state=AttemptState.LANDING, phase="landing",
+        )
+        return run_id
 
-    run_id, lease_id = asyncio.run(_seed_mid_land())
+    run_id = asyncio.run(_seed_mid_land())
 
     # "Restart": a fresh app on the same store; the lifespan startup pass runs
     # before any request is served.
@@ -297,8 +297,9 @@ def test_restart_parks_mid_land_run_for_resolve(tmp_path: Path) -> None:
         assert run["status"] == "error"
         assert run["failure_kind"] == "merge_rejected"
         assert "restarted mid-land" in run["result_line"]
-        lease = asyncio.run(store.get_lease(lease_id))
-        assert lease["status"] == "released"
+        attempt = asyncio.run(store.get_attempt(run_id))
+        assert attempt["state"] == "conflict"
+        assert attempt["finished_at"] is not None
         hold = asyncio.run(store.get_task_state(None, "10.hello"))
         assert hold["state"] == "blocked"
         assert hold["blocked_reason"].startswith("needs resolve:")
@@ -311,8 +312,8 @@ def test_restart_parks_mid_land_run_for_resolve(tmp_path: Path) -> None:
         ]
         assert "task_result" in events_before
 
-        # Idempotent: a second startup pass on the (now released) lease is a
-        # no-op — the CAS on LEASED refuses to double-apply.
+        # Idempotent: a second startup pass on the (now terminal) attempt is a
+        # no-op — the CAS on LANDING refuses to double-apply.
         client.portal.call(client.app.state.reconciler.startup)
         assert [
             e["kind"] for e in asyncio.run(store.run_events(run_id))
@@ -327,7 +328,7 @@ def test_restart_parks_mid_land_run_for_resolve(tmp_path: Path) -> None:
 # Every store method a no-work poll may touch — all reads. Anything else
 # (including reads added later without thought) fails loudly.
 _POLL_READS = frozenset({
-    "queue_pauses", "queue_dedication", "active_leases", "list_blocked",
+    "queue_pauses", "queue_dedication", "live_attempts", "list_blocked",
     "tasks_backing_off", "retryable_tasks", "get_task_state",
 })
 
@@ -368,7 +369,7 @@ def test_no_work_poll_performs_zero_store_writes(tmp_path: Path) -> None:
         assert r.status_code == 200
         assert r.json()["work"] is None
         # The wrapper actually observed the poll (guards against a vacuous pass).
-        assert "active_leases" in _ReadOnlyWhenArmed.calls
+        assert "live_attempts" in _ReadOnlyWhenArmed.calls
 
 
 # --------------------------------------------------------------------------- #
@@ -376,25 +377,28 @@ def test_no_work_poll_performs_zero_store_writes(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_reconciler_expires_overdue_leases(tmp_path: Path) -> None:
+def test_reconciler_expires_overdue_attempts(tmp_path: Path) -> None:
     workspace = build_workspace(tmp_path, tasks={"10.hello": "Do a thing."})
     store = MemoryStore()
     with _client(workspace, store) as client:
         _checkin(client)
         order = _poll(client)
         assert order is not None
-        # Age the lease past its deadline (a negative TTL back-dates expiry).
-        asyncio.run(store.heartbeat_lease(order["lease_id"], -60))
+        # Age the attempt past its deadline (a negative TTL back-dates expiry).
+        asyncio.run(store.heartbeat_attempt(order["lease_id"], -60))
 
         _reconcile(client)
 
-        lease = asyncio.run(store.get_lease(order["lease_id"]))
-        assert lease["status"] == "expired"
-        # Parity with the old inline reclaim: the run row is untouched.
+        attempt = asyncio.run(store.get_attempt(order["lease_id"]))
+        assert attempt["state"] == "expired"
+        # Phase 8 behavior fix: EXPIRED is terminal (finished_at stamped) and
+        # /api/runs truthfully projects "expired" — pre-phase the run row
+        # stayed "running" with finished_at NULL forever.
+        assert attempt["finished_at"] is not None
         run = next(
             x for x in client.get("/api/runs").json() if x["id"] == order["run_id"]
         )
-        assert run["status"] == "running"
+        assert run["status"] == "expired"
         # The task is dispatchable again.
         again = _poll(client)
         assert again is not None and again["task"] == "10.hello"

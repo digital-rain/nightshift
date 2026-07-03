@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from _workspace import build_workspace
 from nightshift import playlists as playlists_mod
+from nightshift.lifecycle import AttemptState
 from nightshift.manager.app import create_app as create_manager_app
 from nightshift.manager.store import MemoryStore
 from nightshift.server.app import create_app as create_server_app
@@ -103,23 +104,25 @@ def test_memory_store_rename_queue() -> None:
     store = MemoryStore()
 
     async def scenario() -> None:
-        await store.create_run(
+        await store.create_attempt(
             "r1", task="t1", queue="alpha", worker_id="w1",
-            backend="claude-code", model="auto",
+            backend="claude-code", model="auto", base_ref=None, ttl_seconds=60,
         )
-        await store.acquire_lease(
-            task="t2", queue="alpha", worker_id="w1", model="auto",
-            base_ref="ref", ttl_seconds=60,
+        await store.create_attempt(
+            "r2", task="t2", queue="alpha", worker_id="w1",
+            backend="claude-code", model="auto", base_ref="ref", ttl_seconds=60,
         )
         await store.set_task_state("alpha", "t3", "blocked", blocked_reason="x")
         await store.set_queue_dedication("alpha", ["w1"])
 
         await store.rename_queue("alpha", "beta")
 
-        assert [r["queue"] for r in await store.list_runs(queue="beta")] == ["beta"]
-        assert await store.list_runs(queue="alpha") == []
-        leases = await store.active_leases()
-        assert all(le["queue"] == "beta" for le in leases)
+        assert sorted(
+            r["queue"] for r in await store.list_attempts(queue="beta")
+        ) == ["beta", "beta"]
+        assert await store.list_attempts(queue="alpha") == []
+        live = await store.live_attempts()
+        assert all(a["queue"] == "beta" for a in live)
         assert await store.get_task_state("alpha", "t3") is None
         assert (await store.get_task_state("beta", "t3"))["state"] == "blocked"
         ded = await store.queue_dedication()
@@ -216,20 +219,23 @@ def test_manager_rename_migrates_store_and_blocks_running(tmp_path: Path) -> Non
         queues={"alpha": {"config": {"repo": "longitude", "order": []}}},
     )
     store = MemoryStore()
-    asyncio.run(store.create_run(
+    # A finished attempt: rename must migrate its queue key but not be blocked
+    # by it (only LIVE attempts block a rename).
+    asyncio.run(store.create_attempt(
         "r1", task="t1", queue="alpha", worker_id="w1",
-        backend="claude-code", model="auto",
+        backend="claude-code", model="auto", base_ref=None, ttl_seconds=60,
     ))
+    asyncio.run(store.update_attempt("r1", state=AttemptState.NO_CHANGE))
     with _mgr(tmp_path, store) as client:
         r = client.put("/api/playlists/alpha", json={"name": "beta"})
         assert r.status_code == 200
-        runs = asyncio.run(store.list_runs(queue="beta"))
+        runs = asyncio.run(store.list_attempts(queue="beta"))
         assert [run["task"] for run in runs] == ["t1"]
 
-        # A live lease on the (now beta) queue blocks a further rename.
-        asyncio.run(store.acquire_lease(
-            task="t1", queue="beta", worker_id="w1", model="auto",
-            base_ref="ref", ttl_seconds=60,
+        # A live attempt on the (now beta) queue blocks a further rename.
+        asyncio.run(store.create_attempt(
+            "r2", task="t1", queue="beta", worker_id="w1", model="auto",
+            backend="claude-code", base_ref="ref", ttl_seconds=60,
         ))
         r = client.put("/api/playlists/beta", json={"name": "gamma"})
         assert r.status_code == 409

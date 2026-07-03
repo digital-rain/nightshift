@@ -115,6 +115,7 @@ def land(
     max_push_retries: int = 3,
     git_refresh_seconds: float = 15.0,
     throttle: SyncThrottle | None = None,
+    attempt_id: str | None = None,
 ) -> LandOutcome:
     """Land a submitted task branch onto canonical ``main`` of the target
     ``repo``, then sync remotely — the orchestration boundary that takes the
@@ -134,6 +135,7 @@ def land(
             max_push_retries=max_push_retries,
             git_refresh_seconds=git_refresh_seconds,
             throttle=throttle,
+            attempt_id=attempt_id,
         )
 
 
@@ -154,9 +156,12 @@ def land_locked(
     max_push_retries: int = 3,
     git_refresh_seconds: float = 15.0,
     throttle: SyncThrottle | None = None,
+    attempt_id: str | None = None,
 ) -> LandOutcome:
     """:func:`land` for callers already holding the RepoLock (the repo
-    executor's land jobs).
+    executor's land jobs). ``attempt_id`` stamps the land idempotency trailer
+    on the squash commit (manager lands only; direct callers omit it and stay
+    recovery-ineligible).
 
     ``repo`` is the workspace-relative child name; the target repo path
     (``repo_root = workspace / repo``) is materialised here only for the git
@@ -234,7 +239,7 @@ def land_locked(
         )
         outcome = integrate_and_push_locked(
             ctx,
-            squash_produce(workspace / repo, branch, title),
+            squash_produce(workspace / repo, branch, title, attempt_id),
             mode=mode,
             max_retries=max_push_retries,
         )
@@ -386,6 +391,7 @@ def push_resolved_main(
     *,
     max_retries: int = 3,
     throttle: SyncThrottle | None = None,
+    attempt_id: str | None = None,
 ) -> tuple[bool, str]:
     """Land an already-squashed resolved commit on origin ``main``, taking the
     RepoLock (direct/CLI callers; the manager's repo executor calls
@@ -393,7 +399,7 @@ def push_resolved_main(
     with repo_lock(workspace, repo):
         return push_resolved_main_locked(
             workspace, repo, remote, sha,
-            max_retries=max_retries, throttle=throttle,
+            max_retries=max_retries, throttle=throttle, attempt_id=attempt_id,
         )
 
 
@@ -405,9 +411,11 @@ def push_resolved_main_locked(
     *,
     max_retries: int = 3,
     throttle: SyncThrottle | None = None,
+    attempt_id: str | None = None,
 ) -> tuple[bool, str]:
     """Land an already-squashed *resolved* commit (``sha``) on origin ``main``.
-    Caller must hold the RepoLock.
+    Caller must hold the RepoLock. ``attempt_id`` stamps the land idempotency
+    trailer on the replayed commit.
 
     The out-of-process resolve runner produces a single squash commit on local
     ``main`` (``runner_legacy.resolve_task``); origin may have advanced while
@@ -432,7 +440,7 @@ def push_resolved_main_locked(
     )
     outcome = integrate_and_push_locked(
         ctx,
-        cherry_produce(workspace / repo, sha),
+        cherry_produce(workspace / repo, sha, attempt_id),
         mode=LandingMode.PUSH,
         max_retries=max_retries,
     )

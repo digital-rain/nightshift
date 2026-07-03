@@ -26,13 +26,19 @@ from nightshift import repos
 from nightshift.config.validate import build_get_response, validate_delta, write_delta
 from nightshift.git.executor import ExecutorPool
 from nightshift.git.store import commit_tasks
-from nightshift.lifecycle import LeaseStatus, TaskHoldKind
+from nightshift.lifecycle import (
+    AttemptRef,
+    AttemptState,
+    TaskHoldKind,
+    on_operator_stop,
+)
 from nightshift.manager import failure_policy
 from nightshift.manager.api_worker import EmitFn, StartResolveFn, jsonable
 from nightshift.manager.config import ManagerConfig
 from nightshift.manager.registry import Registry
 from nightshift.manager.scheduler import queue_label
 from nightshift.manager.store import NightshiftStore
+from nightshift.manager.views import lease_view, run_view
 from nightshift.queue_config import (
     load_play_priorities,
     load_sort_mode,
@@ -293,7 +299,7 @@ def register_operator_api(
         out-of-process (non-blocking) so the manager stays responsive and other
         tasks keep dispatching while the agent works."""
         store = _store()
-        origin = await store.get_run(run_id)
+        origin = await store.get_attempt(run_id)
         if origin is None:
             raise HTTPException(status_code=404, detail="unknown run")
         target_queue = (
@@ -665,7 +671,9 @@ def register_operator_api(
 
     async def _state_payload() -> dict[str, Any]:
         store = _store()
-        leases = await store.active_leases()
+        # Live attempts projected to the historical lease dict shape (the
+        # ``run_id`` key _queue_state serves on the wire).
+        leases = [lease_view(a) for a in await store.live_attempts()]
         pauses = await store.queue_pauses()
         modes = await store.queue_modes()
         focused = _active_playlist
@@ -701,6 +709,30 @@ def register_operator_api(
             # "auto" is the default — persisting None lets the store prune the
             # row once neither a pause nor a non-default mode remains.
             await store.set_queue_mode(key, None if req.mode == "auto" else req.mode)
+        async def _abort_live_attempts() -> None:
+            """Operator stop/skip: abort every live attempt in the queue —
+            CAS RUNNING first, then LANDING (a stop cancels mid-land too,
+            exactly as before). Phase 8 behavior fix: the attempt is stored
+            ABORTED with ``finished_at`` instead of the pre-phase
+            cancelled-lease + forever-``running`` run row; the ``run_finished``
+            emit is unchanged."""
+            for att in await store.live_attempts():
+                if att.get("queue", "main") != key:
+                    continue
+                t = on_operator_stop(AttemptRef(
+                    id=att["id"],
+                    queue=_queue_from_label(att["queue"]),
+                    task=att["task"],
+                ))
+                applied = await store.apply_transition(
+                    t, expected_status=AttemptState.RUNNING
+                )
+                if applied is None:
+                    await store.apply_transition(
+                        t, expected_status=AttemptState.LANDING
+                    )
+                await _emit("run_finished", run_id=att["id"], queue=target)
+
         if req.action == "play":
             await store.set_queue_pause(key, None)
             _queue_failure_state[key] = failure_policy.QueueFailureState()
@@ -708,16 +740,10 @@ def register_operator_api(
             await store.set_queue_pause(key, "operator")
         elif req.action == "stop":
             await store.set_queue_pause(key, "operator")
-            for le in await store.active_leases():
-                if le.get("queue", "main") == key:
-                    await store.set_lease_status(le["id"], LeaseStatus.CANCELLED)
-                    await _emit("run_finished", run_id=le.get("run_id"), queue=target)
+            await _abort_live_attempts()
             await store.set_queue_pause(key, None)
         elif req.action == "skip":
-            for le in await store.active_leases():
-                if le.get("queue", "main") == key:
-                    await store.set_lease_status(le["id"], LeaseStatus.CANCELLED)
-                    await _emit("run_finished", run_id=le.get("run_id"), queue=target)
+            await _abort_live_attempts()
         elif req.action == "select":
             _queue_cursors[key] = req.task
         return JSONResponse(await _state_payload())
@@ -772,7 +798,7 @@ def register_operator_api(
         # An active lease on this queue means a worker is mid-run against it;
         # renaming the dir + DB rows under it would strand that run.
         if req.name is not None and playlists_mod.slugify_name(req.name) != name:
-            active = await _store().active_leases()
+            active = await _store().live_attempts()
             if any(_queue_from_label(le["queue"]) == name for le in active):
                 return JSONResponse(
                     {"error": "playlist has a running task; stop it first"},
@@ -833,7 +859,7 @@ def register_operator_api(
 
     @app.delete("/api/playlists/{name}")
     async def remove_playlist(name: str) -> JSONResponse:
-        active = await _store().active_leases()
+        active = await _store().live_attempts()
         if any(_queue_from_label(le["queue"]) == name for le in active):
             return JSONResponse(
                 {"error": "playlist has a running task; stop it first"},
@@ -917,8 +943,10 @@ def register_operator_api(
     @app.get("/api/runs")
     async def get_runs(queue: str | None = None, limit: int = 200) -> JSONResponse:
         target = _queue_from_label(queue) if queue is not None else None
-        runs = await _store().list_runs(limit=limit, queue=target if queue is not None else None)
-        return JSONResponse([jsonable(r) for r in runs])
+        runs = await _store().list_attempts(
+            limit=limit, queue=target if queue is not None else None
+        )
+        return JSONResponse([jsonable(run_view(r)) for r in runs])
 
     @app.get("/api/runs/{run_id}/events")
     async def get_run_events(run_id: str) -> JSONResponse:
@@ -953,7 +981,9 @@ def register_operator_api(
 
     @app.get("/api/leases")
     async def get_leases() -> JSONResponse:
-        return JSONResponse([jsonable(le) for le in await _store().active_leases()])
+        return JSONResponse(
+            [jsonable(lease_view(a)) for a in await _store().live_attempts()]
+        )
 
     @app.get("/api/blocked")
     async def get_blocked() -> JSONResponse:
@@ -1027,8 +1057,12 @@ def register_operator_api(
         return {
             "cursor": await store.max_event_id(),
             "workers": [jsonable(w) for w in await store.list_workers()],
-            "leases": [jsonable(le) for le in await store.active_leases()],
-            "runs": [jsonable(r) for r in await store.list_runs(limit=50)],
+            "leases": [
+                jsonable(lease_view(a)) for a in await store.live_attempts()
+            ],
+            "runs": [
+                jsonable(run_view(r)) for r in await store.list_attempts(limit=50)
+            ],
             "blocked": [
                 jsonable(b) for b in [*await store.list_blocked(), *fm_rows]
             ],

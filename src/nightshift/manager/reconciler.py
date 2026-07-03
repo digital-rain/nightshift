@@ -2,14 +2,13 @@
 
 One asyncio task (plus a startup pass) owns every "notice and repair" duty the
 worker poll path used to perform inline, so the poll hot path becomes pure
-reads (build candidates → pick → lease → return):
+reads (build candidates → pick → create the attempt → return):
 
-1. **Deadline expiry** — every live lease past its ``expires_at`` gets an
-   :func:`~nightshift.lifecycle.on_deadline` transition (CAS on ``leased``, so
-   a lease consumed concurrently is never double-expired). Leases whose run is
-   mid-land (``phase="landing"``) are exempt: the land job is the only thing
-   that may consume them, and the startup parking pass — not deadline expiry —
-   is the recovery path if the process dies with the job in flight.
+1. **Deadline expiry** — every RUNNING attempt past its ``deadline_at`` gets
+   an :func:`~nightshift.lifecycle.on_deadline` transition (CAS on RUNNING, so
+   an attempt consumed concurrently is never double-expired). LANDING attempts
+   are structurally exempt: once the land is enqueued nothing heartbeats the
+   attempt anymore, and only the land job (or startup recovery) may consume it.
 2. **Hold set/clear** — the ``no_capable_worker`` / bad-repo-reference
    ``blocked`` holds and the ``repo_unavailable`` pauses move here from
    ``worker_poll``, with the same dedup + one-warning-per-queue behavior. The
@@ -17,7 +16,7 @@ reads (build candidates → pick → lease → return):
    worker checked in; the repo reappeared) — dispatch-time clearing remains as
    the fast path.
 3. **GC** — terminal worktrees/branches: a ``task-local/*`` branch whose brief
-   is gone, with no live lease and no task hold, is provably abandoned (a
+   is gone, with no live attempt and no task hold, is provably abandoned (a
    conflicted land always leaves a hold; a queued brief is never GC'd), so its
    worktree+branch are torn down on the repo executor and, cross-machine, its
    consumed WIP ref is pruned best-effort. Finished resolve subprocesses are
@@ -25,12 +24,27 @@ reads (build candidates → pick → lease → return):
 4. **Worker liveness** — silent workers are marked offline
    (``registry.reap_stale``), moved out of the poll path.
 
-The startup pass additionally parks runs interrupted mid-land: a run stuck in
-``phase="landing"`` with a live lease can only be a previous process's
-abandoned executor job (this process hasn't enqueued anything yet), and
-without the Phase 8 land trailer we cannot verify whether its squash reached
-main — so it is conservatively errored (``merge_rejected``) and the task held
-blocked for a resolve via :func:`~nightshift.lifecycle.on_land_interrupted`.
+The startup pass additionally *recovers* attempts interrupted mid-land (Phase
+8): an attempt stuck in state LANDING can only be a previous process's
+abandoned executor job (this process hasn't enqueued anything yet). The
+recovery ladder, in order:
+
+1. **Trailer check** — the land's squash commit carries the
+   ``Nightshift-Attempt: <id>`` trailer; finding it on the target repo's main
+   proves the land completed before the crash → the attempt is completed as
+   LANDED (:func:`~nightshift.lifecycle.on_land_recovered`), nothing re-runs.
+2. **Re-enqueue** — the task branch (or, cross-machine, the recorded
+   ``branch_ref``) survived → the SAME land job is re-enqueued on the repo
+   executor and its result applied via
+   :func:`~nightshift.lifecycle.on_land_result` under a deliberately
+   conservative policy (no watch arming, no queue pause, no auto-resolve).
+   The trailer check having run first is the exactly-once guarantee: a re-run
+   racing an already-pushed land squashes nothing new (empty squash →
+   CONFLICT; the adopt path handles an advanced main).
+3. **Park** — neither → conservatively errored (``merge_rejected``) with the
+   task held blocked for a resolve
+   (:func:`~nightshift.lifecycle.on_land_interrupted`), exactly the pre-Phase-8
+   behavior.
 """
 
 from __future__ import annotations
@@ -39,6 +53,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -46,18 +61,30 @@ from nightshift import playlists as playlists_mod
 from nightshift import repos
 from nightshift.git import GitRunner
 from nightshift.git.executor import ExecutorPool
+from nightshift.git.landing import find_landed_attempt
+from nightshift.git.refs import branch_exists
+from nightshift.git.sync import SyncThrottle
 from nightshift.git.transport import _wip_ref, prune_rendezvous_branch
-from nightshift.git.worktrees import cleanup_task_worktree
+from nightshift.git.worktrees import cleanup_task_worktree, worktree_branch
 from nightshift.lifecycle import (
     AttemptRef,
-    LeaseStatus,
+    AttemptState,
+    LandingMode,
+    LandKind,
+    LandOutcome,
+    Outcome,
+    RetryPolicy,
     RunStatus,
+    SubmitPolicy,
     TaskHoldKind,
     Transition,
     on_deadline,
     on_land_interrupted,
+    on_land_recovered,
+    on_land_result,
 )
 from nightshift.manager.config import ManagerConfig
+from nightshift.manager.landing import land_locked
 from nightshift.manager.registry import Registry
 from nightshift.manager.scheduler import (
     UNROUTABLE_REASON_PREFIXES,
@@ -67,20 +94,21 @@ from nightshift.manager.scheduler import (
     unroutable,
 )
 from nightshift.manager.store import NightshiftStore
-from nightshift.task_files import frontmatter_held_tasks
+from nightshift.manager.work_orders import task_meta
+from nightshift.spawn_daily import resolve_config
+from nightshift.task_files import (
+    drop_completed_task,
+    frontmatter_held_tasks,
+    task_is_evergreen,
+)
 
 
 _log = logging.getLogger("nightshift.manager.reconciler")
 
-
-def _is_mid_land(run: dict[str, Any] | None) -> bool:
-    """The mid-land predicate shared by the deadline-expiry exemption and the
-    startup parking pass: a live run whose land job is queued/running."""
-    return (
-        run is not None
-        and run.get("status") == RunStatus.RUNNING
-        and run.get("phase") == "landing"
-    )
+# Appended to a trailer-recovered attempt's result line in PR mode: the local
+# main CAS precedes ``open_pr`` in the PR pipeline, so the trailer proves the
+# squash reached main but NOT that the PR was ever opened.
+_PR_UNVERIFIED_NOTE = "; PR not verified — check the remote"
 
 
 def reap_finished_resolves(resolves: dict[str, dict[str, Any]]) -> None:
@@ -108,6 +136,11 @@ class Reconciler:
         executors: ExecutorPool,
         resolves: dict[str, dict[str, Any]],
         repo_warnings: set[str | None],
+        # Phase 8: land recovery re-enqueues the same land job the submit path
+        # runs, so it needs the app's sync throttle and the tasks-repo name
+        # (brief drops are content-store jobs).
+        sync_throttle: SyncThrottle,
+        tasks_repo: str,
     ) -> None:
         self._workspace = workspace
         self._tasks_root = tasks_root
@@ -121,17 +154,28 @@ class Reconciler:
         self._executors = executors
         self._resolves = resolves
         self._repo_warnings = repo_warnings
+        self._sync_throttle = sync_throttle
+        self._tasks_repo = tasks_repo
 
     # ------------------------------------------------------------------ #
     # Entry points
     # ------------------------------------------------------------------ #
 
     async def startup(self) -> None:
-        """The startup pass: park mid-land casualties first (their leases must
-        not be treated as ordinary deadline expiries), then one full pass.
-        Isolated like a tick: recovery machinery failing must log loudly, not
-        prevent the manager from booting."""
-        await self._run_duty("mid-land parking", self._park_interrupted_lands)
+        """The startup pass: recover mid-land casualties first (LANDING
+        attempts must not be treated as ordinary deadline expiries), then one
+        full pass. Isolated like a tick: recovery machinery failing must log
+        loudly, not prevent the manager from booting.
+
+        Deliberate trade-off: recovery runs synchronously inside lifespan
+        startup — serially per interrupted attempt, with rung 2 running a
+        full land job inline. Interrupted lands are rare (a crash inside the
+        narrow enqueue→apply window) and bounded (at most one live attempt
+        per task, invariant 1), and each attempt stays LANDING until its
+        rung applies, so nothing else can touch it; briefly blocking boot is
+        simpler and safer than racing the freshly-opened API against a
+        background recovery task."""
+        await self._run_duty("mid-land recovery", self._recover_interrupted_lands)
         await self.reconcile_once()
 
     async def run_forever(self, interval: float) -> None:
@@ -158,27 +202,182 @@ class Reconciler:
             _log.warning("reconciler: %s failed; continuing", name, exc_info=True)
 
     # ------------------------------------------------------------------ #
-    # Startup: interrupted lands
+    # Startup: interrupted lands (the Phase 8 recovery ladder)
     # ------------------------------------------------------------------ #
 
-    async def _park_interrupted_lands(self) -> None:
-        # TODO(phase 8): branch_ref/head_sha from the worker's submit are not
-        # persisted, so parking is the only safe option here. The trailer-based
-        # startup pass needs them recorded to verify-or-re-enqueue instead.
+    async def _recover_interrupted_lands(self) -> None:
         store = self._store()
-        for lease in await store.active_leases():
-            run_id = lease.get("run_id")
-            if not run_id:
+        for attempt in await store.live_attempts():
+            if attempt.get("state") != AttemptState.LANDING:
                 continue
-            if not _is_mid_land(await store.get_run(run_id)):
+            queue = self._queue_from_label(attempt.get("queue"))
+            task = attempt["task"]
+            ref = AttemptRef(id=attempt["id"], queue=queue, task=task)
+            repo = attempt.get("repo")
+            repo_ok = bool(repo) and repos.repo_available(self._workspace, repo)
+
+            # 1. Trailer check: the squash carries `Nightshift-Attempt: <id>`;
+            #    finding it on main proves the land completed before the crash.
+            sha = None
+            if repo_ok:
+                sha = await asyncio.to_thread(
+                    find_landed_attempt, self._workspace / repo, ref.id
+                )
+            if sha:
+                await self._recover_landed(ref, sha)
                 continue
-            ref = AttemptRef(
-                run_id=run_id,
-                lease_id=lease["id"],
-                queue=self._queue_from_label(lease.get("queue")),
-                task=lease["task"],
+
+            # 2. Re-enqueue: the local task branch survived, or (cross-machine)
+            #    the recorded WIP ref can be re-fetched from the rendezvous.
+            recoverable = repo_ok and (
+                await asyncio.to_thread(
+                    branch_exists,
+                    self._workspace / repo,
+                    worktree_branch(task, queue),
+                )
+                or bool(attempt.get("branch_ref") and self._cfg.rendezvous_remote)
             )
-            await self._apply_and_broadcast(on_land_interrupted(ref))
+            if recoverable:
+                await self._reenqueue_land(attempt, ref, repo)
+                continue
+
+            # 3. Park: neither provable nor re-runnable — the pre-Phase-8
+            #    conservative error + blocked hold for a resolve.
+            await self._apply_and_broadcast(
+                on_land_interrupted(ref), expected=AttemptState.LANDING
+            )
+
+    def _effective_mode(self, task: str, queue: str | None) -> LandingMode:
+        """The landing mode this task's land actually ran under (task meta
+        ``make_pr`` overrides the configured default)."""
+        meta = task_meta(self._tasks_root, task, queue)
+        return LandingMode.PR if meta.get("make_pr") else self._cfg.landing_mode
+
+    async def _recover_landed(self, ref: AttemptRef, sha: str) -> bool:
+        """Complete a trailer-verified attempt as LANDED (+ brief drop for
+        non-evergreen tasks). In PR mode the result line carries a caveat:
+        the trailer proves the squash reached main, but the local CAS
+        precedes ``open_pr``, so the PR itself may never have been opened."""
+        task, queue = ref.task, ref.queue
+        note = (
+            _PR_UNVERIFIED_NOTE
+            if self._effective_mode(task, queue) is LandingMode.PR
+            else None
+        )
+        applied = await self._apply_and_broadcast(
+            on_land_recovered(ref, sha, note=note),
+            expected=AttemptState.LANDING,
+        )
+        if applied and not self._task_evergreen(task, queue):
+            await self._drop_brief(task, queue)
+        return applied
+
+    async def _reenqueue_land(
+        self, attempt: dict[str, Any], ref: AttemptRef, repo: str
+    ) -> None:
+        """Re-run the interrupted land job (same args as the submit path,
+        reconstructed from the attempt row + task meta) and apply its result
+        with the same ``on_land_result`` transition — under a deliberately
+        conservative policy: no watch arming, no queue pause, no auto-resolve,
+        no split (recovery never escalates). The in-memory watch/pause effects
+        the transition might carry are ignored here (fresh process, nothing
+        armed); the transactional effects (hold, counter) apply as usual."""
+        task, queue = ref.task, ref.queue
+        meta = task_meta(self._tasks_root, task, queue)
+        effective_mode = (
+            LandingMode.PR if meta.get("make_pr") else self._cfg.landing_mode
+        )
+        title = attempt.get("title") or task
+        try:
+            result = await asyncio.wrap_future(self._executors.submit(repo, partial(
+                land_locked,
+                self._workspace, repo, task, title,
+                queue=queue,
+                base_ref=attempt.get("base_ref"),
+                landing_mode=effective_mode,
+                automerge=bool(meta.get("automerge", True)),
+                draft=bool(meta.get("draft", False)),
+                branch_ref=attempt.get("branch_ref"),
+                head_sha=attempt.get("head_sha"),
+                rendezvous_remote=self._cfg.rendezvous_remote,
+                git_refresh_seconds=self._cfg.cadences.git_refresh_seconds,
+                throttle=self._sync_throttle,
+                attempt_id=ref.id,
+            )))
+        except Exception as exc:
+            # Same terminal shape a crashed submit-path land job maps to.
+            result = LandOutcome(
+                kind=LandKind.TRANSPORT_FAILED,
+                detail=f"recovery land job crashed: {exc}",
+            )
+        if result.kind is LandKind.CONFLICT:
+            # Crash-window re-check: integrate_and_push pushes origin BEFORE
+            # the local main CAS, so dying between the two leaves the trailer
+            # on origin but not on local main — rung 1 misses it, and this
+            # re-run's opening sync pulls the already-pushed squash, making
+            # the re-squash empty (CONFLICT). Local main has just been synced
+            # by the land job, so a second trailer scan now proves that
+            # earlier push: recover as landed instead of parking a false
+            # conflict.
+            sha = await asyncio.to_thread(
+                find_landed_attempt, self._workspace / repo, ref.id
+            )
+            if sha:
+                await self._recover_landed(ref, sha)
+                return
+        task_row = await self._store().get_task_state(queue, task)
+        policy = SubmitPolicy(
+            retry=RetryPolicy(quarantine_after=self._cfg.quarantine_threshold),
+            attempts_without_progress=(
+                int(task_row["attempts_without_progress"]) if task_row else 0
+            ),
+            evergreen=self._task_evergreen(task, queue),
+            pr_mode=effective_mode is LandingMode.PR,
+        )
+        # Synthetic completed outcome: the worker's original submit was lost
+        # with the crash; model/validate_cmd/worktree echo the attempt row so
+        # the terminal update doesn't clobber what dispatch recorded.
+        outcome = Outcome(
+            status=RunStatus.COMPLETED,
+            landable=True,
+            result_line="recovered: landed (manager restarted mid-land)",
+            model=attempt.get("model"),
+            validate_cmd=attempt.get("validate_cmd"),
+            worktree=attempt.get("worktree"),
+        )
+        t = on_land_result(ref, outcome, result, policy)
+        applied = await self._apply_and_broadcast(
+            t, expected=AttemptState.LANDING
+        )
+        if applied and t.effects.drop_brief:
+            await self._drop_brief(task, queue)
+
+    def _task_evergreen(self, task: str, queue: str | None) -> bool:
+        meta = task_meta(self._tasks_root, task, queue)
+        return task_is_evergreen(
+            meta, task,
+            resolve_config(
+                self._workspace, self._tasks_root, playlists_mod.tasks_rel(queue)
+            ),
+        )
+
+    async def _drop_brief(self, task: str, queue: str | None) -> None:
+        """Consume a landed task's brief (non-evergreen) — a content-store
+        mutation, so a tasks-repo executor job. Best-effort like the submit
+        path's backstop."""
+        try:
+            await asyncio.wrap_future(self._executors.submit(
+                self._tasks_repo, partial(
+                    drop_completed_task,
+                    self._tasks_root, task, playlists_mod.tasks_rel(queue),
+                    queue=queue,
+                ),
+            ))
+        except Exception:
+            _log.warning(
+                "reconciler: brief drop failed for %s/%s",
+                queue_label(queue), task, exc_info=True,
+            )
 
     # ------------------------------------------------------------------ #
     # 1. Deadline expiry
@@ -187,37 +386,53 @@ class Reconciler:
     async def _expire_deadlines(self) -> None:
         store = self._store()
         now = datetime.now(UTC)
-        for lease in await store.active_leases():
-            expires = lease.get("expires_at")
-            if expires is None or expires >= now:
+        for attempt in await store.live_attempts():
+            # LANDING is structurally deadline-exempt: once the worker's
+            # submit enqueued the land, nothing heartbeats the attempt anymore
+            # — a slow (or queue-delayed) land could outlive the TTL while its
+            # push may already have reached origin. Expiring it would make the
+            # deferred on_land_result CAS fail, silently dropping a completed
+            # land and re-dispatching the task. If the *process* dies
+            # mid-land, the startup recovery pass owns exactly these attempts.
+            if attempt.get("state") != AttemptState.RUNNING:
                 continue
-            # Mid-land exemption: once the worker's submit enqueued the land,
-            # nothing heartbeats the lease anymore — a slow (or queue-delayed)
-            # land could outlive the TTL while its push may already have
-            # reached origin. Expiring it here would make the deferred
-            # on_land_result CAS fail, silently dropping a completed land and
-            # re-dispatching the task (a duplicate-land attempt). So a lease
-            # whose run is mid-land is deadline-exempt; if the *process* dies
-            # mid-land, the startup parking pass (_park_interrupted_lands) is
-            # the recovery path for exactly these leases.
-            run_id = lease.get("run_id")
-            if run_id and _is_mid_land(await store.get_run(run_id)):
+            deadline = attempt.get("deadline_at")
+            if deadline is None or deadline >= now:
                 continue
             ref = AttemptRef(
-                run_id=run_id or "",
-                lease_id=lease["id"],
-                queue=self._queue_from_label(lease.get("queue")),
-                task=lease["task"],
+                id=attempt["id"],
+                queue=self._queue_from_label(attempt.get("queue")),
+                task=attempt["task"],
             )
-            await self._apply_and_broadcast(on_deadline(ref))
+            await self._apply_and_broadcast(
+                on_deadline(ref), expected=AttemptState.RUNNING
+            )
 
-    async def _apply_and_broadcast(self, t: Transition) -> bool:
-        """CAS-apply a reconciler transition (expected lease state: still
-        LEASED — a lease consumed concurrently is never double-applied) and fan
-        its committed events out like the submit path does. False on a lost
-        CAS."""
+    async def _apply_and_broadcast(
+        self, t: Transition, *, expected: AttemptState
+    ) -> bool:
+        """CAS-apply a reconciler transition (the attempt must still be in
+        ``expected`` state — one consumed concurrently is never
+        double-applied) and fan its committed events out like the submit path
+        does. False on a lost CAS.
+
+        Contract: unlike the submit path, the reconciler executes NO
+        post-commit frontmatter effects. That's unreachable today by
+        construction — the transitions applied here (deadline, recovery,
+        interruption park, and the recovery ``on_land_result`` whose
+        ``land_locked`` never returns NO_CHANGES and whose failure branch
+        carries no flags) never produce them — so a non-empty
+        ``effects.frontmatter`` is logged as dropped rather than crashing
+        the duty (``_run_duty`` isolation is for unexpected errors, not
+        deliberate contract gaps)."""
+        if t.effects.frontmatter:
+            _log.warning(
+                "reconciler: dropping %d frontmatter effect(s) for %s — "
+                "the reconciler has no frontmatter-write plumbing",
+                len(t.effects.frontmatter), t.ref.id,
+            )
         event_ids = await self._store().apply_transition(
-            t, expected_status=LeaseStatus.LEASED
+            t, expected_status=expected
         )
         if event_ids is None:
             return False
@@ -360,8 +575,8 @@ class Reconciler:
     async def _gc_terminal_artifacts(self) -> None:
         store = self._store()
         leased = {
-            (self._queue_from_label(le.get("queue")), le["task"])
-            for le in await store.active_leases()
+            (self._queue_from_label(a.get("queue")), a["task"])
+            for a in await store.live_attempts()
         }
         worktrees_root = self._workspace / ".worktrees"
         if not worktrees_root.is_dir():
