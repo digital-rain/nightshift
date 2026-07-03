@@ -43,7 +43,7 @@ from typing import Any
 
 import httpx
 
-from nightshift import preflight, prompts
+from nightshift import preflight, price, prompts
 
 
 EmitLog = Callable[[str], None]
@@ -210,14 +210,19 @@ class AgentStreamParser:
             return _assistant_text(ev["message"])
         return ""
 
-    def apply(self, result: WorkerResult) -> WorkerResult:
+    def apply(self, result: WorkerResult, model: str | None = None) -> WorkerResult:
         result.turns = self.turns
         result.input_tokens = self.input_tokens
         result.output_tokens = self.output_tokens
         result.cache_read_input_tokens = self.cache_read_input_tokens
         result.cache_creation_input_tokens = self.cache_creation_input_tokens
         result.usage = self.usage_payload
+        # CLI-reported cost (Claude Code's total_cost_usd) wins; the owned price
+        # table is a fallback for runs where the CLI omitted a cost but did
+        # report usage.
         result.cost_usd = self.cost_usd
+        if result.cost_usd is None:
+            result.cost_usd = price.cost_of(model, self.usage_payload)
         return result
 
 
@@ -259,6 +264,7 @@ def _stream_subprocess(
     on_start: OnWorkerStart | None = None,
     parser: AgentStreamParser | None = None,
     timeout: float | None = None,
+    model: str | None = None,
 ) -> WorkerResult:
     """Run ``argv``, streaming combined stdout/stderr line-by-line to
     ``emit_log`` and terminating early if ``should_abort`` returns a reason.
@@ -320,7 +326,7 @@ def _stream_subprocess(
         done.set()
         watcher.join(timeout=1)
     result = WorkerResult(returncode=returncode, aborted=aborted["reason"])
-    return parser.apply(result) if parser is not None else result
+    return parser.apply(result, model) if parser is not None else result
 
 
 def _run_buffered(
@@ -504,6 +510,7 @@ class ClaudeCodeBackend:
             should_abort=should_abort, on_start=on_worker_start,
             parser=AgentStreamParser(),
             timeout=spec.timeout,
+            model=spec.model,
         )
 
 
@@ -529,6 +536,7 @@ class CursorAgentBackend:
             should_abort=should_abort, on_start=on_worker_start,
             parser=AgentStreamParser(),
             timeout=spec.timeout,
+            model=spec.model,
         )
 
 
@@ -670,13 +678,15 @@ class AnthropicBackend:
         emit_log("\n")
         input_tokens, output_tokens = _usage_tokens(usage)
         cache_read, cache_creation = _usage_cache_tokens(usage)
-        # Single-shot completion: one "turn"; cost left to the rollup (token-only).
+        # Single-shot completion: one "turn". Cost from the owned price table
+        # (None when the model isn't priced).
         return WorkerResult(
             returncode=0, turns=1,
             input_tokens=input_tokens, output_tokens=output_tokens,
             cache_read_input_tokens=cache_read,
             cache_creation_input_tokens=cache_creation,
             usage=usage or None,
+            cost_usd=price.cost_of(model, usage),
         )
 
 
@@ -929,7 +939,9 @@ class NightshiftAgentBackend:
             cache_read_input_tokens=cache_read,
             cache_creation_input_tokens=cache_creation,
             usage=usage_payload or None,
-            cost_usd=None,
+            # Vendor half of the model id (e.g. anthropic/claude-…) prices the
+            # Anthropic path; unknown/Ollama vendors return None (honest).
+            cost_usd=price.cost_of(upstream, loop.usage),
         )
 
 

@@ -186,6 +186,44 @@ def test_local_finish_record_matches_previous_on_disk_keys(tmp_path: Path) -> No
     assert not {"landable", "branch_ref", "head_sha", "failure_reason", "validate_cmd"} & set(row)
 
 
+def test_local_finish_record_carries_analytics_fields(tmp_path: Path) -> None:
+    """The worker's on-disk record must carry every field the shared analytics
+    module reads client-side (the worker adapter does no server-side reshaping):
+    landing + telemetry + dimensions + timestamps. Guards the worker side of the
+    analytics record contract against a future field drop."""
+    # Fields the shared analytics adapter (assets/ui/analytics.js) consumes.
+    ANALYTICS_CONSUMED = {
+        "task", "queue", "model", "backend", "status", "landed",
+        "turns", "input_tokens", "output_tokens",
+        "cache_read_input_tokens", "cache_creation_input_tokens",
+        "cost_usd", "usage", "failure_kind", "started_at", "finished_at",
+    }
+    client = _CapturingClient()
+    cfg = WorkerConfig(workspace=tmp_path, worker_id="w1", manager_url="http://x")
+    local = LocalStore(tmp_path)
+    loop = WorkerLoop(cfg, client, local)
+    order = {
+        "run_id": "r1", "lease_id": "l1", "task": "10.demo",
+        "queue": "main", "repo": "longitude", "title": "demo",
+    }
+    local.begin(
+        run_id="r1", task="10.demo", queue="main", title="demo",
+        model="anthropic/claude-sonnet-4-6", backend="anthropic", repo="longitude",
+    )
+    outcome = Outcome(
+        status=RunStatus.COMPLETED, result_line="validated", landable=True,
+        model="anthropic/claude-sonnet-4-6", backend="anthropic", turns=5,
+        input_tokens=1500, output_tokens=400,
+        cache_read_input_tokens=200, cache_creation_input_tokens=100,
+        usage={"input_tokens": 1500}, cost_usd=0.09,
+        worktree=str(tmp_path / "wt"),
+    )
+    loop._submit(order, outcome)
+    row = local.history()[0]
+    missing = ANALYTICS_CONSUMED - set(row)
+    assert not missing, f"analytics fields missing from worker record: {missing}"
+
+
 def test_telemetry_slice_matches_the_old_worker_submit_repack() -> None:
     """`outcome.telemetry.model_dump()` reproduces the dict worker_submit used
     to hand-assemble (the re-packing dict that Phase 1 deletes), extended with

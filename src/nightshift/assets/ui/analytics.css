@@ -1,0 +1,192 @@
+/*
+ * Shared analytics UI styles — consumed by both the manager and worker SPAs.
+ * Uses the shared theme variables from style.css (--bg-elev, --border, --text,
+ * --text-dim, --accent, --ok, --err, …) so it tracks the light/dark toggle
+ * automatically. Prefixed `an-` to avoid colliding with either host's classes.
+ */
+
+.an-root {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.an-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.an-toggle-group {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.an-toggle {
+  background: var(--bg-elev);
+  color: var(--text-dim);
+  border: none;
+  padding: 6px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  border-right: 1px solid var(--border);
+}
+
+.an-toggle:last-child { border-right: none; }
+.an-toggle:hover { color: var(--text); }
+.an-toggle-active { background: var(--accent-soft); color: var(--text); font-weight: 600; }
+
+.an-select {
+  background: var(--bg-elev);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+/* KPI cards */
+.an-kpi-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+}
+
+.an-kpi {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+
+.an-kpi-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+}
+
+.an-kpi-value-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.an-kpi-value {
+  font-size: 24px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.05;
+}
+
+.an-kpi-sub { margin-top: 3px; font-size: 11px; color: var(--text-dim); }
+
+.an-delta {
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  padding: 1px 5px;
+  border-radius: 5px;
+  white-space: nowrap;
+}
+
+.an-delta-good { color: var(--ok); background: color-mix(in srgb, var(--ok) 15%, transparent); }
+.an-delta-bad { color: var(--err); background: color-mix(in srgb, var(--err) 15%, transparent); }
+.an-delta-flat { color: var(--text-dim); }
+
+/* Panels */
+.an-panel {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+
+.an-panel-title {
+  margin: 0 0 12px 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.an-subhead {
+  margin: 14px 0 6px 0;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+}
+
+.an-note { font-size: 11px; color: var(--text-dim); margin-bottom: 10px; }
+
+/* Trends */
+.an-trend-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 16px;
+}
+
+.an-trend-cell { display: flex; flex-direction: column; gap: 6px; }
+.an-trend-label { font-size: 11px; color: var(--text-dim); }
+.an-trend-last { font-size: 11px; color: var(--text); font-variant-numeric: tabular-nums; }
+
+.an-chart {
+  width: 100%;
+  height: 90px;
+  display: block;
+}
+
+.an-bar { fill: var(--accent); opacity: 0.85; }
+.an-bar:hover { opacity: 1; }
+
+/* Tables */
+.an-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.an-table th {
+  text-align: right;
+  padding: 6px 8px;
+  color: var(--text-dim);
+  font-weight: 500;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.an-table th:first-child { text-align: left; }
+
+.an-table td {
+  text-align: right;
+  padding: 6px 8px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+  font-variant-numeric: tabular-nums;
+}
+
+.an-table tr:last-child td { border-bottom: none; }
+
+.an-td-key {
+  text-align: left;
+  color: var(--text);
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.an-ok { color: var(--ok); }
+.an-bad { color: var(--err); }
+
+.an-empty {
+  color: var(--text-dim);
+  font-size: 13px;
+  padding: 24px 0;
+  text-align: center;
+}

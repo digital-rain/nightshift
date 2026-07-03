@@ -235,7 +235,12 @@ class NightshiftStore(Protocol):
     async def update_attempt(self, attempt_id: str, **fields: Any) -> None: ...
     async def live_attempts(self) -> list[dict[str, Any]]: ...
     async def list_attempts(
-        self, *, limit: int = 200, queue: str | None = None, worker_id: str | None = None
+        self,
+        *,
+        limit: int = 200,
+        queue: str | None = None,
+        worker_id: str | None = None,
+        since: str | None = None,
     ) -> list[dict[str, Any]]: ...
     async def heartbeat_attempt(self, attempt_id: str, ttl_seconds: float) -> None: ...
 
@@ -519,7 +524,12 @@ class SqlStoreBase:
         return [_attempt_row(r) for r in rows]
 
     async def list_attempts(
-        self, *, limit: int = 200, queue: str | None = None, worker_id: str | None = None
+        self,
+        *,
+        limit: int = 200,
+        queue: str | None = None,
+        worker_id: str | None = None,
+        since: str | None = None,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         values: list[Any] = []
@@ -529,6 +539,11 @@ class SqlStoreBase:
         if worker_id is not None:
             values.append(worker_id)
             clauses.append(f"worker_id = ${len(values)}")
+        if since is not None:
+            # ISO-8601 timestamp lower bound on the run's start; used by the
+            # analytics UI's time windows (24h / 7d / …).
+            values.append(since)
+            clauses.append(f"started_at >= ${len(values)}")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         values.append(limit)
         async with self._connection() as conn:

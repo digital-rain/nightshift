@@ -234,6 +234,20 @@ The operator UI:
 - Calls `/api/*` for mutations (add task, reorder, settings, etc.).
 - Refresh cadence is driven by `manager.cadences.refresh_ms`.
 
+**Shared analytics module.** The Statistics page in both UIs is one shared,
+self-contained module (`assets/ui/analytics.js` + `analytics.css`) — the manager
+serves it at `/` and the worker mounts the same dir at `/shared`, so there is a
+single implementation. It renders the measure-forward tuning views (KPI header
+with prior-window deltas, daily trends, per-model/backend/queue breakdowns, a
+waste panel, and harness run-shape attribution) over normalized run records.
+Each host supplies a tiny `fetchRuns(sinceIso)` adapter: the manager reads
+`/api/analytics/runs` (which exposes an explicit `landed` flag derived from the
+raw attempt state, so cost-per-landed-change can separate a real change from a
+no-change completion — a distinction the frozen `/api/runs` shape collapses);
+the worker reads its local `/api/history`. Per-run `cost_usd` comes from the
+owned price table (`src/nightshift/price.py`) for the harness and Anthropic
+backends; CLI-reported cost (Claude Code) keeps precedence.
+
 Changes to asset files take effect on the next browser reload (no HMR, no build).
 
 ## Testing

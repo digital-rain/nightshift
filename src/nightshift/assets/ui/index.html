@@ -424,6 +424,11 @@
     </div>
 
     <link rel="stylesheet" href="workers-panel.css" />
+    <link rel="stylesheet" href="analytics.css" />
+    <!-- Shared analytics module (also served to the worker UI at /shared).
+         Loaded before app.js so the global `Analytics` exists when the stats
+         page mounts. -->
+    <script src="analytics.js"></script>
     <script src="app.js"></script>
     <!-- Manager-era additions: Workers fleet page + snapshot/delta SSE so all
          browsers converge live (reorder / status / leases / workers). Loaded

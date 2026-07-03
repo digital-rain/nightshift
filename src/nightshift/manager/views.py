@@ -49,6 +49,39 @@ def run_view(attempt: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# The normalized record the shared analytics UI consumes. Distinct from
+# ``run_view`` on purpose: ``run_view`` is a frozen byte-compatible shape that
+# collapses LANDED/NO_CHANGE to ``completed`` and hides ``state``, but the
+# tuning KPI ("cost per landed change") must tell a landed change from a
+# no-change completion — so this projection exposes an explicit ``landed`` flag
+# derived from the raw ``state`` (which the analytics endpoint alone surfaces).
+# The worker UI produces the same shape from its local JSONL client-side; keep
+# the two in sync.
+ANALYTICS_RUN_KEYS = (
+    "id", "task", "queue", "worker_id", "backend", "model", "repo",
+    "status", "landed", "loc", "turns",
+    "input_tokens", "output_tokens",
+    "cache_read_input_tokens", "cache_creation_input_tokens",
+    "cost_usd", "usage", "failure_kind", "started_at", "finished_at",
+)
+
+
+def analytics_run_view(attempt: dict[str, Any]) -> dict[str, Any]:
+    """Project an attempt row to the analytics record shape (see
+    :data:`ANALYTICS_RUN_KEYS`). ``landed`` is true only for the LANDED state —
+    a real change reached ``main`` — not for NO_CHANGE completions."""
+    state = attempt.get("state")
+    out: dict[str, Any] = {}
+    for key in ANALYTICS_RUN_KEYS:
+        if key == "status":
+            out[key] = run_status_of(state) if state is not None else None
+        elif key == "landed":
+            out[key] = state == "landed"
+        else:
+            out[key] = attempt.get(key)
+    return out
+
+
 def lease_view(attempt: dict[str, Any]) -> dict[str, Any]:
     """Project a LIVE attempt row to the previous lease-row dict shape."""
     return {

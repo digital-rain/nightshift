@@ -153,6 +153,8 @@ Quarantine after the second failure stays as-is — the point is that the one re
 
 **Implemented** (see the token-usage-granularity plan): `attempts` now carries `cache_read_input_tokens`/`cache_creation_input_tokens` (the unfolded splits, subsets of `input_tokens`) alongside a raw `usage` jsonb payload (per-backend vendor-shaped detail, including the harness's per-turn breakdown for input attribution). The stats views sum the cache totals; the Stats UI shows a cache-hit-rate figure next to the Tokens card, and a run's detail pane shows the cached split plus a "Token breakdown" expando for harness runs. Track **cost per landed change** (currently $2.24) as the single KPI these recommendations must move; cache hit rate is now measurable as a supporting metric.
 
+**Cost side of the gap — also closed** (measure-forward tuning-metrics plan): the harness and single-shot Anthropic backends previously left `cost_usd=None`, so the KPI was uncomputable for exactly the path we most want to tune. An owned, version-controlled price table (`src/nightshift/price.py`) now derives `cost_usd` from the accumulated `usage` for priced (Anthropic) models — cache reads at 0.1x, cache writes at 1.25x — with CLI-reported cost (Claude Code) keeping precedence and unpriced models (Ollama/Gemini) staying an honest `None`. A shared analytics module (served to both the manager and worker UIs) renders cost-per-landed-change with prior-window deltas, per-model/backend/queue breakdowns, a waste panel, and harness run-shape attribution over `/api/analytics/runs` (manager) and `/api/history` (worker), so tuning changes are judged forward against live telemetry rather than a benchmark.
+
 ---
 
 ## 5. What *not* to prioritize
@@ -168,7 +170,7 @@ Prompt-size trimming. The full `NIGHTSHIFT.md` charter re-read that every task p
 | 1 | R1 turn cap default + token stop-loss | `backends.py`, `config/worker.py`, `engine.build_claude_argv` | S |
 | 2 | R3 sonnet-first `auto` | `config/worker.py` / `config/manager.py` resolution | S |
 | 3 | R5 deterministic repair in worker path | `worker/execute.py` | S |
-| 4 | §4 persist cache splits — **done** | `backends.py`, run record, manager store | S–M |
+| 4 | §4 persist cache splits + owned price table for `cost_usd` + shared analytics UI — **done** | `backends.py`, `price.py`, run record, manager store, `assets/ui/analytics.js` | S–M |
 | 5 | R2 differentiated retries | `manager/app.py` (Phase B dispatch), `failure_policy.py` | M |
 | 6 | R4 prompt rules + tool-result eviction | `assets/prompts/`, `agent/loop.py` | M |
 

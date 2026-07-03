@@ -165,6 +165,11 @@ def test_backend_captures_cache_splits_and_per_turn_usage_payload(
     ]
     assert per_turn[0]["tool_calls"][0]["result_chars"] > 0
     assert per_turn[1]["tool_calls"] == []  # no tools dispatched on the final turn
+    # cost_usd is now computed from the owned price table (sonnet-4-6: 3/M in,
+    # 15/M out; cache read 0.1x, write 1.25x) over the accumulated usage:
+    #   uncached 60*3 + read 5*3*0.1 + write 3*3*1.25 + out 8*15 = 312.75 / 1e6
+    assert res.cost_usd is not None
+    assert abs(res.cost_usd - 312.75 / 1_000_000) < 1e-12
 
 
 def test_backend_transport_error_is_honest_failure(

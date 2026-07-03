@@ -1984,6 +1984,33 @@ def test_api_runs_snapshot_keys_and_status_projection(tmp_path: Path) -> None:
         assert filtered and all(list(r) == RUN_WIRE_KEYS for r in filtered)
 
 
+def test_api_analytics_runs_landed_flag_and_shape(tmp_path: Path) -> None:
+    """The analytics endpoint exposes an explicit `landed` flag (true only for
+    the LANDED state, not NO_CHANGE) so the cost-per-landed-change KPI can
+    separate a real change from a no-change completion — the distinction
+    /api/runs deliberately collapses."""
+    from nightshift.manager.views import ANALYTICS_RUN_KEYS
+
+    root = _seed(tmp_path, {})
+    store = SqliteStore()
+    with _client(root, store) as client:
+        ids = _seed_every_state(store)
+        rows = {r["id"]: r for r in client.get("/api/analytics/runs").json()}
+        assert set(ids.values()) <= set(rows)
+        for rid, row in rows.items():
+            assert list(row) == list(ANALYTICS_RUN_KEYS), rid
+        # Only the LANDED attempt is a landed change.
+        assert rows[ids["landed"]]["landed"] is True
+        assert rows[ids["no_change"]]["landed"] is False
+        assert rows[ids["failed"]]["landed"] is False
+        # status still projects the same coarse view (both completed).
+        assert rows[ids["landed"]]["status"] == "completed"
+        assert rows[ids["no_change"]]["status"] == "completed"
+        # A future `since` bound returns nothing (time-window filter wired).
+        empty = client.get("/api/analytics/runs?since=2999-01-01T00:00:00%2B00:00").json()
+        assert empty == []
+
+
 def test_api_leases_snapshot_live_only_with_lease_keys(tmp_path: Path) -> None:
     root = _seed(tmp_path, {})
     store = SqliteStore()

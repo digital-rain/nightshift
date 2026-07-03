@@ -93,6 +93,11 @@ const state = {
   selectedPlaylists: new Set(),  // multi-selected playlist names (shift-click extends)
 };
 
+// Whether the shared analytics module is currently mounted on the stats page.
+// Reset on explicit navigation to stats (so a queue switch reloads), left set
+// across SSE refreshes (so the module keeps the operator's window/filter).
+var _analyticsMounted = false;
+
 const LIBRARY_QUEUE = "__library__";
 
 // Transport glyphs for the Now box (borderless triangle / pause bars).
@@ -410,7 +415,7 @@ function setView(view) {
   else if (view === "queue") renderQueue();
   else if (view === "playlists") renderPlaylists();
   else if (view === "history") renderHistory();
-  else if (view === "stats") renderStats();
+  else if (view === "stats") { _analyticsMounted = false; renderStats(); }
   else if (view === "repos") { renderRepos(); loadRepos(); }
   else if (view === "detail") renderDetailScreen();
   else if (view === "playlist-info") renderPlaylistInfo();
@@ -2112,13 +2117,45 @@ function taskDurationSecs(task) {
   return null;
 }
 
+// The stats page is now the shared analytics module (analytics.js), fed by
+// /api/analytics/runs. It owns its own view state (time window, dimension
+// filter), so we mount it once and let it manage itself rather than re-rendering
+// on every SSE refresh (which would reset the operator's selections). The
+// legacy client-side computeStats()/ring-chart renderer below is retained as
+// renderStatsLegacy() but unused, in case a lightweight inline fallback is
+// ever wanted. Mount state lives at the top of the file (_analyticsMounted).
 function renderStats() {
   const titleEl = $("stats-title");
   if (titleEl) {
     titleEl.textContent = state.activePlaylist
-      ? `Statistics \u00b7 ${state.activePlaylist}`
-      : "Statistics \u00b7 main queue";
+      ? `Analytics \u00b7 ${state.activePlaylist}`
+      : "Analytics \u00b7 main queue";
   }
+  const body = $("stats-body");
+  if (!body) return;
+  const empty = $("stats-empty");
+  if (empty) empty.hidden = true;
+
+  if (typeof Analytics === "undefined" || !Analytics.render) {
+    body.textContent = "Analytics module unavailable.";
+    return;
+  }
+  if (_analyticsMounted && body.firstChild) return; // already mounted; leave it
+
+  _analyticsMounted = true;
+  Analytics.render(body, {
+    title: "Analytics",
+    fetchRuns: async (sinceIso) => {
+      const params = new URLSearchParams();
+      if (sinceIso) params.set("since", sinceIso);
+      if (state.activePlaylist) params.set("queue", state.activePlaylist);
+      const qs = params.toString();
+      return getJSON("/api/analytics/runs" + (qs ? "?" + qs : ""));
+    },
+  });
+}
+
+function renderStatsLegacy() {
   const body = $("stats-body");
   if (!body) return;
   body.innerHTML = "";

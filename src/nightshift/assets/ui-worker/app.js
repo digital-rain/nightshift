@@ -7,6 +7,10 @@
 const FALLBACK_REFRESH_MS = 3000;
 let refreshMs = FALLBACK_REFRESH_MS;
 let timer = null;
+// Whether the shared analytics module is mounted on the stats page. Reset on
+// explicit navigation to stats; kept across ticks so it retains the operator's
+// window/filter selections.
+let _analyticsMounted = false;
 
 async function getJSON(path) {
   const resp = await fetch(path, { headers: { Accept: "application/json" } });
@@ -32,7 +36,7 @@ function setView(view) {
   document.getElementById("view-stats").hidden = view !== "stats";
   document.getElementById("view-settings").hidden = view !== "settings";
   if (view === "detail") renderHistoryDetail();
-  if (view === "stats") renderStats();
+  if (view === "stats") { _analyticsMounted = false; renderStats(); }
 }
 
 async function loadInfo() {
@@ -494,7 +498,34 @@ function computeStats() {
   };
 }
 
+// The stats page is now the shared analytics module (served from /shared/
+// analytics.js by the worker's static mount), fed by /api/history. It owns its
+// own view state (window, dimension filter), so mount it once and let it manage
+// itself rather than re-rendering on every tick. The legacy client-side
+// renderer is retained as renderStatsLegacy() but unused. Mount state lives at
+// the top of the file (_analyticsMounted).
 function renderStats() {
+  const body = document.getElementById("stats-body");
+  if (!body) return;
+  const empty = document.getElementById("stats-empty");
+  if (empty) empty.hidden = true;
+
+  if (typeof Analytics === "undefined" || !Analytics.render) {
+    body.textContent = "Analytics module unavailable.";
+    return;
+  }
+  if (_analyticsMounted && body.firstChild) return;
+
+  _analyticsMounted = true;
+  Analytics.render(body, {
+    title: "Analytics",
+    // The worker's /api/history has no `since` param; fetch a generous window
+    // and let the shared module window client-side by started_at.
+    fetchRuns: async () => getJSON("/api/history?limit=5000"),
+  });
+}
+
+function renderStatsLegacy() {
   const body = document.getElementById("stats-body");
   if (!body) return;
   body.innerHTML = "";

@@ -118,6 +118,11 @@
       </section>
     </main>
 
+    <link rel="stylesheet" href="/shared/analytics.css" />
+    <!-- Shared analytics module (reused from the manager UI dir via /shared).
+         Loaded before app.js so the global `Analytics` exists when the stats
+         page mounts. -->
+    <script src="/shared/analytics.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

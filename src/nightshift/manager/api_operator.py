@@ -33,7 +33,7 @@ from nightshift.manager.config import ManagerConfig
 from nightshift.manager.registry import Registry
 from nightshift.manager.scheduler import queue_label
 from nightshift.manager.store import NightshiftStore
-from nightshift.manager.views import lease_view, run_view
+from nightshift.manager.views import analytics_run_view, lease_view, run_view
 from nightshift.manager.wire import (
     EmitFn,
     StartResolveFn,
@@ -721,12 +721,28 @@ def register_operator_api(
     )
 
     @app.get("/api/runs")
-    async def get_runs(queue: str | None = None, limit: int = 200) -> JSONResponse:
+    async def get_runs(
+        queue: str | None = None, limit: int = 200, since: str | None = None
+    ) -> JSONResponse:
         target = _queue_from_label(queue) if queue is not None else None
         runs = await _store().list_attempts(
-            limit=limit, queue=target if queue is not None else None
+            limit=limit, queue=target if queue is not None else None, since=since
         )
         return JSONResponse([jsonable(run_view(r)) for r in runs])
+
+    @app.get("/api/analytics/runs")
+    async def get_analytics_runs(
+        since: str | None = None, limit: int = 2000, queue: str | None = None
+    ) -> JSONResponse:
+        """Normalized run records for the shared analytics UI. Unlike
+        ``/api/runs`` (a frozen shape), this exposes an explicit ``landed`` flag
+        so the KPI can separate landed changes from no-change completions. A
+        higher default ``limit`` lets a 30-day window aggregate client-side."""
+        target = _queue_from_label(queue) if queue is not None else None
+        runs = await _store().list_attempts(
+            limit=limit, queue=target if queue is not None else None, since=since
+        )
+        return JSONResponse([jsonable(analytics_run_view(r)) for r in runs])
 
     @app.get("/api/runs/{run_id}/events")
     async def get_run_events(run_id: str) -> JSONResponse:

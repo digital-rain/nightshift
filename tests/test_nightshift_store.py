@@ -534,6 +534,34 @@ def test_invariant_4_every_terminal_attempt_has_finished_at() -> None:
     _run(scenario())
 
 
+def test_list_attempts_since_filter() -> None:
+    """The analytics time-window filter: `since` restricts to attempts whose
+    started_at is at or after the given ISO timestamp. A past bound returns
+    everything, a future bound returns nothing."""
+    async def scenario() -> None:
+        store = SqliteStore()
+        for n in range(3):
+            await store.create_attempt(
+                f"r{n}", task=f"t{n}", queue=None, worker_id="w1",
+                backend="b", model="m", base_ref=None, ttl_seconds=60,
+            )
+        all_rows = await store.list_attempts()
+        assert len(all_rows) == 3
+        # A bound far in the past keeps everything.
+        past = await store.list_attempts(since="2000-01-01T00:00:00+00:00")
+        assert len(past) == 3
+        # A bound far in the future excludes everything.
+        future = await store.list_attempts(since="2999-01-01T00:00:00+00:00")
+        assert future == []
+        # Combines with the existing worker_id filter.
+        scoped = await store.list_attempts(
+            worker_id="w1", since="2000-01-01T00:00:00+00:00"
+        )
+        assert len(scoped) == 3
+
+    _run(scenario())
+
+
 def test_operator_stop_transition_aborts_a_live_attempt() -> None:
     """Phase 8 behavior fix: stop/skip applies on_operator_stop (ABORTED with
     finished_at) instead of cancelling a lease around a zombie row."""
