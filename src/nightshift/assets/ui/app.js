@@ -2047,19 +2047,30 @@ function computeStats() {
   // Token and cost aggregation across all terminal tasks (including failures).
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
+  let totalCacheReadTokens = 0;
   let totalCost = 0;
   let hasUsage = false;
   const byModel = {};
+  // Turns are averaged only over tasks that report them, so backends that
+  // report no telemetry (e.g. an older CLI build) don't dilute the average.
+  let turnsSum = 0;
+  let turnsCount = 0;
   for (const t of terminal) {
     const inTok = typeof t.input_tokens === "number" ? t.input_tokens : 0;
     const outTok = typeof t.output_tokens === "number" ? t.output_tokens : 0;
+    const cacheRead = typeof t.cache_read_input_tokens === "number" ? t.cache_read_input_tokens : 0;
     const cost = typeof t.cost_usd === "number" ? t.cost_usd : 0;
     if (t.input_tokens !== undefined || t.output_tokens !== undefined || t.cost_usd !== undefined) {
       hasUsage = true;
     }
     totalInputTokens += inTok;
     totalOutputTokens += outTok;
+    totalCacheReadTokens += cacheRead;
     totalCost += cost;
+    if (typeof t.turns === "number") {
+      turnsSum += t.turns;
+      turnsCount++;
+    }
     const model = t.model || "unknown";
     if (!byModel[model]) byModel[model] = { input: 0, output: 0, cost: 0, runs: 0 };
     byModel[model].input += inTok;
@@ -2079,7 +2090,9 @@ function computeStats() {
     loc,
     totalInputTokens,
     totalOutputTokens,
+    totalCacheReadTokens,
     totalCost,
+    avgTurns: turnsCount ? turnsSum / turnsCount : null,
     byModel: hasUsage ? Object.entries(byModel).sort((a, b) => b[1].cost - a[1].cost) : null,
   };
 }
@@ -2124,10 +2137,17 @@ function renderStats() {
     statCard("Commits", String(s.commits), "landed on main"),
     statCard("Lines of code", formatCount(s.loc), "code churned (ex. comments, build, docs)"),
   );
+  if (s.avgTurns !== null) {
+    cards.append(statCard("Avg turns", s.avgTurns.toFixed(1), "per task"));
+  }
   if (s.byModel) {
     const totalTok = s.totalInputTokens + s.totalOutputTokens;
+    const cacheRate = s.totalInputTokens > 0 ? s.totalCacheReadTokens / s.totalInputTokens : 0;
+    const tokensSub = s.totalCacheReadTokens > 0
+      ? `${compactTokens(s.totalInputTokens)} in (${(cacheRate * 100).toFixed(0)}% cached) · ${compactTokens(s.totalOutputTokens)} out`
+      : `${compactTokens(s.totalInputTokens)} in · ${compactTokens(s.totalOutputTokens)} out`;
     cards.append(
-      statCard("Tokens", compactTokens(totalTok), `${compactTokens(s.totalInputTokens)} in · ${compactTokens(s.totalOutputTokens)} out`),
+      statCard("Tokens", compactTokens(totalTok), tokensSub),
       statCard("Cost", `$${s.totalCost.toFixed(2)}`, "USD across all runs"),
     );
   }
@@ -3645,11 +3665,15 @@ function runDetailPairs(run, rec) {
   pairs.push(["Launched by", run.launched_by || "—"]);
   // Token usage and cost — only shown when the run carries this data.
   if (rec.model) pairs.push(["Model", rec.model]);
+  if (typeof rec.turns === "number") pairs.push(["Turns", String(rec.turns)]);
   const inTok = typeof rec.input_tokens === "number" ? rec.input_tokens : null;
   const outTok = typeof rec.output_tokens === "number" ? rec.output_tokens : null;
+  const cacheRead = typeof rec.cache_read_input_tokens === "number" ? rec.cache_read_input_tokens : null;
   if (inTok !== null || outTok !== null) {
-    const tok = [inTok !== null ? `${compactTokens(inTok)} in` : null,
-                 outTok !== null ? `${compactTokens(outTok)} out` : null]
+    const inPart = inTok !== null
+      ? `${compactTokens(inTok)} in${cacheRead ? ` (${compactTokens(cacheRead)} cached)` : ""}`
+      : null;
+    const tok = [inPart, outTok !== null ? `${compactTokens(outTok)} out` : null]
       .filter(Boolean).join(" · ");
     pairs.push(["Tokens", tok]);
   }
@@ -3657,6 +3681,98 @@ function runDetailPairs(run, rec) {
     pairs.push(["Cost", `$${rec.cost_usd.toFixed(4)}`]);
   }
   return pairs;
+}
+
+// ----- token breakdown (harness runs only) --------------------------------
+// Attributes input-token growth to specific tool calls with zero extra API
+// calls: no vendor splits input composition, but the harness owns the
+// transcript, so turn N's input minus turn (N-1)'s output is (approximately)
+// the tokens turn (N-1)'s tool results added — split proportionally by
+// result_chars when a turn ran more than one tool. Turn 1's own input is the
+// static prompt/setup baseline (charter + tool defs + brief).
+function computeTokenBreakdown(perTurn) {
+  if (!Array.isArray(perTurn) || perTurn.length === 0) return null;
+  const foldedInput = (u) => {
+    if (!u) return null;
+    const inp = u.input_tokens;
+    if (typeof inp !== "number") return null;
+    return inp + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
+  };
+  const setup = foldedInput(perTurn[0].usage);
+  if (setup === null) return null;
+  // added: tokens newly attributed to this turn's context growth.
+  // survives: how many later turns re-sent it (added is billed `survives` times).
+  const byTool = new Map(); // name -> { added, cumulative }
+  let selfFeed = 0;
+  let selfFeedCumulative = 0;
+  const totalTurns = perTurn.length;
+  for (let i = 1; i < perTurn.length; i++) {
+    const prev = perTurn[i - 1];
+    const curInput = foldedInput(perTurn[i].usage);
+    const prevOutput = prev.usage && typeof prev.usage.output_tokens === "number"
+      ? prev.usage.output_tokens : 0;
+    if (curInput === null) continue;
+    const prevInput = foldedInput(prev.usage) || 0;
+    const delta = Math.max(0, curInput - prevInput);
+    const survives = totalTurns - i; // this turn's addition re-sent on every later turn
+    const toolChars = (prev.tool_calls || []).reduce((s, t) => s + (t.result_chars || 0), 0);
+    const toolShare = Math.max(0, delta - prevOutput);
+    selfFeed += Math.min(delta, prevOutput);
+    selfFeedCumulative += Math.min(delta, prevOutput) * survives;
+    if (toolChars > 0 && toolShare > 0) {
+      for (const call of prev.tool_calls) {
+        const share = toolShare * (call.result_chars / toolChars);
+        const entry = byTool.get(call.name) || { added: 0, cumulative: 0 };
+        entry.added += share;
+        entry.cumulative += share * survives;
+        byTool.set(call.name, entry);
+      }
+    }
+  }
+  const tools = Array.from(byTool.entries())
+    .map(([name, v]) => ({ name, added: Math.round(v.added), cumulative: Math.round(v.cumulative) }))
+    .sort((a, b) => b.cumulative - a.cumulative);
+  return {
+    setup: Math.round(setup),
+    setupCumulative: setup * totalTurns,
+    selfFeed: Math.round(selfFeed),
+    selfFeedCumulative: Math.round(selfFeedCumulative),
+    tools,
+  };
+}
+
+// The "Token breakdown" expando: attribution of input tokens to prompt/setup,
+// per-tool context growth, and assistant self-feed — harness runs only
+// (rec.usage.per_turn is populated by NightshiftAgentBackend alone).
+function tokenBreakdownPanel(rec) {
+  const usage = rec.usage;
+  if (!usage || !Array.isArray(usage.per_turn)) return null;
+  const breakdown = computeTokenBreakdown(usage.per_turn);
+  if (!breakdown) return null;
+
+  const rows = [
+    { label: "Prompt & setup", added: breakdown.setup, cumulative: breakdown.setupCumulative },
+    ...breakdown.tools.map((t) => ({ label: t.name, added: t.added, cumulative: t.cumulative })),
+  ];
+  if (breakdown.selfFeed > 0) {
+    rows.push({ label: "Assistant self-feed", added: breakdown.selfFeed, cumulative: breakdown.selfFeedCumulative });
+  }
+
+  const panel = expando("Token breakdown", { open: false });
+  const note = document.createElement("p");
+  note.className = "token-breakdown-note";
+  note.textContent = "Attribution derived from per-turn deltas (no vendor breakdown exists) \u2014 "
+    + "\u201cadded\u201d is tokens appended to context; \u201ccumulative\u201d is how much that "
+    + "addition cost across every later turn it was re-sent in.";
+  panel.body.append(note);
+
+  const pairs = rows
+    .sort((a, b) => b.cumulative - a.cumulative)
+    .map((row) => [row.label, `${compactTokens(row.added)} added \u00b7 ${compactTokens(row.cumulative)} cumulative`]);
+  const grid = metaGrid(pairs);
+  grid.classList.add("token-breakdown-grid");
+  panel.body.append(grid);
+  return panel.panel;
 }
 
 // A read-only <pre> that lazy-loads a run's captured log (live tail when the
@@ -3860,6 +3976,8 @@ function taskDetailContent(brief, draft, opts = {}) {
     const rd = expando("Run details", { open: false });
     rd.body.append(metaGrid(runDetailPairs(run, rec)));
     frag.append(rd.panel);
+    const tb = tokenBreakdownPanel(rec);
+    if (tb) frag.append(tb);
   }
   if (isNow || rec) {
     const runId = isNow ? (state.player.run_id || state.currentRunId) : (run && run.id);
@@ -4186,6 +4304,8 @@ function renderHistoryDetail() {
   const rd = expando("Run details", { open: true });
   rd.body.append(metaGrid(runDetailPairs(run, rec)));
   body.append(rd.panel);
+  const tb = tokenBreakdownPanel(rec);
+  if (tb) body.append(tb);
 
   // LOG — the run's captured output (history-only).
   const lg = expando("Log", { open: false });

@@ -140,6 +140,31 @@ def test_gemini_argv_and_stats_parse() -> None:
     assert stats["input_tokens"] == 1200   # prompt + cached
     assert stats["output_tokens"] == 300   # candidates
     assert stats["cost_usd"] is None       # Gemini CLI reports no dollar cost
+    # Gemini's "cached" figure is a cache *read* only — no write concept.
+    assert stats["cache_read_input_tokens"] == 200
+    assert stats["cache_creation_input_tokens"] is None
+    # The raw stats.models subtree rides along (keeps thoughts/tool detail).
+    assert stats["usage"] == {"gemini-2.5-pro": {
+        "api": {"totalRequests": 4},
+        "tokens": {"prompt": 1000, "cached": 200, "candidates": 300},
+    }}
+
+
+def test_gemini_stats_parse_with_no_models_reports_no_cache_activity() -> None:
+    stats = backends_mod.parse_gemini_stats({"response": "done"})
+    assert stats["turns"] is None
+    assert stats["cache_read_input_tokens"] is None
+    assert stats["usage"] is None
+
+
+def test_usage_cache_tokens_distinguishes_unreported_from_zero() -> None:
+    # Missing fields entirely -> None, None (vendor doesn't report cache activity).
+    assert backends_mod._usage_cache_tokens(None) == (None, None)
+    assert backends_mod._usage_cache_tokens({"input_tokens": 10}) == (None, None)
+    # Explicit 0 is a real, reported zero.
+    assert backends_mod._usage_cache_tokens({
+        "cache_read_input_tokens": 0, "cache_creation_input_tokens": 5,
+    }) == (0, 5)
 
 
 def test_cursor_argv_overrides() -> None:

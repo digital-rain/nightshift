@@ -391,6 +391,45 @@ def test_execute_dispatches_by_model_provider(tmp_path: Path, monkeypatch) -> No
     assert outcome.model == "ollama-cloud/gpt-oss:120b"
 
 
+def test_execute_passes_through_cache_splits_and_usage_payload(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The tele dict execute_work_order builds carries the WorkerResult's
+    cache-split + raw usage fields through to the Outcome (token-usage-
+    granularity plan, wire plumbing)."""
+    workspace = build_workspace(tmp_path, tasks={"00.demo": "Do a thing."})
+    usage_payload = {"input_tokens": 1000, "cache_read_input_tokens": 300}
+
+    class _FakeBackend:
+        name = "nightshift"
+        agentic = True
+
+        def available(self, config=None) -> bool:
+            return True
+
+        def run(self, spec, emit_log, should_abort, on_worker_start=None):
+            return WorkerResult(
+                returncode=0, turns=2, input_tokens=1000, output_tokens=50,
+                cache_read_input_tokens=300, cache_creation_input_tokens=0,
+                usage=usage_payload,
+            )
+
+    monkeypatch.setattr(backends_mod, "require_backend", lambda p: _FakeBackend())
+    cfg = WorkerConfig(
+        workspace=workspace, worker_id="w", manager_url="http://x",
+        models=["nightshift/anthropic/claude-sonnet-4-6"],
+    )
+    order = {
+        "task": "00.demo", "repo": "longitude", "queue": "main",
+        "body": "Do a thing.", "base_ref": "HEAD",
+        "config": {"model": "nightshift/anthropic/claude-sonnet-4-6", "validate": ""},
+    }
+    outcome = execute_work_order(cfg, order, on_phase=lambda _p: None, on_log=lambda _l: None)
+    assert outcome.cache_read_input_tokens == 300
+    assert outcome.cache_creation_input_tokens == 0
+    assert outcome.usage == usage_payload
+
+
 # --------------------------------------------------------------------------- #
 # Worker-local two-failure backoff
 # --------------------------------------------------------------------------- #

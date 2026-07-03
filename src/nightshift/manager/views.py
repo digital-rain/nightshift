@@ -24,9 +24,10 @@ from nightshift.lifecycle import run_status_of
 RUN_VIEW_KEYS = (
     "id", "task", "queue", "worker_id", "backend", "model", "repo",
     "required_mcps", "status", "phase", "result_line", "commit_sha", "loc",
-    "remote", "pushed", "turns", "input_tokens", "output_tokens", "cost_usd",
-    "failure_kind", "failure_reason", "validate_cmd", "worktree", "title",
-    "body", "started_at", "finished_at",
+    "remote", "pushed", "turns", "input_tokens", "output_tokens",
+    "cache_read_input_tokens", "cache_creation_input_tokens", "usage",
+    "cost_usd", "failure_kind", "failure_reason", "validate_cmd", "worktree",
+    "title", "body", "started_at", "finished_at",
 )
 
 # The exact pre-Phase-8 lease-row key set and order (the retired store's acquire_lease

@@ -164,6 +164,9 @@ CREATE TABLE nightshift.attempts (
     turns          integer,
     input_tokens   integer,
     output_tokens  integer,
+    cache_read_input_tokens     integer,
+    cache_creation_input_tokens integer,
+    usage          text,
     cost_usd       real,
     failure_kind   text,
     failure_reason text,
@@ -250,6 +253,8 @@ SELECT
     coalesce(sum(input_tokens), 0)                    AS total_input_tokens,
     coalesce(sum(output_tokens), 0)                   AS total_output_tokens,
     coalesce(sum(coalesce(input_tokens, 0) + coalesce(output_tokens, 0)), 0) AS total_tokens,
+    coalesce(sum(cache_read_input_tokens), 0)         AS total_cache_read_tokens,
+    coalesce(sum(cache_creation_input_tokens), 0)     AS total_cache_creation_tokens,
     coalesce(sum(cost_usd), 0)                        AS total_cost_usd
 FROM attempts;
 
@@ -270,6 +275,8 @@ SELECT
     coalesce(sum(input_tokens), 0)                    AS total_input_tokens,
     coalesce(sum(output_tokens), 0)                   AS total_output_tokens,
     coalesce(sum(coalesce(input_tokens, 0) + coalesce(output_tokens, 0)), 0) AS total_tokens,
+    coalesce(sum(cache_read_input_tokens), 0)         AS total_cache_read_tokens,
+    coalesce(sum(cache_creation_input_tokens), 0)     AS total_cache_creation_tokens,
     coalesce(sum(cost_usd), 0)                        AS total_cost_usd,
     max(started_at)                                   AS last_run_at
 FROM attempts
@@ -293,6 +300,8 @@ SELECT
     coalesce(sum(input_tokens), 0)                    AS total_input_tokens,
     coalesce(sum(output_tokens), 0)                   AS total_output_tokens,
     coalesce(sum(coalesce(input_tokens, 0) + coalesce(output_tokens, 0)), 0) AS total_tokens,
+    coalesce(sum(cache_read_input_tokens), 0)         AS total_cache_read_tokens,
+    coalesce(sum(cache_creation_input_tokens), 0)     AS total_cache_creation_tokens,
     coalesce(sum(cost_usd), 0)                        AS total_cost_usd
 FROM attempts
 WHERE backend IS NOT NULL
@@ -315,6 +324,8 @@ SELECT
     coalesce(sum(input_tokens), 0)                    AS total_input_tokens,
     coalesce(sum(output_tokens), 0)                   AS total_output_tokens,
     coalesce(sum(coalesce(input_tokens, 0) + coalesce(output_tokens, 0)), 0) AS total_tokens,
+    coalesce(sum(cache_read_input_tokens), 0)         AS total_cache_read_tokens,
+    coalesce(sum(cache_creation_input_tokens), 0)     AS total_cache_creation_tokens,
     coalesce(sum(cost_usd), 0)                        AS total_cost_usd
 FROM attempts
 WHERE model IS NOT NULL
@@ -337,6 +348,8 @@ SELECT
     coalesce(sum(input_tokens), 0)                    AS total_input_tokens,
     coalesce(sum(output_tokens), 0)                   AS total_output_tokens,
     coalesce(sum(coalesce(input_tokens, 0) + coalesce(output_tokens, 0)), 0) AS total_tokens,
+    coalesce(sum(cache_read_input_tokens), 0)         AS total_cache_read_tokens,
+    coalesce(sum(cache_creation_input_tokens), 0)     AS total_cache_creation_tokens,
     coalesce(sum(cost_usd), 0)                        AS total_cost_usd
 FROM attempts
 GROUP BY queue;

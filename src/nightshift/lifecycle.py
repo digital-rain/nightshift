@@ -229,11 +229,22 @@ class Telemetry(BaseModel):
     """Best-effort agent telemetry captured from the backend run (``None``
     when the backend can't report it), plus the validate command the worker
     actually ran and the worktree it used. Recorded on every outcome — a
-    failed/no-change run still burned turns and tokens."""
+    failed/no-change run still burned turns and tokens.
+
+    ``cache_read_input_tokens``/``cache_creation_input_tokens`` are the
+    Anthropic-shaped cache split of ``input_tokens`` (subsets of it, not
+    additional tokens — invariant: their sum is <= ``input_tokens``); backends
+    that don't report cache activity leave them ``None``. ``usage`` is the raw
+    vendor-shaped usage payload (per-turn detail, per-model splits, thinking/
+    tool tokens, …) kept for post-processing beyond the normalized columns.
+    """
 
     turns: int | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    usage: dict[str, Any] | None = None
     cost_usd: float | None = None
     validate_cmd: str | None = None
     worktree: str | None = None

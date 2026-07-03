@@ -759,6 +759,9 @@ def register_worker_api(
             "turns": body.turns,
             "input_tokens": body.input_tokens,
             "output_tokens": body.output_tokens,
+            "cache_read_input_tokens": body.cache_read_input_tokens,
+            "cache_creation_input_tokens": body.cache_creation_input_tokens,
+            "usage": body.usage,
             "cost_usd": body.cost_usd,
         }
         landed = bool(body.landed and body.status == RunStatus.COMPLETED)

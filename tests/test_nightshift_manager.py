@@ -1889,13 +1889,16 @@ def test_open_store_no_dsn_is_sqlite(monkeypatch) -> None:
 
 
 # The exact pre-Phase-8 run-row wire keys (order included: JSON objects keep
-# insertion order and the previous rows were column-ordered).
+# insertion order and the previous rows were column-ordered), extended with
+# the token-usage-granularity fields (cache splits + raw usage payload) added
+# alongside input_tokens/output_tokens — see manager/views.py RUN_VIEW_KEYS.
 RUN_WIRE_KEYS = [
     "id", "task", "queue", "worker_id", "backend", "model", "repo",
     "required_mcps", "status", "phase", "result_line", "commit_sha", "loc",
-    "remote", "pushed", "turns", "input_tokens", "output_tokens", "cost_usd",
-    "failure_kind", "failure_reason", "validate_cmd", "worktree", "title",
-    "body", "started_at", "finished_at",
+    "remote", "pushed", "turns", "input_tokens", "output_tokens",
+    "cache_read_input_tokens", "cache_creation_input_tokens", "usage",
+    "cost_usd", "failure_kind", "failure_reason", "validate_cmd", "worktree",
+    "title", "body", "started_at", "finished_at",
 ]
 
 # The exact pre-Phase-8 lease-row wire keys.

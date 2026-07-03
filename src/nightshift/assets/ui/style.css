@@ -809,6 +809,8 @@ body {
 .detail-meta { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; }
 .meta-k { color: var(--text-dim); }
 .meta-v { color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-word; }
+.token-breakdown-note { color: var(--text-dim); font-size: 12px; line-height: 1.4; margin: 0 0 10px; }
+.token-breakdown-grid { margin-top: 4px; }
 .detail-result { padding: 8px 10px; background: var(--bg-sunken); border-radius: 8px; }
 .detail-result .fail-badge { margin-left: 8px; vertical-align: middle; }
 .detail-error {

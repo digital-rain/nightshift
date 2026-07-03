@@ -112,7 +112,7 @@ Implications for the new `nightshift` provider:
 - It registers in `_BACKENDS` like the others; **no engine/execute change is required** for the core harness. `known_providers()` / `require_backend()` pick it up automatically.
 - It sets **`agentic = True`** and actually writes files in `spec.cwd`, so the engine's no-commit guard lets the squash land a commit (unlike today's API backends, which finish as "no changes").
 - The loop is bounded by **`spec.max_turns`** (frontmatter `turns`, unlimited by default) and **`spec.timeout`** (the per-worker wall-clock cap), not a hardcoded count.
-- Telemetry flows back through `WorkerResult` (`turns`, `input_tokens`, `output_tokens`, `cost_usd`), folding Anthropic `cache_creation`/`cache_read` tokens into input via the existing `_usage_tokens` helper — so the manager's rollups and the token-budget assertions (§10) work unchanged.
+- Telemetry flows back through `WorkerResult` (`turns`, `input_tokens`, `output_tokens`, `cost_usd`), folding Anthropic `cache_creation`/`cache_read` tokens into input via the existing `_usage_tokens` helper — so the manager's rollups and the token-budget assertions (§10) work unchanged. The unfolded cache splits also land separately on `cache_read_input_tokens`/`cache_creation_input_tokens`, and the loop's per-turn usage (incl. dispatched tool names/result sizes, `LoopResult.per_turn_usage`) rides along in `usage` — see the token-usage-granularity plan and §4 of `2026-07-03-token-usage-analysis.md`.
 - **Migration off Cursor is a config edit:** a worker drops `cursor/<model>` from its advertised `models` and adds `nightshift/<vendor>/<model>`; `auto_model`/`max_model` repoint. No scheduler or manager change.
 
 ---
@@ -187,7 +187,7 @@ These map cleanly onto the Anthropic request body; for `ollama-cloud`/`ollama` t
 ### 5.5 Abort, telemetry, failure
 
 Poll `should_abort()` between turns and inside `run_bash`; enforce `spec.timeout` as a wall-clock deadline.
-Report `turns` (loop iterations), summed `input_tokens`/`output_tokens`, and `cost_usd` (or `None`, rolled up by the manager).
+Report `turns` (loop iterations), summed `input_tokens`/`output_tokens`, the unfolded `cache_read_input_tokens`/`cache_creation_input_tokens`, and `cost_usd` (or `None`, rolled up by the manager). `usage` carries the accumulated Anthropic-shaped blob plus `per_turn` (one record per turn: raw usage + dispatched tool names/result sizes) for input-attribution post-processing (see the token-usage-granularity plan).
 On an unrecoverable API error, return `WorkerResult(returncode!=0, error=...)` so the engine records an honest failure with no partial commit.
 
 ---

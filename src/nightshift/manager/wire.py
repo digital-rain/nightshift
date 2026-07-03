@@ -102,6 +102,9 @@ class ResolveResultBody(BaseModel):
     turns: int | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    usage: dict[str, Any] | None = None
     cost_usd: float | None = None
 
 

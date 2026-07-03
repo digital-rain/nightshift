@@ -217,6 +217,41 @@ def test_agent_stream_parser_passes_through_non_json() -> None:
     assert parser.turns is None and parser.input_tokens is None
 
 
+def test_agent_stream_parser_captures_cache_splits_and_model_usage() -> None:
+    """Cache splits fold into input_tokens (existing behavior) and also land
+    separately on cache_read/cache_creation; the raw usage blob plus Claude
+    Code's modelUsage ride along in usage_payload for the run's usage jsonb."""
+    parser = AgentStreamParser()
+    lines = [
+        '{"type":"result","subtype":"success","num_turns":9,'
+        '"usage":{"input_tokens":1000,"cache_read_input_tokens":200,'
+        '"cache_creation_input_tokens":50,"output_tokens":300},'
+        '"modelUsage":{"claude-opus-4-8":{"inputTokens":1000,"outputTokens":300}},'
+        '"total_cost_usd":0.1234}',
+    ]
+    for line in lines:
+        parser.feed(line)
+    assert parser.cache_read_input_tokens == 200
+    assert parser.cache_creation_input_tokens == 50
+    assert parser.usage_payload["input_tokens"] == 1000
+    assert parser.usage_payload["cache_read_input_tokens"] == 200
+    assert "claude-opus-4-8" in parser.usage_payload["modelUsage"]
+
+
+def test_agent_stream_parser_apply_sets_cache_fields_and_usage_on_result() -> None:
+    from nightshift.backends import WorkerResult
+
+    parser = AgentStreamParser()
+    parser.feed(
+        '{"type":"result","num_turns":2,'
+        '"usage":{"input_tokens":500,"cache_read_input_tokens":100,"output_tokens":50}}'
+    )
+    result = parser.apply(WorkerResult(returncode=0))
+    assert result.cache_read_input_tokens == 100
+    assert result.cache_creation_input_tokens is None  # not reported
+    assert result.usage["input_tokens"] == 500
+
+
 # --------------------------------------------------------------------------- #
 # result_line extraction + worker env (relocated from test_nightshift_ui.py)
 # --------------------------------------------------------------------------- #

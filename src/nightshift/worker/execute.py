@@ -291,6 +291,9 @@ def execute_work_order(
             "turns": result.turns,
             "input_tokens": result.input_tokens,
             "output_tokens": result.output_tokens,
+            "cache_read_input_tokens": result.cache_read_input_tokens,
+            "cache_creation_input_tokens": result.cache_creation_input_tokens,
+            "usage": result.usage,
             "cost_usd": result.cost_usd,
         }
 

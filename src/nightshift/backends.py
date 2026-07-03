@@ -90,6 +90,14 @@ class WorkerResult:
     leave them ``None``. They flow through the run record so the manager can roll
     them up per worker / model / backend / queue. Single-shot API backends report
     ``turns=1``; the agent CLIs report their own turn count.
+
+    ``cache_read_input_tokens``/``cache_creation_input_tokens`` are the subset
+    of ``input_tokens`` served from / written to the vendor's prompt cache
+    (Anthropic-shaped; ``None`` when the backend doesn't report cache activity
+    at all — Ollama, or an Anthropic call with no cache breakpoints). ``usage``
+    is the raw vendor-shaped usage payload (per-turn detail for the harness,
+    per-model splits for Claude Code, thinking/tool tokens for Gemini, …),
+    kept for detail beyond what the normalized columns hold.
     """
 
     returncode: int
@@ -98,6 +106,9 @@ class WorkerResult:
     turns: int | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    usage: dict[str, Any] | None = None
     cost_usd: float | None = None
 
 
@@ -119,6 +130,20 @@ def _usage_tokens(usage: dict[str, Any] | None) -> tuple[int | None, int | None]
     return inp, out
 
 
+def _usage_cache_tokens(usage: dict[str, Any] | None) -> tuple[int | None, int | None]:
+    """Pull (cache_read, cache_creation) token counts from an Anthropic-shaped
+    ``usage`` blob. ``None`` (not 0) when the backend didn't report the field
+    at all, so a real zero (cache enabled but missed) stays distinguishable
+    from "this vendor doesn't report cache activity"."""
+    if not isinstance(usage, dict):
+        return None, None
+    read = usage.get("cache_read_input_tokens")
+    creation = usage.get("cache_creation_input_tokens")
+    read = int(read) if read is not None else None
+    creation = int(creation) if creation is not None else None
+    return read, creation
+
+
 class AgentStreamParser:
     """Defensive parser for an agent CLI's ``stream-json`` output.
 
@@ -129,13 +154,20 @@ class AgentStreamParser:
     ``--output-format`` flag still streams readable output — it just yields no
     telemetry. Schema differences between Claude Code and cursor-agent are
     tolerated: usage/turns/cost are read wherever they appear.
+
+    The raw ``usage`` blob (cache splits, and whatever else the CLI includes
+    alongside it, e.g. Claude Code's per-model ``modelUsage``) is kept
+    verbatim in ``usage_payload`` for detail beyond the normalized fields.
     """
 
     def __init__(self) -> None:
         self.turns: int | None = None
         self.input_tokens: int | None = None
         self.output_tokens: int | None = None
+        self.cache_read_input_tokens: int | None = None
+        self.cache_creation_input_tokens: int | None = None
         self.cost_usd: float | None = None
+        self.usage_payload: dict[str, Any] | None = None
 
     def _capture(self, ev: dict[str, Any]) -> None:
         if "num_turns" in ev and ev["num_turns"] is not None:
@@ -151,6 +183,16 @@ class AgentStreamParser:
             self.input_tokens = inp
         if out is not None:
             self.output_tokens = out
+        read, creation = _usage_cache_tokens(usage)
+        if read is not None:
+            self.cache_read_input_tokens = read
+        if creation is not None:
+            self.cache_creation_input_tokens = creation
+        if isinstance(usage, dict):
+            self.usage_payload = usage
+        model_usage = ev.get("modelUsage")
+        if isinstance(model_usage, dict):
+            self.usage_payload = {**(self.usage_payload or {}), "modelUsage": model_usage}
 
     def feed(self, line: str) -> str:
         text = line.strip()
@@ -172,6 +214,9 @@ class AgentStreamParser:
         result.turns = self.turns
         result.input_tokens = self.input_tokens
         result.output_tokens = self.output_tokens
+        result.cache_read_input_tokens = self.cache_read_input_tokens
+        result.cache_creation_input_tokens = self.cache_creation_input_tokens
+        result.usage = self.usage_payload
         result.cost_usd = self.cost_usd
         return result
 
@@ -364,24 +409,34 @@ def parse_gemini_stats(data: dict[str, Any]) -> dict[str, Any]:
 
     The ``stats.models[*]`` map carries per-model ``api`` (request counts) and
     ``tokens`` (prompt/candidates/cached/…). Turns ≈ total model API requests;
-    input folds prompt + cached, output uses candidate (response) tokens. Gemini
-    reports no dollar cost, so ``cost_usd`` stays ``None``.
+    input folds prompt + cached, output uses candidate (response) tokens.
+    Gemini's ``cached`` figure is a cache *read* count (there's no cache-write
+    concept in its API, so ``cache_creation_input_tokens`` stays ``None``).
+    Gemini reports no dollar cost, so ``cost_usd`` stays ``None``. The raw
+    ``stats.models`` subtree rides along in ``usage`` — it also carries
+    ``thoughts``/``tool`` token counts the normalized fields don't hold.
     """
     models = (data.get("stats") or {}).get("models") or {}
     turns = 0
     inp = 0
     out = 0
+    cache_read = 0
     for m in models.values():
         if not isinstance(m, dict):
             continue
         turns += int((m.get("api") or {}).get("totalRequests", 0) or 0)
         tok = m.get("tokens") or {}
-        inp += int(tok.get("prompt", 0) or 0) + int(tok.get("cached", 0) or 0)
+        cached = int(tok.get("cached", 0) or 0)
+        inp += int(tok.get("prompt", 0) or 0) + cached
         out += int(tok.get("candidates", tok.get("response", 0)) or 0)
+        cache_read += cached
     return {
         "turns": turns or None,
         "input_tokens": inp or None,
         "output_tokens": out or None,
+        "cache_read_input_tokens": cache_read if models else None,
+        "cache_creation_input_tokens": None,
+        "usage": models or None,
         "cost_usd": None,
     }
 
@@ -570,8 +625,7 @@ class AnthropicBackend:
             "stream": True,
             "messages": [{"role": "user", "content": spec.prompt}],
         }
-        input_tokens: int | None = None
-        output_tokens: int | None = None
+        usage: dict[str, Any] = {}
         try:
             with httpx.stream(
                 "POST",
@@ -605,20 +659,24 @@ class AnthropicBackend:
                         if text:
                             emit_log(text)
                     elif etype == "message_start":
-                        usage = event.get("message", {}).get("usage", {})
-                        if usage.get("input_tokens") is not None:
-                            input_tokens = int(usage["input_tokens"])
+                        # Carries the cache splits (cache_control isn't set on
+                        # this single-shot call, so they're typically 0, but
+                        # are folded/reported like any other Anthropic usage).
+                        usage.update(event.get("message", {}).get("usage", {}) or {})
                     elif etype == "message_delta":
-                        usage = event.get("usage", {})
-                        if usage.get("output_tokens") is not None:
-                            output_tokens = int(usage["output_tokens"])
+                        usage.update(event.get("usage", {}) or {})
         except httpx.HTTPError as exc:
             return WorkerResult(returncode=1, error=f"anthropic request failed: {exc}")
         emit_log("\n")
+        input_tokens, output_tokens = _usage_tokens(usage)
+        cache_read, cache_creation = _usage_cache_tokens(usage)
         # Single-shot completion: one "turn"; cost left to the rollup (token-only).
         return WorkerResult(
             returncode=0, turns=1,
             input_tokens=input_tokens, output_tokens=output_tokens,
+            cache_read_input_tokens=cache_read,
+            cache_creation_input_tokens=cache_creation,
+            usage=usage or None,
         )
 
 
@@ -645,6 +703,7 @@ def _ollama_generate(
     body = {"model": model, "prompt": prompt, "stream": True}
     input_tokens: int | None = None
     output_tokens: int | None = None
+    usage: dict[str, Any] = {}
     try:
         with httpx.stream(
             "POST", f"{host}/api/generate", json=body, headers=headers,
@@ -675,18 +734,23 @@ def _ollama_generate(
                 if event.get("done"):
                     if event.get("prompt_eval_count") is not None:
                         input_tokens = int(event["prompt_eval_count"])
+                        usage["prompt_eval_count"] = input_tokens
                     if event.get("eval_count") is not None:
                         output_tokens = int(event["eval_count"])
+                        usage["eval_count"] = output_tokens
                     break
     except httpx.HTTPError as exc:
         return WorkerResult(
             returncode=1, error=f"{label} request failed: {exc}{error_hint}"
         )
     emit_log("\n")
-    # Token counts but no dollar cost; single-shot → one turn.
+    # Token counts but no dollar cost; single-shot → one turn. Ollama reports
+    # no cache split at all (not even a KV-cached-prefix concept in the API),
+    # so cache_read/cache_creation stay None rather than a misleading 0.
     return WorkerResult(
         returncode=0, turns=1,
         input_tokens=input_tokens, output_tokens=output_tokens,
+        usage=usage or None,
     )
 
 
@@ -852,12 +916,19 @@ class NightshiftAgentBackend:
         if loop.error is not None:
             return WorkerResult(returncode=1, error=loop.error, turns=loop.turns)
         input_tokens, output_tokens = _usage_tokens(loop.usage)
+        cache_read, cache_creation = _usage_cache_tokens(loop.usage)
+        usage_payload = dict(loop.usage)
+        if loop.per_turn_usage:
+            usage_payload["per_turn"] = loop.per_turn_usage
         return WorkerResult(
             returncode=0,
             aborted=loop.aborted,
             turns=loop.turns,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cache_read_input_tokens=cache_read,
+            cache_creation_input_tokens=cache_creation,
+            usage=usage_payload or None,
             cost_usd=None,
         )
 

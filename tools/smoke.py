@@ -3,14 +3,20 @@
 Run via ``just smoke``. Builds an isolated temp workspace (its own clone of
 this repo as the target, its own ``nightshift-tasks`` content store, its own
 ``.nightshift`` config), then launches ``python -m nightshift.manager`` and a
-worker subprocess and drives two tasks through their full lifecycle over the
-operator API:
+worker subprocess and drives the operator API through:
 
-* a good task — dispatched, paused mid-run, stopped (lease cancelled, the
-  worker's late submit is fenced with a 409), started again, validated, and
-  squash-landed onto the clone's main;
-* a bad task — errors, is marked failed, is retried by the phase-B policy,
-  fails again, and ends quarantined with the queue paused (``retry_failed``).
+* playlist rescan — materialise a queue per workspace repo, hide it, rescan
+  again (the hidden queue must stay hidden), unhide it;
+* the main queue — a good task dispatched, paused mid-run, stopped (the
+  attempt is aborted and the worker's late submit is fenced), started again,
+  validated, and squash-landed onto the clone's main; a bad task that errors,
+  is retried by the phase-B policy, fails again, and ends quarantined with
+  the queue paused (``retry_failed``);
+* the rescanned playlist queue — select it as the focused queue, create a
+  simple task and run it to completion; edit/save a task (title + body);
+  run/pause/stop it; disable/enable it while paused and mid-run;
+* quarantine release — clear the bad task's quarantine, fix its brief via an
+  edit, press play, and watch it land.
 
 The only substituted seam is the agent backend: the worker subprocess (this
 same script with ``--role worker``) registers a deterministic ``smoke``
@@ -30,6 +36,7 @@ Full walkthrough: docs/topics/smoke-test.md.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import shutil
 import socket
@@ -215,6 +222,14 @@ def build_workspace(workspace: Path, port: int) -> None:
         "preflight": "",
         "order": [],
     }, indent=2) + "\n")
+    # Workspace-level content-store config: queues materialised later by the
+    # playlist rescan carry only repo+order in their own config, so they
+    # inherit this layer's cheap validate/preflight instead of the engine
+    # defaults (`just validate` / `uv sync --frozen`).
+    (tasks / "config.json").write_text(json.dumps({
+        "validate": f"test -f {ARTIFACT}",
+        "preflight": "",
+    }, indent=2) + "\n")
     (tasks / ".gitignore").write_text("*/runs/\n*/logs/\n")
     _git(tasks, "init", "--quiet")
     _git(tasks, "symbolic-ref", "HEAD", "refs/heads/main")
@@ -291,8 +306,19 @@ class Api:
         resp.raise_for_status()
         return resp.json()
 
+    def put(self, path: str, body: dict[str, Any]) -> Any:
+        resp = self.http.put(path, json=body)
+        resp.raise_for_status()
+        return resp.json()
+
     def transport(self, action: str) -> Any:
+        """Drive the focused queue's transport (mirrors the UI controls)."""
         return self.post("/api/transport", {"action": action})
+
+    def focus(self, playlist: str | None) -> None:
+        """Select a queue as the UI focus (``None`` = main); subsequent
+        queue-less task/queue/transport calls target it, like the UI."""
+        self.post("/api/active", {"playlist": playlist})
 
     def state(self) -> dict[str, Any]:
         return self.get("/api/state")
@@ -300,8 +326,20 @@ class Api:
     def leases(self) -> list[dict[str, Any]]:
         return self.get("/api/leases")
 
+    def leases_for(self, label: str) -> list[dict[str, Any]]:
+        """Active leases on one queue (rows store main as '' — normalize)."""
+        return [le for le in self.leases() if (le.get("queue") or "main") == label]
+
     def runs_for(self, task: str) -> list[dict[str, Any]]:
         return [r for r in self.get("/api/runs") if r.get("task") == task]
+
+    def landed_run(self, task: str) -> dict[str, Any] | None:
+        """The task's completed-and-landed run, if any."""
+        return next(
+            (r for r in self.runs_for(task)
+             if r["status"] == "completed" and r.get("commit_sha")),
+            None,
+        )
 
 
 def _spawn(argv: list[str], log_path: Path, cwd: Path) -> subprocess.Popen:
@@ -309,21 +347,55 @@ def _spawn(argv: list[str], log_path: Path, cwd: Path) -> subprocess.Popen:
     return subprocess.Popen(argv, cwd=cwd, stdout=log, stderr=subprocess.STDOUT)
 
 
-def _step(n: int, text: str) -> None:
-    print(f"[smoke] {n:>2}. {text}", flush=True)
+_STEPS = itertools.count(1)
 
 
-def run_scenario(api: Api, workspace: Path) -> None:
-    clone = workspace / TARGET_REPO
+def _step(text: str) -> None:
+    print(f"[smoke] {next(_STEPS):>2}. {text}", flush=True)
 
-    _step(2, "manager is up; workspace repos visible")
-    repos = api.get("/api/repos")
-    check(
-        any(r["name"] == TARGET_REPO and r["available"] for r in repos["repos"]),
-        f"clone missing from /api/repos: {repos}",
-    )
 
-    _step(3, "create good + bad tasks via the operator API")
+# ----- scenario phases ------------------------------------------------------ #
+
+
+def phase_rescan_and_hide(api: Api) -> None:
+    """Playlists page: rescan materialises a queue per workspace repo; hiding
+    one parks it, and a second rescan must not resurrect it."""
+    _step("rescan: a playlist appears for each workspace repo")
+    result = api.post("/api/playlists/rescan")
+    check(TARGET_REPO in result["created"],
+          f"rescan did not create '{TARGET_REPO}': {result}")
+    names = {pl["name"] for pl in result["playlists"]}
+    check(names == {TARGET_REPO},
+          f"expected only '{TARGET_REPO}' (content store skipped), got {names}")
+    info = api.get(f"/api/playlists/{TARGET_REPO}")
+    check(info["repository"] == TARGET_REPO and not info["disabled"],
+          f"bad playlist binding after rescan: {info}")
+
+    _step("hide the repo's playlist; rescan again must not resurrect it")
+    api.put(f"/api/playlists/{TARGET_REPO}", {"disabled": True})
+    listed = {pl["name"]: pl for pl in api.get("/api/playlists")}
+    check(listed[TARGET_REPO]["disabled"] is True, f"hide did not stick: {listed}")
+    # Hidden = parked: dropped from the scheduler's queue set and /api/repos.
+    queues = {q["queue"] for q in api.get("/api/repos")["queues"]}
+    check(TARGET_REPO not in queues, f"hidden playlist still scheduled: {queues}")
+    result = api.post("/api/playlists/rescan")
+    check(TARGET_REPO in result["configured"] and TARGET_REPO not in result["created"],
+          f"rescan should reconfigure, not recreate: {result}")
+    listed = {pl["name"]: pl for pl in api.get("/api/playlists")}
+    check(listed[TARGET_REPO]["disabled"] is True,
+          f"rescan resurrected the hidden playlist: {listed}")
+    # Unhide for the playlist phases below.
+    api.put(f"/api/playlists/{TARGET_REPO}", {"disabled": False})
+    queues = {q["queue"]: q for q in api.get("/api/repos")["queues"]}
+    check(TARGET_REPO in queues and queues[TARGET_REPO]["available"],
+          f"unhidden playlist missing from /api/repos: {queues}")
+
+
+def phase_main_lifecycle(api: Api, clone: Path) -> str:
+    """Main queue: create a good and a bad task, drive play/pause/stop/start,
+    land the good one, quarantine the bad one. Returns the bad task's id
+    (released and landed in the final phase)."""
+    _step("create good + bad tasks via the operator API")
     good = api.post("/api/tasks", {
         "title": "Smoke slow good",
         "text": f"Deterministic smoke task.\n\nSMOKE: sleep={SLOW_SLEEP:g} commit\n",
@@ -337,7 +409,7 @@ def run_scenario(api: Api, workspace: Path) -> None:
     queue = [row["task"] for row in api.get("/api/queue")]
     check(queue == [good, bad], f"unexpected queue order: {queue}")
 
-    _step(4, "pause the queue, then start the worker: nothing may dispatch")
+    _step("pause the queue, then start the worker: nothing may dispatch")
     state = api.transport("pause")
     check(state["state"] == "paused" and state["pause_reason"] == "operator",
           f"expected operator pause, got {state}")
@@ -349,7 +421,7 @@ def run_scenario(api: Api, workspace: Path) -> None:
     check(api.leases() == [], "a lease was granted while the queue was paused")
     check(api.state()["state"] == "paused", "queue lost its pause")
 
-    _step(5, f"play: '{good}' starts running")
+    _step(f"play: '{good}' starts running")
     api.transport("play")
     wait_for(
         f"'{good}' to start",
@@ -359,31 +431,22 @@ def run_scenario(api: Api, workspace: Path) -> None:
     first_run_id = api.state()["run_id"]
     check(bool(first_run_id), "playing state carries no run_id")
 
-    _step(6, "pause mid-run: state pauses, the in-flight lease survives")
+    _step("pause mid-run: state pauses, the in-flight lease survives")
     state = api.transport("pause")
     check(state["state"] == "paused" and state["pause_reason"] == "operator",
           f"expected operator pause, got {state}")
     check(len(api.leases()) == 1, "pause should not cancel the in-flight lease")
 
-    _step(7, "stop: lease cancelled; the worker's late submit must be fenced")
+    _step("stop: lease cancelled; the worker's late submit must be fenced")
     api.transport("stop")
     wait_for("lease cancellation", lambda: api.leases() == [], timeout=5.0)
     api.transport("pause")  # hold the queue while the doomed run drains
     time.sleep(SLOW_SLEEP + 1.5)  # backend finishes sleeping, submits, gets 409
 
-    _step(8, f"start again: '{good}' re-runs, validates, and lands")
+    _step(f"start again: '{good}' re-runs, validates, and lands")
     api.transport("play")
-    wait_for(
-        f"'{good}' to land",
-        lambda: any(
-            r["status"] == "completed" and r.get("commit_sha")
-            for r in api.runs_for(good)
-        ),
-    )
-    landed = next(
-        r for r in api.runs_for(good)
-        if r["status"] == "completed" and r.get("commit_sha")
-    )
+    wait_for(f"'{good}' to land", lambda: api.landed_run(good) is not None)
+    landed = api.landed_run(good)
     check(landed["id"] != first_run_id,
           "the stopped run landed — the stale-submit fence did not hold")
     first_run = next(r for r in api.runs_for(good) if r["id"] == first_run_id)
@@ -396,7 +459,7 @@ def run_scenario(api: Api, workspace: Path) -> None:
     resp = api.http.get(f"/api/tasks/{good}")
     check(resp.status_code == 404, "landed brief should be dropped from the queue")
 
-    _step(9, f"error path: '{bad}' fails, retries, and ends quarantined")
+    _step(f"error path: '{bad}' fails, retries, and ends quarantined")
     wait_for(
         f"'{bad}' to be quarantined after retry",
         lambda: api.get(f"/api/tasks/{bad}")["quarantined"],
@@ -411,6 +474,148 @@ def run_scenario(api: Api, workspace: Path) -> None:
     blocked = api.get("/api/blocked")
     check(any(b.get("task") == bad and b.get("state") == "quarantined" for b in blocked),
           f"'{bad}' missing from /api/blocked: {blocked}")
+    return bad
+
+
+def phase_playlist_create_and_run(api: Api, clone: Path) -> None:
+    """Select the rescanned queue, add a simple task, press run, and watch it
+    complete. The task carries no explicit model — it must inherit the
+    manager's ``default_model`` through the config layers."""
+    _step(f"select the '{TARGET_REPO}' queue; create a simple task; run it")
+    api.focus(TARGET_REPO)
+    api.transport("pause")  # hold dispatch between 'create' and 'run'
+    simple = api.post("/api/tasks", {
+        "title": "Smoke playlist simple",
+        "text": "Simple task on the rescanned queue.\n\nSMOKE: commit\n",
+    })["task"]
+    listed = [row["task"] for row in api.get("/api/queue")]
+    check(listed == [simple], f"unexpected playlist queue: {listed}")
+    api.transport("play")
+    wait_for(f"'{simple}' to land", lambda: api.landed_run(simple) is not None)
+    subject = _git(clone, "log", "-1", "--format=%s")
+    check(subject == "task: Smoke playlist simple",
+          f"unexpected squash commit on clone main: {subject!r}")
+    resp = api.http.get(f"/api/tasks/{simple}")
+    check(resp.status_code == 404, "landed brief should be dropped from the queue")
+
+
+def phase_edit_task(api: Api) -> str:
+    """Edit/save: patch a task's title and body from the detail pane and read
+    both back. Returns the edited task's id (its slug must not change)."""
+    _step("edit/save: patch title + body; the file reflects both, id is stable")
+    api.transport("pause")
+    task = api.post("/api/tasks", {
+        "title": "Smoke before edit",
+        "text": "Placeholder spec.\n\nSMOKE: fail\n",
+    })["task"]
+    api.patch(f"/api/tasks/{task}", {
+        "title": "Smoke lifecycle",
+        "body": f"Edited spec.\n\nSMOKE: sleep={SLOW_SLEEP:g} commit",
+    })
+    brief = api.get(f"/api/tasks/{task}")  # same id — edits never rename
+    check(brief["title"] == "Smoke lifecycle",
+          f"title edit not persisted: {brief['title']!r}")
+    check("SMOKE: sleep=" in brief["body"] and "SMOKE: fail" not in brief["body"],
+          f"body edit not persisted: {brief['body']!r}")
+    return task
+
+
+def phase_playlist_run_pause_stop(api: Api, task: str) -> None:
+    """Run/pause/stop the edited task on the playlist queue (the same
+    transport contract the main queue proved, now against a named queue)."""
+    _step(f"playlist transport: run/pause/stop '{task}'")
+    api.transport("play")
+    wait_for(
+        f"'{task}' to start",
+        lambda: api.state()["state"] == "playing"
+        and api.state()["now_playing"] == task,
+    )
+    state = api.transport("pause")
+    check(state["state"] == "paused", f"expected paused, got {state}")
+    check(len(api.leases_for(TARGET_REPO)) == 1,
+          "pause should not cancel the in-flight playlist lease")
+    api.transport("stop")
+    wait_for("playlist lease cancellation",
+             lambda: api.leases_for(TARGET_REPO) == [], timeout=5.0)
+    api.transport("pause")  # hold the queue while the doomed run drains
+    time.sleep(SLOW_SLEEP + 1.5)
+    check(api.landed_run(task) is None,
+          "the stopped playlist run landed — the fence did not hold")
+    check(api.http.get(f"/api/tasks/{task}").status_code == 200,
+          "stopped task's brief should stay in the queue")
+
+
+def phase_disable_enable(api: Api, clone: Path, task: str) -> None:
+    """Disable/enable the task while the queue is paused and mid-run: a
+    disabled task never dispatches (even on a playing queue); disabling an
+    in-flight run never kills it — it drains and lands."""
+    _step("disable while paused: play dispatches nothing until re-enabled")
+    api.patch(f"/api/tasks/{task}", {"disabled": True})
+    row = next(r for r in api.get("/api/queue") if r["task"] == task)
+    check(row["disabled"], f"disabled flag not reflected in queue row: {row}")
+    api.transport("play")
+    time.sleep(2.0)  # several poll cycles at poll_seconds=0.5
+    check(api.leases_for(TARGET_REPO) == [],
+          "a disabled task was dispatched on a playing queue")
+
+    _step("enable on the live queue: the task starts; disable mid-run drains")
+    api.patch(f"/api/tasks/{task}", {"disabled": False})
+    wait_for(
+        f"'{task}' to start after enable",
+        lambda: api.state()["now_playing"] == task,
+    )
+    api.patch(f"/api/tasks/{task}", {"disabled": True})  # mid-run toggle
+    check(len(api.leases_for(TARGET_REPO)) == 1,
+          "disabling mid-run must not cancel the in-flight lease")
+    wait_for(f"'{task}' to land", lambda: api.landed_run(task) is not None)
+    subject = _git(clone, "log", "-1", "--format=%s")
+    check(subject == "task: Smoke lifecycle",
+          f"unexpected squash commit on clone main: {subject!r}")
+    check(api.http.get(f"/api/tasks/{task}").status_code == 404,
+          "landed brief should be dropped even when disabled mid-run")
+
+
+def phase_clear_quarantine(api: Api, clone: Path, bad: str) -> None:
+    """Release the quarantined task the way the detail pane does, fix its
+    brief via an edit, press play, and watch the once-bad task land."""
+    _step(f"clear quarantine: '{bad}' is released, fixed via edit, and lands")
+    api.focus(None)  # back to the main queue
+    api.patch(f"/api/tasks/{bad}", {"quarantined": False, "failed": False})
+    brief = api.get(f"/api/tasks/{bad}")
+    check(not brief["quarantined"] and not brief["failed"],
+          f"quarantine release not persisted: {brief}")
+    blocked = api.get("/api/blocked")
+    check(not any(b.get("task") == bad for b in blocked),
+          f"released task still in /api/blocked: {blocked}")
+    # The queue stays paused (retry_failed) until the operator presses play —
+    # which leaves room to fix the brief before it re-dispatches.
+    check(api.state()["state"] == "paused", "release should not unpause the queue")
+    api.patch(f"/api/tasks/{bad}", {"body": "Fixed spec.\n\nSMOKE: commit"})
+    api.transport("play")
+    wait_for(f"'{bad}' to land after release", lambda: api.landed_run(bad) is not None)
+    subject = _git(clone, "log", "-1", "--format=%s")
+    check(subject == "task: Smoke always fails",
+          f"unexpected squash commit on clone main: {subject!r}")
+    check(api.get("/api/queue") == [], "main queue should end empty")
+
+
+def run_scenario(api: Api, workspace: Path) -> None:
+    clone = workspace / TARGET_REPO
+
+    _step("manager is up; workspace repos visible")
+    repos = api.get("/api/repos")
+    check(
+        any(r["name"] == TARGET_REPO and r["available"] for r in repos["repos"]),
+        f"clone missing from /api/repos: {repos}",
+    )
+
+    phase_rescan_and_hide(api)
+    bad = phase_main_lifecycle(api, clone)
+    phase_playlist_create_and_run(api, clone)
+    task = phase_edit_task(api)
+    phase_playlist_run_pause_stop(api, task)
+    phase_disable_enable(api, clone, task)
+    phase_clear_quarantine(api, clone, bad)
 
 
 def orchestrate(keep: bool) -> int:
@@ -426,7 +631,7 @@ def orchestrate(keep: bool) -> int:
         build_workspace(workspace, port)
         logs = workspace / "logs"
 
-        _step(1, f"launch manager (:{port}) and wait for readiness")
+        _step(f"launch manager (:{port}) and wait for readiness")
         manager = _spawn(
             [sys.executable, "-m", "nightshift.manager",
              "--workspace", str(workspace), "--host", "127.0.0.1", "--port", str(port)],

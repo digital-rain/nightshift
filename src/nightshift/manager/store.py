@@ -59,12 +59,22 @@ def _attempt_set_sql(
 ) -> tuple[str, list[Any]]:
     """Assemble the attempt-row SET clause for validated ``fields`` (values
     fill ``$start..``), with the one-shot ``finished_at``/``released_at``
-    stamps when ``new_state`` is terminal (invariant 4)."""
+    stamps when ``new_state`` is terminal (invariant 4).
+
+    A dict-valued field (currently just ``usage``, the raw vendor telemetry
+    payload) is JSON-encoded with an explicit ``::jsonb`` cast — the SQLite
+    dialect seam strips casts, so this runs verbatim on both stores, same as
+    ``required_mcps`` in ``create_attempt``.
+    """
     sets: list[str] = []
     values: list[Any] = []
     for i, (key, value) in enumerate(fields.items(), start=start):
-        sets.append(f"{key} = ${i}")
-        values.append(value)
+        if isinstance(value, dict):
+            sets.append(f"{key} = ${i}::jsonb")
+            values.append(json.dumps(value))
+        else:
+            sets.append(f"{key} = ${i}")
+            values.append(value)
     if new_state in ATTEMPT_TERMINAL_STATES:
         sets.append("finished_at = COALESCE(finished_at, now())")
         sets.append("released_at = COALESCE(released_at, now())")
@@ -909,6 +919,8 @@ def _attempt_row(row: Any) -> dict[str, Any]:
     d = dict(row)
     if "required_mcps" in d:
         d["required_mcps"] = _jsonish(d.get("required_mcps")) or []
+    if "usage" in d:
+        d["usage"] = _jsonish(d.get("usage"))
     return d
 
 

@@ -118,6 +118,55 @@ def test_backend_applies_edit_via_loop(
     assert (res.input_tokens, res.output_tokens) == (25, 8)
 
 
+def test_backend_captures_cache_splits_and_per_turn_usage_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cache splits fold into the normalized WorkerResult fields; the raw
+    per-turn usage (incl. tool_calls for input attribution) rides along in
+    ``usage`` — token-usage-granularity plan, harness capture."""
+    (tmp_path / "code.txt").write_text("old line\n", encoding="utf-8")
+    edits = "<<<<<<< SEARCH\nold line\n=======\nnew line\n>>>>>>> REPLACE\n"
+    calls = iter(
+        [
+            Completion(
+                "editing",
+                [ToolCall("c1", "edit_file", {"path": "code.txt", "edits": edits})],
+                {
+                    "input_tokens": 20, "output_tokens": 6,
+                    "cache_read_input_tokens": 5, "cache_creation_input_tokens": 3,
+                },
+                "tool_use",
+            ),
+            Completion("done", [], {"input_tokens": 40, "output_tokens": 2}, "end_turn"),
+        ]
+    )
+
+    def fake_complete(messages, tools, knobs, **kw):
+        return next(calls)
+
+    monkeypatch.setattr(transport, "complete", fake_complete)
+    backend = backends_mod.NightshiftAgentBackend()
+    res = backend.run(
+        _spec(tmp_path, "anthropic/claude-sonnet-4-6"),
+        lambda _s: None,
+        lambda: None,
+    )
+    assert res.returncode == 0
+    assert (res.input_tokens, res.output_tokens) == (68, 8)  # 20+3+5 + 40
+    assert res.cache_read_input_tokens == 5
+    assert res.cache_creation_input_tokens == 3
+    assert res.usage is not None
+    per_turn = res.usage["per_turn"]
+    assert len(per_turn) == 2
+    assert per_turn[0]["turn"] == 1
+    assert per_turn[0]["usage"]["cache_read_input_tokens"] == 5
+    assert per_turn[0]["tool_calls"] == [
+        {"name": "edit_file", "result_chars": per_turn[0]["tool_calls"][0]["result_chars"]}
+    ]
+    assert per_turn[0]["tool_calls"][0]["result_chars"] > 0
+    assert per_turn[1]["tool_calls"] == []  # no tools dispatched on the final turn
+
+
 def test_backend_transport_error_is_honest_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

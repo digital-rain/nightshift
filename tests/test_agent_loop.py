@@ -71,6 +71,60 @@ def test_loop_dispatches_tool_then_finishes(tmp_path: Path) -> None:
     assert "[read_file] ok" in joined
 
 
+def test_per_turn_usage_records_usage_and_tool_calls(tmp_path: Path) -> None:
+    """LoopResult.per_turn_usage carries one record per turn (raw usage +
+    dispatched tool names/result sizes) — the raw material the run-detail UI's
+    token-breakdown attribution is computed from."""
+    calls = iter(
+        [
+            Completion(
+                "let me read",
+                [ToolCall("t1", "read_file", {"path": "f.txt"})],
+                {"input_tokens": 10, "output_tokens": 3},
+                "tool_use",
+            ),
+            Completion("done reading", [], {"input_tokens": 25, "output_tokens": 2}, "end_turn"),
+        ]
+    )
+
+    def fake(messages, tools, knobs, **kw):
+        return next(calls)
+
+    res = run_loop(
+        transport_complete=fake,
+        registry=_registry(tmp_path),
+        charter="CHARTER",
+        brief="read f.txt",
+        model="anthropic/claude-opus-4-8",
+    )
+    assert len(res.per_turn_usage) == 2
+    t1, t2 = res.per_turn_usage
+    assert t1["turn"] == 1
+    assert t1["usage"] == {"input_tokens": 10, "output_tokens": 3}
+    assert len(t1["tool_calls"]) == 1
+    assert t1["tool_calls"][0]["name"] == "read_file"
+    assert t1["tool_calls"][0]["result_chars"] > 0  # measures the rendered block
+    assert t2["turn"] == 2
+    assert t2["usage"] == {"input_tokens": 25, "output_tokens": 2}
+    assert t2["tool_calls"] == []  # no tools dispatched on the final turn
+
+
+def test_per_turn_usage_empty_when_transport_errors_before_any_turn(
+    tmp_path: Path,
+) -> None:
+    def boom(messages, tools, knobs, **kw):
+        raise TransportError("boom")
+
+    res = run_loop(
+        transport_complete=boom,
+        registry=_registry(tmp_path),
+        charter="C",
+        brief="b",
+        model="anthropic/x",
+    )
+    assert res.per_turn_usage == []
+
+
 def test_max_turns_honoured(tmp_path: Path) -> None:
     def always_tool(messages, tools, knobs, **kw):
         return Completion("", [ToolCall("t", "read_file", {"path": "f.txt"})], {}, "tool_use")

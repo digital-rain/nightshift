@@ -62,13 +62,16 @@ from nightshift.worker.loop import WorkerLoop
 
 
 # The submit payload keys as posted by WorkerLoop._submit BEFORE the Outcome
-# unification (Phase 0 wire format). Ground rule: byte-identical wire.
+# unification (Phase 0 wire format), plus the token-usage-granularity fields
+# (cache splits + raw usage payload) added alongside turns/input/output/cost.
+# Ground rule: byte-identical wire, modulo additive telemetry fields.
 PREVIOUS_SUBMIT_PAYLOAD_KEYS = frozenset({
     "worker_id", "lease_id", "task", "queue", "repo", "title",
     "status", "result_line", "backend", "model", "landable",
     "branch_ref", "head_sha", "failure_kind", "failure_reason",
-    "turns", "input_tokens", "output_tokens", "cost_usd",
-    "validate_cmd", "worktree", "quarantine",
+    "turns", "input_tokens", "output_tokens",
+    "cache_read_input_tokens", "cache_creation_input_tokens", "usage",
+    "cost_usd", "validate_cmd", "worktree", "quarantine",
 })
 
 # The envelope the loop adds around the Outcome (lease/task identity + the
@@ -80,13 +83,17 @@ ENVELOPE_KEYS = frozenset({
 # The local-store finish record keys as written to the worker's runs.jsonl
 # BEFORE the Outcome unification: run identity + the outcome fields the local
 # Now/History UI shows + the manager's land result, plus the started_at /
-# finished_at stamps LocalStore.finish adds itself. Ground rule: the on-disk
-# format stays byte-identical.
+# finished_at stamps LocalStore.finish adds itself, plus the token-usage-
+# granularity fields (not in _LOCAL_HISTORY_EXCLUDE, so they ride along like
+# turns/input_tokens/output_tokens/cost_usd). Ground rule: the on-disk format
+# stays byte-identical, modulo additive telemetry fields.
 PREVIOUS_LOCAL_FINISH_KEYS = frozenset({
     "run_id", "task", "queue", "title", "repo",
     "model", "backend", "status", "failure_kind", "result_line",
     "commit_sha", "landed", "quarantined",
-    "turns", "input_tokens", "output_tokens", "cost_usd", "worktree",
+    "turns", "input_tokens", "output_tokens",
+    "cache_read_input_tokens", "cache_creation_input_tokens", "usage",
+    "cost_usd", "worktree",
     "started_at", "finished_at",
 })
 
@@ -181,19 +188,24 @@ def test_local_finish_record_matches_previous_on_disk_keys(tmp_path: Path) -> No
 
 def test_telemetry_slice_matches_the_old_worker_submit_repack() -> None:
     """`outcome.telemetry.model_dump()` reproduces the dict worker_submit used
-    to hand-assemble (the re-packing dict that Phase 1 deletes)."""
+    to hand-assemble (the re-packing dict that Phase 1 deletes), extended with
+    the token-usage-granularity fields (cache splits + raw usage payload)."""
     outcome = Outcome(
         status=RunStatus.COMPLETED, turns=8, input_tokens=1500,
-        output_tokens=400, cost_usd=0.09, validate_cmd="just validate",
-        worktree="/w/t",
+        output_tokens=400, cache_read_input_tokens=200,
+        cache_creation_input_tokens=100, usage={"input_tokens": 1500},
+        cost_usd=0.09, validate_cmd="just validate", worktree="/w/t",
     )
     assert outcome.telemetry.model_dump() == {
         "turns": 8, "input_tokens": 1500, "output_tokens": 400,
+        "cache_read_input_tokens": 200, "cache_creation_input_tokens": 100,
+        "usage": {"input_tokens": 1500},
         "cost_usd": 0.09, "validate_cmd": "just validate", "worktree": "/w/t",
     }
     assert set(Telemetry.model_fields) == {
-        "turns", "input_tokens", "output_tokens", "cost_usd",
-        "validate_cmd", "worktree",
+        "turns", "input_tokens", "output_tokens",
+        "cache_read_input_tokens", "cache_creation_input_tokens", "usage",
+        "cost_usd", "validate_cmd", "worktree",
     }
 
 

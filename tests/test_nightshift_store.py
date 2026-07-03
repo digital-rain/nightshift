@@ -38,6 +38,9 @@ RETRY_COUNTERS_MIGRATION = (
     MIGRATIONS_DIR / "20260731000002_nightshift_retry_counters.sql"
 )
 ATTEMPTS_MIGRATION = MIGRATIONS_DIR / "20260731000004_nightshift_attempts.sql"
+USAGE_DETAIL_MIGRATION = (
+    MIGRATIONS_DIR / "20260731000005_nightshift_usage_detail.sql"
+)
 
 
 def _run(coro):
@@ -238,6 +241,7 @@ def test_turns_and_tokens_roll_up_per_model_backend_queue() -> None:
     _run(store.update_attempt(
         "r1", state=AttemptState.LANDED, loc=10,
         turns=7, input_tokens=1000, output_tokens=200, cost_usd=0.05,
+        cache_read_input_tokens=600, cache_creation_input_tokens=50,
     ))
     _run(_attempt(store, "r2", task="t2", backend="claude-code",
                   model="claude-opus-4-8"))
@@ -258,18 +262,55 @@ def test_turns_and_tokens_roll_up_per_model_backend_queue() -> None:
     assert overall["total_input_tokens"] == 1800  # 1000 + 500 + 300
     assert overall["total_output_tokens"] == 380  # 200 + 100 + 80
     assert overall["total_tokens"] == 2180
+    assert overall["total_cache_read_tokens"] == 600      # only r1 reported it
+    assert overall["total_cache_creation_tokens"] == 50
     assert round(overall["total_cost_usd"], 4) == 0.07  # ollama cost is None
 
     by_model = {r["model"]: r for r in _run(store.stats_by_model())}
     assert by_model["claude-opus-4-8"]["total_runs"] == 2
     assert by_model["claude-opus-4-8"]["total_turns"] == 10
     assert by_model["claude-opus-4-8"]["total_tokens"] == 1800
+    assert by_model["claude-opus-4-8"]["total_cache_read_tokens"] == 600
     assert round(by_model["claude-opus-4-8"]["avg_turns"], 1) == 5.0
 
     by_queue = {r["queue"]: r for r in _run(store.stats_by_queue())}
     # main queue key is "" (the playlist is "alpha").
     assert by_queue[""]["total_turns"] == 10
     assert by_queue["alpha"]["total_turns"] == 1
+
+
+def test_usage_payload_round_trips_through_update_and_get_attempt() -> None:
+    """The raw vendor-shaped ``usage`` jsonb column round-trips as a dict
+    (encoded on write via ``_attempt_set_sql``, decoded on read via
+    ``_attempt_row``/``_jsonish``, same treatment as ``required_mcps``)."""
+    store = SqliteStore()
+    _run(_attempt(store, "r1", backend="nightshift", model="anthropic/claude-opus-4-8"))
+    payload = {
+        "input_tokens": 1000, "output_tokens": 200,
+        "cache_read_input_tokens": 600,
+        "per_turn": [{"turn": 1, "usage": {"input_tokens": 1000, "output_tokens": 200},
+                      "tool_calls": [{"name": "read_file", "result_chars": 4200}]}],
+    }
+    _run(store.update_attempt(
+        "r1", state=AttemptState.LANDED,
+        input_tokens=1000, output_tokens=200, cache_read_input_tokens=600,
+        usage=payload,
+    ))
+    attempt = _run(store.get_attempt("r1"))
+    assert attempt["usage"] == payload
+    assert attempt["cache_read_input_tokens"] == 600
+    assert attempt["cache_creation_input_tokens"] is None  # not reported
+
+
+def test_new_usage_columns_default_null_not_zero_on_a_fresh_attempt() -> None:
+    """A freshly created attempt (no update_attempt yet) leaves the new
+    cache/usage columns NULL — distinct from the historical-backfill 0."""
+    store = SqliteStore()
+    _run(_attempt(store, "r1"))
+    attempt = _run(store.get_attempt("r1"))
+    assert attempt["cache_read_input_tokens"] is None
+    assert attempt["cache_creation_input_tokens"] is None
+    assert attempt["usage"] is None
 
 
 def test_blocked_attempt_gets_finished_at() -> None:
@@ -781,6 +822,35 @@ def test_attempts_migration_shape() -> None:
     assert "to_regclass('nightshift.attempts')" in down
     # The internal-only landing re-enqueue columns exist (never projected).
     assert "branch_ref" in up and "head_sha" in up
+
+
+def test_usage_detail_migration_shape() -> None:
+    """Token usage granularity: the two cache-split columns + the raw usage
+    jsonb column, 0-backfilled (not NULL-left) for pre-existing rows, and the
+    five stats views recreated with cache totals in both directions."""
+    sql = USAGE_DETAIL_MIGRATION.read_text()
+    assert "-- migrate:up" in sql and "-- migrate:down" in sql
+    up = sql[sql.index("-- migrate:up"):sql.index("-- migrate:down")]
+    down = sql[sql.index("-- migrate:down"):]
+    assert "ADD COLUMN IF NOT EXISTS cache_read_input_tokens     bigint" in up
+    assert "ADD COLUMN IF NOT EXISTS cache_creation_input_tokens bigint" in up
+    assert "ADD COLUMN IF NOT EXISTS usage                       jsonb" in up
+    # Backfill existing history to 0, not left NULL.
+    assert "SET cache_read_input_tokens = 0, cache_creation_input_tokens = 0" in up
+    for view in (
+        "stats_overall", "stats_by_worker", "stats_by_backend",
+        "stats_by_model", "stats_by_queue",
+    ):
+        assert f"CREATE VIEW nightshift.{view}" in up
+        assert f"CREATE VIEW nightshift.{view}" in down
+    assert "total_cache_read_tokens" in up
+    assert "total_cache_creation_tokens" in up
+    # down: the views revert to the pre-migration shape (no cache totals) and
+    # the three columns are dropped.
+    assert "total_cache_read_tokens" not in down
+    assert "DROP COLUMN IF EXISTS cache_read_input_tokens" in down
+    assert "DROP COLUMN IF EXISTS cache_creation_input_tokens" in down
+    assert "DROP COLUMN IF EXISTS usage" in down
 
 
 def test_capability_migration_adds_columns_and_queue_routing() -> None:

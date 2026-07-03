@@ -17,6 +17,7 @@ timestamp or task id in it would bust the cache prefix every run (invariant 7a).
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -48,6 +49,17 @@ class LoopResult:
     failure — no edits are claimed (spec §5.5). ``aborted`` set means the
     controller asked us to stop. ``input_tokens``/``output_tokens`` are summed
     across turns (cache splits folded in by the caller via ``_usage_tokens``).
+
+    ``per_turn_usage`` is one record per turn: ``{"turn": N, "usage": {...},
+    "tool_calls": [{"name": ..., "result_chars": ...}, ...]}``. ``usage`` is
+    that turn's raw completion usage (pre-fold, so cache splits survive);
+    ``tool_calls`` are the tools dispatched off that turn's completion, whose
+    rendered ``tool_result`` blocks get prepended to the *next* turn's input —
+    which is what makes this enough to attribute input growth after the fact
+    with no extra API calls: turn N's input minus turn (N-1)'s output is
+    (approximately) the tokens turn (N-1)'s tool_calls added to the
+    transcript, split proportionally across them by ``result_chars`` when a
+    turn ran more than one tool.
     """
 
     turns: int = 0
@@ -55,6 +67,7 @@ class LoopResult:
     error: str | None = None
     aborted: str | None = None
     usage: dict[str, Any] = field(default_factory=dict)
+    per_turn_usage: list[dict[str, Any]] = field(default_factory=list)
     honoured: dict[str, Any] = field(default_factory=dict)
 
 
@@ -171,6 +184,10 @@ def run_loop(
 
         result.turns += 1
         _sum_usage(result.usage, completion.usage)
+        turn_record: dict[str, Any] = {
+            "turn": result.turns, "usage": completion.usage, "tool_calls": [],
+        }
+        result.per_turn_usage.append(turn_record)
         result.honoured = completion.honoured
         if completion.text:
             result.text = completion.text
@@ -206,6 +223,12 @@ def run_loop(
             if outcome.is_error:
                 block["is_error"] = True
             tool_results.append(block)
+            # result_chars measures the rendered block, not just outcome.content,
+            # so it tracks what actually re-enters the transcript (incl. the
+            # is_error/tool_use_id wrapping) for the next turn's input delta.
+            turn_record["tool_calls"].append(
+                {"name": call.name, "result_chars": len(json.dumps(block))}
+            )
         messages.append({"role": "user", "content": tool_results})
 
     result.error = f"reached max_turns ({limit}) without completing"
