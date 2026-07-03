@@ -27,6 +27,7 @@ from nightshift.config.worker import (
     load_worker_config,
     save_worker_config,
 )
+from nightshift.resolve_runner import select_run_backend
 
 
 def _spec(tmp_path: Path, model: str, config: dict[str, Any] | None = None) -> WorkerSpec:
@@ -54,8 +55,6 @@ def test_nightshift_registered() -> None:
 
 
 def test_select_run_backend_strips_provider() -> None:
-    from nightshift.engine import select_run_backend
-
     backend, bare = select_run_backend("nightshift/anthropic/claude-sonnet-4-6", None)
     assert isinstance(backend, backends_mod.NightshiftAgentBackend)
     assert bare == "anthropic/claude-sonnet-4-6"
@@ -113,7 +112,7 @@ def test_backend_applies_edit_via_loop(
     )
     assert res.returncode == 0
     assert res.turns == 2
-    # the real write flowed through to disk (what engine.squash_to_main commits)
+    # the real write flowed through to disk (what git.squash.squash_to_main commits)
     assert (tmp_path / "code.txt").read_text() == "new line\n"
     # usage folded via _usage_tokens (no cache splits here → plain sums)
     assert (res.input_tokens, res.output_tokens) == (25, 8)

@@ -20,13 +20,13 @@ import pytest
 from starlette.testclient import TestClient
 
 from _workspace import build_workspace, make_target_repo
-from nightshift.engine import setup_worktree
+from nightshift.git.worktrees import setup_worktree
 from nightshift.lifecycle import AttemptState
-from nightshift.manager.api_worker import jsonable
 from nightshift.manager.app import create_app
 from nightshift.manager.hub import Hub
 from nightshift.manager.landing import canonical_head
-from nightshift.manager.store import MemoryStore
+from nightshift.manager.store_sqlite import SqliteStore
+from nightshift.manager.wire import jsonable
 
 
 def _find_field(
@@ -55,8 +55,8 @@ def _seed(tmp_path: Path, tasks: dict[str, str], **kwargs) -> Path:
     return build_workspace(tmp_path, tasks=tasks, **kwargs)
 
 
-def _client(workspace: Path, store: MemoryStore | None = None) -> TestClient:
-    return TestClient(create_app(workspace, store=store or MemoryStore()))
+def _client(workspace: Path, store: SqliteStore | None = None) -> TestClient:
+    return TestClient(create_app(workspace, store=store or SqliteStore()))
 
 
 def test_checkin_poll_handshake(tmp_path: Path) -> None:
@@ -113,7 +113,7 @@ def test_pinned_model_without_backend_is_blocked(tmp_path: Path) -> None:
 
 def test_run_events_and_failed_submit_release(tmp_path: Path) -> None:
     root = _seed(tmp_path, {"10.hello": "Do a thing."})
-    store = MemoryStore()
+    store = SqliteStore()
     with _client(root, store) as client:
         client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
         order = client.post(
@@ -262,7 +262,7 @@ def test_submit_records_turns_tokens_for_rollups(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _clear_backoff(store: MemoryStore, task: str, queue: str | None = None) -> None:
+def _clear_backoff(store: SqliteStore, task: str, queue: str | None = None) -> None:
     """Release a task's retry backoff so a test can re-dispatch it without
     waiting out next_eligible_at (Phase 5: failed tasks back off)."""
     asyncio.run(store.clear_task_backoff(queue, task))
@@ -292,7 +292,7 @@ def _poll_and_submit_no_change(client: TestClient, task: str) -> dict[str, Any]:
 
 def test_repeated_no_change_quarantines_and_halts_dispatch(tmp_path: Path) -> None:
     root = _seed(tmp_path, {"10.loop": "Move a setting that's already moved."})
-    store = MemoryStore()
+    store = SqliteStore()
     with _client(root, store) as client:
         client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
 
@@ -318,7 +318,7 @@ def test_repeated_no_change_quarantines_and_halts_dispatch(tmp_path: Path) -> No
 
 def test_patch_quarantined_false_releases_task_for_dispatch(tmp_path: Path) -> None:
     root = _seed(tmp_path, {"10.loop": "Move a setting that's already moved."})
-    store = MemoryStore()
+    store = SqliteStore()
     with _client(root, store) as client:
         client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
 
@@ -358,7 +358,7 @@ def test_quarantine_threshold_zero_disables_the_guard(tmp_path: Path) -> None:
     root = _seed(tmp_path, {"10.loop": "Idempotent task."})
     os.environ["NIGHTSHIFT_QUARANTINE_THRESHOLD"] = "0"
     try:
-        store = MemoryStore()
+        store = SqliteStore()
         with _client(root, store) as client:
             client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
             # First no-change submit: quarantine guard disabled (threshold=0),
@@ -386,7 +386,7 @@ def test_interleaved_runs_no_longer_mask_a_no_progress_streak(tmp_path: Path) ->
         "10.loop": "Move a setting that's already moved.",
         "11.noise": "Busy neighbor.",
     })
-    store = MemoryStore()
+    store = SqliteStore()
     with _client(root, store) as client:
         client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
 
@@ -431,7 +431,7 @@ def test_backoff_excludes_failed_task_until_eligible(tmp_path: Path) -> None:
     """Phase 5 deliberate fix: an errored task backs off (next_eligible_at)
     instead of re-leasing immediately, and dispatch honors the backoff."""
     root = _seed(tmp_path, {"10.flaky": "Fails once."})
-    store = MemoryStore()
+    store = SqliteStore()
     with _client(root, store) as client:
         client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
         order = client.post(
@@ -457,9 +457,14 @@ def test_backoff_excludes_failed_task_until_eligible(tmp_path: Path) -> None:
         ).json()["work"] is None
 
         # Simulate the backoff elapsing (inject a past timestamp).
-        with store._lock:
-            store._tasks[("", "10.flaky")]["next_eligible_at"] = (
-                datetime.now(UTC) - timedelta(seconds=1)
+        past = (datetime.now(UTC) - timedelta(seconds=1)).isoformat(
+            timespec="microseconds"
+        )
+        with store._db_lock:
+            store._db.execute(
+                "UPDATE nightshift.tasks SET next_eligible_at = ?1 "
+                "WHERE queue = '' AND task = '10.flaky'",
+                (past,),
             )
         again = client.post(
             "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
@@ -472,7 +477,7 @@ def test_environment_failure_cools_worker_not_task(tmp_path: Path) -> None:
     the task — the submitting worker gets a scoped cooldown while another
     worker picks the task right up."""
     root = _seed(tmp_path, {"10.envy": "Needs a healthy box."})
-    store = MemoryStore()
+    store = SqliteStore()
     with _client(root, store) as client:
         client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
         client.post("/api/worker/checkin", json={"worker_id": "w2", "backend": "claude-code"})
@@ -511,7 +516,7 @@ def test_land_resets_the_retry_counter(tmp_path: Path) -> None:
     """Per greenfield: a land resets attempts_without_progress (here: the
     counter row is deleted outright — reset is free)."""
     workspace = _seed(tmp_path, {"10.hello": "Do a thing."})
-    store = MemoryStore()
+    store = SqliteStore()
     with _client(workspace, store) as client:
         client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
         # One failure first, so there is a nonzero counter to reset.
@@ -574,7 +579,7 @@ def test_run_log_reconstructed_from_task_log_events(tmp_path: Path) -> None:
 def test_queue_with_absent_repo_pauses_then_resumes_after_rescan(tmp_path: Path) -> None:
     # The main queue is bound to a repo that isn't on disk yet.
     workspace = _seed(tmp_path, {"10.work": "Do it."}, main_repo="ghost", repos=())
-    store = MemoryStore()
+    store = SqliteStore()
     with _client(workspace, store) as client:
         client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
 
@@ -626,7 +631,7 @@ def test_malformed_task_repo_ref_blocks_not_dispatched(tmp_path: Path) -> None:
     # The queue default repo is valid + present, but the task pins an unsafe
     # (path-traversal) override that must be rejected as an authoring error.
     workspace = _seed(tmp_path, {"10.work": "---\nrepo: ../evil\n---\nDo it."})
-    store = MemoryStore()
+    store = SqliteStore()
     with _client(workspace, store) as client:
         client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
         assert client.post(
@@ -804,7 +809,7 @@ def test_submit_with_expired_lease_rejected_without_writes(tmp_path: Path) -> No
     workspace = _seed(tmp_path, {"10.hello": "Do a thing."})
     tasks_root = workspace / "nightshift-tasks"
     repo_root = workspace / "longitude"
-    store = MemoryStore()
+    store = SqliteStore()
     with _client(workspace, store) as client:
         order = _poll_with_landable_branch(client, workspace, "10.hello")
         head_before = canonical_head(repo_root)
@@ -833,7 +838,7 @@ def test_submit_with_cancelled_lease_rejected(tmp_path: Path) -> None:
     must not land."""
     workspace = _seed(tmp_path, {"10.hello": "Do a thing."})
     repo_root = workspace / "longitude"
-    store = MemoryStore()
+    store = SqliteStore()
     with _client(workspace, store) as client:
         order = _poll_with_landable_branch(client, workspace, "10.hello")
         head_before = canonical_head(repo_root)
@@ -944,7 +949,7 @@ _ARMED_ALLOWED = frozenset({
 })
 
 
-class _TransitionOnlyStore(MemoryStore):
+class _TransitionOnlyStore(SqliteStore):
     """Deny-by-default once armed: any store method outside _ARMED_ALLOWED
     raises, so every submit-path mutation of runs/leases/overlay/events must
     ride the single apply_transition call — including write methods added to
@@ -1011,7 +1016,7 @@ def test_submit_commits_through_exactly_one_store_write(tmp_path: Path) -> None:
         assert "task_result" in kinds
 
 
-class _CrashAfterApplyStore(MemoryStore):
+class _CrashAfterApplyStore(SqliteStore):
     """Simulates the process dying immediately after the single write step."""
 
     async def apply_transition(self, t: Any, **kw: Any) -> list[int] | None:
@@ -1202,7 +1207,7 @@ def test_poll_syncs_origin_before_pinning_base_ref(tmp_path: Path) -> None:
 
 def test_resolve_endpoint_spawns_and_caps(tmp_path: Path) -> None:
     root = _seed(tmp_path, {"10.x": "do a thing"})
-    store = MemoryStore()
+    store = SqliteStore()
     asyncio.run(store.create_attempt(
         "r1", task="10.x", queue="main", worker_id="w1", backend="claude-code",
         model="auto", base_ref=None, ttl_seconds=60, title="X", repo="longitude",
@@ -1225,7 +1230,7 @@ def test_resolve_endpoint_spawns_and_caps(tmp_path: Path) -> None:
 
 def test_resolve_endpoint_unknown_run_404(tmp_path: Path) -> None:
     root = _seed(tmp_path, {"10.x": "do"})
-    app = create_app(root, store=MemoryStore())
+    app = create_app(root, store=SqliteStore())
     _stub_spawn(app)
     with TestClient(app) as client:
         assert client.post("/api/runs/nope/10.x/resolve").status_code == 404
@@ -1233,7 +1238,7 @@ def test_resolve_endpoint_unknown_run_404(tmp_path: Path) -> None:
 
 def test_resolve_result_completes_task(tmp_path: Path) -> None:
     root = _seed(tmp_path, {"10.x": "do"})
-    store = MemoryStore()
+    store = SqliteStore()
     asyncio.run(store.create_attempt(
         "c1", task="10.x", queue="main", worker_id="manager:resolve",
         backend="claude-code", model="auto", base_ref=None, ttl_seconds=0,
@@ -1257,7 +1262,7 @@ def test_resolve_result_completes_task(tmp_path: Path) -> None:
 
 def test_resolve_result_failure_reblocks_task(tmp_path: Path) -> None:
     root = _seed(tmp_path, {"10.x": "do"})
-    store = MemoryStore()
+    store = SqliteStore()
     asyncio.run(store.create_attempt(
         "c1", task="10.x", queue="main", worker_id="manager:resolve",
         backend="claude-code", model="auto", base_ref=None, ttl_seconds=0,
@@ -1286,7 +1291,7 @@ def test_resolve_result_with_unresolvable_origin_rejected(tmp_path: Path) -> Non
     origin run, the task overlay, and the brief are all untouched."""
     root = _seed(tmp_path, {"10.x": "do"})
     tasks_root = root / "nightshift-tasks"
-    store = MemoryStore()
+    store = SqliteStore()
     asyncio.run(store.create_attempt(
         "o1", task="10.x", queue="main", worker_id="w1", backend="claude-code",
         model="auto", base_ref=None, ttl_seconds=60, title="X", repo="longitude",
@@ -1329,7 +1334,7 @@ def test_resolve_result_updates_resolvable_origin(tmp_path: Path) -> None:
     """The happy path still works: an origin run held in a resolvable state
     (error/blocked) is completed alongside the resolve run."""
     root = _seed(tmp_path, {"10.x": "do"})
-    store = MemoryStore()
+    store = SqliteStore()
     asyncio.run(store.create_attempt(
         "o1", task="10.x", queue="main", worker_id="w1", backend="claude-code",
         model="auto", base_ref=None, ttl_seconds=60, title="X", repo="longitude",
@@ -1363,7 +1368,7 @@ def test_conflict_auto_escalates_to_resolve(tmp_path: Path) -> None:
     out-of-process resolver instead of merely blocking the task."""
     root = _seed(tmp_path, {"10.edit": "edit the readme"})
     repo_root = root / "longitude"
-    app = create_app(root, store=MemoryStore())
+    app = create_app(root, store=SqliteStore())
     calls = _stub_spawn(app)
     with TestClient(app) as client:
         client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
@@ -1626,7 +1631,7 @@ def test_validation_error_blocks_task_not_failed(tmp_path: Path) -> None:
 
 def test_full_failure_lifecycle_drain_then_retry_then_quarantine(tmp_path: Path) -> None:
     root = _seed(tmp_path, {"10.a": "A.", "20.b": "B."})
-    store = MemoryStore()
+    store = SqliteStore()
     with _client(root, store) as client:
         client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
 
@@ -1700,7 +1705,7 @@ def test_unrelated_save_does_not_clear_quarantine(tmp_path: Path) -> None:
     """Regression: saving an unrelated field (title) must not accidentally clear
     system-set quarantine or failed state (the original divergent-state bug)."""
     root = _seed(tmp_path, {"10.loop": "Move a setting that's already moved."})
-    store = MemoryStore()
+    store = SqliteStore()
     with _client(root, store) as client:
         client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
 
@@ -1867,13 +1872,14 @@ def test_dsn_absent_is_none(tmp_path: Path, monkeypatch) -> None:
     assert load_manager_config(root).dsn is None
 
 
-def test_open_store_no_dsn_is_memory(monkeypatch) -> None:
-    # open_store with no arg + no NIGHTSHIFT_PG_DSN falls back to MemoryStore.
-    from nightshift.manager.store import MemoryStore, open_store
+def test_open_store_no_dsn_is_sqlite(monkeypatch) -> None:
+    # open_store with no arg + no NIGHTSHIFT_PG_DSN falls back to SqliteStore.
+    from nightshift.manager.store import open_store
+    from nightshift.manager.store_sqlite import SqliteStore
 
     monkeypatch.delenv("NIGHTSHIFT_PG_DSN", raising=False)
     store = asyncio.run(open_store())
-    assert isinstance(store, MemoryStore)
+    assert isinstance(store, SqliteStore)
 
 
 # --------------------------------------------------------------------------- #
@@ -1899,7 +1905,7 @@ LEASE_WIRE_KEYS = [
 ]
 
 
-def _seed_every_state(store: MemoryStore) -> dict[str, str]:
+def _seed_every_state(store: SqliteStore) -> dict[str, str]:
     """One attempt per storable state (distinct tasks — invariant 1 allows a
     single live attempt per task). Returns {state: attempt id}."""
     scenarios: list[tuple[str, AttemptState | None, dict[str, Any]]] = [
@@ -1940,7 +1946,7 @@ def _seed_every_state(store: MemoryStore) -> dict[str, str]:
 
 def test_api_runs_snapshot_keys_and_status_projection(tmp_path: Path) -> None:
     root = _seed(tmp_path, {})
-    store = MemoryStore()
+    store = SqliteStore()
     with _client(root, store) as client:
         # Seed after lifespan startup: a pre-seeded LANDING attempt would be
         # parked by the manager's own interrupted-land recovery.
@@ -1977,7 +1983,7 @@ def test_api_runs_snapshot_keys_and_status_projection(tmp_path: Path) -> None:
 
 def test_api_leases_snapshot_live_only_with_lease_keys(tmp_path: Path) -> None:
     root = _seed(tmp_path, {})
-    store = MemoryStore()
+    store = SqliteStore()
     with _client(root, store) as client:
         ids = _seed_every_state(store)
         leases = client.get("/api/leases").json()
@@ -1995,7 +2001,7 @@ def test_sse_snapshot_frame_carries_the_same_run_and_lease_shapes(
     tmp_path: Path,
 ) -> None:
     root = _seed(tmp_path, {})
-    store = MemoryStore()
+    store = SqliteStore()
     with _client(root, store) as client:
         ids = _seed_every_state(store)
         # The endpoint ends its stream once the (fake) server reports shutdown;

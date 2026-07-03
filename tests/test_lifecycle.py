@@ -44,7 +44,10 @@ from nightshift.lifecycle import (
     TaskHoldKind,
     Telemetry,
     Transition,
-    fold_legacy,
+    run_status_of,
+)
+from nightshift.lifecycle_compat import fold_legacy, split_state
+from nightshift.transitions import (
     on_deadline,
     on_land_enqueued,
     on_land_recovered,
@@ -52,8 +55,6 @@ from nightshift.lifecycle import (
     on_operator_stop,
     on_split_result,
     on_submit,
-    run_status_of,
-    split_state,
 )
 from nightshift.worker.config import WorkerConfig
 from nightshift.worker.local_store import LocalStore
@@ -385,12 +386,14 @@ def test_error_non_validation_hold_kind_gets_a_kind_derived_reason() -> None:
     }
     # No detail at all: the reason is just the kind.
     bare = on_submit(
-        REF, _outcome(RunStatus.ERROR, failure_kind=FailureKind.DISK), SubmitPolicy()
+        REF,
+        _outcome(RunStatus.ERROR, failure_kind=FailureKind.BLOCKED),
+        SubmitPolicy(),
     )
     assert isinstance(bare, Transition)
     assert bare.state is AttemptState.FAILED  # non-merge kinds stay FAILED
     assert bare.effects.hold is not None
-    assert bare.effects.hold.reason == "disk"
+    assert bare.effects.hold.reason == "blocked"
 
 
 def test_error_worker_quarantine_flag_quarantines_immediately() -> None:
@@ -834,9 +837,6 @@ def test_retry_policy_classifies_every_failure_kind() -> None:
         FailureKind.BLOCKED: RetryAction.HOLD,
         FailureKind.MERGE_CONFLICT: RetryAction.HOLD,
         FailureKind.MERGE_REJECTED: RetryAction.HOLD,
-        FailureKind.REPO_CONFIG: RetryAction.HOLD,
-        FailureKind.DISK: RetryAction.HOLD,
-        FailureKind.ABORTED: RetryAction.HOLD,
     }
     assert {k: policy.on_failure(k) for k in FailureKind} == expected
     # The module-level frozenset is derived from this classification.
@@ -928,6 +928,12 @@ REACHABLE_LEGACY_COMBOS: list[tuple[tuple[str | None, str, str | None, str | Non
     (("released", "error", None, "merge_rejected", "w1"), AttemptState.CONFLICT),
     (("released", "error", None, "worker_error", "w1"), AttemptState.FAILED),
     (("released", "error", None, None, "w1"), AttemptState.FAILED),
+    # Retired legacy single-process-runner kinds: FailureKind no longer has
+    # them, but old runs rows still carry the strings — the migration CASE
+    # (and fold_legacy, which string-compares) folds them to FAILED.
+    (("released", "error", None, "repo_config", "w1"), AttemptState.FAILED),
+    (("released", "error", None, "disk", "w1"), AttemptState.FAILED),
+    (("released", "error", None, "aborted", "w1"), AttemptState.FAILED),
     (("released", "aborted", None, None, "w1"), AttemptState.ABORTED),
     (("released", "skipped", None, None, "w1"), AttemptState.SKIPPED),
     (("cancelled", "running", None, None, "w1"), AttemptState.ABORTED),

@@ -18,7 +18,7 @@ from typing import Any
 from nightshift.lifecycle import run_status_of
 
 
-# The exact pre-Phase-8 run-row key set and order (MemoryStore.create_run /
+# The exact pre-Phase-8 run-row key set and order (the retired store's create_run /
 # the runs table SELECT *). ``status`` is projected from ``state``; every
 # other key is a passthrough column.
 RUN_VIEW_KEYS = (
@@ -29,7 +29,7 @@ RUN_VIEW_KEYS = (
     "body", "started_at", "finished_at",
 )
 
-# The exact pre-Phase-8 lease-row key set and order (MemoryStore.acquire_lease
+# The exact pre-Phase-8 lease-row key set and order (the retired store's acquire_lease
 # / the leases table SELECT *). ``id`` and ``run_id`` are both the attempt id
 # (the id value changed from a uuid to the run-id string; the UI treats it
 # opaquely), ``status`` is always ``leased`` (only live attempts are

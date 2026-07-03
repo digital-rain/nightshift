@@ -23,7 +23,6 @@ from pathlib import Path
 import pytest
 
 from _workspace import build_workspace, git_commit_all
-from nightshift.engine import setup_worktree, worktree_branch
 from nightshift.git import landing as git_landing_mod
 from nightshift.git import locks as locks_mod
 from nightshift.git import refs as refs_mod
@@ -41,6 +40,7 @@ from nightshift.git.landing import (
 from nightshift.git.locks import repo_lock
 from nightshift.git.refs import replay_commit
 from nightshift.git.runner import GitResult, GitRunner
+from nightshift.git.worktrees import setup_worktree, worktree_branch
 from nightshift.lifecycle import LandingMode, LandKind, LandOutcome
 from nightshift.manager import landing as manager_landing_mod
 from nightshift.manager.landing import adopt_or_nothing, canonical_head, land

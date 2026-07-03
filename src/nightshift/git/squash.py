@@ -182,8 +182,8 @@ def squash_to_main(
     queue: str | None = None,
 ) -> tuple[str | None, str, bool]:
     """Merge the task's worktree branch as a single squash commit on the target
-    repo's ``main`` (``repo_root = workspace / repo``) — the legacy entry point
-    (``runner_legacy``/CLI recover), now a shim over
+    repo's ``main`` (``repo_root = workspace / repo``) — the resolve runner's
+    local land entry point, a thin wrapper over
     :func:`nightshift.git.landing.integrate_and_push` in local-only mode.
 
     Returns the historical tuple: ``(sha, "", False)`` on success, or
@@ -213,14 +213,13 @@ def squash_to_main(
             return outcome.sha, outcome.detail, False
         case LandKind.CONFLICT:
             if outcome.conflicts:
-                # The historical wording, pinned by squash_failure_kind and the
-                # legacy runner's operator messages.
+                # The historical wording, pinned by squash_failure_kind.
                 shown = "\n".join(f"    {p}" for p in outcome.conflicts)
                 return None, (
                     f"merge conflict — '{branch}' and main made overlapping edits to "
                     f"{len(outcome.conflicts)} file(s):\n{shown}\n"
                     "This cannot be auto-recovered; resolve the 3-way merge by hand "
-                    "(see `recover_task` docs) or drop the stale branch."
+                    "or drop the stale branch."
                 ), False
             return None, outcome.detail, False
         case LandKind.PUSH_REJECTED:

@@ -268,7 +268,7 @@ The store is selected from `NIGHTSHIFT_PG_DSN` (env/.env).
 | Setting | Effect |
 |---|---|
 | `NIGHTSHIFT_PG_DSN` set | Use Postgres (`PgStore`). Run `just migrate` to create/upgrade the schema. |
-| (unset) | In-memory store (`MemoryStore`): no DB needed, state lost on restart. |
+| (unset) | In-memory SQLite store (`SqliteStore`): no DB needed, state lost on restart. |
 
 ### Applying the schema
 
@@ -279,7 +279,7 @@ The store is selected from `NIGHTSHIFT_PG_DSN` (env/.env).
 
 ## Startup order
 
-1. **Manager first** — `just manager` (or `just server` for single-host mode).
+1. **Manager first** — `just manager`.
 2. **Workers after** — `just worker [port]`. Each worker connects to `NIGHTSHIFT_MANAGER_URL` immediately on startup; if the manager isn't reachable, the worker exits with `httpx.ConnectError: Connection refused`.
 
 The operator UI is served by the manager; open it in a browser once the manager logs `Uvicorn running on …`.

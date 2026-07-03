@@ -1,6 +1,6 @@
 """Tests for the nightshift manager store + schema (Phase 0/4/8).
 
-The MemoryStore exercises the same async interface as the PgStore, so these
+The SqliteStore exercises the same async interface as the PgStore, so these
 verify the CRUD/attempt/stats semantics without a live database. The migration
 tests pin the schema shape the PgStore relies on. The Phase 4 section covers
 ``apply_transition``: the CAS fence and the all-or-nothing outbox write. The
@@ -25,10 +25,9 @@ from nightshift.lifecycle import (
     TaskHoldKind,
     Transition,
     TransitionEvent,
-    on_deadline,
-    on_operator_stop,
 )
-from nightshift.manager.store import MemoryStore
+from nightshift.manager.store_sqlite import SqliteStore
+from nightshift.transitions import on_deadline, on_operator_stop
 
 
 MIGRATION = MIGRATIONS_DIR / "20260730000001_nightshift_schema.sql"
@@ -51,7 +50,7 @@ def _run(coro):
 
 
 def test_register_and_list_workers() -> None:
-    store = MemoryStore()
+    store = SqliteStore()
     _run(store.register_worker("w1", backend="claude-code", queues=None, priorities=None))
     _run(store.register_worker("w2", backend="ollama", queues=["main"], priorities=[0, 1]))
     workers = _run(store.list_workers())
@@ -62,7 +61,7 @@ def test_register_and_list_workers() -> None:
 
 
 def test_register_worker_advertises_models_and_mcps() -> None:
-    store = MemoryStore()
+    store = SqliteStore()
     _run(store.register_worker(
         "w1", backend="cursor", queues=None, priorities=None,
         models=["claude-opus-4-8", "gpt-5.5"], mcps=["slack", "github"],
@@ -78,7 +77,7 @@ def test_register_worker_advertises_models_and_mcps() -> None:
 
 
 def test_queue_dedication_round_trip() -> None:
-    store = MemoryStore()
+    store = SqliteStore()
     assert _run(store.queue_dedication()) == {}
     _run(store.set_queue_dedication("ops", ["w-trusted", "w-backup"]))
     assert _run(store.queue_dedication()) == {"ops": ["w-trusted", "w-backup"]}
@@ -88,7 +87,7 @@ def test_queue_dedication_round_trip() -> None:
 
 
 def test_create_attempt_records_required_mcps() -> None:
-    store = MemoryStore()
+    store = SqliteStore()
     _run(store.create_attempt(
         "r1", task="t1", queue=None, worker_id="w1",
         backend="cursor", model="auto", base_ref=None, ttl_seconds=60,
@@ -99,7 +98,7 @@ def test_create_attempt_records_required_mcps() -> None:
 
 
 def test_worker_status_and_stale_expiry() -> None:
-    store = MemoryStore()
+    store = SqliteStore()
     _run(store.register_worker("w1", backend="claude-code", queues=None, priorities=None))
     _run(store.set_worker_status("w1", status="busy", current_task="t", current_queue=None))
     assert _run(store.get_worker("w1"))["status"] == "busy"
@@ -114,7 +113,7 @@ def test_worker_status_and_stale_expiry() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _attempt(store: MemoryStore, attempt_id: str, task: str = "t1", **kw):
+def _attempt(store: SqliteStore, attempt_id: str, task: str = "t1", **kw):
     kw.setdefault("queue", None)
     kw.setdefault("worker_id", "w1")
     kw.setdefault("backend", "claude-code")
@@ -128,7 +127,7 @@ def test_invariant_1_one_live_attempt_per_task() -> None:
     """Greenfield invariant 1: at most one attempt per (queue, task) is in a
     live state — the second create_attempt is refused while the first is
     RUNNING or LANDING, and allowed again once it is terminal."""
-    store = MemoryStore()
+    store = SqliteStore()
     first = _run(_attempt(store, "r1"))
     assert first is not None
     assert _run(_attempt(store, "r2")) is None
@@ -150,7 +149,7 @@ def test_invariant_1_one_live_attempt_per_task() -> None:
 def test_deadline_expiry_via_on_deadline_transition() -> None:
     """Phase 8: expiry is the on_deadline transition (RUNNING → EXPIRED, a
     terminal state with finished_at), replacing reclaim_expired_leases."""
-    store = MemoryStore()
+    store = SqliteStore()
     _run(_attempt(store, "r1", ttl_seconds=-1))  # already overdue
     ref = AttemptRef(id="r1", queue=None, task="t1")
     assert _run(store.apply_transition(
@@ -169,7 +168,7 @@ def test_deadline_expiry_via_on_deadline_transition() -> None:
 
 
 def test_blocked_task_state() -> None:
-    store = MemoryStore()
+    store = SqliteStore()
     _run(store.set_task_state(None, "t1", "blocked", blocked_reason="no ollama worker"))
     blocked = _run(store.list_blocked())
     assert len(blocked) == 1
@@ -180,14 +179,14 @@ def test_blocked_task_state() -> None:
 
 
 def test_retryable_tasks_includes_failed_state() -> None:
-    store = MemoryStore()
+    store = SqliteStore()
     _run(store.set_task_state(None, "a", "failed", blocked_reason="worker error"))
     rows = _run(store.retryable_tasks(None))
     assert [r["task"] for r in rows] == ["a"]
 
 
 def test_retryable_tasks_includes_retry_eligible_blocked_only() -> None:
-    store = MemoryStore()
+    store = SqliteStore()
     _run(store.set_task_state(None, "honest", "blocked", blocked_reason="agent declined", retry_eligible=True))
     _run(store.set_task_state(None, "conflict", "blocked", blocked_reason="needs resolve", retry_eligible=False))
     rows = {r["task"] for r in _run(store.retryable_tasks(None))}
@@ -195,7 +194,7 @@ def test_retryable_tasks_includes_retry_eligible_blocked_only() -> None:
 
 
 def test_retryable_tasks_scoped_to_queue() -> None:
-    store = MemoryStore()
+    store = SqliteStore()
     _run(store.set_task_state(None, "a", "failed"))
     _run(store.set_task_state("other", "b", "failed"))
     rows = _run(store.retryable_tasks(None))
@@ -208,7 +207,7 @@ def test_retryable_tasks_scoped_to_queue() -> None:
 
 
 def test_attempts_and_stats_by_backend() -> None:
-    store = MemoryStore()
+    store = SqliteStore()
     _run(_attempt(store, "r1", backend="claude-code", model="claude-opus-4-8"))
     _run(store.update_attempt(
         "r1", state=AttemptState.LANDED, loc=42, commit_sha="deadbeef",
@@ -232,7 +231,7 @@ def test_attempts_and_stats_by_backend() -> None:
 
 
 def test_turns_and_tokens_roll_up_per_model_backend_queue() -> None:
-    store = MemoryStore()
+    store = SqliteStore()
     # Two attempts on the same model/backend (one landed, one failed) + a
     # third in a playlist queue on a different backend.
     _run(_attempt(store, "r1", backend="claude-code", model="claude-opus-4-8"))
@@ -277,7 +276,7 @@ def test_blocked_attempt_gets_finished_at() -> None:
     """`blocked` is a terminal state: the attempt is over (the *task* is what
     stays held), so it must get finished_at like every other terminal state.
     Pre-Phase-1 this drifted: blocked runs kept finished_at = NULL forever."""
-    store = MemoryStore()
+    store = SqliteStore()
     _run(_attempt(store, "r1"))
     _run(store.update_attempt(
         "r1", state=AttemptState.BLOCKED, result_line="blocked: needs creds",
@@ -290,7 +289,7 @@ def test_blocked_attempt_gets_finished_at() -> None:
 def test_update_attempt_raises_on_unknown_fields() -> None:
     """The updatable-field set derives from the Outcome/Telemetry models;
     unknown fields raise instead of being silently dropped."""
-    store = MemoryStore()
+    store = SqliteStore()
     _run(_attempt(store, "r1"))
     with pytest.raises(ValueError, match="nonsense_field"):
         _run(store.update_attempt("r1", nonsense_field=1))
@@ -302,7 +301,7 @@ def test_update_attempt_raises_on_unknown_fields() -> None:
 
 
 def test_events_are_monotonic_and_cursorable() -> None:
-    store = MemoryStore()
+    store = SqliteStore()
     first = _run(store.append_event("queue_changed", queue=None))
     second = _run(store.append_event("task_started", run_id="r1", task="t1"))
     assert second > first
@@ -320,7 +319,7 @@ def test_events_are_monotonic_and_cursorable() -> None:
 # --------------------------------------------------------------------------- #
 
 
-async def _live_attempt(store: MemoryStore) -> AttemptRef:
+async def _live_attempt(store: SqliteStore) -> AttemptRef:
     """Create one running attempt, returning its identity."""
     row = await store.create_attempt(
         "r1", task="t1", queue=None, worker_id="w1",
@@ -349,7 +348,7 @@ def test_apply_transition_writes_attempt_overlay_and_events_together() -> None:
     """Greenfield invariant 3: state and events change together (the success
     half — the failure halves are the CAS and bad-fields tests below)."""
     async def scenario() -> None:
-        store = MemoryStore()
+        store = SqliteStore()
         ref = await _live_attempt(store)
         ids = await store.apply_transition(
             _error_transition(ref),
@@ -376,7 +375,7 @@ def test_invariant_2_submit_for_non_live_attempt_writes_nothing() -> None:
     state that already moved) writes nothing — no attempt fields, no overlay,
     no events."""
     async def scenario() -> None:
-        store = MemoryStore()
+        store = SqliteStore()
         ref = await _live_attempt(store)
         # Wrong worker: the submit fence.
         assert await store.apply_transition(
@@ -401,7 +400,7 @@ def test_invariant_2_submit_for_non_live_attempt_writes_nothing() -> None:
 
 def test_apply_transition_concurrent_applies_one_wins() -> None:
     async def scenario() -> None:
-        store = MemoryStore()
+        store = SqliteStore()
         ref = await _live_attempt(store)
         landed = Transition(
             ref=ref,
@@ -434,7 +433,7 @@ def test_invariant_3_bad_fields_write_neither_state_nor_events() -> None:
     """Greenfield invariant 3, failure half: validation happens before any
     mutation — a malformed transition can't leave partial state."""
     async def scenario() -> None:
-        store = MemoryStore()
+        store = SqliteStore()
         ref = await _live_attempt(store)
         bad = Transition(
             ref=ref,
@@ -459,7 +458,7 @@ def test_invariant_4_every_terminal_attempt_has_finished_at() -> None:
     apply_transition AND via the direct update_attempt path (the resolve
     writer); non-terminal states leave it NULL."""
     async def scenario() -> None:
-        store = MemoryStore()
+        store = SqliteStore()
         # apply_transition path: one attempt per terminal state.
         for n, state in enumerate(sorted(ATTEMPT_TERMINAL_STATES)):
             rid = f"rt{n}"
@@ -498,7 +497,7 @@ def test_operator_stop_transition_aborts_a_live_attempt() -> None:
     """Phase 8 behavior fix: stop/skip applies on_operator_stop (ABORTED with
     finished_at) instead of cancelling a lease around a zombie row."""
     async def scenario() -> None:
-        store = MemoryStore()
+        store = SqliteStore()
         ref = await _live_attempt(store)
         assert await store.apply_transition(
             on_operator_stop(ref), expected_status=AttemptState.RUNNING,
@@ -527,7 +526,7 @@ def _counted_error(ref: AttemptRef, *, backoff: float | None = 60.0) -> Transiti
 
 def test_increment_creates_a_pure_counter_row_invisible_to_views() -> None:
     async def scenario() -> None:
-        store = MemoryStore()
+        store = SqliteStore()
         ref = await _live_attempt(store)
         await store.apply_transition(
             _counted_error(ref),
@@ -548,7 +547,7 @@ def test_increment_creates_a_pure_counter_row_invisible_to_views() -> None:
 
 def test_increment_without_backoff_clears_a_stale_one() -> None:
     async def scenario() -> None:
-        store = MemoryStore()
+        store = SqliteStore()
         ref = await _live_attempt(store)
         await store.apply_transition(
             _counted_error(ref),
@@ -570,7 +569,7 @@ def test_increment_without_backoff_clears_a_stale_one() -> None:
 
 def test_hold_write_preserves_the_counter_and_backoff() -> None:
     async def scenario() -> None:
-        store = MemoryStore()
+        store = SqliteStore()
         ref = await _live_attempt(store)
         await store.apply_transition(
             _counted_error(ref),
@@ -597,7 +596,7 @@ def test_hold_write_preserves_the_counter_and_backoff() -> None:
 
 def test_landed_reset_deletes_the_counter_row() -> None:
     async def scenario() -> None:
-        store = MemoryStore()
+        store = SqliteStore()
         ref = await _live_attempt(store)
         await store.apply_transition(
             _counted_error(ref),
@@ -620,7 +619,7 @@ def test_landed_reset_deletes_the_counter_row() -> None:
 
 def test_clear_hold_demotes_but_keeps_a_nonzero_counter() -> None:
     async def scenario() -> None:
-        store = MemoryStore()
+        store = SqliteStore()
         ref = await _live_attempt(store)
         await store.apply_transition(
             _counted_error(ref),
@@ -650,7 +649,7 @@ def test_clear_hold_demotes_but_keeps_a_nonzero_counter() -> None:
 
 def test_clear_task_state_demotes_or_resets() -> None:
     async def scenario() -> None:
-        store = MemoryStore()
+        store = SqliteStore()
         ref = await _live_attempt(store)
         await store.apply_transition(
             _counted_error(ref),
@@ -677,7 +676,7 @@ def test_clear_task_state_demotes_or_resets() -> None:
 
 def test_clear_task_backoff_only_touches_the_backoff() -> None:
     async def scenario() -> None:
-        store = MemoryStore()
+        store = SqliteStore()
         ref = await _live_attempt(store)
         await store.apply_transition(
             _counted_error(ref),

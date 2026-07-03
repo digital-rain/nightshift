@@ -1,13 +1,16 @@
-"""Manager state store — the Postgres ``nightshift`` schema, behind a Protocol.
+"""Manager state store — the ``nightshift`` schema, behind a Protocol.
 
-Two implementations share one async interface (:class:`NightshiftStore`):
+One SQL query layer (:class:`SqlStoreBase`, written in Postgres dialect)
+serves two backends through the :class:`NightshiftStore` protocol:
 
 * :class:`PgStore` — the production store over a :class:`PgPoolLike` pool. Per
   ``.cursor/rules/no-inline-asyncpg.mdc`` it never imports ``asyncpg``; it only
   takes a structural pool. This is the canonical durable store.
-* :class:`MemoryStore` — an in-process store with the same interface, used by
-  unit tests (no live DB) and as a co-located fallback when ``NIGHTSHIFT_PG_DSN``
-  is unset.
+* :class:`~nightshift.manager.store_sqlite.SqliteStore` — the same query layer
+  on an in-memory SQLite database (Phase 9, replacing the hand-synchronized
+  ``MemoryStore`` twin). A small dialect seam translates the SQL text; tests
+  exercise the production SQL semantics by construction. Used by unit tests
+  and as the co-located fallback when ``NIGHTSHIFT_PG_DSN`` is unset.
 
 Both keep the same shapes so the manager service is identical regardless of
 which is mounted. :func:`open_store` picks one from the environment.
@@ -17,9 +20,7 @@ from __future__ import annotations
 
 import json
 import os
-import threading
-from collections.abc import Sequence
-from datetime import UTC, datetime, timedelta
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any, Protocol, assert_never
 
 from nightshift.lifecycle import (
@@ -30,10 +31,6 @@ from nightshift.lifecycle import (
     Transition,
 )
 from nightshift.pg import PgPoolLike
-
-
-def _now() -> datetime:
-    return datetime.now(UTC)
 
 
 # The attempt columns update_attempt may touch, derived from the shared
@@ -55,15 +52,6 @@ def _check_attempt_fields(fields: dict[str, Any], *, allow_state: bool) -> None:
     unknown = set(fields) - allowed
     if unknown:
         raise ValueError(f"update_attempt: unknown field(s): {sorted(unknown)}")
-
-
-def _stamp_terminal(row: dict[str, Any]) -> None:
-    """Terminal ⇒ finished (invariant 4): stamp ``finished_at`` and
-    ``released_at`` once when an in-memory attempt reaches a terminal state."""
-    if row["state"] in ATTEMPT_TERMINAL_STATES:
-        now = _now()
-        row["finished_at"] = row.get("finished_at") or now
-        row["released_at"] = row.get("released_at") or now
 
 
 def _attempt_set_sql(
@@ -315,30 +303,37 @@ def _qkey(queue: str | None) -> str:
     return queue or ""
 
 
+class SqlRunner(Protocol):
+    """The statement-execution surface both dialects provide: asyncpg's
+    connection satisfies it structurally; the SQLite runner translates the
+    Postgres SQL text and executes it on its serialized connection."""
+
+    async def execute(self, query: str, *args: Any) -> Any: ...
+    async def fetch(self, query: str, *args: Any) -> list[Any]: ...
+    async def fetchrow(self, query: str, *args: Any) -> Any: ...
+    async def fetchval(self, query: str, *args: Any) -> Any: ...
+
+
 # --------------------------------------------------------------------------- #
-# In-memory store (tests / co-located fallback)
+# The shared query layer (Postgres dialect; one implementation of every verb)
 # --------------------------------------------------------------------------- #
 
 
-class MemoryStore:
-    """Thread-safe in-process store. Same interface as :class:`PgStore`.
+class SqlStoreBase:
+    """Every store verb, written once against :class:`SqlRunner`.
 
-    Useful for unit tests (no DB) and a single-machine co-located deployment
-    where standing up Postgres would be overkill. State is lost on restart.
+    Subclasses supply the two seams: ``_connection()`` (a runner for
+    single-statement calls) and ``_transaction()`` (a runner whose statements
+    commit or roll back atomically). SQL is authored in Postgres dialect; the
+    SQLite subclass translates text at execution time (Phase 9's "one query
+    layer, dialect seam only").
     """
 
-    def __init__(self) -> None:
-        self._lock = threading.RLock()
-        self._workers: dict[str, dict[str, Any]] = {}
-        self._attempts: dict[str, dict[str, Any]] = {}
-        self._tasks: dict[tuple[str, str], dict[str, Any]] = {}
-        self._events: list[dict[str, Any]] = []
-        self._event_seq = 0
-        # queue label -> bound worker ids (manager-side dedication)
-        self._dedication: dict[str, list[str]] = {}
-        # queue label -> {"paused_reason", "mode"} (durable transport state;
-        # a row exists only while it carries a pause or a non-default mode)
-        self._queue_state: dict[str, dict[str, str | None]] = {}
+    def _connection(self) -> AbstractAsyncContextManager[SqlRunner]:
+        raise NotImplementedError
+
+    def _transaction(self) -> AbstractAsyncContextManager[SqlRunner]:
+        raise NotImplementedError
 
     async def init(self) -> None:
         return None
@@ -359,674 +354,7 @@ class MemoryStore:
         mcps: list[str] | None = None,
         meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        with self._lock:
-            now = _now()
-            existing = self._workers.get(worker_id)
-            registered = existing["registered_at"] if existing else now
-            row = {
-                "id": worker_id,
-                "backend": backend,
-                "queues": queues,
-                "priorities": priorities,
-                "models": models or [],
-                "mcps": mcps or [],
-                "status": "idle",
-                "current_task": None,
-                "current_queue": None,
-                "current_run_id": None,
-                "registered_at": registered,
-                "last_checkin_at": now,
-                "last_heartbeat_at": now,
-                "meta": meta or {},
-            }
-            self._workers[worker_id] = row
-            return dict(row)
-
-    async def set_worker_status(
-        self,
-        worker_id: str,
-        *,
-        status: str,
-        current_task: str | None = None,
-        current_queue: str | None = None,
-        current_run_id: str | None = None,
-    ) -> None:
-        with self._lock:
-            row = self._workers.get(worker_id)
-            if row is None:
-                return
-            row["status"] = status
-            row["current_task"] = current_task
-            row["current_queue"] = current_queue
-            row["current_run_id"] = current_run_id
-            row["last_heartbeat_at"] = _now()
-
-    async def heartbeat_worker(self, worker_id: str) -> None:
-        with self._lock:
-            row = self._workers.get(worker_id)
-            if row is not None:
-                row["last_heartbeat_at"] = _now()
-
-    async def list_workers(self) -> list[dict[str, Any]]:
-        with self._lock:
-            return [dict(r) for r in sorted(self._workers.values(), key=lambda r: r["id"])]
-
-    async def get_worker(self, worker_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._workers.get(worker_id)
-            return dict(row) if row else None
-
-    async def expire_stale_workers(self, ttl_seconds: float) -> list[str]:
-        with self._lock:
-            cutoff = _now() - timedelta(seconds=ttl_seconds)
-            stale = [
-                wid
-                for wid, r in self._workers.items()
-                if r["status"] != "offline" and r["last_heartbeat_at"] < cutoff
-            ]
-            for wid in stale:
-                self._workers[wid]["status"] = "offline"
-            return stale
-
-    # ---- attempts ---------------------------------------------------------- #
-
-    async def create_attempt(
-        self,
-        attempt_id: str,
-        *,
-        task: str,
-        queue: str | None,
-        worker_id: str | None,
-        backend: str | None,
-        model: str | None,
-        base_ref: str | None,
-        ttl_seconds: float,
-        title: str | None = None,
-        body: str | None = None,
-        required_mcps: list[str] | None = None,
-        repo: str | None = None,
-        validate_cmd: str | None = None,
-        state: str = "running",
-    ) -> dict[str, Any] | None:
-        """Create one attempt row. When ``state`` is live, refuses (returns
-        ``None``) while another live attempt exists for (queue, task) —
-        mirroring the PG partial unique index (invariant 1). Resolve children
-        pass ``state="resolving"`` (not live; no deadline)."""
-        with self._lock:
-            qk = _qkey(queue)
-            if state in ATTEMPT_LIVE_STATES:
-                for row in self._attempts.values():
-                    if (
-                        row["queue"] == qk
-                        and row["task"] == task
-                        and row["state"] in ATTEMPT_LIVE_STATES
-                    ):
-                        return None
-            now = _now()
-            row = {
-                "id": attempt_id,
-                "task": task,
-                "queue": qk,
-                "worker_id": worker_id,
-                "backend": backend,
-                "model": model,
-                "repo": repo,
-                "required_mcps": required_mcps or [],
-                "state": state,
-                "phase": None,
-                "result_line": None,
-                "commit_sha": None,
-                "loc": None,
-                "remote": None,
-                "pushed": None,
-                "turns": None,
-                "input_tokens": None,
-                "output_tokens": None,
-                "cost_usd": None,
-                "failure_kind": None,
-                "failure_reason": None,
-                "validate_cmd": validate_cmd,
-                "worktree": None,
-                "title": title,
-                "body": body,
-                "started_at": now,
-                "finished_at": None,
-                # lease-side columns
-                "base_ref": base_ref,
-                "acquired_at": now,
-                "heartbeat_at": now,
-                "deadline_at": (
-                    now + timedelta(seconds=ttl_seconds)
-                    if state in ATTEMPT_LIVE_STATES
-                    else None
-                ),
-                "released_at": None,
-                "branch_ref": None,
-                "head_sha": None,
-            }
-            self._attempts[attempt_id] = row
-            return dict(row)
-
-    async def get_attempt(self, attempt_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._attempts.get(attempt_id)
-            return dict(row) if row else None
-
-    async def update_attempt(self, attempt_id: str, **fields: Any) -> None:
-        _check_attempt_fields(fields, allow_state=True)
-        with self._lock:
-            row = self._attempts.get(attempt_id)
-            if row is None:
-                return
-            if fields.get("state") in ATTEMPT_LIVE_STATES:
-                # Mirror PG's attempts_live_task_uniq partial index: setting a
-                # live state must not create a second live attempt for the
-                # task (invariant 1). Same-row moves (an already-live row
-                # going RUNNING→LANDING) pass — the check excludes the row
-                # being updated.
-                for other_id, other in self._attempts.items():
-                    if (
-                        other_id != attempt_id
-                        and other["queue"] == row["queue"]
-                        and other["task"] == row["task"]
-                        and other["state"] in ATTEMPT_LIVE_STATES
-                    ):
-                        raise ValueError(
-                            "update_attempt: a live attempt already exists "
-                            f"for ({row['queue']!r}, {row['task']!r})"
-                        )
-            row.update(fields)
-            _stamp_terminal(row)
-
-    async def live_attempts(self) -> list[dict[str, Any]]:
-        with self._lock:
-            return [
-                dict(r)
-                for r in self._attempts.values()
-                if r["state"] in ATTEMPT_LIVE_STATES
-            ]
-
-    async def list_attempts(
-        self, *, limit: int = 200, queue: str | None = None, worker_id: str | None = None
-    ) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = list(self._attempts.values())
-        if queue is not None:
-            rows = [r for r in rows if r["queue"] == _qkey(queue)]
-        if worker_id is not None:
-            rows = [r for r in rows if r["worker_id"] == worker_id]
-        rows.sort(key=lambda r: r["started_at"], reverse=True)
-        return [dict(r) for r in rows[:limit]]
-
-    async def heartbeat_attempt(self, attempt_id: str, ttl_seconds: float) -> None:
-        with self._lock:
-            row = self._attempts.get(attempt_id)
-            if row is None or row["state"] not in ATTEMPT_LIVE_STATES:
-                return
-            now = _now()
-            row["heartbeat_at"] = now
-            row["deadline_at"] = now + timedelta(seconds=ttl_seconds)
-
-    # ---- transitions ------------------------------------------------------ #
-
-    async def apply_transition(
-        self,
-        t: Transition,
-        *,
-        expected_status: str,
-        expected_worker_id: str | None = None,
-    ) -> list[int] | None:
-        """Apply one lifecycle transition atomically (under the store lock).
-
-        CAS: the attempt must exist in ``expected_status`` (and, when given,
-        belong to ``expected_worker_id`` — the submit fence); otherwise nothing
-        is written and ``None`` is returned (invariant 2). On success the
-        attempt row, task overlay, and events all change together (invariant
-        3); the inserted event ids are returned so the caller can broadcast
-        exactly what committed.
-        """
-        # Validate before mutating so a bad field set can't leave partial state.
-        _check_attempt_fields(t.fields, allow_state=False)
-        with self._lock:
-            row = self._attempts.get(t.ref.id)
-            if row is None or row["state"] != expected_status:
-                return None
-            if expected_worker_id is not None and row["worker_id"] != expected_worker_id:
-                return None
-            row["state"] = t.state
-            if t.fields:
-                row.update(t.fields)
-            _stamp_terminal(row)
-            key = (_qkey(t.ref.queue), t.ref.task)
-            hold = t.effects.hold
-            if hold is not None:
-                prior = self._tasks.get(key)
-                self._tasks[key] = {
-                    "queue": key[0],
-                    "task": t.ref.task,
-                    "state": hold.kind,
-                    "blocked_reason": hold.reason,
-                    "repo": None,
-                    "retry_eligible": hold.retry_eligible,
-                    # A hold write never clobbers the retry counter/backoff.
-                    "attempts_without_progress": (
-                        prior["attempts_without_progress"] if prior else 0
-                    ),
-                    "next_eligible_at": prior["next_eligible_at"] if prior else None,
-                    "updated_at": _now(),
-                }
-            self._apply_progress(key, t.effects.progress, t.effects.next_eligible_in)
-            if hold is None and t.effects.clear_hold:
-                task_row = self._tasks.get(key)
-                if task_row is not None:
-                    if (
-                        task_row["attempts_without_progress"] == 0
-                        and task_row["next_eligible_at"] is None
-                    ):
-                        self._tasks.pop(key)
-                    else:
-                        # Demote to a pure counter row (state NULL = no hold).
-                        task_row.update(
-                            state=None, blocked_reason=None, repo=None,
-                            retry_eligible=False, updated_at=_now(),
-                        )
-            ids: list[int] = []
-            for ev in t.events:
-                self._event_seq += 1
-                self._events.append({
-                    "id": self._event_seq,
-                    "kind": ev.kind,
-                    "run_id": ev.run_id,
-                    "queue": ev.queue,
-                    "task": ev.task,
-                    "payload": dict(ev.payload or {}),
-                    "ts": _now(),
-                })
-                ids.append(self._event_seq)
-            return ids
-
-    # ---- task state ------------------------------------------------------- #
-
-    def _apply_progress(
-        self,
-        key: tuple[str, str],
-        progress: Progress,
-        next_eligible_in: float | None,
-    ) -> None:
-        """Apply a transition's counter op (caller holds the lock). Mirrors
-        the PG ``_TASK_INCREMENT_SQL`` / ``_TASK_RESET_SQL`` statements."""
-        match progress:
-            case Progress.NONE:
-                return
-            case Progress.INCREMENT:
-                row = self._tasks.get(key)
-                if row is None:
-                    row = {
-                        "queue": key[0],
-                        "task": key[1],
-                        "state": None,
-                        "blocked_reason": None,
-                        "repo": None,
-                        "retry_eligible": False,
-                        "attempts_without_progress": 0,
-                        "next_eligible_at": None,
-                        "updated_at": _now(),
-                    }
-                    self._tasks[key] = row
-                row["attempts_without_progress"] += 1
-                row["next_eligible_at"] = (
-                    _now() + timedelta(seconds=next_eligible_in)
-                    if next_eligible_in is not None
-                    else None
-                )
-                row["updated_at"] = _now()
-            case Progress.RESET:
-                row = self._tasks.get(key)
-                if row is not None:
-                    row["attempts_without_progress"] = 0
-                    row["next_eligible_at"] = None
-                    row["updated_at"] = _now()
-            case _:
-                assert_never(progress)
-
-    async def set_task_state(
-        self,
-        queue: str | None,
-        task: str,
-        state: str,
-        *,
-        blocked_reason: str | None = None,
-        repo: str | None = None,
-        retry_eligible: bool = False,
-    ) -> None:
-        with self._lock:
-            key = (_qkey(queue), task)
-            prior = self._tasks.get(key)
-            self._tasks[key] = {
-                "queue": key[0],
-                "task": task,
-                "state": state,
-                "blocked_reason": blocked_reason,
-                "repo": repo,
-                "retry_eligible": retry_eligible,
-                # Preserved on upsert, like _TASK_UPSERT_SQL's ON CONFLICT.
-                "attempts_without_progress": (
-                    prior["attempts_without_progress"] if prior else 0
-                ),
-                "next_eligible_at": prior["next_eligible_at"] if prior else None,
-                "updated_at": _now(),
-            }
-
-    async def get_task_state(self, queue: str | None, task: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._tasks.get((_qkey(queue), task))
-            return dict(row) if row else None
-
-    async def list_blocked(self) -> list[dict[str, Any]]:
-        with self._lock:
-            return [
-                {k: r[k] for k in _TASK_VIEW_COLUMNS}
-                for r in self._tasks.values()
-                if r["state"] == "blocked"
-            ]
-
-    async def tasks_in_state(self, state: str) -> list[dict[str, Any]]:
-        with self._lock:
-            return [
-                {
-                    "queue": r["queue"],
-                    "task": r["task"],
-                    "state": r["state"],
-                    "repo": r.get("repo"),
-                    "blocked_reason": r.get("blocked_reason"),
-                }
-                for r in self._tasks.values()
-                if r["state"] == state
-            ]
-
-    async def retryable_tasks(self, queue: str | None) -> list[dict[str, Any]]:
-        with self._lock:
-            qk = _qkey(queue)
-            return [
-                {
-                    "queue": r["queue"], "task": r["task"], "state": r["state"],
-                    "blocked_reason": r.get("blocked_reason"),
-                }
-                for r in self._tasks.values()
-                if r["queue"] == qk
-                and (r["state"] == "failed" or (r["state"] == "blocked" and r.get("retry_eligible")))
-            ]
-
-    async def clear_task_state(
-        self, queue: str | None, task: str, *, reset_progress: bool = False
-    ) -> None:
-        """Clear a task's hold. ``reset_progress`` (a landed resolve — real
-        progress) also zeroes the retry counter, deleting the row outright;
-        otherwise the counter survives on a demoted row while the backoff is
-        cleared (an explicit release means "dispatchable now")."""
-        with self._lock:
-            key = (_qkey(queue), task)
-            row = self._tasks.get(key)
-            if row is None:
-                return
-            if reset_progress or row["attempts_without_progress"] == 0:
-                self._tasks.pop(key)
-            else:
-                row.update(
-                    state=None, blocked_reason=None, repo=None,
-                    retry_eligible=False, next_eligible_at=None,
-                    updated_at=_now(),
-                )
-
-    async def tasks_backing_off(self) -> list[dict[str, Any]]:
-        with self._lock:
-            now = _now()
-            return [
-                {
-                    "queue": r["queue"], "task": r["task"],
-                    "next_eligible_at": r["next_eligible_at"],
-                }
-                for r in self._tasks.values()
-                if r["next_eligible_at"] is not None and r["next_eligible_at"] > now
-            ]
-
-    async def clear_task_backoff(self, queue: str | None, task: str) -> None:
-        with self._lock:
-            row = self._tasks.get((_qkey(queue), task))
-            if row is not None and row["next_eligible_at"] is not None:
-                row["next_eligible_at"] = None
-                row["updated_at"] = _now()
-
-    # ---- queue dedication ------------------------------------------------- #
-
-    async def queue_dedication(self) -> dict[str, list[str]]:
-        with self._lock:
-            return {q: list(w) for q, w in self._dedication.items() if w}
-
-    async def set_queue_dedication(
-        self, queue_label: str, worker_ids: list[str]
-    ) -> None:
-        with self._lock:
-            cleaned = [w for w in worker_ids if w]
-            if cleaned:
-                self._dedication[queue_label] = cleaned
-            else:
-                self._dedication.pop(queue_label, None)
-
-    # ---- queue transport state (Phase 7) ----------------------------------- #
-
-    def _queue_state_row(self, queue_label: str) -> dict[str, str | None]:
-        return self._queue_state.setdefault(
-            queue_label, {"paused_reason": None, "mode": None}
-        )
-
-    def _prune_queue_state(self, queue_label: str) -> None:
-        row = self._queue_state.get(queue_label)
-        if row is not None and row["paused_reason"] is None and row["mode"] is None:
-            self._queue_state.pop(queue_label, None)
-
-    async def queue_pauses(self) -> dict[str, str]:
-        with self._lock:
-            return {
-                q: row["paused_reason"]
-                for q, row in self._queue_state.items()
-                if row["paused_reason"] is not None
-            }
-
-    async def set_queue_pause(self, queue_label: str, reason: str | None) -> None:
-        with self._lock:
-            self._queue_state_row(queue_label)["paused_reason"] = reason
-            self._prune_queue_state(queue_label)
-
-    async def queue_modes(self) -> dict[str, str]:
-        with self._lock:
-            return {
-                q: row["mode"]
-                for q, row in self._queue_state.items()
-                if row["mode"] is not None
-            }
-
-    async def set_queue_mode(self, queue_label: str, mode: str | None) -> None:
-        with self._lock:
-            self._queue_state_row(queue_label)["mode"] = mode
-            self._prune_queue_state(queue_label)
-
-    # ---- queue rename ----------------------------------------------------- #
-
-    async def rename_queue(self, old: str, new: str) -> None:
-        """Repoint every queue-keyed row from ``old`` to ``new`` (playlists only;
-        the main queue is never renamed)."""
-        if not old or old == new:
-            return
-        with self._lock:
-            ok, nk = _qkey(old), _qkey(new)
-            for attempt in self._attempts.values():
-                if attempt["queue"] == ok:
-                    attempt["queue"] = nk
-            for event in self._events:
-                if event.get("queue") == old:
-                    event["queue"] = new
-            for key, row in list(self._tasks.items()):
-                if row["queue"] == ok:
-                    row["queue"] = nk
-                    self._tasks[(nk, row["task"])] = self._tasks.pop(key)
-            if old in self._dedication:
-                self._dedication[new] = self._dedication.pop(old)
-            if old in self._queue_state:
-                self._queue_state[new] = self._queue_state.pop(old)
-
-    # ---- events ----------------------------------------------------------- #
-
-    async def append_event(
-        self,
-        kind: str,
-        *,
-        run_id: str | None = None,
-        queue: str | None = None,
-        task: str | None = None,
-        payload: dict[str, Any] | None = None,
-    ) -> int:
-        with self._lock:
-            self._event_seq += 1
-            row = {
-                "id": self._event_seq,
-                "kind": kind,
-                "run_id": run_id,
-                "queue": queue,
-                "task": task,
-                "payload": payload or {},
-                "ts": _now(),
-            }
-            self._events.append(row)
-            return self._event_seq
-
-    async def events_since(self, cursor: int, *, limit: int = 500) -> list[dict[str, Any]]:
-        with self._lock:
-            return [dict(e) for e in self._events if e["id"] > cursor][:limit]
-
-    async def max_event_id(self) -> int:
-        with self._lock:
-            return self._event_seq
-
-    async def run_events(self, run_id: str) -> list[dict[str, Any]]:
-        with self._lock:
-            return [dict(e) for e in self._events if e["run_id"] == run_id]
-
-    # ---- stats ------------------------------------------------------------ #
-
-    async def stats_overall(self) -> dict[str, Any]:
-        with self._lock:
-            runs = list(self._attempts.values())
-        return _aggregate(runs)
-
-    async def stats_by_worker(self) -> list[dict[str, Any]]:
-        with self._lock:
-            runs = list(self._attempts.values())
-        return _group_stats(runs, "worker_id")
-
-    async def stats_by_backend(self) -> list[dict[str, Any]]:
-        with self._lock:
-            runs = list(self._attempts.values())
-        return _group_stats(runs, "backend")
-
-    async def stats_by_model(self) -> list[dict[str, Any]]:
-        with self._lock:
-            runs = list(self._attempts.values())
-        return _group_stats(runs, "model")
-
-    async def stats_by_queue(self) -> list[dict[str, Any]]:
-        with self._lock:
-            runs = list(self._attempts.values())
-        return _group_stats(runs, "queue")
-
-
-# Stats bucket sets over attempt states — the wire-status projection applied
-# to aggregation (keep in lockstep with the recreated SQL stats views in
-# migration 20260731000004). "expired" is deliberately unbucketed, exactly as
-# the zombie expired runs never were pre-phase.
-_STATS_COMPLETED = frozenset({"landed", "no_change"})
-_STATS_ERRORED = frozenset({"failed", "conflict"})
-
-
-def _aggregate(runs: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    completed = [r for r in runs if r["state"] in _STATS_COMPLETED]
-    durations = [
-        (r["finished_at"] - r["started_at"]).total_seconds()
-        for r in runs
-        if r.get("finished_at") and r.get("started_at")
-    ]
-    # Telemetry counts over *all* runs (a failed attempt still burns turns/tokens);
-    # LOC stays completed-only. Mirrors the SQL stats views.
-    turn_vals = [int(r["turns"]) for r in runs if r.get("turns") is not None]
-    cost_vals = [float(r["cost_usd"]) for r in runs if r.get("cost_usd") is not None]
-    total_input = sum(int(r["input_tokens"] or 0) for r in runs)
-    total_output = sum(int(r["output_tokens"] or 0) for r in runs)
-    return {
-        "total_runs": len(runs),
-        "completed": len(completed),
-        "errored": sum(1 for r in runs if r["state"] in _STATS_ERRORED),
-        "aborted": sum(1 for r in runs if r["state"] == "aborted"),
-        "skipped": sum(1 for r in runs if r["state"] == "skipped"),
-        "total_loc": sum(int(r["loc"] or 0) for r in completed),
-        "avg_seconds": (sum(durations) / len(durations)) if durations else 0.0,
-        "total_turns": sum(turn_vals),
-        "avg_turns": (sum(turn_vals) / len(turn_vals)) if turn_vals else 0.0,
-        "total_input_tokens": total_input,
-        "total_output_tokens": total_output,
-        "total_tokens": total_input + total_output,
-        "total_cost_usd": sum(cost_vals),
-    }
-
-
-def _group_stats(runs: Sequence[dict[str, Any]], key: str) -> list[dict[str, Any]]:
-    groups: dict[str, list[dict[str, Any]]] = {}
-    for r in runs:
-        gk = r.get(key)
-        if gk is None:
-            continue
-        groups.setdefault(gk, []).append(r)
-    out: list[dict[str, Any]] = []
-    for gk, items in sorted(groups.items()):
-        agg = _aggregate(items)
-        agg[key] = gk
-        out.append(agg)
-    return out
-
-
-# --------------------------------------------------------------------------- #
-# Postgres store (PgPoolLike — no direct asyncpg)
-# --------------------------------------------------------------------------- #
-
-
-class PgStore:
-    """Durable store over a structural :class:`PgPoolLike` pool.
-
-    Never imports ``asyncpg`` (Invariant 3 / ``no-inline-asyncpg``); the pool is
-    handed in. Rows come back as mappings; we coerce to plain dicts so callers
-    don't depend on the driver's record type.
-    """
-
-    def __init__(self, pool: PgPoolLike) -> None:
-        self._pool = pool
-
-    async def init(self) -> None:
-        return None
-
-    async def close(self) -> None:
-        await self._pool.close()
-
-    async def register_worker(
-        self,
-        worker_id: str,
-        *,
-        backend: str,
-        queues: list[str] | None,
-        priorities: list[int] | None,
-        models: list[str] | None = None,
-        mcps: list[str] | None = None,
-        meta: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO nightshift.workers
@@ -1065,7 +393,7 @@ class PgStore:
         current_queue: str | None = None,
         current_run_id: str | None = None,
     ) -> None:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             await conn.execute(
                 """
                 UPDATE nightshift.workers
@@ -1077,26 +405,26 @@ class PgStore:
             )
 
     async def heartbeat_worker(self, worker_id: str) -> None:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             await conn.execute(
                 "UPDATE nightshift.workers SET last_heartbeat_at = now() WHERE id = $1",
                 worker_id,
             )
 
     async def list_workers(self) -> list[dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             rows = await conn.fetch("SELECT * FROM nightshift.workers ORDER BY id")
         return [_worker_row(r) for r in rows]
 
     async def get_worker(self, worker_id: str) -> dict[str, Any] | None:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM nightshift.workers WHERE id = $1", worker_id
             )
         return _worker_row(row) if row else None
 
     async def expire_stale_workers(self, ttl_seconds: float) -> list[str]:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             rows = await conn.fetch(
                 """
                 UPDATE nightshift.workers
@@ -1108,6 +436,8 @@ class PgStore:
                 str(int(ttl_seconds)),
             )
         return [r["id"] for r in rows]
+
+    # ---- attempts ---------------------------------------------------------- #
 
     async def create_attempt(
         self,
@@ -1132,7 +462,7 @@ class PgStore:
         # for index inference (invariant 1: one live attempt per task).
         # A non-live attempt (resolve child) never trips it and carries no
         # deadline.
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             row = await conn.fetchrow(
                 f"""
                 INSERT INTO nightshift.attempts
@@ -1154,7 +484,7 @@ class PgStore:
         return _attempt_row(row) if row else None
 
     async def get_attempt(self, attempt_id: str) -> dict[str, Any] | None:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM nightshift.attempts WHERE id = $1", attempt_id
             )
@@ -1165,14 +495,14 @@ class PgStore:
             return
         _check_attempt_fields(fields, allow_state=True)
         sets, values = _attempt_set_sql(fields, fields.get("state"), start=2)
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             await conn.execute(
                 f"UPDATE nightshift.attempts SET {sets} WHERE id = $1",
                 attempt_id, *values,
             )
 
     async def live_attempts(self) -> list[dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             rows = await conn.fetch(
                 f"SELECT * FROM nightshift.attempts WHERE state IN ({_ATTEMPT_LIVE_SQL})"
             )
@@ -1191,7 +521,7 @@ class PgStore:
             clauses.append(f"worker_id = ${len(values)}")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         values.append(limit)
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             rows = await conn.fetch(
                 f"SELECT * FROM nightshift.attempts {where} "
                 f"ORDER BY started_at DESC LIMIT ${len(values)}",
@@ -1200,7 +530,7 @@ class PgStore:
         return [_attempt_row(r) for r in rows]
 
     async def heartbeat_attempt(self, attempt_id: str, ttl_seconds: float) -> None:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             await conn.execute(
                 f"""
                 UPDATE nightshift.attempts
@@ -1210,6 +540,8 @@ class PgStore:
                 """,
                 attempt_id, str(int(ttl_seconds)),
             )
+
+    # ---- transitions ------------------------------------------------------ #
 
     async def apply_transition(
         self,
@@ -1229,7 +561,7 @@ class PgStore:
         _check_attempt_fields(t.fields, allow_state=False)
         sets, values = _attempt_set_sql(t.fields, t.state, start=5)
         extra = f", {sets}" if sets else ""
-        async with self._pool.acquire() as conn, conn.transaction():
+        async with self._transaction() as conn:
             row = await conn.fetchrow(
                 f"""
                 UPDATE nightshift.attempts
@@ -1267,13 +599,15 @@ class PgStore:
             for ev in t.events:
                 ids.append(await conn.fetchval(
                     """
-                    INSERT INTO nightshift.events (kind, run_id, queue, task, payload)
-                    VALUES ($1, $2, $3, $4, $5::jsonb)
+                    INSERT INTO nightshift.events (kind, run_id, queue, task, payload, ts)
+                    VALUES ($1, $2, $3, $4, $5::jsonb, now())
                     RETURNING id
                     """,
                     ev.kind, ev.run_id, ev.queue, ev.task, json.dumps(ev.payload or {}),
                 ))
             return ids
+
+    # ---- task state ------------------------------------------------------- #
 
     async def set_task_state(
         self,
@@ -1285,14 +619,14 @@ class PgStore:
         repo: str | None = None,
         retry_eligible: bool = False,
     ) -> None:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             await conn.execute(
                 _TASK_UPSERT_SQL,
                 _qkey(queue), task, state, blocked_reason, repo, retry_eligible,
             )
 
     async def get_task_state(self, queue: str | None, task: str) -> dict[str, Any] | None:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM nightshift.tasks WHERE queue = $1 AND task = $2",
                 _qkey(queue), task,
@@ -1300,7 +634,7 @@ class PgStore:
         return dict(row) if row else None
 
     async def list_blocked(self) -> list[dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             rows = await conn.fetch(
                 f"SELECT {', '.join(_TASK_VIEW_COLUMNS)} "
                 "FROM nightshift.tasks WHERE state = 'blocked'"
@@ -1308,7 +642,7 @@ class PgStore:
         return [dict(r) for r in rows]
 
     async def tasks_in_state(self, state: str) -> list[dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             rows = await conn.fetch(
                 "SELECT queue, task, state, repo, blocked_reason FROM nightshift.tasks WHERE state = $1",
                 state,
@@ -1316,7 +650,7 @@ class PgStore:
         return [dict(r) for r in rows]
 
     async def retryable_tasks(self, queue: str | None) -> list[dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             rows = await conn.fetch(
                 """
                 SELECT queue, task, state, blocked_reason FROM nightshift.tasks
@@ -1333,7 +667,7 @@ class PgStore:
         progress) also zeroes the retry counter, deleting the row outright;
         otherwise the counter survives on a demoted row while the backoff is
         cleared (an explicit release means "dispatchable now")."""
-        async with self._pool.acquire() as conn, conn.transaction():
+        async with self._transaction() as conn:
             if reset_progress:
                 await conn.execute(
                     "DELETE FROM nightshift.tasks WHERE queue = $1 AND task = $2",
@@ -1344,7 +678,7 @@ class PgStore:
             await conn.execute(_TASK_RELEASE_DEMOTE_SQL, _qkey(queue), task)
 
     async def tasks_backing_off(self) -> list[dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             rows = await conn.fetch(
                 """
                 SELECT queue, task, next_eligible_at FROM nightshift.tasks
@@ -1354,7 +688,7 @@ class PgStore:
         return [dict(r) for r in rows]
 
     async def clear_task_backoff(self, queue: str | None, task: str) -> None:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             await conn.execute(
                 """
                 UPDATE nightshift.tasks
@@ -1364,8 +698,10 @@ class PgStore:
                 _qkey(queue), task,
             )
 
+    # ---- queue dedication / transport state -------------------------------- #
+
     async def queue_dedication(self) -> dict[str, list[str]]:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             rows = await conn.fetch(
                 "SELECT queue, worker_id FROM nightshift.queue_routing ORDER BY queue"
             )
@@ -1378,7 +714,7 @@ class PgStore:
         self, queue_label: str, worker_ids: list[str]
     ) -> None:
         cleaned = [w for w in worker_ids if w]
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             await conn.execute(
                 "DELETE FROM nightshift.queue_routing WHERE queue = $1",
                 queue_label,
@@ -1394,7 +730,7 @@ class PgStore:
                 )
 
     async def queue_pauses(self) -> dict[str, str]:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             rows = await conn.fetch(
                 "SELECT queue, paused_reason FROM nightshift.queue_state "
                 "WHERE paused_reason IS NOT NULL"
@@ -1402,7 +738,7 @@ class PgStore:
         return {r["queue"]: r["paused_reason"] for r in rows}
 
     async def set_queue_pause(self, queue_label: str, reason: str | None) -> None:
-        async with self._pool.acquire() as conn, conn.transaction():
+        async with self._transaction() as conn:
             await conn.execute(
                 """
                 INSERT INTO nightshift.queue_state (queue, paused_reason, updated_at)
@@ -1415,7 +751,7 @@ class PgStore:
             await conn.execute(_QUEUE_STATE_PRUNE_SQL, queue_label)
 
     async def queue_modes(self) -> dict[str, str]:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             rows = await conn.fetch(
                 "SELECT queue, mode FROM nightshift.queue_state "
                 "WHERE mode IS NOT NULL"
@@ -1423,7 +759,7 @@ class PgStore:
         return {r["queue"]: r["mode"] for r in rows}
 
     async def set_queue_mode(self, queue_label: str, mode: str | None) -> None:
-        async with self._pool.acquire() as conn, conn.transaction():
+        async with self._transaction() as conn:
             await conn.execute(
                 """
                 INSERT INTO nightshift.queue_state (queue, mode, updated_at)
@@ -1442,13 +778,15 @@ class PgStore:
         value maps them all."""
         if not old or old == new:
             return
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             for table in ("attempts", "tasks", "events", "queue_routing",
                           "queue_state"):
                 await conn.execute(
                     f"UPDATE nightshift.{table} SET queue = $2 WHERE queue = $1",
                     old, new,
                 )
+
+    # ---- events ------------------------------------------------------------ #
 
     async def append_event(
         self,
@@ -1459,18 +797,18 @@ class PgStore:
         task: str | None = None,
         payload: dict[str, Any] | None = None,
     ) -> int:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             return await conn.fetchval(
                 """
-                INSERT INTO nightshift.events (kind, run_id, queue, task, payload)
-                VALUES ($1, $2, $3, $4, $5::jsonb)
+                INSERT INTO nightshift.events (kind, run_id, queue, task, payload, ts)
+                VALUES ($1, $2, $3, $4, $5::jsonb, now())
                 RETURNING id
                 """,
                 kind, run_id, queue, task, json.dumps(payload or {}),
             )
 
     async def events_since(self, cursor: int, *, limit: int = 500) -> list[dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             rows = await conn.fetch(
                 "SELECT * FROM nightshift.events WHERE id > $1 ORDER BY id LIMIT $2",
                 cursor, limit,
@@ -1478,41 +816,73 @@ class PgStore:
         return [_event_row(r) for r in rows]
 
     async def max_event_id(self) -> int:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             value = await conn.fetchval("SELECT COALESCE(max(id), 0) FROM nightshift.events")
         return int(value or 0)
 
     async def run_events(self, run_id: str) -> list[dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             rows = await conn.fetch(
                 "SELECT * FROM nightshift.events WHERE run_id = $1 ORDER BY id", run_id
             )
         return [_event_row(r) for r in rows]
 
+    # ---- stats -------------------------------------------------------------- #
+
     async def stats_overall(self) -> dict[str, Any]:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             row = await conn.fetchrow("SELECT * FROM nightshift.stats_overall")
-        return dict(row) if row else _aggregate([])
+        return dict(row)
 
     async def stats_by_worker(self) -> list[dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             rows = await conn.fetch("SELECT * FROM nightshift.stats_by_worker ORDER BY worker_id")
         return [dict(r) for r in rows]
 
     async def stats_by_backend(self) -> list[dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             rows = await conn.fetch("SELECT * FROM nightshift.stats_by_backend ORDER BY backend")
         return [dict(r) for r in rows]
 
     async def stats_by_model(self) -> list[dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             rows = await conn.fetch("SELECT * FROM nightshift.stats_by_model ORDER BY model")
         return [dict(r) for r in rows]
 
     async def stats_by_queue(self) -> list[dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._connection() as conn:
             rows = await conn.fetch("SELECT * FROM nightshift.stats_by_queue ORDER BY queue")
         return [dict(r) for r in rows]
+
+
+# --------------------------------------------------------------------------- #
+# Postgres store (PgPoolLike — no direct asyncpg)
+# --------------------------------------------------------------------------- #
+
+
+class PgStore(SqlStoreBase):
+    """Durable store over a structural :class:`PgPoolLike` pool.
+
+    Never imports ``asyncpg`` (Invariant 3 / ``no-inline-asyncpg``); the pool is
+    handed in. Rows come back as mappings; we coerce to plain dicts so callers
+    don't depend on the driver's record type.
+    """
+
+    def __init__(self, pool: PgPoolLike) -> None:
+        self._pool = pool
+
+    async def close(self) -> None:
+        await self._pool.close()
+
+    @asynccontextmanager
+    async def _connection(self):
+        async with self._pool.acquire() as conn:
+            yield conn
+
+    @asynccontextmanager
+    async def _transaction(self):
+        async with self._pool.acquire() as conn, conn.transaction():
+            yield conn
 
 
 def _jsonish(value: Any) -> Any:
@@ -1557,13 +927,17 @@ async def open_store(dsn: str | None = None) -> NightshiftStore:
     """Open the durable store from the environment, or an in-memory fallback.
 
     Uses Postgres (``PgStore``) when a DSN is available (``dsn`` arg, else
-    ``NIGHTSHIFT_PG_DSN``), else an in-memory store so a co-located
-    single-machine run needs no DB. The asyncpg import is local to this factory
-    so the module never imports a PG client at top level.
+    ``NIGHTSHIFT_PG_DSN``), else an in-memory SQLite store so a co-located
+    single-machine run needs no DB. Both backend imports are local to this
+    factory: asyncpg so the module never imports a PG client at top level,
+    and ``store_sqlite`` because it imports this module (the shared query
+    layer) at its own top level.
     """
     dsn = dsn or os.environ.get("NIGHTSHIFT_PG_DSN")
     if not dsn:
-        store: NightshiftStore = MemoryStore()
+        from nightshift.manager.store_sqlite import SqliteStore
+
+        store: NightshiftStore = SqliteStore()
         await store.init()
         return store
     # The single asyncpg seam (`nightshift.pg`) owns the client; we only ever

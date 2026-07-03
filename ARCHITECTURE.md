@@ -95,7 +95,8 @@ sequenceDiagram
 |--------|---------------|
 | `app.py` | FastAPI app — worker API (`/api/worker/*`), operator API (`/api/*`), SSE (`/api/events`), static UI |
 | `config.py` | Load + validate `config.json` into `ManagerConfig` |
-| `store.py` | State protocol (`NightshiftStore`) with `PgStore` + `MemoryStore` implementations |
+| `store.py` | State protocol (`NightshiftStore`) + the shared SQL query layer + `PgStore` |
+| `store_sqlite.py` | `SqliteStore` — the same query layer on in-memory SQLite (tests / no-DB fallback) |
 | `scheduler.py` | Cross-queue next-task arbitration: capability matching, priority, round-robin tiebreak |
 | `landing.py` | Git authority — conflict detection, squash, remote policy (none/push/pr) |
 | `hub.py` | SSE broadcast hub for live operator UI updates |
@@ -118,7 +119,10 @@ The manager serves the operator UI as static files from `src/nightshift/assets/u
 
 | Module | Responsibility |
 |--------|---------------|
-| `engine.py` | Orchestration primitives: task lists, worktree lifecycle, backend dispatch, validate/repair, squash commits, event emission |
+| `git/` | The git seam: `GitRunner` subprocess boundary, worktrees, squash landing, sync, transport |
+| `task_files.py`, `queue_config.py` | Task lists, brief round-trips, queue order/priorities |
+| `preflight.py`, `prompts.py` | Run preconditions, env sync, prompt building |
+| `resolve_runner.py` | Conflict-resolve driver run by the manager's out-of-process resolve job |
 | `backends.py` | Pluggable backend shims: `claude-code`, `cursor`, `gemini`, `anthropic`, `ollama` |
 | `events.py` | Observable event types (`RUN_STARTED`, `TASK_RESULT`, etc.) |
 | `repos.py` | Workspace repo addressing, slug validation, availability checks |
@@ -128,13 +132,12 @@ The manager serves the operator UI as static files from `src/nightshift/assets/u
 | `pg.py` | The only asyncpg seam — structural pool type + `open_pool` |
 | `_paths.py` | Shipped-asset vs operator-state path resolution |
 
-### Legacy & optional
+### Optional
 
 | Module | Responsibility |
 |--------|---------------|
-| `server/` | Single-box UI server (viewer + player, `:8799`) — predates the manager/worker split |
 | `slack/` | Socket Mode capture daemon + outbound notifications |
-| `run_local.py` | CLI runner — drives the engine directly (no manager) |
+| `run_local.py` | One-shot CLI runner — ephemeral in-process manager + one worker loop |
 
 ## State model
 
@@ -144,9 +147,9 @@ The manager serves the operator UI as static files from `src/nightshift/assets/u
 │                                              │
 │  NightshiftStore (Protocol)                  │
 │  ┌────────────┐   ┌────────────────────────┐ │
-│  │ MemoryStore│   │ PgStore                │ │
+│  │ SqliteStore│   │ PgStore                │ │
 │  │ (fallback) │   │ nightshift.* schema    │ │
-│  └────────────┘   │ workers, leases, runs, │ │
+│  └────────────┘   │ workers, attempts,     │ │
 │                    │ events, queue_routing  │ │
 │                    └────────────────────────┘ │
 │                                              │
@@ -241,7 +244,7 @@ just validate   # ruff + pytest
 ```
 
 Tests use `tests/_workspace.py` (`build_workspace()`) to construct fake multi-repo workspaces with real git repos.
-No live Postgres required for the majority of the suite — tests exercise `MemoryStore` directly.
+No live Postgres required — tests exercise the same SQL query layer through `SqliteStore` (in-memory SQLite).
 
 Key test scopes:
 - Manager API and worker protocol (`test_nightshift_manager.py`, `test_nightshift_worker.py`)

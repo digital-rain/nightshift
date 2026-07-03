@@ -78,10 +78,6 @@ from nightshift.lifecycle import (
     SubmitPolicy,
     TaskHoldKind,
     Transition,
-    on_deadline,
-    on_land_interrupted,
-    on_land_recovered,
-    on_land_result,
 )
 from nightshift.manager.config import ManagerConfig
 from nightshift.manager.landing import land_locked
@@ -100,6 +96,12 @@ from nightshift.task_files import (
     drop_completed_task,
     frontmatter_held_tasks,
     task_is_evergreen,
+)
+from nightshift.transitions import (
+    on_deadline,
+    on_land_interrupted,
+    on_land_recovered,
+    on_land_result,
 )
 
 

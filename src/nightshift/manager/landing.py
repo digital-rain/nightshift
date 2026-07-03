@@ -418,7 +418,7 @@ def push_resolved_main_locked(
     trailer on the replayed commit.
 
     The out-of-process resolve runner produces a single squash commit on local
-    ``main`` (``runner_legacy.resolve_task``); origin may have advanced while
+    ``main`` (``resolve_runner.resolve_task``); origin may have advanced while
     its agent worked, so this is the integrate loop with the cherry producer:
     re-sync origin (rescuing the divergence the resolved commit deliberately
     created — hence ``rescue_divergence_on_first_sync``), replay the commit

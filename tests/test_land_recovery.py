@@ -20,16 +20,16 @@ from typing import Any
 from starlette.testclient import TestClient
 
 from _workspace import build_workspace
-from nightshift.engine import setup_worktree
 from nightshift.git.landing import attempt_trailer_line, find_landed_attempt
+from nightshift.git.worktrees import setup_worktree
 from nightshift.lifecycle import AttemptState, LandKind, TaskHoldKind
 from nightshift.manager.app import create_app
 from nightshift.manager.landing import canonical_head, land
-from nightshift.manager.store import MemoryStore
+from nightshift.manager.store_sqlite import SqliteStore
 
 
-def _client(workspace: Path, store: MemoryStore | None = None) -> TestClient:
-    return TestClient(create_app(workspace, store=store or MemoryStore()))
+def _client(workspace: Path, store: SqliteStore | None = None) -> TestClient:
+    return TestClient(create_app(workspace, store=store or SqliteStore()))
 
 
 def _poll_with_landable_branch(
@@ -65,7 +65,7 @@ def _commit_count(repo_root: Path) -> int:
     return int(out.strip())
 
 
-def _seed_landing_attempt(store: MemoryStore, run_id: str, task: str) -> None:
+def _seed_landing_attempt(store: SqliteStore, run_id: str, task: str) -> None:
     """A LANDING attempt exactly as a crashed process would have left it."""
     async def seed() -> None:
         row = await store.create_attempt(
@@ -145,7 +145,7 @@ def test_invariant_5_recovery_with_trailer_does_not_reland(tmp_path: Path) -> No
     commit count are unchanged."""
     workspace = build_workspace(tmp_path, tasks={"10.hello": "Do a thing."})
     repo_root = workspace / "longitude"
-    store = MemoryStore()
+    store = SqliteStore()
     _seed_landing_attempt(store, "run-x", "10.hello")
 
     # The previous process's land job DID complete: trailer on main.
@@ -197,7 +197,7 @@ def test_recovery_reenqueues_interrupted_land_with_surviving_branch(
     lands exactly once and now carries the trailer."""
     workspace = build_workspace(tmp_path, tasks={"10.hello": "Do a thing."})
     repo_root = workspace / "longitude"
-    store = MemoryStore()
+    store = SqliteStore()
     _seed_landing_attempt(store, "run-x", "10.hello")
 
     # The worker's branch exists with committed work; nothing was landed.
@@ -241,7 +241,7 @@ def test_rung2_reenqueue_that_cannot_land_parks_as_conflict(
     is NOT consumed."""
     workspace = build_workspace(tmp_path, tasks={"10.hello": "Do a thing."})
     repo_root = workspace / "longitude"
-    store = MemoryStore()
+    store = SqliteStore()
     _seed_landing_attempt(store, "run-x", "10.hello")
 
     # The branch exists (rung 2 fires) but sits exactly at main: empty squash.

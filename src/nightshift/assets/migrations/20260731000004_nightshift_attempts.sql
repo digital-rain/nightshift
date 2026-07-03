@@ -9,7 +9,7 @@
 -- released_at), plus branch_ref/head_sha persisted at the LANDING transition
 -- for restart re-enqueue (internal-only; never projected to the API).
 --
--- The fold CASE below is the SQL twin of nightshift.lifecycle.fold_legacy —
+-- The fold CASE below is the SQL twin of nightshift.lifecycle_compat.fold_legacy —
 -- keep them in lockstep (test_lifecycle.py pins the Python side; the shape
 -- test in test_nightshift_store.py pins this file's structure).
 CREATE TABLE IF NOT EXISTS nightshift.attempts (
@@ -86,7 +86,7 @@ BEGIN
     END IF;
 
     -- Runs (LEFT JOIN latest lease) with the fold CASE — the SQL twin of
-    -- lifecycle.fold_legacy: lease status dominates for cancelled/expired/
+    -- lifecycle_compat.fold_legacy: lease status dominates for cancelled/expired/
     -- landed; a live lease + running run splits RUNNING/LANDING on phase;
     -- everything else folds by run status alone (zombie combos canonicalize:
     -- cancelled/expired leases with running runs, released running rows, and
@@ -180,7 +180,7 @@ END $$;
 -- to the state vocabulary: completed = landed|no_change, errored =
 -- failed|conflict. 'expired' is deliberately unbucketed, exactly as the
 -- zombie expired runs never were pre-phase. Keep in lockstep with
--- MemoryStore._aggregate.
+-- the SQLite store's stats views (store_sqlite._SCHEMA).
 CREATE VIEW nightshift.stats_overall AS
 SELECT
     count(*)                                          AS total_runs,
@@ -293,7 +293,7 @@ GROUP BY queue;
 -- migrate:down
 
 -- Split attempts back into leases + runs (the SQL twin of
--- nightshift.lifecycle.split_state). Run ids are kept; lease ids regenerate
+-- nightshift.lifecycle_compat.split_state). Run ids are kept; lease ids regenerate
 -- via gen_random_uuid (the originals were consumed by the fold; lease-only
 -- attempts regain a row the same way). ABORTED canonicalizes to
 -- (cancelled, aborted) — see fold_legacy's zombie notes.

@@ -130,10 +130,6 @@ class TestDefaultsDriftGuard:
         from nightshift.config.player import PlayerConfig
         assert PlayerConfig().repeat_interval == "30m"
 
-    def test_player_port(self):
-        from nightshift.config.player import PlayerConfig
-        assert PlayerConfig().port == 8799
-
 
 # ─── §8.2 Metadata completeness ──────────────────────────────────────────────
 
@@ -255,14 +251,13 @@ class TestRoundTrip:
         )
 
         original = PlayerConfig(theme="light", transport_mode="repeat",
-                                repeat_interval="1h", port=9000)
+                                repeat_interval="1h")
         save_player_config(workspace, original)
         loaded = load_player_config(workspace)
 
         assert loaded.theme == "light"
         assert loaded.transport_mode == "repeat"
         assert loaded.repeat_interval == "1h"
-        assert loaded.port == 9000
 
     def test_cadences_nested_in_manager_json(self, workspace: Path, monkeypatch):
         monkeypatch.delenv("NIGHTSHIFT_PG_DSN", raising=False)
@@ -409,11 +404,6 @@ class TestApplyClassification:
         f = next(f for f in dataclasses.fields(PlayerConfig) if f.name == "theme")
         assert f.metadata["nightshift"]["apply"] == "live"
 
-    def test_player_port_is_restart(self):
-        from nightshift.config.player import PlayerConfig
-        f = next(f for f in dataclasses.fields(PlayerConfig) if f.name == "port")
-        assert f.metadata["nightshift"]["apply"] == "restart"
-
     def test_operator_max_per_day_is_next_task(self):
         from nightshift.config.manager import OperatorConfig
         f = next(f for f in dataclasses.fields(OperatorConfig) if f.name == "max_per_day")
@@ -454,12 +444,10 @@ class TestNoLegacyPaths:
         ).replace("manager.json", "")
 
     def test_settings_reads_player_json(self):
-        """load_settings reads .nightshift/player.json, not .nightshift/settings.json."""
-        # Both should resolve to the same path
+        """Operator UI preferences live at .nightshift/player.json, not the
+        legacy .nightshift/settings.json."""
         from pathlib import Path
 
         from nightshift.config.io import player_json_path
-        from nightshift.server.settings import settings_path
         ws = Path("/fake")
-        assert settings_path(ws) == player_json_path(ws)
-        assert "player.json" in str(settings_path(ws))
+        assert player_json_path(ws) == ws / ".nightshift" / "player.json"

@@ -12,9 +12,9 @@ import subprocess
 from pathlib import Path
 
 from _workspace import build_workspace, git_commit_all
-from nightshift.engine import setup_worktree, worktree_branch
 from nightshift.git import landing as git_landing_mod
 from nightshift.git.runner import GitResult
+from nightshift.git.worktrees import setup_worktree, worktree_branch
 from nightshift.lifecycle import LAND_SUCCESS_KINDS, LandKind
 from nightshift.manager.landing import (
     base_ref_drifted,

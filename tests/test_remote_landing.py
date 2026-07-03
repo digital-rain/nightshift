@@ -28,25 +28,25 @@ from _workspace import (
     make_bare_remote,
 )
 from nightshift.backends import WorkerResult
-from nightshift.engine import (
-    _is_ancestor,
-    fetch_rendezvous_branch,
+from nightshift.git import GitRunner
+from nightshift.git.refs import is_ancestor
+from nightshift.git.sync import (
+    SyncThrottle,
     maybe_sync_main_to_origin,
+    sync_main_to_origin,
+)
+from nightshift.git.transport import (
+    fetch_rendezvous_branch,
     normalize_wip_prefix,
     prune_rendezvous_branch,
     publish_task_branch,
-    setup_worktree,
-    sync_main_to_origin,
-    worktree_branch,
-    worktree_dir,
 )
-from nightshift.git import GitRunner
-from nightshift.git.sync import SyncThrottle
+from nightshift.git.worktrees import setup_worktree, worktree_branch, worktree_dir
 from nightshift.lifecycle import LandKind, LandOutcome
 from nightshift.manager.app import create_app
 from nightshift.manager.config import load_manager_config
 from nightshift.manager.landing import canonical_head, land
-from nightshift.manager.store import MemoryStore
+from nightshift.manager.store_sqlite import SqliteStore
 from nightshift.worker.config import WorkerConfig, load_worker_config
 from nightshift.worker.execute import execute_work_order
 from nightshift.worker.local_store import LocalStore
@@ -290,7 +290,7 @@ def test_sync_main_to_origin_rescues_operator_commit_over_divergence(
     # operator commit is rescued and replayed on top of origin's advance.
     new_head = sync_main_to_origin(workspace, repo, "origin")
     assert new_head is not None
-    assert _is_ancestor(repo_root, advanced, new_head)  # origin's work integrated
+    assert is_ancestor(repo_root, advanced, new_head)  # origin's work integrated
     assert (repo_root / "feature.txt").exists()
     assert (repo_root / "lint.txt").exists()  # operator commit survived
     # The operator commit now sits on top of origin's advance, not lost.
@@ -323,7 +323,7 @@ def test_sync_collapses_redundant_squash_but_keeps_operator_commit(tmp_path: Pat
         workspace, repo, "origin", dropped_commits=dropped
     )
     assert new_head is not None
-    assert _is_ancestor(repo_root, merged, new_head)
+    assert is_ancestor(repo_root, merged, new_head)
     assert (repo_root / "merged.txt").exists()
     assert (repo_root / "lint.txt").exists()  # operator commit replayed
     assert dropped == []  # a redundant collapse is not a casualty
@@ -863,7 +863,7 @@ def _run_once_capturing_land_mode(tmp_path: Path, monkeypatch, brief: str) -> st
 
     monkeypatch.setattr("nightshift.manager.api_worker.land_locked", spy_land)
 
-    with TestClient(create_app(workspace, store=MemoryStore())) as tc:
+    with TestClient(create_app(workspace, store=SqliteStore())) as tc:
         cfg = WorkerConfig(
             workspace=workspace, worker_id="w1", manager_url="http://test",
         )

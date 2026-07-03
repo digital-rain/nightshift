@@ -19,7 +19,7 @@ from typing import Any
 from starlette.testclient import TestClient
 
 from _workspace import build_workspace
-from nightshift.engine import setup_worktree
+from nightshift.git.worktrees import setup_worktree
 from nightshift.lifecycle import AttemptState, LandKind, LandOutcome
 from nightshift.manager.app import create_app
 from nightshift.manager.scheduler import (
@@ -27,11 +27,11 @@ from nightshift.manager.scheduler import (
     TaskCandidate,
     unroutable,
 )
-from nightshift.manager.store import MemoryStore
+from nightshift.manager.store_sqlite import SqliteStore
 
 
-def _client(workspace: Path, store: MemoryStore | None = None) -> TestClient:
-    return TestClient(create_app(workspace, store=store or MemoryStore()))
+def _client(workspace: Path, store: SqliteStore | None = None) -> TestClient:
+    return TestClient(create_app(workspace, store=store or SqliteStore()))
 
 
 def _checkin(client: TestClient, worker_id: str = "w1", **extra: Any) -> None:
@@ -160,7 +160,7 @@ def test_mid_land_attempt_is_exempt_from_deadline_expiry(
     RUNNING attempts. The startup recovery pass owns mid-land casualties."""
     workspace = build_workspace(tmp_path, tasks={"10.hello": "Do a thing."})
     land_entered, land_gate = _gated_land(monkeypatch)
-    store = MemoryStore()
+    store = SqliteStore()
 
     with _client(workspace, store) as client:
         order = _poll_with_landable_branch(client, workspace, "10.hello")
@@ -201,7 +201,7 @@ def test_discarded_land_result_leaves_an_operator_visible_trace(
     kind, no new vocabulary)."""
     workspace = build_workspace(tmp_path, tasks={"10.hello": "Do a thing."})
     land_entered, land_gate = _gated_land(monkeypatch)
-    store = MemoryStore()
+    store = SqliteStore()
 
     with _client(workspace, store) as client:
         order = _poll_with_landable_branch(client, workspace, "10.hello")
@@ -245,7 +245,7 @@ def test_discarded_land_result_leaves_an_operator_visible_trace(
 
 def test_paused_queue_stays_paused_across_manager_restart(tmp_path: Path) -> None:
     workspace = build_workspace(tmp_path, tasks={"10.hello": "Do a thing."})
-    store = MemoryStore()
+    store = SqliteStore()
 
     with _client(workspace, store) as client:
         client.post("/api/transport", json={"action": "pause", "queue": None})
@@ -274,7 +274,7 @@ def test_restart_parks_mid_land_run_for_resolve(tmp_path: Path) -> None:
     conservative park: attempt CONFLICT (merge_rejected), task blocked for
     resolve — never lost, never double-landed."""
     workspace = build_workspace(tmp_path, tasks={"10.hello": "Do a thing."})
-    store = MemoryStore()
+    store = SqliteStore()
 
     async def _seed_mid_land() -> str:
         run_id = "run-mid-land"
@@ -333,7 +333,7 @@ _POLL_READS = frozenset({
 })
 
 
-class _ReadOnlyWhenArmed(MemoryStore):
+class _ReadOnlyWhenArmed(SqliteStore):
     armed = False
     calls: list[str] = []
 
@@ -379,7 +379,7 @@ def test_no_work_poll_performs_zero_store_writes(tmp_path: Path) -> None:
 
 def test_reconciler_expires_overdue_attempts(tmp_path: Path) -> None:
     workspace = build_workspace(tmp_path, tasks={"10.hello": "Do a thing."})
-    store = MemoryStore()
+    store = SqliteStore()
     with _client(workspace, store) as client:
         _checkin(client)
         order = _poll(client)
@@ -507,7 +507,7 @@ def test_rescan_resets_repo_warning_dedup_for_the_reconciler(tmp_path: Path) -> 
     stale object and the re-warn would silently never happen."""
     workspace = build_workspace(tmp_path, tasks={"10.hello": "Do a thing."})
     (workspace / "longitude").rename(tmp_path / "longitude-hidden")
-    store = MemoryStore()
+    store = SqliteStore()
 
     def _warning_count() -> int:
         return sum(

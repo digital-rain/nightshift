@@ -8,7 +8,7 @@ and fresh work can start off the last pre-conflict commit while this runs.
 What it does, in order:
 
 1. Integrate origin/main into the local clone so the rebase target is current.
-2. Run :func:`nightshift.runner_legacy.resolve_task` in the task's *preserved* worktree
+2. Run :func:`nightshift.resolve_runner.resolve_task` in the task's *preserved* worktree
    (rebase onto main → agent resolves conflicts → re-validate → squash to local
    main), streaming the run's events back to the manager so the live log and
    ``resolve`` phase show in the UI.
@@ -30,7 +30,7 @@ from nightshift import playlists as playlists_mod
 from nightshift.events import RUN_FINISHED, RUN_STARTED, Event
 from nightshift.git.sync import sync_main_to_origin
 from nightshift.lifecycle import FailureKind, LandingMode, RunStatus
-from nightshift.runner_legacy import resolve_task
+from nightshift.resolve_runner import resolve_task
 from nightshift.spawn_daily import resolve_config
 from nightshift.worker.client import ManagerClient
 
