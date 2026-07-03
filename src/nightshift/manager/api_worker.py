@@ -55,6 +55,7 @@ from nightshift.lifecycle import (
     MERGE_FAILURE_KINDS,
     AttemptRef,
     AttemptState,
+    Backoff,
     FailureKind,
     GitPhase,
     LandingMode,
@@ -498,6 +499,7 @@ def register_worker_api(
             retry=RetryPolicy(
                 quarantine_after=cfg.quarantine_threshold,
                 immediate_quarantine=body.quarantine,
+                backoff=Backoff(base_seconds=cfg.retry_backoff_seconds),
             ),
             attempts_without_progress=(
                 int(task_row["attempts_without_progress"]) if task_row else 0

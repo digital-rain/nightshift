@@ -46,6 +46,9 @@ class ManagerConfig:
     # Consecutive no-progress runs of a task before it is quarantined (held in
     # the queue but skipped by every worker). 0 disables the guard.
     quarantine_threshold: int = 2
+    # Base of the exponential retry backoff (seconds). Smoke/tests dial this
+    # down so the failure round-trip runs in seconds, not minutes.
+    retry_backoff_seconds: float = 60.0
     # Optimistic-concurrency landing knobs (see manager/landing.py).
     max_push_retries: int = 3
     validate_on_integrate: bool = False
@@ -74,6 +77,7 @@ def load_manager_config(workspace: Path) -> ManagerConfig:
         rendezvous_remote=settings.operator.rendezvous_remote,
         wip_ref_prefix=settings.operator.wip_ref_prefix,
         quarantine_threshold=settings.operator.quarantine_threshold,
+        retry_backoff_seconds=settings.operator.retry_backoff_seconds,
         max_push_retries=settings.operator.max_push_retries,
         validate_on_integrate=settings.operator.validate_on_integrate,
         auto_resolve=settings.operator.auto_resolve,

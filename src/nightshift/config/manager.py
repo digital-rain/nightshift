@@ -154,6 +154,13 @@ class OperatorConfig:
             "queue but skipped by every worker so a confused task cannot burn "
             "budget in a re-execution loop. 0 disables quarantine."),
         env="NIGHTSHIFT_QUARANTINE_THRESHOLD"))
+    retry_backoff_seconds: float = field(default=60.0, metadata=meta(
+        category="Worker execution policy", label="Retry backoff seconds",
+        desc=(
+            "Base of the exponential retry backoff: the n-th consecutive "
+            "no-progress attempt delays the task's next dispatch by "
+            "base * 2**(n-1) seconds (capped at an hour)."),
+        ))
 
     auto_resolve: bool = field(default=True, metadata=meta(
         category="Conflict resolution", label="Auto resolve",
@@ -332,6 +339,7 @@ def load_manager_settings(workspace: Path) -> ManagerSettings:
             os.environ.get("NIGHTSHIFT_QUARANTINE_THRESHOLD")
             or data.get("quarantine_threshold"),
             2),
+        retry_backoff_seconds=_as_float(data.get("retry_backoff_seconds"), 60.0),
         auto_resolve=bool(data.get("auto_resolve", True)),
         max_resolve_attempts=_as_int(data.get("max_resolve_attempts"), 2),
         resolve_model=data.get("resolve_model"),
@@ -387,6 +395,7 @@ def save_manager_settings(workspace: Path, settings: ManagerSettings) -> None:
         "max_fix_attempts": settings.operator.max_fix_attempts,
         "validate": settings.operator.validate_cmd,
         "quarantine_threshold": settings.operator.quarantine_threshold,
+        "retry_backoff_seconds": settings.operator.retry_backoff_seconds,
         "auto_resolve": settings.operator.auto_resolve,
         "max_resolve_attempts": settings.operator.max_resolve_attempts,
         "resolve_model": settings.operator.resolve_model,

@@ -197,6 +197,10 @@ def build_workspace(workspace: Path, port: int) -> None:
         check=True, capture_output=True, text=True,
     )
     _git(clone, "remote", "remove", "origin")
+    # The clone's default branch mirrors the source checkout's HEAD, which may
+    # be a feature branch. Landing targets ``refs/heads/main`` (Phase 6: refs
+    # are authoritative), so pin the branch name regardless of where smoke ran.
+    _git(clone, "branch", "-M", "main")
     _git(clone, "config", "user.name", "nightshift-smoke")
     _git(clone, "config", "user.email", "smoke@nightshift.local")
 
@@ -227,6 +231,9 @@ def build_workspace(workspace: Path, port: int) -> None:
         "landing_mode": "none",
         "rendezvous_remote": None,
         "default_model": SMOKE_MODEL,
+        # Production backoff is 60s * 2**(n-1); the failure round-trip here
+        # must retry within the smoke timeout, so dial the base way down.
+        "retry_backoff_seconds": 0.5,
         "cadences": {
             "poll_seconds": 0.5,
             "heartbeat_seconds": 2.0,

@@ -69,6 +69,7 @@ from nightshift.git.worktrees import cleanup_task_worktree, worktree_branch
 from nightshift.lifecycle import (
     AttemptRef,
     AttemptState,
+    Backoff,
     LandingMode,
     LandKind,
     LandOutcome,
@@ -329,7 +330,10 @@ class Reconciler:
                 return
         task_row = await self._store().get_task_state(queue, task)
         policy = SubmitPolicy(
-            retry=RetryPolicy(quarantine_after=self._cfg.quarantine_threshold),
+            retry=RetryPolicy(
+                quarantine_after=self._cfg.quarantine_threshold,
+                backoff=Backoff(base_seconds=self._cfg.retry_backoff_seconds),
+            ),
             attempts_without_progress=(
                 int(task_row["attempts_without_progress"]) if task_row else 0
             ),
