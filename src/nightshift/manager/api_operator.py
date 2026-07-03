@@ -603,7 +603,9 @@ def register_operator_api(
     ) -> dict[str, Any]:
         """Build a per-queue state dict in the shape the UI expects."""
         key = queue_label(queue)
-        lease = next((le for le in leases if le.get("queue", "main") == key), None)
+        # Lease rows store the main queue as '' (see store._qkey); normalize to
+        # the label before comparing.
+        lease = next((le for le in leases if queue_label(le.get("queue")) == key), None)
         pause_reason = pauses.get(key)
         paused = pause_reason is not None
         if paused:
@@ -671,7 +673,10 @@ def register_operator_api(
             cancelled-lease + forever-``running`` run row; the ``run_finished``
             emit is unchanged."""
             for att in await store.live_attempts():
-                if att.get("queue", "main") != key:
+                # Attempt rows store the main queue as '' (see store._qkey);
+                # normalize to the label before comparing (main's fix, carried
+                # into the Phase 8 rewrite of this block).
+                if queue_label(att.get("queue")) != key:
                     continue
                 t = on_operator_stop(AttemptRef(
                     id=att["id"],

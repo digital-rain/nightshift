@@ -315,7 +315,7 @@ def register_worker_api(
             label = queue_label(q)
             if label in queue_pauses:
                 continue
-            if any(le.get("queue", "main") == label for le in active):
+            if any(queue_label(le.get("queue")) == label for le in active):
                 continue
             cands = candidates_by_queue[q]
             ready_exists = any((c.queue, c.task) not in blocked for c in cands)
