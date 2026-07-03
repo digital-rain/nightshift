@@ -56,7 +56,7 @@ body {
   box-shadow: 0 1px 4px var(--shadow);
 }
 .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.logo { height: 32px; width: auto; display: block; }
+.logo { height: 40px; width: auto; display: block; }
 .brand-text { display: flex; flex-direction: column; line-height: 1.1; min-width: 0; }
 .brand-name { font-weight: 700; font-size: 15px; color: var(--text); }
 .brand-tag { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
