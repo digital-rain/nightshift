@@ -26,6 +26,7 @@ import contextlib
 import os
 import subprocess
 import sys
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -35,13 +36,15 @@ from fastapi.staticfiles import StaticFiles
 from nightshift import playlists as playlists_mod
 from nightshift._paths import UI_DIR
 from nightshift.events import new_run_id
-from nightshift.git.sync import maybe_sync_main_to_origin
-from nightshift.lifecycle import FailureKind, RunStatus
+from nightshift.git.executor import ExecutorPool
+from nightshift.git.sync import SyncThrottle, sync_main_locked
+from nightshift.lifecycle import RESOLVE_WORKER_ID, AttemptState, FailureKind
 from nightshift.manager import failure_policy
 from nightshift.manager.api_operator import register_operator_api
 from nightshift.manager.api_worker import register_worker_api
 from nightshift.manager.config import ManagerConfig, load_manager_config
 from nightshift.manager.hub import Hub
+from nightshift.manager.reconciler import Reconciler, reap_finished_resolves
 from nightshift.manager.registry import Registry
 from nightshift.manager.scheduler import SchedulerState
 from nightshift.manager.store import NightshiftStore, open_store
@@ -65,6 +68,12 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
     tasks_repo = cfg.tasks_repo
     tasks_root = workspace / tasks_repo
 
+    # Phase 7: per-repo serialized git executors + the app-owned sync throttle.
+    # Every git mutation in the manager (land, sync, resolved-push, adopt,
+    # content-store commits) is a job on the target repo's executor.
+    executors = ExecutorPool(workspace)
+    sync_throttle = SyncThrottle()
+
     async def _origin_sync_loop() -> None:
         """Periodically refresh origin/main for every queue's target repo.
 
@@ -72,7 +81,8 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         A check fetches origin/main and fast-forwards local main only when the
         remote tip moved; otherwise the repo is left alone until the next
         interval. ``0`` disables the background loop (dispatch/land still refresh
-        on their own throttle)."""
+        on their own throttle). The sync runs as a repo-executor job so it can
+        never interleave with a land on the same repo."""
         interval = cfg.cadences.git_refresh_seconds
         remote = cfg.rendezvous_remote
         if not interval or interval <= 0 or not remote:
@@ -96,14 +106,27 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                     if not target or target in seen:
                         continue
                     seen.add(target)
-                    await asyncio.to_thread(
-                        maybe_sync_main_to_origin,
-                        workspace,
-                        target,
-                        remote,
+                    if not sync_throttle.due(workspace, target, interval):
+                        continue
+                    await asyncio.wrap_future(executors.submit(target, partial(
+                        sync_main_locked,
+                        workspace, target, remote,
                         min_interval_seconds=interval,
-                    )
+                        force=False,
+                        throttle=sync_throttle,
+                    )))
             await asyncio.sleep(interval)
+
+    async def _drain_git_jobs() -> None:
+        """Test seam / shutdown helper: block until every queued git job *and*
+        every pending async-land completion has finished. Loops because a land
+        completion itself submits content-store jobs."""
+        while True:
+            await asyncio.to_thread(executors.drain)
+            pending = {t for t in app.state.land_completions if not t.done()}
+            if not pending:
+                return
+            await asyncio.gather(*pending, return_exceptions=True)
 
     @contextlib.asynccontextmanager
     async def _lifespan(app: FastAPI):
@@ -112,16 +135,34 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         app.state.registry = Registry(
             app.state.store, stale_seconds=cfg.cadences.worker_stale_seconds
         )
+        # Reconciler: startup pass first (park mid-land casualties, expire
+        # deadlines, reconcile holds), then the periodic loop. The interval
+        # reuses poll_seconds — the cadence these duties were noticed at when
+        # they lived inline in worker_poll.
+        await app.state.reconciler.startup()
+        reconcile_task = asyncio.create_task(
+            app.state.reconciler.run_forever(cfg.cadences.poll_seconds)
+        )
         sync_task = asyncio.create_task(_origin_sync_loop())
         app.state.origin_sync_task = sync_task
         try:
             yield
         finally:
             sync_task.cancel()
+            reconcile_task.cancel()
             # CancelledError is a BaseException (not Exception), so suppress it
-            # explicitly alongside any teardown error from the sync loop.
+            # explicitly alongside any teardown error from the loops.
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await sync_task
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await reconcile_task
+            # Drain rather than abandon: land jobs are bounded (push retries
+            # cap them) and an abandoned mid-land job would need the startup
+            # parking on next boot. A hard kill still recovers via that pass.
+            with contextlib.suppress(Exception):
+                await _drain_git_jobs()
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(executors.shutdown)
             with contextlib.suppress(Exception):
                 await app.state.store.close()
 
@@ -140,7 +181,19 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
     # {run_id: {"proc", "repo", "task", "queue", "origin_run_id"}}. Used to cap
     # concurrency per repo and to reap finished jobs.
     app.state.resolves = {}
+    # Environment-failure cooldowns: (worker_id, queue label) -> expiry. A
+    # cooled-down worker isn't offered that queue until expiry; other workers
+    # still are. Deliberately in-memory (a restart clears a cooldown early —
+    # harmless); queue pause/mode state is the durable piece (in the store).
+    app.state.worker_cooldowns = {}
     app.state.store = store  # may be None until lifespan opens one
+    app.state.git_executors = executors
+    app.state.sync_throttle = sync_throttle
+    # Pending async-land completion tasks (event-loop coroutines applying
+    # on_land_result once the executor job finishes); tracked so the drain
+    # seam and lifespan shutdown can await them.
+    app.state.land_completions = set()
+    app.state.drain_git_jobs = _drain_git_jobs
 
     def _store() -> NightshiftStore:
         return app.state.store
@@ -161,7 +214,7 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         event_id = await store.append_event(
             kind, run_id=run_id, queue=queue, task=task, payload=payload
         )
-        await app.state.hub.publish(
+        await _broadcast(
             {
                 "id": event_id,
                 "kind": kind,
@@ -171,6 +224,11 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                 "payload": payload or {},
             }
         )
+
+    async def _broadcast(event: dict[str, Any]) -> None:
+        """Fan an already-persisted event out to all browsers (the outbox half
+        of ``_emit`` — used for events committed inside ``apply_transition``)."""
+        await app.state.hub.publish(event)
 
     # ----- queue helpers --------------------------------------------------- #
 
@@ -191,14 +249,6 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
                 if not p.get("disabled")
             ],
         ]
-
-    def _reap_resolves() -> None:
-        """Drop bookkeeping for resolve subprocesses that have exited."""
-        for rid in [
-            rid for rid, r in app.state.resolves.items()
-            if r["proc"].poll() is not None
-        ]:
-            app.state.resolves.pop(rid, None)
 
     def _active_resolves(repo: str) -> int:
         return sum(
@@ -265,28 +315,34 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
 
         Returns ``(started, child_run_id, error)``. Used by both the explicit
         Resolve endpoint and the auto-escalation path on a landing conflict."""
-        _reap_resolves()
+        reap_finished_resolves(app.state.resolves)
         if _active_resolves(repo) >= max(1, cfg.max_concurrent_resolves):
             return False, None, "a resolve is already running for this repo"
         store = _store()
         child_run_id = new_run_id()
-        await store.create_run(
+        # Resolve children are RESOLVING attempts: never live (they must not
+        # block re-dispatch of the task they repair) and deadline-less (the
+        # subprocess reaper owns their lifetime, not the TTL sweep).
+        await store.create_attempt(
             child_run_id,
             task=task,
             queue=queue,
-            worker_id="manager:resolve",
+            worker_id=RESOLVE_WORKER_ID,
             backend=cfg.raw.get("resolve_backend"),
             model=cfg.raw.get("resolve_model"),
+            base_ref=None,
+            ttl_seconds=0,
             title=title,
             repo=repo,
+            state=AttemptState.RESOLVING,
         )
         started = app.state.spawn_resolve(
             child_run_id, task=task, queue=queue, repo=repo,
             title=title, origin_run_id=origin_run_id,
         )
         if not started:
-            await store.update_run(
-                child_run_id, status=RunStatus.ERROR,
+            await store.update_attempt(
+                child_run_id, state=AttemptState.FAILED,
                 result_line="failed to launch resolver process",
                 failure_kind=FailureKind.WORKER_LAUNCH,
             )
@@ -297,25 +353,44 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         )
         return True, child_run_id, None
 
-    _paused_queues: dict[str, str] = {}
     _queue_failure_state: dict[str, failure_policy.QueueFailureState] = {}
 
     def _failure_state(label: str) -> failure_policy.QueueFailureState:
         return _queue_failure_state.setdefault(label, failure_policy.QueueFailureState())
+
+    app.state.reconciler = Reconciler(
+        workspace=workspace,
+        tasks_root=tasks_root,
+        cfg=cfg,
+        store=_store,
+        registry=_registry,
+        emit=_emit,
+        broadcast=_broadcast,
+        queue_from_label=_queue_from_label,
+        all_queues=_all_queues,
+        executors=executors,
+        resolves=app.state.resolves,
+        repo_warnings=app.state.repo_warnings,
+        sync_throttle=sync_throttle,
+        tasks_repo=tasks_repo,
+    )
 
     register_worker_api(
         app,
         cfg=cfg,
         workspace=workspace,
         tasks_root=tasks_root,
+        tasks_repo=tasks_repo,
         _store=_store,
         _registry=_registry,
         _emit=_emit,
         _queue_from_label=_queue_from_label,
         _all_queues=_all_queues,
-        _paused_queues=_paused_queues,
         _failure_state=_failure_state,
         _start_resolve=_start_resolve,
+        _broadcast=_broadcast,
+        _executors=executors,
+        _sync_throttle=sync_throttle,
     )
     register_operator_api(
         app,
@@ -328,9 +403,9 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         _emit=_emit,
         _queue_from_label=_queue_from_label,
         _all_queues=_all_queues,
-        _paused_queues=_paused_queues,
         _queue_failure_state=_queue_failure_state,
         _start_resolve=_start_resolve,
+        _executors=executors,
     )
 
     # ----- static UI ------------------------------------------------------- #

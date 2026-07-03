@@ -12,8 +12,10 @@ import subprocess
 from pathlib import Path
 
 from _workspace import build_workspace, git_commit_all
-from nightshift.engine import setup_worktree, worktree_branch
-from nightshift.manager import landing as landing_mod
+from nightshift.git import landing as git_landing_mod
+from nightshift.git.runner import GitResult
+from nightshift.git.worktrees import setup_worktree, worktree_branch
+from nightshift.lifecycle import LAND_SUCCESS_KINDS, LandKind
 from nightshift.manager.landing import (
     base_ref_drifted,
     canonical_head,
@@ -62,7 +64,7 @@ def test_clean_land_succeeds(tmp_path: Path) -> None:
     _make_branch_commit(workspace, repo, "10.add", path="new.txt", content="hello\n")
     base = canonical_head(repo_root)
     result = land(workspace, repo, "10.add", "add new file", queue=None, base_ref=base)
-    assert result.landed is True
+    assert result.kind is LandKind.LANDED
     assert result.sha
     assert (repo_root / "new.txt").exists()
     # The branch was reclaimed after landing.
@@ -92,8 +94,8 @@ def test_land_refuses_on_drift_conflict(tmp_path: Path) -> None:
 
     assert base_ref_drifted(repo_root, base) is True
     result = land(workspace, repo, "20.edit", "edit file", queue=None, base_ref=base)
-    assert result.landed is False
-    assert result.conflict is True
+    assert result.kind is LandKind.CONFLICT
+    assert result.conflicts
     # Branch preserved for resolution.
     assert _git(repo_root, "branch", "--list", worktree_branch("20.edit")).strip() != ""
 
@@ -115,7 +117,8 @@ def test_adopt_agent_land_on_main_without_branch(tmp_path: Path) -> None:
     (repo_root / "file.txt").write_text("agent landed\n")
     _git(repo_root, "commit", "-am", "feat: agent landed on main")
     result = land(workspace, repo, "10.adopt", "adopt agent land", queue=None, base_ref=base)
-    assert result.landed is True
+    assert result.kind is LandKind.ADOPTED
+    assert result.kind in LAND_SUCCESS_KINDS
     assert result.sha == canonical_head(repo_root)
     assert "adopted agent land" in result.detail
     assert "agent landed" in (repo_root / "file.txt").read_text()
@@ -129,7 +132,7 @@ def test_adopt_does_not_trigger_when_branch_has_commits(tmp_path: Path) -> None:
     (repo_root / "file.txt").write_text("other\n")
     _git(repo_root, "commit", "-am", "other main commit")
     result = land(workspace, repo, "10.add", "add new file", queue=None, base_ref=base)
-    assert result.landed is True
+    assert result.kind is LandKind.LANDED
     assert (repo_root / "new.txt").exists()
 
 
@@ -145,7 +148,7 @@ def test_push_mode_records_pushed_on_success(tmp_path: Path) -> None:
         workspace, repo, "10.add", "add new file", queue=None, base_ref=base,
         landing_mode="push",
     )
-    assert result.landed is True
+    assert result.kind is LandKind.LANDED
     assert result.remote == "push"
     assert result.pushed is True
 
@@ -187,7 +190,7 @@ def test_push_mode_integrates_origin_advance(tmp_path: Path) -> None:
         workspace, repo, "10.add", "add new file", queue=None, base_ref=base,
         landing_mode="push", rendezvous_remote="origin",
     )
-    assert result.landed is True
+    assert result.kind is LandKind.LANDED
     assert result.pushed is True
     # Local main now carries both the origin advance and our squash.
     assert (repo_root / "other.txt").exists()
@@ -208,20 +211,23 @@ def test_push_retry_after_nonfastforward_rejection(
     _make_branch_commit(workspace, repo, "10.add", path="new.txt", content="hello\n")
 
     calls = {"n": 0}
-    real = landing_mod._push_head_to_main
+    real = git_landing_mod.push_main
 
-    def flaky(ws: Path, r: str, remote: str):
+    def flaky(ws: Path, r: str, remote: str, sha: str) -> GitResult:
         calls["n"] += 1
         if calls["n"] == 1:
-            return False, "non-fast-forward (simulated)"
-        return real(ws, r, remote)
+            return GitResult(
+                argv=("git", "push"), returncode=1,
+                stdout="", stderr="non-fast-forward (simulated)",
+            )
+        return real(ws, r, remote, sha)
 
-    monkeypatch.setattr(landing_mod, "_push_head_to_main", flaky)
+    monkeypatch.setattr(git_landing_mod, "push_main", flaky)
     result = land(
         workspace, repo, "10.add", "add new file", queue=None, base_ref=base,
         landing_mode="push", rendezvous_remote="origin", max_push_retries=3,
     )
-    assert result.landed is True
+    assert result.kind is LandKind.LANDED
     assert result.pushed is True
     assert calls["n"] == 2  # one rejection, then success
     assert (repo_root / "new.txt").exists()

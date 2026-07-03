@@ -22,9 +22,8 @@ For the full component map, data flow, state model, and design rationale see [`A
 src/nightshift/            the package (run as `python -m nightshift.<entry>`)
   manager/                 operator + worker HTTP API, operator UI, store, landing, scheduler
   worker/                  poll loop, per-task execution, worker UI, manager client
-  server/                  legacy single-box UI server (viewer + player)
   slack/                   optional inbound capture daemon + outbound notifications
-  engine.py                git worktrees, backend dispatch, validate/repair, landing primitives
+  git/                     the git seam: runner, worktrees, squash, landing, sync, transport
   pg.py                    the only asyncpg seam (structural pool type + open_pool)
   _paths.py                shipped-asset vs. operator-state path resolution
   assets/                  shipped, package-relative: ui/, ui-worker/, templates/, prompts/, migrations/
@@ -85,7 +84,6 @@ The same settings can come from `NIGHTSHIFT_*` environment variables (env wins o
 | Start the manager | `just manager [port]` |
 | Start a worker | `just worker [ui-port]` |
 | Worker, no UI (loop only) | `just worker-headless` |
-| Legacy single-box UI server | `just server [port]` |
 | Slack capture daemon | `just slackd` (needs `uv sync --extra slack`) |
 | Run tests | `just test` |
 | Lint + tests | `just validate` |

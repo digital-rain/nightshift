@@ -1,116 +1,23 @@
-"""Squash-merge a task branch onto local ``main`` (+ autostash and the
-lines-of-code accounting for the landed squash commit).
+"""``squash_to_main`` — the legacy squash-land entry point (now a shim over the
+Phase-6 plumbing pipeline) — plus the lines-of-code accounting for the landed
+squash commit.
 
-Moved verbatim from ``engine.py`` in Phase 3 of the rebuild-in-place migration.
+The autostash machinery that used to live here (``stash_operator_work``,
+``restore_operator_work``, ``AUTOSTASH_MESSAGE``, the ``reset --hard`` unwind)
+is deleted: the plumbing land never touches the working tree, so there is
+nothing to set aside and nothing to unwind. The working-tree status helpers
+(``landing_blockers``/``porcelain_path``) moved to :mod:`nightshift.preflight`.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import assert_never
 
 from nightshift.git import GitRunner
-from nightshift.git.locks import landing_lock
-from nightshift.git.refs import branch_exists
+from nightshift.git.landing import RepoContext, integrate_and_push, squash_produce
 from nightshift.git.worktrees import worktree_branch
-
-
-def _tracked_changes(repo_root: Path) -> list[str]:
-    """Porcelain status lines for *tracked* changes in ``repo_root`` (ignores
-    untracked ``??`` files, which only block a merge if they collide — and that
-    case surfaces via git's own stderr instead)."""
-    result = GitRunner(repo_root).run("status", "--porcelain")
-    return [
-        line for line in result.stdout.splitlines()
-        if line.strip() and not line.startswith("??")
-    ]
-
-
-def porcelain_path(line: str) -> str:
-    """Extract the working path from a ``git status --porcelain`` line.
-
-    Lines are ``XY <path>``; a rename is ``R  <old> -> <new>`` — we want the
-    destination. Surrounding quotes (git quotes paths with special chars) are
-    stripped so callers see a clean repo-relative path."""
-    path = line[3:] if len(line) > 3 else line.strip()
-    if " -> " in path:
-        path = path.split(" -> ", 1)[1]
-    return path.strip().strip('"')
-
-
-def landing_blockers(repo_root: Path) -> list[str]:
-    """Tracked changes in the target repo that should block a squash-merge.
-
-    The content store is a *separate* repo, so briefs/queue config never live in
-    ``repo_root`` and can't be a blocker. Every tracked change here is therefore
-    genuine operator *code* WIP — return all of it (the land still stash/restores
-    it when ``autostash`` is on)."""
-    return _tracked_changes(repo_root)
-
-
-AUTOSTASH_MESSAGE = "nightshift-autostash"
-
-
-def stash_operator_work(repo_root: Path, paths: list[str]) -> str | None:
-    """Set aside the operator's tracked code WIP (the given ``paths``) in the
-    target repo for the land critical section. Returns the captured stash
-    *commit sha*, or ``None`` when there was nothing to set aside.
-
-    Stack-free by design: ``git stash create`` records the WIP as a commit object
-    without touching the LIFO stash stack, so a human running ``git stash``
-    mid-land can never perturb it. ``stash create`` does not revert the tree, so
-    we then explicitly clean just the blocker ``paths``."""
-    if not paths:
-        return None
-    git = GitRunner(repo_root)
-    created = git.run("stash", "create", AUTOSTASH_MESSAGE)
-    sha = created.stdout.strip()
-    if not created.ok or not sha:
-        return None
-    # `stash create` captured the WIP but left the tree dirty; clean exactly the
-    # blocker paths so the merge sees them at HEAD. Best-effort: the WIP is
-    # already safely captured in ``sha``.
-    git.run("checkout", "HEAD", "--", *paths)
-    return sha
-
-
-def restore_operator_work(repo_root: Path, sha: str, paths: list[str]) -> str | None:
-    """Re-apply the set-aside WIP commit ``sha`` on top of the landed tree.
-    Returns ``None`` on success, or a human-readable conflict detail when the
-    apply conflicts with what the task just landed.
-
-    On conflict the blocker ``paths`` are rolled back to the landed ``HEAD`` (so
-    the tree is left clean, not littered with conflict markers) and the WIP is
-    preserved on the stash stack under the ``nightshift-autostash`` message via
-    ``git stash store`` so the operator can recover it by hand — never lost."""
-    git = GitRunner(repo_root)
-    result = git.run("stash", "apply", sha)
-    if result.ok:
-        return None
-    # Conflict: clear the half-applied blocker paths and stash-store the sha so
-    # the WIP is findable for a manual restore. Both are best-effort — the WIP
-    # commit ``sha`` itself is what must survive, and it already exists.
-    if paths:
-        git.run("checkout", "HEAD", "--", *paths)
-    git.run("stash", "store", "-m", AUTOSTASH_MESSAGE, sha)
-    detail = (result.stderr.strip() or result.stdout.strip()
-              or "git stash apply failed")
-    return detail
-
-
-def _reset_to_head(repo_root: Path) -> None:
-    """Undo a half-applied squash so a failed merge never leaves ``repo_root`` in
-    a conflicted/partly-staged state. Safe only because :func:`squash_to_main`
-    refuses to start when the tree already has tracked changes."""
-    # Best-effort: this is already the failure-recovery path; there is nothing
-    # more to do if the reset itself fails.
-    GitRunner(repo_root).run("reset", "--hard", "HEAD")
-
-
-def conflicted_paths(repo_root: Path) -> list[str]:
-    """Files left with unmerged (conflicted) entries in the index after a failed
-    ``git merge --squash``. Must be read *before* :func:`_reset_to_head`."""
-    result = GitRunner(repo_root).run("diff", "--name-only", "--diff-filter=U")
-    return [line for line in result.stdout.splitlines() if line.strip()]
+from nightshift.lifecycle import LandingMode, LandKind
 
 
 # --------------------------------------------------------------------------
@@ -273,109 +180,53 @@ def squash_to_main(
     title: str,
     *,
     queue: str | None = None,
-    autostash: bool = True,
 ) -> tuple[str | None, str, bool]:
     """Merge the task's worktree branch as a single squash commit on the target
-    repo's ``main`` (``repo_root = workspace / repo``).
+    repo's ``main`` (``repo_root = workspace / repo``) — the resolve runner's
+    local land entry point, a thin wrapper over
+    :func:`nightshift.git.landing.integrate_and_push` in local-only mode.
 
-    Returns ``(sha, "", False)`` on success, or ``(None, detail, recoverable)``
-    on failure where ``detail`` is a human-readable reason and ``recoverable``
-    says whether re-attempting the *same* squash could succeed once the user
-    clears a blocker.
+    Returns the historical tuple: ``(sha, "", False)`` on success, or
+    ``(None, detail, recoverable)`` on failure. The plumbing pipeline never
+    touches the working tree, so:
 
-    Briefs/queue config live in the separate content store and are delivered via
-    a run-scratch file, so the target repo only ever receives the implementation
-    squash — there is nothing to snapshot up-front, and every tracked change in
-    ``repo_root`` is genuine operator *code* WIP. That WIP is handled by
-    ``autostash`` (default on, set per-queue via ``autostash_operator_work``):
-
-    * ``autostash=True`` — the operator's tracked code changes are set aside with
-      ``git stash`` for the brief merge+commit, then restored. A success may
-      return ``(sha, detail, False)`` with a non-empty ``detail`` when restoring
-      the set-aside work hit a conflict (the land still happened; the stash entry
-      is preserved). Callers that key off ``sha is None`` treat this as success.
-    * ``autostash=False`` — preserves the old behavior: a code blocker returns
-      ``recoverable=True`` ("main has uncommitted changes").
-
-    Two failure shapes still matter and are NOT the same:
-
-    * **Transient blocker** (``recoverable=True``) — ``main`` has uncommitted code
-      and autostash is off. Re-running after committing/stashing will work.
-    * **Content conflict** (``recoverable=False``) — the branch and ``main`` made
-      overlapping edits. ``git merge --squash`` aborts; re-running fails
-      identically. We list the conflicting files for a human 3-way resolution.
-
-    On any merge/commit failure the working tree is reset back to ``HEAD`` (and
-    any set-aside work restored) so it is never left half-merged.
-
-    The whole critical section (optional set-aside → merge → commit →
-    reset-on-failure → restore) runs under :func:`landing_lock` (per
-    workspace+repo), so concurrent queue runners (and a CLI process) serialize on
-    the repo's index/HEAD/stash instead of seeing a half-merged tree.
+    * operator WIP never blocks (the old ``autostash`` knob is gone); a land
+      overlapping uncommitted work returns ``(sha, detail, False)`` with a
+      CHECKOUT_BEHIND notice in ``detail`` — the land happened, the checkout
+      was left behind ``main``;
+    * a content conflict returns ``recoverable=False`` with the historical
+      "merge conflict — …" wording (so :func:`squash_failure_kind` still
+      classifies it ``merge_conflict``);
+    * there is no half-merged state to unwind on any failure.
     """
     repo_root = workspace / repo
     branch = worktree_branch(task, queue)
-
-    if not branch_exists(repo_root, branch):
-        return None, f"no task branch '{branch}' to merge (nothing to recover)", False
-
-    with landing_lock(workspace, repo):
-        blockers = landing_blockers(repo_root)
-        wip_sha: str | None = None
-        blocker_paths: list[str] = []
-        if blockers:
-            blocker_paths = [porcelain_path(line) for line in blockers]
-            if autostash:
-                wip_sha = stash_operator_work(repo_root, blocker_paths)
-            if not autostash or wip_sha is None:
-                shown = "\n".join(f"    {line}" for line in blockers[:20])
-                extra = "" if len(blockers) <= 20 else f"\n    … and {len(blockers) - 20} more"
+    outcome = integrate_and_push(
+        RepoContext(workspace, repo),
+        squash_produce(repo_root, branch, title),
+        mode=LandingMode.NONE,
+    )
+    match outcome.kind:
+        case LandKind.LANDED:
+            return outcome.sha, outcome.detail, False
+        case LandKind.CHECKOUT_BEHIND:
+            return outcome.sha, outcome.detail, False
+        case LandKind.CONFLICT:
+            if outcome.conflicts:
+                # The historical wording, pinned by squash_failure_kind.
+                shown = "\n".join(f"    {p}" for p in outcome.conflicts)
                 return None, (
-                    "main has uncommitted changes — commit or stash them before the "
-                    f"squash-merge can run:\n{shown}{extra}"
-                ), True
-
-        restore_detail: str | None = None
-        git = GitRunner(repo_root)
-        try:
-            merge = git.run("merge", "--squash", branch)
-            if not merge.ok:
-                conflicts = conflicted_paths(repo_root)
-                _reset_to_head(repo_root)
-                if conflicts:
-                    shown = "\n".join(f"    {p}" for p in conflicts)
-                    return None, (
-                        f"merge conflict — '{branch}' and main made overlapping edits to "
-                        f"{len(conflicts)} file(s):\n{shown}\n"
-                        "This cannot be auto-recovered; resolve the 3-way merge by hand "
-                        "(see `recover_task` docs) or drop the stale branch."
-                    ), False
-                detail = (
-                    merge.stderr.strip()
-                    or merge.stdout.strip()
-                    or f"git merge --squash {branch} exited {merge.returncode}"
-                )
-                return None, f"merge --squash failed:\n{detail}", False
-
-            commit = git.run("commit", "-m", f"task: {title}")
-            if not commit.ok:
-                detail = (
-                    commit.stderr.strip()
-                    or commit.stdout.strip()
-                    or f"git commit exited {commit.returncode}"
-                )
-                _reset_to_head(repo_root)
-                return None, f"commit failed:\n{detail}", False
-
-            sha = git.run("rev-parse", "--short", "HEAD").stdout.strip()
-        finally:
-            if wip_sha:
-                restore_detail = restore_operator_work(repo_root, wip_sha, blocker_paths)
-
-    if restore_detail:
-        return sha, (
-            f"landed ({sha}), but your set-aside working changes could not be "
-            f"reapplied cleanly — they are kept in `git stash` for manual "
-            f"restore:\n{restore_detail}"
-        ), False
-    return sha, "", False
+                    f"merge conflict — '{branch}' and main made overlapping edits to "
+                    f"{len(outcome.conflicts)} file(s):\n{shown}\n"
+                    "This cannot be auto-recovered; resolve the 3-way merge by hand "
+                    "or drop the stale branch."
+                ), False
+            return None, outcome.detail, False
+        case LandKind.PUSH_REJECTED:
+            # Local-only mode: main kept moving under the land — transient.
+            return None, outcome.detail, True
+        case LandKind.NO_CHANGES | LandKind.ADOPTED | LandKind.TRANSPORT_FAILED:
+            # Unreachable in local squash mode; report rather than crash.
+            return None, outcome.detail or str(outcome.kind), False
+        case _:
+            assert_never(outcome.kind)

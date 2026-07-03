@@ -15,7 +15,7 @@ import nightshift.backends as backends_mod
 from _workspace import build_workspace
 from nightshift.backends import WorkerResult, WorkerSpec
 from nightshift.manager.app import create_app
-from nightshift.manager.store import MemoryStore
+from nightshift.manager.store_sqlite import SqliteStore
 from nightshift.worker.config import WorkerConfig, load_worker_config
 from nightshift.worker.execute import execute_work_order
 from nightshift.worker.local_store import LocalStore
@@ -312,7 +312,7 @@ def test_worker_lands_a_task_via_manager(tmp_path: Path, monkeypatch) -> None:
     repo_root = workspace / "longitude"  # the target repo bound to the main queue
     monkeypatch.setattr(backends_mod, "require_backend", lambda name: _CommittingBackend())
 
-    with TestClient(create_app(workspace, store=MemoryStore())) as tc:
+    with TestClient(create_app(workspace, store=SqliteStore())) as tc:
         cfg = WorkerConfig(
             workspace=workspace, worker_id="w1",
             manager_url="http://test",
@@ -323,6 +323,9 @@ def test_worker_lands_a_task_via_manager(tmp_path: Path, monkeypatch) -> None:
 
         did = loop.run_once()
         assert did is True
+        # Phase 7: the submit queues the land on the manager's repo executor
+        # and returns; drain before asserting the landed state.
+        tc.portal.call(tc.app.state.drain_git_jobs)
 
         # The task landed on the TARGET repo's main (the generated file is now
         # committed there, not in the workspace or the content store).

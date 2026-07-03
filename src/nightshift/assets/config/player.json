@@ -1,6 +1,5 @@
 {
   "theme": "dark",
   "transport_mode": "auto",
-  "repeat_interval": "30m",
-  "port": 8799
+  "repeat_interval": "30m"
 }

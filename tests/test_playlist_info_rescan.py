@@ -1,9 +1,8 @@
 """Playlist-info page + workspace-rescan tests.
 
 Covers the shared core (rename + rescan helpers in :mod:`nightshift.playlists`),
-the manager store's queue-rename migration, and the operator endpoints on both
-the manager and the legacy server that back the new playlist-info page and the
-Playlists-page "Rescan" button.
+the manager store's queue-rename migration, and the manager operator endpoints
+that back the playlist-info page and the Playlists-page "Rescan" button.
 """
 
 from __future__ import annotations
@@ -16,9 +15,9 @@ from fastapi.testclient import TestClient
 
 from _workspace import build_workspace
 from nightshift import playlists as playlists_mod
+from nightshift.lifecycle import AttemptState
 from nightshift.manager.app import create_app as create_manager_app
-from nightshift.manager.store import MemoryStore
-from nightshift.server.app import create_app as create_server_app
+from nightshift.manager.store_sqlite import SqliteStore
 
 
 # --------------------------------------------------------------------------- #
@@ -100,26 +99,28 @@ def test_rescan_into_playlists(tmp_path: Path) -> None:
 
 
 def test_memory_store_rename_queue() -> None:
-    store = MemoryStore()
+    store = SqliteStore()
 
     async def scenario() -> None:
-        await store.create_run(
+        await store.create_attempt(
             "r1", task="t1", queue="alpha", worker_id="w1",
-            backend="claude-code", model="auto",
+            backend="claude-code", model="auto", base_ref=None, ttl_seconds=60,
         )
-        await store.acquire_lease(
-            task="t2", queue="alpha", worker_id="w1", model="auto",
-            base_ref="ref", ttl_seconds=60,
+        await store.create_attempt(
+            "r2", task="t2", queue="alpha", worker_id="w1",
+            backend="claude-code", model="auto", base_ref="ref", ttl_seconds=60,
         )
         await store.set_task_state("alpha", "t3", "blocked", blocked_reason="x")
         await store.set_queue_dedication("alpha", ["w1"])
 
         await store.rename_queue("alpha", "beta")
 
-        assert [r["queue"] for r in await store.list_runs(queue="beta")] == ["beta"]
-        assert await store.list_runs(queue="alpha") == []
-        leases = await store.active_leases()
-        assert all(le["queue"] == "beta" for le in leases)
+        assert sorted(
+            r["queue"] for r in await store.list_attempts(queue="beta")
+        ) == ["beta", "beta"]
+        assert await store.list_attempts(queue="alpha") == []
+        live = await store.live_attempts()
+        assert all(a["queue"] == "beta" for a in live)
         assert await store.get_task_state("alpha", "t3") is None
         assert (await store.get_task_state("beta", "t3"))["state"] == "blocked"
         ded = await store.queue_dedication()
@@ -133,8 +134,8 @@ def test_memory_store_rename_queue() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _mgr(workspace: Path, store: MemoryStore | None = None) -> TestClient:
-    return TestClient(create_manager_app(workspace, store=store or MemoryStore()))
+def _mgr(workspace: Path, store: SqliteStore | None = None) -> TestClient:
+    return TestClient(create_manager_app(workspace, store=store or SqliteStore()))
 
 
 def test_manager_playlist_create_info_rename_repo(tmp_path: Path) -> None:
@@ -215,21 +216,24 @@ def test_manager_rename_migrates_store_and_blocks_running(tmp_path: Path) -> Non
         tmp_path, repos=("longitude",),
         queues={"alpha": {"config": {"repo": "longitude", "order": []}}},
     )
-    store = MemoryStore()
-    asyncio.run(store.create_run(
+    store = SqliteStore()
+    # A finished attempt: rename must migrate its queue key but not be blocked
+    # by it (only LIVE attempts block a rename).
+    asyncio.run(store.create_attempt(
         "r1", task="t1", queue="alpha", worker_id="w1",
-        backend="claude-code", model="auto",
+        backend="claude-code", model="auto", base_ref=None, ttl_seconds=60,
     ))
+    asyncio.run(store.update_attempt("r1", state=AttemptState.NO_CHANGE))
     with _mgr(tmp_path, store) as client:
         r = client.put("/api/playlists/alpha", json={"name": "beta"})
         assert r.status_code == 200
-        runs = asyncio.run(store.list_runs(queue="beta"))
+        runs = asyncio.run(store.list_attempts(queue="beta"))
         assert [run["task"] for run in runs] == ["t1"]
 
-        # A live lease on the (now beta) queue blocks a further rename.
-        asyncio.run(store.acquire_lease(
-            task="t1", queue="beta", worker_id="w1", model="auto",
-            base_ref="ref", ttl_seconds=60,
+        # A live attempt on the (now beta) queue blocks a further rename.
+        asyncio.run(store.create_attempt(
+            "r2", task="t1", queue="beta", worker_id="w1", model="auto",
+            backend="claude-code", base_ref="ref", ttl_seconds=60,
         ))
         r = client.put("/api/playlists/beta", json={"name": "gamma"})
         assert r.status_code == 409
@@ -260,43 +264,3 @@ def test_manager_rename_rejects_bad_repo(tmp_path: Path) -> None:
         assert r.status_code == 400
 
 
-# --------------------------------------------------------------------------- #
-# Legacy server endpoints
-# --------------------------------------------------------------------------- #
-
-
-def _srv(workspace: Path) -> TestClient:
-    return TestClient(create_server_app(workspace))
-
-
-def test_server_playlist_info_rename_rescan(tmp_path: Path) -> None:
-    build_workspace(
-        tmp_path, main_repo="longitude", repos=("longitude", "widgets"),
-        queues={"alpha": {"config": {"order": []}}},
-    )
-    with _srv(tmp_path) as client:
-        # Info.
-        info = client.get("/api/playlists/alpha").json()
-        assert info["name"] == "alpha"
-        assert info["repository"] is None
-
-        # Rename + repo in one PUT.
-        r = client.put(
-            "/api/playlists/alpha", json={"name": "beta", "repository": "longitude"}
-        )
-        assert r.status_code == 200
-        assert r.json() == {
-            "name": "beta",
-            "task_count": 0,
-            "repository": "longitude",
-            "validate": None,
-            "disabled": False,
-        }
-        assert client.get("/api/playlists/alpha").status_code == 404
-
-        # Rescan materialises a playlist per workspace repo.
-        r = client.post("/api/playlists/rescan", json={})
-        assert r.status_code == 200
-        names = {p["name"] for p in r.json()["playlists"]}
-        assert {"longitude", "widgets", "beta"} <= names
-        assert client.get("/api/playlists/longitude").json()["repository"] == "longitude"

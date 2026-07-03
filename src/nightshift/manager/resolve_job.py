@@ -8,15 +8,16 @@ and fresh work can start off the last pre-conflict commit while this runs.
 What it does, in order:
 
 1. Integrate origin/main into the local clone so the rebase target is current.
-2. Run :func:`nightshift.runner_legacy.resolve_task` in the task's *preserved* worktree
+2. Run :func:`nightshift.resolve_runner.resolve_task` in the task's *preserved* worktree
    (rebase onto main → agent resolves conflicts → re-validate → squash to local
    main), streaming the run's events back to the manager so the live log and
    ``resolve`` phase show in the UI.
-3. Push the resolved commit to origin/main under the integrate lock (bounded
-   retry that replays onto a freshly-advanced origin), so the merge is strictly
-   serialized against every other land while the agent work above ran unlocked.
-4. Report the final outcome to the manager's resolve-result endpoint, which
-   updates the run, clears/holds the task, and republishes queue state.
+3. Report the resolved squash SHA to the manager's resolve-result endpoint.
+   Since Phase 7 the subprocess never pushes origin itself: the manager lands
+   the reported SHA as a job on the repo's executor (``produce=cherry(sha)``),
+   so push authority is single-threaded per repo and the last cross-process
+   integrate-lock consumer is gone. The endpoint updates the run, clears/holds
+   the task, and republishes queue state.
 """
 
 from __future__ import annotations
@@ -29,8 +30,7 @@ from nightshift import playlists as playlists_mod
 from nightshift.events import RUN_FINISHED, RUN_STARTED, Event
 from nightshift.git.sync import sync_main_to_origin
 from nightshift.lifecycle import FailureKind, LandingMode, RunStatus
-from nightshift.manager.landing import push_resolved_main
-from nightshift.runner_legacy import resolve_task
+from nightshift.resolve_runner import resolve_task
 from nightshift.spawn_daily import resolve_config
 from nightshift.worker.client import ManagerClient
 
@@ -96,26 +96,9 @@ def main(argv: list[str] | None = None) -> int:
 
     landed = bool(result.success)
     sha = result.commit_sha
-    push_detail = ""
-    # ``resolve_task`` squashed onto *local* main; for push mode we still have to
-    # land that commit on origin/main (serialized, replaying past any origin
-    # advance that happened during the agent run).
-    if landed and landing_mode is LandingMode.PUSH and remote:
-        ok, info = push_resolved_main(
-            workspace,
-            repo,
-            remote,
-            sha or "",
-            max_retries=args.max_push_retries,
-            autostash=bool(config.get("autostash_operator_work", True)),
-        )
-        if ok:
-            sha = info
-        else:
-            landed = False
-            push_detail = info
-
-    remote_kind = "push" if (landing_mode is LandingMode.PUSH and remote) else None
+    # ``resolve_task`` squashed onto *local* main. The origin push is the
+    # manager's (Phase 7): ``pushed: None`` on a landed push-mode resolve tells
+    # worker_resolve_result to land the SHA on the repo executor.
     payload = {
         "task": task,
         "queue": queue,
@@ -126,10 +109,10 @@ def main(argv: list[str] | None = None) -> int:
         "result_line": result.result_line
         or ("resolved: landed" if landed else "resolve failed"),
         "failure_kind": None if landed else (result.failure_kind or FailureKind.MERGE_CONFLICT),
-        "failure_reason": None if landed else (result.error or push_detail or None),
+        "failure_reason": None if landed else (result.error or None),
         "loc": result.loc if landed else None,
-        "remote": remote_kind if landed else None,
-        "pushed": True if (landed and remote_kind) else None,
+        "remote": None,
+        "pushed": None,
     }
     client.resolve_result(run_id, payload)
     emit(Event(RUN_FINISHED, {"task": task}))

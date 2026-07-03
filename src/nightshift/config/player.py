@@ -1,7 +1,8 @@
 """Player configuration model — .nightshift/player.json.
 
-Replaces the hand-maintained SCHEMA/DEFAULTS/validate_settings in
-server/settings.py with a typed dataclass carrying editor metadata.
+Operator UI/player preferences as a typed dataclass carrying editor metadata
+(the settings registry derives the /api/settings surface from it). The
+``port`` knob died with the legacy single-box UI server in Phase 9.
 """
 
 from __future__ import annotations
@@ -54,10 +55,6 @@ class PlayerConfig:
         category="Transport", label="Repeat interval",
         desc="Wait between repeat play-throughs (e.g. 45s, 30m, 2h, 1h30m).",
         apply="live", type="duration"))
-    port: int = field(default=8799, metadata=meta(
-        category="Server", label="Server port",
-        desc="Port the Nightshift UI server listens on (applies on next launch).",
-        apply="restart"))
 
 
 def load_player_config(workspace: Path) -> PlayerConfig:
@@ -67,7 +64,6 @@ def load_player_config(workspace: Path) -> PlayerConfig:
         theme=data.get("theme", "dark"),
         transport_mode=data.get("transport_mode", "auto"),
         repeat_interval=data.get("repeat_interval", "30m"),
-        port=int(data.get("port", 8799)),
     )
 
 
@@ -77,30 +73,5 @@ def save_player_config(workspace: Path, config: PlayerConfig) -> None:
         "theme": config.theme,
         "transport_mode": config.transport_mode,
         "repeat_interval": config.repeat_interval,
-        "port": config.port,
     }
     save_json(player_json_path(workspace), data)
-
-
-def validate_player_config(values: dict[str, Any]) -> list[str]:
-    """Return human-readable validation errors (empty when valid)."""
-    errors: list[str] = []
-
-    mode = values.get("transport_mode")
-    if mode not in {"oneshot", "auto", "repeat"}:
-        errors.append("transport_mode must be one of oneshot, auto, repeat")
-
-    if mode == "repeat" or values.get("repeat_interval"):
-        try:
-            parse_duration(values.get("repeat_interval", ""))
-        except ValueError as exc:
-            errors.append(f"repeat_interval: {exc}")
-
-    if values.get("theme") not in {"light", "dark"}:
-        errors.append("theme must be light or dark")
-
-    port = values.get("port")
-    if not isinstance(port, int) or isinstance(port, bool) or not (1 <= port <= 65535):
-        errors.append("port must be an integer between 1 and 65535")
-
-    return errors

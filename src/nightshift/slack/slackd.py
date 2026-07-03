@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from nightshift.config.io import load_dotenv
 from nightshift.git import GitRunner
 from nightshift.repos import DEFAULT_TASKS_REPO
 from nightshift.slack.config import SlackConfig, resolve_slack_config
@@ -353,8 +354,6 @@ def run(workspace: Path, *, argv: list[str] | None = None) -> int:
     no-op rather than a crash (spec §3, §9). ``slack-bolt`` is imported here,
     inside the daemon path, never at module import.
     """
-    from nightshift.run_local import load_dotenv
-
     load_dotenv(workspace)
     tasks_root = workspace / _resolve_tasks_repo(workspace)
     runner_config = resolve_config(workspace, tasks_root)

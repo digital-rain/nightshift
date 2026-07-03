@@ -9,7 +9,7 @@ default ship state — the notifier is disabled and every hook is a cheap no-op
 
 The tokens are *secrets*, never config: the bot token is read from
 ``SLACK_BOT_TOKEN`` and the Socket Mode app token from ``SLACK_APP_TOKEN``
-(both loaded from ``.env`` by ``run_local.load_dotenv``). Absent token ⇒ that
+(both loaded from ``.env`` by ``config.io.load_dotenv``). Absent token ⇒ that
 direction is disabled, regardless of the ``enabled`` flag.
 """
 

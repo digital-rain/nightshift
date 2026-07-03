@@ -53,15 +53,6 @@ worker-headless:
     echo "launching worker-headless on {{workspace}}"
     {{py}} -m nightshift.worker --workspace "{{workspace}}" --no-ui
 
-# Launch the legacy single-box UI server (viewer + player; default :8799).
-server port="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    args=(--workspace "{{workspace}}")
-    if [ -n "{{port}}" ]; then args+=(--port "{{port}}"); fi
-    echo "launching server on {{workspace}}:{{port}}"
-    {{py}} -m nightshift.server "${args[@]}"
-
 # Launch the Slack Socket Mode capture daemon (needs the `slack` extra + tokens).
 slackd:
     echo "launching slackd on {{workspace}}"

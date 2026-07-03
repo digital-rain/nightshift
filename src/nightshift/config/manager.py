@@ -100,10 +100,6 @@ class OperatorConfig:
     draft: bool = field(default=False, metadata=meta(
         category="Landing & Git", label="Draft",
         desc="Default draft state for PR-mode landings."))
-    autostash_operator_work: bool = field(default=True, metadata=meta(
-        category="Landing & Git", label="Autostash operator work",
-        desc="Stash uncommitted operator work before a local landing.",
-        ))
     max_push_retries: int = field(default=3, metadata=meta(
         category="Landing & Git", label="Max push retries",
         desc=(
@@ -158,6 +154,13 @@ class OperatorConfig:
             "queue but skipped by every worker so a confused task cannot burn "
             "budget in a re-execution loop. 0 disables quarantine."),
         env="NIGHTSHIFT_QUARANTINE_THRESHOLD"))
+    retry_backoff_seconds: float = field(default=60.0, metadata=meta(
+        category="Worker execution policy", label="Retry backoff seconds",
+        desc=(
+            "Base of the exponential retry backoff: the n-th consecutive "
+            "no-progress attempt delays the task's next dispatch by "
+            "base * 2**(n-1) seconds (capped at an hour)."),
+        ))
 
     auto_resolve: bool = field(default=True, metadata=meta(
         category="Conflict resolution", label="Auto resolve",
@@ -314,7 +317,6 @@ def load_manager_settings(workspace: Path) -> ManagerSettings:
             or "nightshift-tasks"),
         automerge=bool(data.get("automerge", False)),
         draft=bool(data.get("draft", False)),
-        autostash_operator_work=bool(data.get("autostash_operator_work", True)),
         max_push_retries=_as_int(data.get("max_push_retries"), 3),
         validate_on_integrate=bool(data.get("validate_on_integrate", False)),
         forbidden_paths=_as_tuple(
@@ -337,6 +339,7 @@ def load_manager_settings(workspace: Path) -> ManagerSettings:
             os.environ.get("NIGHTSHIFT_QUARANTINE_THRESHOLD")
             or data.get("quarantine_threshold"),
             2),
+        retry_backoff_seconds=_as_float(data.get("retry_backoff_seconds"), 60.0),
         auto_resolve=bool(data.get("auto_resolve", True)),
         max_resolve_attempts=_as_int(data.get("max_resolve_attempts"), 2),
         resolve_model=data.get("resolve_model"),
@@ -383,7 +386,6 @@ def save_manager_settings(workspace: Path, settings: ManagerSettings) -> None:
         "max_nights_before_parking": settings.operator.max_nights_before_parking,
         "automerge": settings.operator.automerge,
         "draft": settings.operator.draft,
-        "autostash_operator_work": settings.operator.autostash_operator_work,
         "max_push_retries": settings.operator.max_push_retries,
         "validate_on_integrate": settings.operator.validate_on_integrate,
         "diff_cap_lines": settings.operator.diff_cap_lines,
@@ -393,6 +395,7 @@ def save_manager_settings(workspace: Path, settings: ManagerSettings) -> None:
         "max_fix_attempts": settings.operator.max_fix_attempts,
         "validate": settings.operator.validate_cmd,
         "quarantine_threshold": settings.operator.quarantine_threshold,
+        "retry_backoff_seconds": settings.operator.retry_backoff_seconds,
         "auto_resolve": settings.operator.auto_resolve,
         "max_resolve_attempts": settings.operator.max_resolve_attempts,
         "resolve_model": settings.operator.resolve_model,

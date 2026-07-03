@@ -135,7 +135,6 @@ Secrets (`shared_secret`, `dsn`) are **not** in this file — they live in `.env
 | `forbidden_template_paths` | (regex list) | Paths forbidden in template/decomposition runs. |
 | `automerge` | `false` | Default automerge for PR-mode landings. |
 | `draft` | `false` | Default draft state for PR-mode landings. |
-| `autostash_operator_work` | `true` | Stash uncommitted operator work before a local landing. |
 | `max_fix_attempts` | `6` | Fix retries (dispatch path). |
 | `validate` | `just validate` | System-wide default validate command run after each task. Per-queue `validate` in queue `config.json` overrides this. Empty string disables validation globally. |
 | `auto_resolve` | `true` | Hand out resolve work-orders on conflict/validation failure. |
@@ -269,7 +268,7 @@ The store is selected from `NIGHTSHIFT_PG_DSN` (env/.env).
 | Setting | Effect |
 |---|---|
 | `NIGHTSHIFT_PG_DSN` set | Use Postgres (`PgStore`). Run `just migrate` to create/upgrade the schema. |
-| (unset) | In-memory store (`MemoryStore`): no DB needed, state lost on restart. |
+| (unset) | In-memory SQLite store (`SqliteStore`): no DB needed, state lost on restart. |
 
 ### Applying the schema
 
@@ -280,7 +279,7 @@ The store is selected from `NIGHTSHIFT_PG_DSN` (env/.env).
 
 ## Startup order
 
-1. **Manager first** — `just manager` (or `just server` for single-host mode).
+1. **Manager first** — `just manager`.
 2. **Workers after** — `just worker [port]`. Each worker connects to `NIGHTSHIFT_MANAGER_URL` immediately on startup; if the manager isn't reachable, the worker exits with `httpx.ConnectError: Connection refused`.
 
 The operator UI is served by the manager; open it in a browser once the manager logs `Uvicorn running on …`.

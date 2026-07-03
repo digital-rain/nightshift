@@ -24,8 +24,6 @@ from nightshift.git.worktrees import (
     worktree_dir,
 )
 from nightshift.lifecycle import FailureKind, RunStatus
-from nightshift.repos import DEFAULT_TASKS_REPO
-from nightshift.runner_legacy import run_task
 from nightshift.worker.config import WorkerConfig
 from nightshift.worker.execute import execute_work_order
 
@@ -143,28 +141,9 @@ def test_setup_worktree_failure_raises_typed_git_error(tmp_path: Path) -> None:
     assert "worktree add" in str(exc_info.value)
 
 
-def test_run_task_maps_worktree_failure(tmp_path: Path, monkeypatch) -> None:
+def test_execute_work_order_maps_worktree_failure(tmp_path: Path, monkeypatch) -> None:
     """A failed worktree add surfaces as failure_kind=worktree_failed, not a
     traceback."""
-    workspace = build_workspace(
-        tmp_path, tasks={"10-do": "---\nmodel: auto\n---\nDo it."}
-    )
-
-    def boom(*args, **kwargs):
-        raise GitError("git worktree add failed (exit 128): fatal: boom")
-
-    monkeypatch.setattr("nightshift.runner_legacy.setup_worktree", boom)
-    events = []
-    result = run_task(
-        workspace, workspace / DEFAULT_TASKS_REPO, "10-do", emit=events.append
-    )
-    assert result.success is False
-    assert result.failure_kind == "worktree_failed"
-    task_results = [e for e in events if e.type == "task_result"]
-    assert task_results and task_results[-1].payload["failure_kind"] == "worktree_failed"
-
-
-def test_execute_work_order_maps_worktree_failure(tmp_path: Path, monkeypatch) -> None:
     workspace = build_workspace(tmp_path)
 
     class _Backend:

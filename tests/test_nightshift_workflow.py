@@ -32,7 +32,7 @@ def _recipe_names(justfile: str) -> set[str]:
 
 def test_justfile_exposes_core_recipes() -> None:
     recipes = _recipe_names(JUSTFILE_PATH.read_text())
-    for recipe in ("manager", "worker", "server", "migrate", "rollback", "test"):
+    for recipe in ("manager", "worker", "migrate", "rollback", "test"):
         assert recipe in recipes, f"justfile is missing the `{recipe}` recipe"
 
 
@@ -41,7 +41,6 @@ def test_justfile_run_recipes_invoke_package_modules() -> None:
     # The run recipes drive the installed package entry modules, not tools/ paths.
     assert "-m nightshift.manager" in justfile
     assert "-m nightshift.worker" in justfile
-    assert "-m nightshift.server" in justfile
 
 
 def test_justfile_migrations_point_at_package_assets() -> None:

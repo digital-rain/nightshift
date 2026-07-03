@@ -29,7 +29,7 @@ def save_json(path: Path, data: dict[str, Any]) -> None:
 def load_dotenv(workspace: Path) -> None:
     """Load ``<workspace>/.env`` into ``os.environ`` (setdefault semantics).
 
-    Must be called at the start of every entrypoint (manager, worker, server)
+    Must be called at the start of every entrypoint (manager, worker, slackd)
     so secrets-in-.env resolve uniformly. A real env var always wins.
     """
     path = workspace / ".env"

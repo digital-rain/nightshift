@@ -22,12 +22,12 @@ from typing import Any
 import nightshift.backends as backends_mod
 from _workspace import build_workspace, git, git_commit_all
 from nightshift.backends import WorkerResult
-from nightshift.engine import (
+from nightshift.git.sync import maybe_sync_main_to_origin
+from nightshift.preflight import (
     DEFAULT_PREFLIGHT_CMD,
     ensure_env_synced,
     lock_changed_between,
     lock_fingerprint,
-    maybe_sync_main_to_origin,
     preflight_cmd_from_blob,
     resolve_preflight_cmd,
 )
