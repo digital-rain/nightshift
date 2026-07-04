@@ -3,7 +3,7 @@
 **Subject:** Where the manager/local-worker pipeline actually spends model tokens, measured from the worker's own run history, and five prioritized changes to cut the spend.
 **Status:** Analysis + proposal — the findings are measured (not estimated); the recommendations are not yet implemented. Where this doc and code disagree, the code governs.
 **Dataset:** `~/workspaces/.nightshift-worker/runs.jsonl` — 114 runs on worker `vm-1` through 2026-07-03, with per-run `turns` / `input_tokens` / `output_tokens` / `cost_usd` telemetry captured by `backends.AgentStreamParser`.
-**Primary sources:** `src/nightshift/backends.py` (`AgentStreamParser`, `_usage_tokens`, `_stream_subprocess`), `src/nightshift/engine.py` (`build_claude_argv`, `_attempt_repair`), `src/nightshift/worker/execute.py`, `src/nightshift/agent/loop.py`, `docs/spec/failure-retry-policy.md`, `docs/spec/agentic-backend.md` (§1.3), `docs/spec/faster-claude-code-vscode.md`.
+**Primary sources:** `src/nightshift/backends.py` (`AgentStreamParser`, `_usage_tokens`, `_stream_subprocess`), `src/nightshift/engine.py` (`build_claude_argv`, `_attempt_repair`), `src/nightshift/worker/execute.py`, `src/nightshift/agent/loop.py`, `docs/topics/task-state-handling.md`, `docs/spec/agentic-backend.md` (§1.3), `docs/spec/faster-claude-code-vscode.md`.
 
 ---
 
@@ -24,7 +24,7 @@ This is the run-history proof of what `agentic-backend.md` §1.3 asserts from fi
 Caveats to keep in mind when reading the numbers:
 
 - **`input_tokens` folds cache reads in.** `_usage_tokens` sums `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`, so the input figure measures *context throughput*, not billed-at-full-rate prefill. Cache reads bill at ~10%. `cost_usd` (reported by the CLI) is the trustworthy money column. See §4.
-- The history spans the period *before* the failure-retry policy (`failure-retry-policy.md`) fully landed; 8 runs show `quarantined`. Attempt-count pathologies below partly predate that policy — but the policy does not close the gaps identified in §3.2.
+- The history spans the period *before* the failure-retry policy (now documented in `docs/topics/task-state-handling.md`) fully landed; 8 runs show `quarantined`. Attempt-count pathologies below partly predate that policy — but the policy does not close the gaps identified in §3.2.
 - Sample size for some cells is small (e.g. 5 runs over 100 turns); treat exact percentages as indicative, the ordering as robust.
 
 To regenerate the stats:
@@ -112,7 +112,7 @@ Opus costs 2.3× more per unit of shipped work and lands less often. (Some routi
 
 **Evidence:** §2.2 — 10 never-landed multi-attempt tasks burned $54; the worst task was attempted 6 times identically.
 
-The failure-retry policy (`failure-retry-policy.md`) already bounds *when* retries happen (drain-first, two-strikes pause, retry-fail → quarantine). What it does not require is that a retry **differ from the failed attempt**: today a Phase B retry re-dispatches the identical model + prompt, and the recorded `failure_reason` is never fed back.
+The failure-retry policy (`docs/topics/task-state-handling.md`) already bounds *when* retries happen (drain-first, two-strikes pause, retry-fail → quarantine). What it does not require is that a retry **differ from the failed attempt**: today a Phase B retry re-dispatches the identical model + prompt, and the recorded `failure_reason` is never fed back.
 
 **Change:** on Phase B dispatch of a task marked `failed: true`, the manager applies one of, in order of preference:
 1. **Model demotion/switch** — resolve to a different model than the failed attempt (cheaper first; see R3).
