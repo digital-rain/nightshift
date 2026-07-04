@@ -63,11 +63,19 @@ from nightshift.task_files import (
     create_task,
     delete_task,
     frontmatter_held_tasks,
+    import_task,
     list_queue,
     read_task,
     set_task_meta,
 )
 from nightshift.transitions import on_operator_stop
+
+
+class QueueImport(BaseModel):
+    # Source queue (null = the main queue); the tasks to copy (null = the
+    # whole source queue, in its configured order).
+    source: str | None = None
+    tasks: list[str] | None = None
 
 
 class QueueOrder(BaseModel):
@@ -303,6 +311,46 @@ def register_operator_api(
         """The main queue's tasks, surfaced in the Playlists screen as the
         library row count and in the Add-from picker."""
         return JSONResponse(list_queue(tasks_root, playlists_mod.tasks_rel(None)))
+
+    @app.post("/api/queue/import")
+    async def import_into_queue(
+        req: QueueImport, queue: str | None = None
+    ) -> JSONResponse:
+        """Copy task(s) from another queue (a playlist, or the main queue when
+        ``source`` is null) into the target queue, appending them to its order
+        — the Add-from/Add-to picker's endpoint (restored from the legacy
+        server after Phase 9 retired it)."""
+        if req.source is not None and not playlists_mod.exists(tasks_root, req.source):
+            return JSONResponse({"error": "source playlist not found"}, status_code=404)
+        target = _resolve_queue(queue)
+        if not _queue_exists(target):
+            return JSONResponse({"error": "queue not found"}, status_code=404)
+        src_rel = playlists_mod.tasks_rel(req.source)
+        dest_rel = playlists_mod.tasks_rel(target)
+        if src_rel == dest_rel:
+            return JSONResponse(
+                {"error": "source and destination are the same queue"}, status_code=400
+            )
+        tasks = req.tasks or [t["task"] for t in list_queue(tasks_root, src_rel)]
+        imported: list[dict] = []
+        for task in tasks:
+            try:
+                imported.append(import_task(tasks_root, src_rel, task, dest_rel))
+            except FileNotFoundError:
+                return JSONResponse(
+                    {"error": f"task not found in source: {task}"}, status_code=404
+                )
+        if imported:
+            await _commit(
+                f"nightshift: import {len(imported)} task(s) "
+                f"from {queue_label(req.source)} to {queue_label(target)}"
+            )
+            await _emit(
+                "queue_changed",
+                queue=target,
+                payload={"imported": [t["task"] for t in imported]},
+            )
+        return JSONResponse({"imported": imported}, status_code=201)
 
     @app.get("/api/tasks/{task}")
     async def get_task(task: str, queue: str | None = None) -> JSONResponse:

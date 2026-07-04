@@ -28,6 +28,7 @@ from nightshift.queue_config import (
     save_queue_config_value,
 )
 from nightshift.spawn_daily import load_queue_config
+from nightshift.task_files import list_queue
 
 
 class PlaylistCreate(BaseModel):
@@ -101,6 +102,28 @@ def register_playlist_api(
             "validate": cfg.get("validate"),
             "disabled": playlists_mod.is_disabled(tasks_root, name),
         }
+
+    @app.get("/api/main/info")
+    def get_main_info() -> JSONResponse:
+        """The main queue's info payload, mirroring the per-playlist info
+        endpoint so the playlist-info screen can display the "library"."""
+        cfg = load_queue_config(tasks_root, playlists_mod.tasks_rel(None))
+        count = len(list_queue(tasks_root, playlists_mod.tasks_rel(None)))
+        return JSONResponse({
+            "name": "library",
+            "task_count": count,
+            "repository": cfg.get("repo"),
+            "validate": cfg.get("validate"),
+            "disabled": False,
+        })
+
+    @app.get("/api/playlists/{name}/tasks")
+    def get_playlist_tasks(name: str) -> JSONResponse:
+        """List a playlist's tasks without making it active, so the Add-from
+        picker can preview and copy individual tasks."""
+        if not playlists_mod.exists(tasks_root, name):
+            return JSONResponse({"error": "playlist not found"}, status_code=404)
+        return JSONResponse(list_queue(tasks_root, playlists_mod.tasks_rel(name)))
 
     @app.get("/api/playlists/{name}")
     def get_playlist(name: str) -> JSONResponse:

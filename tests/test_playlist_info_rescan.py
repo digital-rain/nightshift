@@ -264,3 +264,85 @@ def test_manager_rename_rejects_bad_repo(tmp_path: Path) -> None:
         assert r.status_code == 400
 
 
+# --------------------------------------------------------------------------- #
+# Add-from/Add-to picker endpoints (restored after Phase 9 retired the legacy
+# server): /api/queue/import, /api/main/info, /api/playlists/{name}/tasks
+# --------------------------------------------------------------------------- #
+
+
+def test_manager_queue_import_copies_between_queues(tmp_path: Path) -> None:
+    build_workspace(
+        tmp_path,
+        tasks={"alpha": "Do alpha.\n", "beta": "Do beta.\n"},
+        queues={"web": {
+            "tasks": {"gamma": "Do gamma.\n"},
+            "config": {"repo": "longitude", "order": ["gamma"]},
+        }},
+    )
+    tasks_root = tmp_path / "nightshift-tasks"
+    with _mgr(tmp_path) as client:
+        # Named task from the main queue ("library", source null) into a
+        # playlist — a copy, not a move.
+        r = client.post(
+            "/api/queue/import?queue=web", json={"source": None, "tasks": ["alpha"]}
+        )
+        assert r.status_code == 201
+        assert [t["task"] for t in r.json()["imported"]] == ["alpha"]
+        assert (tasks_root / "web" / "alpha.md").read_text() == "Do alpha.\n"
+        assert (tasks_root / "main" / "alpha.md").exists()
+        order = json.loads((tasks_root / "web" / "config.json").read_text())["order"]
+        assert order == ["gamma", "alpha"]
+
+        # The whole playlist into main (tasks null, empty queue param = main);
+        # a name collision gets the -2 suffix.
+        r = client.post("/api/queue/import?queue=", json={"source": "web"})
+        assert r.status_code == 201
+        assert [t["task"] for t in r.json()["imported"]] == ["gamma", "alpha-2"]
+        assert (tasks_root / "main" / "gamma.md").exists()
+        assert (tasks_root / "main" / "alpha-2.md").read_text() == "Do alpha.\n"
+
+
+def test_manager_queue_import_guards(tmp_path: Path) -> None:
+    build_workspace(
+        tmp_path,
+        tasks={"alpha": "A.\n"},
+        queues={"web": {"config": {"order": []}}},
+    )
+    with _mgr(tmp_path) as client:
+        # Source and destination must differ.
+        r = client.post("/api/queue/import?queue=", json={"source": None})
+        assert r.status_code == 400
+        # Unknown source playlist / destination queue / source task.
+        assert client.post(
+            "/api/queue/import?queue=web", json={"source": "ghost"}
+        ).status_code == 404
+        assert client.post(
+            "/api/queue/import?queue=nope", json={"source": None}
+        ).status_code == 404
+        assert client.post(
+            "/api/queue/import?queue=web",
+            json={"source": None, "tasks": ["missing"]},
+        ).status_code == 404
+
+
+def test_manager_addfrom_picker_endpoints(tmp_path: Path) -> None:
+    build_workspace(
+        tmp_path,
+        tasks={"alpha": "A.\n"},
+        queues={"web": {
+            "tasks": {"gamma": "G.\n"},
+            "config": {"repo": "longitude", "order": ["gamma"]},
+        }},
+    )
+    with _mgr(tmp_path) as client:
+        # /api/main/info mirrors the playlist-info payload for the "library".
+        info = client.get("/api/main/info").json()
+        assert info["name"] == "library"
+        assert info["task_count"] == 1
+        assert info["repository"] == "longitude"
+        # /api/playlists/{name}/tasks previews a queue without changing focus.
+        tasks = client.get("/api/playlists/web/tasks").json()
+        assert [t["task"] for t in tasks] == ["gamma"]
+        assert client.get("/api/playlists/ghost/tasks").status_code == 404
+
+

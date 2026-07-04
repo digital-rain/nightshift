@@ -11,9 +11,11 @@ Import is a *move* with git authority on both sides: the brief becomes
 canonical in the content store (``nightshift-tasks/<queue>/``) and the source
 file is removed from the repo's ``main`` by the manager (the sole writer to
 ``main``), so a brief exists in exactly one place, can never run twice, and
-is never lost. See ``docs/spec/2026-07-04-repo-task-import.md``.
+is never lost. The scan reads the inbox from the same authority the removal
+writes to — the ``main`` *tree*, never the operator checkout, which may be
+parked on any branch. See ``docs/spec/2026-07-04-repo-task-import.md``.
 
-This module is shared-core: pure scan/copy plus the lock-held removal
+This module is shared-core: read-only scan/copy plus the lock-held removal
 orchestration; the HTTP surface lives in
 :mod:`nightshift.manager.api_repo_tasks`.
 """
@@ -62,40 +64,50 @@ class RepoTask:
     text: str
 
 
-def _local_order(inbox_dir: Path) -> list[str]:
-    """The inbox-local ``config.json`` ``order`` list (best-effort: ``[]`` on
-    a missing/malformed file — callers fall back to filename order)."""
-    path = inbox_dir / "config.json"
-    if not path.is_file():
+def _local_order(git: GitRunner, treeish: str) -> list[str]:
+    """The inbox-local ``config.json`` ``order`` list read from the inbox tree
+    (best-effort: ``[]`` on a missing/malformed file — callers fall back to
+    filename order)."""
+    raw = git.run("cat-file", "blob", f"{treeish}/config.json")
+    if not raw.ok:
         return []
     try:
-        data = json.loads(path.read_text())
-    except (ValueError, OSError):
+        data = json.loads(raw.stdout)
+    except ValueError:
         return []
     order = data.get("order") if isinstance(data, dict) else None
     return [str(name) for name in order] if isinstance(order, list) else []
 
 
-def _scan_dir(inbox_dir: Path) -> list[Path]:
-    """The ``*.md`` files of one inbox dir in its published order: stems listed
-    in the dir's ``config.json`` ``order`` first, the rest by filename."""
-    if not inbox_dir.is_dir():
+def _scan_tree(git: GitRunner, treeish: str) -> list[str]:
+    """The ``*.md`` blob names of one inbox tree (``<sha>:.tasks[/…]``) in its
+    published order: stems listed in the tree's ``config.json`` ``order``
+    first, the rest by filename. ``[]`` when the tree does not exist."""
+    listing = git.run("ls-tree", "-z", treeish)
+    if not listing.ok:
         return []
-    by_stem = {p.stem: p for p in inbox_dir.glob("*.md") if p.is_file()}
-    rank = {name: i for i, name in enumerate(_local_order(inbox_dir))}
+    by_stem: dict[str, str] = {}
+    for entry in listing.stdout.split("\0"):
+        meta, _, name = entry.partition("\t")
+        if meta.split()[1:2] == ["blob"] and name.endswith(".md"):
+            by_stem[name[: -len(".md")]] = name
+    rank = {name: i for i, name in enumerate(_local_order(git, treeish))}
     listed = sorted((s for s in by_stem if s in rank), key=lambda s: rank[s])
     unlisted = sorted(s for s in by_stem if s not in rank)
     return [by_stem[s] for s in (*listed, *unlisted)]
 
 
-def _parse_brief(path: Path) -> tuple[dict, str] | None:
-    """Parse one inbox file into ``(frontmatter, text)`` — ``None`` when it is
+def _parse_brief(git: GitRunner, treeish: str, name: str) -> tuple[dict, str] | None:
+    """Read one inbox blob into ``(frontmatter, text)`` — ``None`` when it is
     not an importable brief. Stems starting with ``_`` or ``.`` (templates,
     evergreen inboxes like ``_todo.md``) and ``autosplit: true`` sources
     (recurring, tooling appends to them in place) stay in the repo."""
-    if path.stem.startswith(("_", ".")):
+    if name.startswith(("_", ".")):
         return None
-    text = path.read_text(errors="replace")
+    raw = git.run("cat-file", "blob", f"{treeish}/{name}")
+    if not raw.ok:
+        return None
+    text = raw.stdout
     meta = split_frontmatter(text)[0] if text.startswith("---") else {}
     if meta.get("autosplit"):
         return None
@@ -109,16 +121,22 @@ def scan_repo_tasks(
     tasks_root: Path,
     dest_rel: str,
 ) -> list[RepoTask]:
-    """Scan ``<workspace>/<repo>/.tasks`` for briefs importable into a queue.
+    """Scan the repo's canonical ``main`` for ``.tasks`` briefs importable
+    into a queue.
 
-    Flat root files come first, then the subdir matching ``queue_name`` (the
-    queue's label; other subdirs belong to other queues and stay untouched),
-    each group in its published order (:func:`_scan_dir`). Read-only — the
-    import itself is :func:`copy_repo_tasks` + :func:`remove_repo_tasks_locked`.
+    The scan reads the ``main`` *tree* — the same authority the removal
+    commits to — never the operator checkout, which may be parked on any
+    branch (a drained brief must disappear from the preview even while some
+    feature branch still carries the file). Flat root files come first, then
+    the subdir matching ``queue_name`` (the queue's label; other subdirs
+    belong to other queues and stay untouched), each group in its published
+    order (:func:`_scan_tree`). Read-only — the import itself is
+    :func:`copy_repo_tasks` + :func:`remove_repo_tasks_locked`.
     """
     repo_root = workspace / repo
-    home = repo_root / REPO_TASKS_DIR
-    if not home.is_dir():
+    git = GitRunner(repo_root)
+    base = main_sha(repo_root)
+    if base is None:
         return []
 
     dest_dir = tasks_root / dest_rel
@@ -129,20 +147,23 @@ def scan_repo_tasks(
     )
 
     out: list[RepoTask] = []
-    for path in (*_scan_dir(home), *_scan_dir(home / queue_name)):
-        parsed = _parse_brief(path)
-        if parsed is None:
-            continue
-        meta, text = parsed
-        out.append(RepoTask(
-            name=path.stem,
-            title=resolve_title(path.stem, meta),
-            source=str(path.relative_to(repo_root)),
-            priority=task_priority(meta),
-            disabled=is_disabled(meta),
-            duplicate=text in existing,
-            text=text,
-        ))
+    for inbox in (REPO_TASKS_DIR, f"{REPO_TASKS_DIR}/{queue_name}"):
+        treeish = f"{base}:{inbox}"
+        for name in _scan_tree(git, treeish):
+            parsed = _parse_brief(git, treeish, name)
+            if parsed is None:
+                continue
+            meta, text = parsed
+            stem = name[: -len(".md")]
+            out.append(RepoTask(
+                name=stem,
+                title=resolve_title(stem, meta),
+                source=f"{inbox}/{name}",
+                priority=task_priority(meta),
+                disabled=is_disabled(meta),
+                duplicate=text in existing,
+                text=text,
+            ))
     return out
 
 

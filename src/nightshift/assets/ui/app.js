@@ -4916,7 +4916,7 @@ async function importFrom(source, tasks) {
 // twice (docs/spec/2026-07-04-repo-task-import.md).
 async function openRepoImport() {
   $("repoimport-status").hidden = true;
-  $("repoimport-desc").textContent = "";
+  $("repoimport-desc").textContent = "Scanning the repository\u2026";
   $("repoimport-empty").hidden = true;
   $("repoimport-list").innerHTML = "";
   $("repoimport-go").hidden = true;
@@ -4924,6 +4924,7 @@ async function openRepoImport() {
   let data;
   try { data = await getJSON(`/api/queue/repo-tasks${queueParam()}`); }
   catch { data = null; }
+  $("repoimport-desc").textContent = "";
   renderRepoImport(data);
 }
 
@@ -4962,7 +4963,9 @@ function renderRepoImport(data) {
 
 function repoImportRow(t) {
   const li = document.createElement("li");
-  li.className = "addfrom-task";
+  // "static": preview rows, not click targets — the whole batch imports via
+  // the Import button (no per-task selection).
+  li.className = "addfrom-task static";
   const title = document.createElement("span");
   title.className = "addfrom-task-title";
   title.textContent = t.title || t.task;
@@ -4985,12 +4988,26 @@ function repoImportRow(t) {
 
 async function runRepoImport() {
   const go = $("repoimport-go");
+  if (go.disabled) return;
+  const label = go.textContent;
+  const status = $("repoimport-status");
+  // Immediate feedback: the removal side syncs and pushes the repo's main,
+  // which can take a few seconds — without this the click looks inert.
   go.disabled = true;
-  const { ok, data } = await sendJSON(
-    `/api/queue/repo-tasks/import${queueParam()}`, "POST", {});
+  go.textContent = "Importing\u2026";
+  status.textContent = "Importing\u2026 moving tasks into the queue and removing them from the repository.";
+  status.hidden = false;
+  let result;
+  try {
+    result = await sendJSON(`/api/queue/repo-tasks/import${queueParam()}`, "POST", {});
+  } catch {
+    result = { ok: false, data: null };
+  }
+  const { ok, data } = result;
   if (!ok) {
     go.disabled = false;
-    alert((data && data.error) || "could not import tasks");
+    go.textContent = label;
+    status.textContent = (data && data.error) || "Could not import tasks.";
     return;
   }
   await loadQueue();
@@ -5002,9 +5019,7 @@ async function runRepoImport() {
     (d ? ` (${d} already in queue)` : "") +
     (data.removed ? " and removed them from the repository." : ".");
   if (data.warning) msg += ` Warning: ${data.warning}`;
-  const status = $("repoimport-status");
   status.textContent = msg;
-  status.hidden = false;
   $("repoimport-desc").textContent = "";
 }
 

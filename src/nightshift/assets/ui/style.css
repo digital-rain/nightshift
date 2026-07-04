@@ -361,6 +361,10 @@ body {
 .addfrom-task:hover { background: var(--border); }
 .addfrom-task .addfrom-add { width: 22px; height: 22px; font-size: 14px; }
 .addfrom-task-title { flex: 1; font-size: 13px; }
+/* Preview-only rows (repo import modal): not click targets, so no
+   pointer/hover invitation. */
+.addfrom-task.static { cursor: default; }
+.addfrom-task.static:hover { background: none; }
 
 /* ---- Now screen ---- */
 .now-layout { display: flex; flex-direction: column; width: 100%; gap: 16px; }

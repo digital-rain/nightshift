@@ -34,7 +34,11 @@ idempotent (see *Dedupe*).
 
 ## Scan rules (`nightshift/repo_tasks.py`)
 
-For queue X bound to repo R, the importable set from `<workspace>/R/.tasks`:
+For queue X bound to repo R, the importable set is read from the `.tasks`
+tree of R's **canonical `main`** (`main_sha`) — the same authority the
+removal commits to, never the operator checkout. A checkout parked on a
+feature branch neither hides main's briefs nor re-offers drained ones, and
+uncommitted working-tree files are not published yet. Within that tree:
 
 - **Flat layout:** `.tasks/*.md` directly in the root.
 - **Queue-dir layout:** `.tasks/X/*.md` — only the subdir matching the
@@ -103,16 +107,21 @@ pattern — `api_operator.py` is near the 1k-line budget).
 The queue page's **"+ Add" menu** gains **"Import from repository…"**. It
 opens a modal in the established `addfrom` pattern: fetches the preview,
 lists each brief (title, source path, an "in queue" tag on duplicates), one
-**Import** button. Empty state: "No importable tasks in `R/.tasks`."
-Success refreshes the queue and reports the count plus the push warning, if
-any.
+**Import** button. Rows are static previews (no per-task selection); the
+button is the only action and reports progress ("Importing…") while the
+move runs — the removal syncs and pushes the repo's main, which takes a few
+seconds. Empty state: "No importable tasks in `R/.tasks`." Success refreshes
+the queue and reports the count plus the push warning, if any.
 
 ## Testing
 
 Against `tests/_workspace.py` fixtures (`tests/test_repo_tasks.py`):
 
 - scan-rule units: both layouts, `_`/`.` and autosplit skipping, ordering,
-  dedupe flagging;
+  dedupe flagging, uncommitted files ignored;
+- main-tree authority: with the checkout parked on a feature branch the
+  preview still serves main's briefs, and drained briefs leave the preview
+  even while the branch carries the files on disk;
 - end-to-end API: briefs land in the content store (committed), source files
   removed from repo `main` (commit present, clean checkout advanced), order
   appended;

@@ -64,6 +64,9 @@ def test_scan_rules_and_order(tmp_path: Path) -> None:
         ".tasks/main/gamma.md": "Do gamma.\n",
         ".tasks/other/delta.md": "Belongs to another queue.\n",
     })
+    # Published = committed on main: an uncommitted working-tree file is not
+    # part of the inbox yet.
+    (repo_root / ".tasks" / "uncommitted.md").write_text("Not published.\n")
     entries = scan_repo_tasks(ws, "longitude", "main", ws / "nightshift-tasks", "main")
     # Root files first in their published order, then the queue subdir's.
     assert [e.name for e in entries] == ["beta", "alpha", "gamma"]
@@ -162,6 +165,30 @@ def test_import_moves_briefs_into_queue_and_off_main(tmp_path: Path) -> None:
         # The queue serves the imported briefs; the inbox is drained.
         assert {t["task"] for t in client.get("/api/queue").json()} >= {"alpha", "beta"}
         assert client.get("/api/queue/repo-tasks").json()["count"] == 0
+
+
+def test_import_reads_and_drains_main_not_the_checkout(tmp_path: Path) -> None:
+    """The inbox is the ``main`` *tree*: a checkout parked on a feature branch
+    neither hides main's briefs nor re-offers drained ones (the operator's
+    on-disk copy of the file is irrelevant to the preview)."""
+    ws = build_workspace(tmp_path)
+    repo_root = ws / "longitude"
+    _publish(repo_root, {".tasks/alpha.md": "Do alpha.\n"})
+    git(repo_root, "checkout", "-b", "feature")
+    with _client(ws) as client:
+        preview = client.get("/api/queue/repo-tasks").json()
+        assert [t["task"] for t in preview["tasks"]] == ["alpha"]
+
+        data = client.post("/api/queue/repo-tasks/import").json()
+        assert [t["task"] for t in data["imported"]] == ["alpha"]
+        assert data["removed"] is True
+
+        # Drained from main -> gone from the preview, even though the feature
+        # checkout still carries the file on disk.
+        assert client.get("/api/queue/repo-tasks").json()["count"] == 0
+    assert (repo_root / ".tasks" / "alpha.md").exists()
+    assert ".tasks/alpha.md" not in git(repo_root, "ls-tree", "-r", "--name-only", "main")
+    assert git(repo_root, "branch", "--show-current") == "feature"
 
 
 def test_import_scopes_to_the_queues_subdir(tmp_path: Path) -> None:
