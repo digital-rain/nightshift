@@ -4910,6 +4910,104 @@ async function importFrom(source, tasks) {
   }
 }
 
+// ----- Import from repository (.tasks publishing inbox) -------------------
+// Drains briefs external tooling published into the bound repo's `.tasks/`
+// into this queue, removing them from the repo's main so they never run
+// twice (docs/spec/2026-07-04-repo-task-import.md).
+async function openRepoImport() {
+  $("repoimport-status").hidden = true;
+  $("repoimport-desc").textContent = "";
+  $("repoimport-empty").hidden = true;
+  $("repoimport-list").innerHTML = "";
+  $("repoimport-go").hidden = true;
+  $("repoimport-modal").hidden = false;
+  let data;
+  try { data = await getJSON(`/api/queue/repo-tasks${queueParam()}`); }
+  catch { data = null; }
+  renderRepoImport(data);
+}
+
+function renderRepoImport(data) {
+  const empty = $("repoimport-empty");
+  const desc = $("repoimport-desc");
+  const go = $("repoimport-go");
+  const ul = $("repoimport-list");
+  ul.innerHTML = "";
+  if (!data || data.error) {
+    empty.textContent = (data && data.error) || "could not scan the repository";
+    empty.hidden = false;
+    return;
+  }
+  if (!data.available) {
+    empty.textContent = data.repo
+      ? `Repository “${data.repo}” is not available in the workspace.`
+      : "This queue has no repository set; bind one on its info page first.";
+    empty.hidden = false;
+    return;
+  }
+  if (!data.count) {
+    empty.textContent = `No importable tasks in ${data.repo}/.tasks.`;
+    empty.hidden = false;
+    return;
+  }
+  desc.textContent =
+    `${data.count} task${data.count === 1 ? "" : "s"} published in ` +
+    `${data.repo}/.tasks. Importing moves them into this queue and removes ` +
+    "them from the repository.";
+  for (const t of data.tasks) ul.append(repoImportRow(t));
+  go.textContent = `Import ${data.count} task${data.count === 1 ? "" : "s"}`;
+  go.hidden = false;
+  go.disabled = false;
+}
+
+function repoImportRow(t) {
+  const li = document.createElement("li");
+  li.className = "addfrom-task";
+  const title = document.createElement("span");
+  title.className = "addfrom-task-title";
+  title.textContent = t.title || t.task;
+  title.title = t.source;
+  li.append(title);
+  if (t.duplicate) {
+    const tag = document.createElement("span");
+    tag.className = "addfrom-tag";
+    tag.textContent = "in queue";
+    tag.title = "Identical brief already in this queue — the repo copy will just be removed.";
+    li.append(tag);
+  } else if (t.disabled) {
+    const tag = document.createElement("span");
+    tag.className = "addfrom-tag";
+    tag.textContent = "disabled";
+    li.append(tag);
+  }
+  return li;
+}
+
+async function runRepoImport() {
+  const go = $("repoimport-go");
+  go.disabled = true;
+  const { ok, data } = await sendJSON(
+    `/api/queue/repo-tasks/import${queueParam()}`, "POST", {});
+  if (!ok) {
+    go.disabled = false;
+    alert((data && data.error) || "could not import tasks");
+    return;
+  }
+  await loadQueue();
+  $("repoimport-list").innerHTML = "";
+  go.hidden = true;
+  const n = (data.imported || []).length;
+  const d = (data.deduped || []).length;
+  let msg = `Imported ${n} task${n === 1 ? "" : "s"}` +
+    (d ? ` (${d} already in queue)` : "") +
+    (data.removed ? " and removed them from the repository." : ".");
+  if (data.warning) msg += ` Warning: ${data.warning}`;
+  const status = $("repoimport-status");
+  status.textContent = msg;
+  status.hidden = false;
+  $("repoimport-desc").textContent = "";
+}
+
 // ----- Add to another playlist -------------------------------------------
 // Copy the row-menu's target task(s) from the current queue into a chosen
 // destination queue, reusing the server's `/api/queue/import` endpoint with the
@@ -5735,6 +5833,7 @@ function wire() {
     item.addEventListener("click", () => {
       closeAddMenu();
       if (item.dataset.act === "new") openAdd();
+      else if (item.dataset.act === "import-repo") openRepoImport();
       else openAddFrom();
     });
   }
@@ -5757,6 +5856,11 @@ function wire() {
   $("addto-modal").addEventListener("click", (e) => {
     if (e.target === $("addto-modal")) $("addto-modal").hidden = true;
   });
+  $("repoimport-close").addEventListener("click", () => ($("repoimport-modal").hidden = true));
+  $("repoimport-modal").addEventListener("click", (e) => {
+    if (e.target === $("repoimport-modal")) $("repoimport-modal").hidden = true;
+  });
+  $("repoimport-go").addEventListener("click", runRepoImport);
   // Gear → popup menu (Settings / Workers / Repos), mirroring the Add dropdown.
   $("btn-settings").addEventListener("click", (e) => {
     e.stopPropagation();

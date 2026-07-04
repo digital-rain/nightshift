@@ -121,6 +121,7 @@ The manager serves the operator UI as static files from `src/nightshift/assets/u
 |--------|---------------|
 | `git/` | The git seam: `GitRunner` subprocess boundary, worktrees, squash landing, sync, transport |
 | `task_files.py`, `queue_config.py` | Task lists, brief round-trips, queue order/priorities |
+| `repo_tasks.py` | Repo task import: drain a target repo's `.tasks/` publishing inbox into its queue (scan both legacy layouts, copy to the content store, remove from repo `main` via the landing pipeline) |
 | `preflight.py`, `prompts.py` | Run preconditions, env sync, prompt building |
 | `resolve_runner.py` | Conflict-resolve driver run by the manager's out-of-process resolve job |
 | `backends.py` | Pluggable backend shims: `claude-code`, `cursor`, `gemini`, `anthropic`, `ollama` |

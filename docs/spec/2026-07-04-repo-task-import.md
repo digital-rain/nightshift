@@ -60,8 +60,8 @@ For queue X bound to repo R, the importable set from `<workspace>/R/.tasks`:
 
 ## Import flow (order of operations = never lose a task)
 
-`POST /api/queue/repo-tasks/import?queue=X`, all manager-side, serialized
-per queue:
+`POST /api/queue/repo-tasks/import?queue=X`, all manager-side, one import at
+a time (imports are rare, operator-initiated actions):
 
 1. **Scan** (read-only, rules above).
 2. **Copy into the content store:** write each non-duplicate brief to
