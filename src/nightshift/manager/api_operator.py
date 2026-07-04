@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import time
+import uuid
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
@@ -24,6 +26,7 @@ from pydantic import BaseModel
 from nightshift import playlists as playlists_mod
 from nightshift import repos
 from nightshift.config.validate import build_get_response, validate_delta, write_delta
+from nightshift.enhance import EnhanceError, enhance_brief
 from nightshift.git.executor import ExecutorPool
 from nightshift.git.store import commit_tasks
 from nightshift.lifecycle import AttemptRef, AttemptState, TaskHoldKind
@@ -109,6 +112,10 @@ class TaskCreate(BaseModel):
     repo: str | None = None
     loop: bool | None = None
     loop_max_iterations: int | None = None
+    # Enhance-on-create: run the manager-side brief rewrite before writing the
+    # file. ``text`` is then the ORIGINAL brief; the enhanced rewrite becomes
+    # the effective body and the original is preserved below the marker.
+    enhance: bool = False
 
 
 class TaskUpdate(BaseModel):
@@ -137,6 +144,14 @@ class TaskUpdate(BaseModel):
     loop: bool | None = None
     loop_max_iterations: int | None = None
     split: bool | None = None
+    # The preserved pre-enhancement text ("" drops the marker section).
+    original_brief: str | None = None
+
+
+class RunRating(BaseModel):
+    """The operator's thumbs verdict on a run: 'up', 'down', or null (clear)."""
+
+    rating: str | None = None
 
 
 def _validate_priority(value: object) -> int:
@@ -315,6 +330,7 @@ def register_operator_api(
                 "task": None,
                 "title": "",
                 "body": "",
+                "original_brief": "",
                 "frontmatter": {
                     "model": resolved["model"],
                     "draft": resolved["draft"],
@@ -339,14 +355,65 @@ def register_operator_api(
             repo_override = normalize_repo(body.repo)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
+        # Enhance-on-create: the rewrite happens BEFORE the file exists, so a
+        # failed enhancement never creates a task (the operator's draft
+        # survives client-side — they can retry or toggle enhancement off).
+        # The blocking transport runs off the event loop; either outcome is
+        # recorded in the enhancements telemetry table.
+        text, original = body.text, None
+        enhance_telemetry: dict[str, Any] | None = None
+        if body.enhance:
+            started = time.monotonic()
+            try:
+                result = await asyncio.to_thread(
+                    enhance_brief,
+                    body.title,
+                    body.text,
+                    model=cfg.enhance_brief_model,
+                    env=dict(os.environ),
+                )
+            except EnhanceError as exc:
+                await _store().record_enhancement(
+                    uuid.uuid4().hex,
+                    queue=target,
+                    task=None,
+                    model=cfg.enhance_brief_model,
+                    input_tokens=None,
+                    output_tokens=None,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    ok=False,
+                    error=str(exc),
+                )
+                return JSONResponse(
+                    {"error": f"brief enhancement failed: {exc}"}, status_code=502
+                )
+            text, original = result.text, body.text
+            usage = result.usage or {}
+            enhance_telemetry = {
+                "model": result.model,
+                "input_tokens": usage.get("input_tokens"),
+                "output_tokens": usage.get("output_tokens"),
+                "duration_ms": int((time.monotonic() - started) * 1000),
+            }
         try:
-            created = create_task(tasks_root, body.title, body.text, target_rel)
+            created = create_task(
+                tasks_root, body.title, text, target_rel, original=original
+            )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except FileExistsError as exc:
             return JSONResponse({"error": f"task already exists: {exc}"}, status_code=409)
+        if enhance_telemetry is not None:
+            await _store().record_enhancement(
+                uuid.uuid4().hex,
+                queue=target,
+                task=created["task"],
+                ok=True,
+                **enhance_telemetry,
+            )
         # Apply optional frontmatter fields from the create pane (repo
-        # override, loop mode) to the freshly created file.
+        # override, loop mode, enhancement attribution) to the freshly
+        # created file.
         meta_changes: dict[str, object | None] = {}
         if repo_override is not None:
             meta_changes["repo"] = repo_override
@@ -354,6 +421,8 @@ def register_operator_api(
             meta_changes["loop"] = body.loop
         if body.loop_max_iterations is not None:
             meta_changes["loop_max_iterations"] = body.loop_max_iterations
+        if body.enhance:
+            meta_changes["enhanced"] = True
         if meta_changes:
             with contextlib.suppress(FileNotFoundError, ValueError):
                 set_task_meta(
@@ -744,6 +813,29 @@ def register_operator_api(
         )
         return JSONResponse([jsonable(analytics_run_view(r)) for r in runs])
 
+    @app.patch("/api/runs/{run_id}/rating")
+    async def patch_run_rating(run_id: str, body: RunRating) -> JSONResponse:
+        """Record the operator's thumbs verdict on a run ('up'/'down'; null
+        clears it). The rating lives on the attempt row so the enhanced-vs-raw
+        stats can aggregate satisfaction alongside outcome states."""
+        if body.rating not in (None, "up", "down"):
+            return JSONResponse(
+                {"error": "rating must be 'up', 'down', or null"}, status_code=400
+            )
+        store = _store()
+        attempt = await store.get_attempt(run_id)
+        if attempt is None:
+            return JSONResponse({"error": "unknown run"}, status_code=404)
+        await store.update_attempt(run_id, rating=body.rating)
+        await _emit(
+            "run_rated",
+            run_id=run_id,
+            queue=_queue_from_label(attempt.get("queue")),
+            task=attempt.get("task"),
+            payload={"rating": body.rating},
+        )
+        return JSONResponse({"id": run_id, "rating": body.rating})
+
     @app.get("/api/runs/{run_id}/events")
     async def get_run_events(run_id: str) -> JSONResponse:
         return JSONResponse([jsonable(e) for e in await _store().run_events(run_id)])
@@ -772,6 +864,10 @@ def register_operator_api(
                 "by_backend": [jsonable(r) for r in await store.stats_by_backend()],
                 "by_model": [jsonable(r) for r in await store.stats_by_model()],
                 "by_queue": [jsonable(r) for r in await store.stats_by_queue()],
+                "by_enhanced": [
+                    jsonable(r) for r in await store.stats_by_enhanced()
+                ],
+                "enhancements": jsonable(await store.enhancements_summary()),
             }
         )
 

@@ -15,6 +15,9 @@
  *     turns, input_tokens, output_tokens, cache_read_input_tokens,
  *     cache_creation_input_tokens, cost_usd, usage, failure_kind,
  *     started_at, finished_at }
+ * Optional (manager records only): enhanced (bool — the brief went through
+ * the enhance-on-create rewrite) and rating ('up' | 'down' | null — the
+ * operator's thumbs verdict), which drive the "Brief enhancement" panel.
  *
  * The tuning KPI is cost per LANDED change; `landed` is true only for a real
  * change reaching main (not a no-change completion), so the manager derives it
@@ -361,6 +364,56 @@
     }
     table.append(tbody);
     panel.append(table);
+    container.append(panel);
+  }
+
+  // ---- brief enhancement (enhanced vs raw) -------------------------------- //
+
+  // Compare runs whose brief went through the enhance-on-create rewrite with
+  // raw-brief runs: outcome (land rate), operator satisfaction (thumbs), and
+  // cost. Only rendered when the records carry the `enhanced` flag (the
+  // manager's normalized records do; the worker UI's local records may not).
+  function renderEnhancement(container, runs) {
+    const terminal = runs.filter(isTerminal).filter((r) => typeof r.enhanced === "boolean");
+    if (!terminal.length) return;
+    const enhanced = terminal.filter((r) => r.enhanced);
+    if (!enhanced.length && !terminal.some((r) => r.rating)) return; // nothing to compare yet
+
+    const groups = [
+      { label: "Enhanced brief", list: enhanced },
+      { label: "Raw brief", list: terminal.filter((r) => !r.enhanced) },
+    ].filter((g) => g.list.length);
+
+    const panel = el("div", "an-panel");
+    panel.append(el("h3", "an-panel-title", "Brief enhancement"));
+    const table = el("table", "an-table");
+    const thead = el("thead");
+    const htr = el("tr");
+    ["", "Runs", "Land %", "\u{1F44D}", "\u{1F44E}", "Avg turns", "$/landed", "Cost"].forEach((h) => {
+      htr.append(el("th", null, h));
+    });
+    thead.append(htr);
+    table.append(thead);
+    const tbody = el("tbody");
+    for (const g of groups) {
+      const agg = aggregate(g.list);
+      const up = g.list.filter((r) => r.rating === "up").length;
+      const down = g.list.filter((r) => r.rating === "down").length;
+      const tr = el("tr");
+      tr.append(el("td", "an-td-key", g.label));
+      tr.append(el("td", null, String(agg.runs)));
+      tr.append(el("td", null, agg.landRate !== null ? fmtPct(agg.landRate) : "—"));
+      tr.append(el("td", null, up ? String(up) : "—"));
+      tr.append(el("td", null, down ? String(down) : "—"));
+      tr.append(el("td", null, agg.avgTurns !== null ? fmtNum(agg.avgTurns) : "—"));
+      tr.append(el("td", null, agg.hasCost ? fmtMoney(agg.costPerLanded) : "—"));
+      tr.append(el("td", null, agg.hasCost ? fmtMoney(agg.cost) : "—"));
+      tbody.append(tr);
+    }
+    table.append(tbody);
+    panel.append(table);
+    panel.append(el("div", "an-note",
+      "Thumbs are manual operator ratings on runs; land rate and cost compare enhanced-on-create briefs against raw ones."));
     container.append(panel);
   }
 
@@ -952,6 +1005,7 @@
       if (distinct(current, (r) => r.worker_id).length > 1) {
         renderBreakdown(body, "By worker", current, (r) => r.worker_id);
       }
+      renderEnhancement(body, current);
       renderWaste(body, current);
       renderRunShape(body, current);
       renderTurnComposition(body, current);

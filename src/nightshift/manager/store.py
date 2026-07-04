@@ -42,7 +42,7 @@ from nightshift.pg import PgPoolLike
 # must not.
 ATTEMPT_UPDATABLE_FIELDS = frozenset(
     set(Outcome.model_fields) - {"landable", "status"}
-) | {"state", "phase", "commit_sha", "loc", "remote", "pushed"}
+) | {"state", "phase", "commit_sha", "loc", "remote", "pushed", "rating"}
 
 
 def _check_attempt_fields(fields: dict[str, Any], *, allow_state: bool) -> None:
@@ -230,6 +230,7 @@ class NightshiftStore(Protocol):
         repo: str | None = None,
         validate_cmd: str | None = None,
         state: str = "running",
+        enhanced: bool = False,
     ) -> dict[str, Any] | None: ...
     async def get_attempt(self, attempt_id: str) -> dict[str, Any] | None: ...
     async def update_attempt(self, attempt_id: str, **fields: Any) -> None: ...
@@ -311,6 +312,23 @@ class NightshiftStore(Protocol):
     async def stats_by_backend(self) -> list[dict[str, Any]]: ...
     async def stats_by_model(self) -> list[dict[str, Any]]: ...
     async def stats_by_queue(self) -> list[dict[str, Any]]: ...
+    async def stats_by_enhanced(self) -> list[dict[str, Any]]: ...
+
+    # enhancement telemetry (the manager's enhance-brief requests)
+    async def record_enhancement(
+        self,
+        enhancement_id: str,
+        *,
+        queue: str | None,
+        task: str | None,
+        model: str | None,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        duration_ms: int | None,
+        ok: bool,
+        error: str | None = None,
+    ) -> None: ...
+    async def enhancements_summary(self) -> dict[str, Any]: ...
 
 
 def _qkey(queue: str | None) -> str:
@@ -471,6 +489,7 @@ class SqlStoreBase:
         repo: str | None = None,
         validate_cmd: str | None = None,
         state: str = "running",
+        enhanced: bool = False,
     ) -> dict[str, Any] | None:
         # The ON CONFLICT predicate must match the partial unique index
         # (attempts_live_task_uniq) in migration 20260731000004 *verbatim*
@@ -482,19 +501,19 @@ class SqlStoreBase:
                 f"""
                 INSERT INTO nightshift.attempts
                     (id, task, queue, worker_id, backend, model, repo,
-                     required_mcps, validate_cmd, state, title, body,
+                     required_mcps, validate_cmd, state, title, body, enhanced,
                      base_ref, started_at, acquired_at, heartbeat_at, deadline_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11,
-                        $12, $13, now(), now(), now(),
+                        $12, $13, $14, now(), now(), now(),
                         CASE WHEN $10 IN ({_ATTEMPT_LIVE_SQL})
-                             THEN now() + ($14 || ' seconds')::interval END)
+                             THEN now() + ($15 || ' seconds')::interval END)
                 ON CONFLICT (queue, task) WHERE state IN ({_ATTEMPT_LIVE_SQL})
                 DO NOTHING
                 RETURNING *
                 """,
                 attempt_id, task, _qkey(queue), worker_id, backend, model, repo,
                 json.dumps(required_mcps or []), validate_cmd, state, title, body,
-                base_ref, str(int(ttl_seconds)),
+                enhanced, base_ref, str(int(ttl_seconds)),
             )
         return _attempt_row(row) if row else None
 
@@ -878,6 +897,64 @@ class SqlStoreBase:
         async with self._connection() as conn:
             rows = await conn.fetch("SELECT * FROM nightshift.stats_by_queue ORDER BY queue")
         return [dict(r) for r in rows]
+
+    async def stats_by_enhanced(self) -> list[dict[str, Any]]:
+        async with self._connection() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM nightshift.stats_by_enhanced ORDER BY enhanced"
+            )
+        # SQLite hands the grouped boolean back as 0/1; widen it here (the
+        # row adapters key off column names only for attempt rows).
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["enhanced"] = bool(d.get("enhanced"))
+            out.append(d)
+        return out
+
+    # ---- enhancement telemetry --------------------------------------------- #
+
+    async def record_enhancement(
+        self,
+        enhancement_id: str,
+        *,
+        queue: str | None,
+        task: str | None,
+        model: str | None,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        duration_ms: int | None,
+        ok: bool,
+        error: str | None = None,
+    ) -> None:
+        async with self._connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO nightshift.enhancements
+                    (id, queue, task, model, input_tokens, output_tokens,
+                     duration_ms, ok, error, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+                """,
+                enhancement_id, _qkey(queue), task, model, input_tokens,
+                output_tokens, duration_ms, ok, error,
+            )
+
+    async def enhancements_summary(self) -> dict[str, Any]:
+        async with self._connection() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    count(*)                                   AS total,
+                    count(*) FILTER (WHERE ok)                 AS succeeded,
+                    count(*) FILTER (WHERE NOT ok)             AS failed,
+                    coalesce(sum(input_tokens), 0)             AS total_input_tokens,
+                    coalesce(sum(output_tokens), 0)            AS total_output_tokens,
+                    coalesce(avg(duration_ms) FILTER (WHERE duration_ms IS NOT NULL), 0)
+                                                               AS avg_duration_ms
+                FROM nightshift.enhancements
+                """
+            )
+        return dict(row)
 
 
 # --------------------------------------------------------------------------- #

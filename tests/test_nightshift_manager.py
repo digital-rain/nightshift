@@ -20,13 +20,16 @@ import pytest
 from starlette.testclient import TestClient
 
 from _workspace import build_workspace, make_target_repo
+from nightshift.enhance import EnhanceError, EnhanceResult
 from nightshift.git.worktrees import setup_worktree
 from nightshift.lifecycle import AttemptState
+from nightshift.manager import api_operator
 from nightshift.manager.app import create_app
 from nightshift.manager.hub import Hub
 from nightshift.manager.landing import canonical_head
 from nightshift.manager.store_sqlite import SqliteStore
 from nightshift.manager.wire import jsonable
+from nightshift.task_files import ORIGINAL_BRIEF_MARKER
 
 
 def _find_field(
@@ -1066,6 +1069,176 @@ def test_work_order_shape_carries_repo_task_path_and_base_ref(tmp_path: Path) ->
         assert order["base_ref"] == canonical_head(repo_root)
 
 
+def test_work_order_strips_original_brief_and_carries_enhanced(tmp_path: Path) -> None:
+    """Workers only see the effective brief: the preserved pre-enhancement tail
+    never enters the work order, while the ``enhanced`` frontmatter flag rides
+    along for attempt attribution."""
+    workspace = _seed(tmp_path, {
+        "10.hello": (
+            "---\nenhanced: true\n---\n"
+            f"The enhanced spec.\n\n{ORIGINAL_BRIEF_MARKER}\nthe raw ask\n"
+        ),
+    })
+    with _client(workspace) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        order = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        assert order["body"] == "The enhanced spec."
+        assert ORIGINAL_BRIEF_MARKER not in order["body"]
+        assert "the raw ask" not in order["body"]
+        assert order["enhanced"] is True
+        # The flag is stamped onto the attempt row and projected on the run view.
+        run = next(
+            r for r in client.get("/api/runs").json() if r["id"] == order["run_id"]
+        )
+        assert run["enhanced"] is True
+        assert run["rating"] is None
+
+
+def test_work_order_enhanced_defaults_false(tmp_path: Path) -> None:
+    workspace = _seed(tmp_path, {"10.plain": "Just do the thing."})
+    with _client(workspace) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        order = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        assert order["enhanced"] is False
+        run = next(
+            r for r in client.get("/api/runs").json() if r["id"] == order["run_id"]
+        )
+        assert run["enhanced"] is False
+
+
+def test_post_task_enhance_rewrites_and_preserves_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enhance-on-create: the rewrite becomes the effective body, the typed
+    text survives as the original brief, the file is stamped ``enhanced``, and
+    the request lands in the enhancements telemetry."""
+    workspace = _seed(tmp_path, {})
+
+    def fake_enhance(title: str, text: str, *, model: str, env: dict) -> EnhanceResult:
+        assert title == "Fix ops" and text == "make it nicer"
+        return EnhanceResult(
+            text="A precise, self-contained spec.",
+            model=model,
+            usage={"input_tokens": 100, "output_tokens": 40},
+        )
+
+    monkeypatch.setattr(api_operator, "enhance_brief", fake_enhance)
+    with _client(workspace) as client:
+        r = client.post(
+            "/api/tasks",
+            json={"title": "Fix ops", "text": "make it nicer", "enhance": True},
+        )
+        assert r.status_code == 200
+        task = r.json()["task"]
+
+        brief = client.get(f"/api/tasks/{task}").json()
+        assert brief["body"] == "A precise, self-contained spec."
+        assert brief["original_brief"] == "make it nicer"
+        assert brief["frontmatter"]["enhanced"] is True
+
+        stats = client.get("/api/stats").json()
+        assert {"by_enhanced", "enhancements"} <= set(stats)
+        summary = stats["enhancements"]
+        assert summary["total"] == 1
+        assert summary["succeeded"] == 1
+        assert summary["failed"] == 0
+        assert summary["total_input_tokens"] == 100
+        assert summary["total_output_tokens"] == 40
+
+
+def test_post_task_enhance_failure_is_502_and_creates_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed enhancement refuses the create (the operator's draft survives
+    client-side) — no task file, no queue entry — but the failed request is
+    still recorded in the telemetry."""
+    workspace = _seed(tmp_path, {})
+
+    def fake_enhance(title: str, text: str, *, model: str, env: dict) -> EnhanceResult:
+        raise EnhanceError("vendor down")
+
+    monkeypatch.setattr(api_operator, "enhance_brief", fake_enhance)
+    with _client(workspace) as client:
+        r = client.post(
+            "/api/tasks",
+            json={"title": "Fix ops", "text": "make it nicer", "enhance": True},
+        )
+        assert r.status_code == 502
+        assert "vendor down" in r.json()["error"]
+        assert client.get("/api/queue").json() == []
+        assert not (workspace / "nightshift-tasks/main/fix-ops.md").exists()
+
+        summary = client.get("/api/stats").json()["enhancements"]
+        assert summary["total"] == 1
+        assert summary["succeeded"] == 0
+        assert summary["failed"] == 1
+
+
+def test_post_task_without_enhance_never_calls_the_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _seed(tmp_path, {})
+
+    def explode(*args: object, **kwargs: object) -> EnhanceResult:
+        raise AssertionError("enhance_brief must not be called")
+
+    monkeypatch.setattr(api_operator, "enhance_brief", explode)
+    with _client(workspace) as client:
+        r = client.post("/api/tasks", json={"title": "Plain", "text": "just do it"})
+        assert r.status_code == 200
+        brief = client.get(f"/api/tasks/{r.json()['task']}").json()
+        assert brief["body"] == "just do it"
+        assert brief["original_brief"] == ""
+        assert client.get("/api/stats").json()["enhancements"]["total"] == 0
+
+
+def test_patch_task_edits_original_brief(tmp_path: Path) -> None:
+    workspace = _seed(tmp_path, {})
+    with _client(workspace) as client:
+        client.post("/api/tasks", json={"title": "Halves", "text": "spec"})
+        r = client.patch("/api/tasks/halves", json={"original_brief": "raw ask"})
+        assert r.status_code == 200
+        brief = client.get("/api/tasks/halves").json()
+        assert brief["body"] == "spec"
+        assert brief["original_brief"] == "raw ask"
+
+
+def test_run_rating_round_trip(tmp_path: Path) -> None:
+    """The thumbs endpoint: up/down persist onto the run view, null clears,
+    junk is a 400, and an unknown run is a 404."""
+    workspace = _seed(tmp_path, {"10.hello": "Do a thing."})
+    with _client(workspace) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        order = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        run_id = order["run_id"]
+
+        r = client.patch(f"/api/runs/{run_id}/rating", json={"rating": "up"})
+        assert r.status_code == 200 and r.json() == {"id": run_id, "rating": "up"}
+        run = next(x for x in client.get("/api/runs").json() if x["id"] == run_id)
+        assert run["rating"] == "up"
+
+        # Re-rating overwrites; null clears.
+        client.patch(f"/api/runs/{run_id}/rating", json={"rating": "down"})
+        run = next(x for x in client.get("/api/runs").json() if x["id"] == run_id)
+        assert run["rating"] == "down"
+        client.patch(f"/api/runs/{run_id}/rating", json={"rating": None})
+        run = next(x for x in client.get("/api/runs").json() if x["id"] == run_id)
+        assert run["rating"] is None
+
+        assert client.patch(
+            f"/api/runs/{run_id}/rating", json={"rating": "meh"}
+        ).status_code == 400
+        assert client.patch(
+            "/api/runs/nope/rating", json={"rating": "up"}
+        ).status_code == 404
+
+
 def test_content_store_commits_are_local_and_pushless(tmp_path: Path) -> None:
     # Empty main queue; commit_tasks gives the content store a local git repo.
     workspace = _seed(tmp_path, {})
@@ -1891,14 +2064,15 @@ def test_open_store_no_dsn_is_sqlite(monkeypatch) -> None:
 # The exact pre-Phase-8 run-row wire keys (order included: JSON objects keep
 # insertion order and the previous rows were column-ordered), extended with
 # the token-usage-granularity fields (cache splits + raw usage payload) added
-# alongside input_tokens/output_tokens — see manager/views.py RUN_VIEW_KEYS.
+# alongside input_tokens/output_tokens, and with the enhance-tracking fields
+# (enhanced flag + operator rating) — see manager/views.py RUN_VIEW_KEYS.
 RUN_WIRE_KEYS = [
     "id", "task", "queue", "worker_id", "backend", "model", "repo",
     "required_mcps", "status", "phase", "result_line", "commit_sha", "loc",
     "remote", "pushed", "turns", "input_tokens", "output_tokens",
     "cache_read_input_tokens", "cache_creation_input_tokens", "usage",
     "cost_usd", "failure_kind", "failure_reason", "validate_cmd", "worktree",
-    "title", "body", "started_at", "finished_at",
+    "title", "body", "started_at", "finished_at", "enhanced", "rating",
 ]
 
 # The exact pre-Phase-8 lease-row wire keys.

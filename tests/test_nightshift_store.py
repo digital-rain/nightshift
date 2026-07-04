@@ -41,6 +41,9 @@ ATTEMPTS_MIGRATION = MIGRATIONS_DIR / "20260731000004_nightshift_attempts.sql"
 USAGE_DETAIL_MIGRATION = (
     MIGRATIONS_DIR / "20260731000005_nightshift_usage_detail.sql"
 )
+ENHANCE_TRACKING_MIGRATION = (
+    MIGRATIONS_DIR / "20260801000001_nightshift_enhance_tracking.sql"
+)
 
 
 def _run(coro):
@@ -277,6 +280,73 @@ def test_turns_and_tokens_roll_up_per_model_backend_queue() -> None:
     # main queue key is "" (the playlist is "alpha").
     assert by_queue[""]["total_turns"] == 10
     assert by_queue["alpha"]["total_turns"] == 1
+
+
+def test_stats_by_enhanced_splits_outcomes_and_ratings() -> None:
+    """The enhanced-vs-raw rollup: attempts group by their ``enhanced`` stamp
+    (widened back to bool from SQLite's 0/1) with the same outcome vocabulary
+    as the other stats views plus the thumbs tallies."""
+    store = SqliteStore()
+    _run(_attempt(store, "r1", enhanced=True))
+    _run(store.update_attempt(
+        "r1", state=AttemptState.LANDED, loc=10, turns=4, rating="up",
+    ))
+    _run(_attempt(store, "r2", task="t2", enhanced=True))
+    _run(store.update_attempt(
+        "r2", state=AttemptState.FAILED, failure_kind="validation_error",
+        rating="down",
+    ))
+    _run(_attempt(store, "r3", task="t3"))  # raw (enhanced defaults false)
+    _run(store.update_attempt("r3", state=AttemptState.LANDED, loc=5))
+
+    rows = {row["enhanced"]: row for row in _run(store.stats_by_enhanced())}
+    assert set(rows) == {True, False}
+    enhanced, raw = rows[True], rows[False]
+    assert enhanced["total_runs"] == 2
+    assert enhanced["landed"] == 1
+    assert enhanced["errored"] == 1
+    assert enhanced["rated_up"] == 1
+    assert enhanced["rated_down"] == 1
+    assert enhanced["total_turns"] == 4
+    assert raw["total_runs"] == 1
+    assert raw["landed"] == 1
+    assert raw["rated_up"] == 0 and raw["rated_down"] == 0
+
+
+def test_rating_round_trips_through_update_and_get_attempt() -> None:
+    store = SqliteStore()
+    _run(_attempt(store, "r1", enhanced=True))
+    attempt = _run(store.get_attempt("r1"))
+    assert attempt["enhanced"] is True
+    assert attempt["rating"] is None
+    _run(store.update_attempt("r1", rating="up"))
+    assert _run(store.get_attempt("r1"))["rating"] == "up"
+    # Clearing the verdict writes NULL back.
+    _run(store.update_attempt("r1", rating=None))
+    assert _run(store.get_attempt("r1"))["rating"] is None
+
+
+def test_record_enhancement_and_summary() -> None:
+    """Enhancement telemetry: one row per enhance-brief request (success or
+    failure), rolled up by the summary the stats endpoint serves."""
+    store = SqliteStore()
+    assert _run(store.enhancements_summary())["total"] == 0
+    _run(store.record_enhancement(
+        "e1", queue=None, task="fix-ops", model="anthropic/claude-sonnet-4-6",
+        input_tokens=100, output_tokens=40, duration_ms=900, ok=True,
+    ))
+    _run(store.record_enhancement(
+        "e2", queue="alpha", task=None, model="anthropic/claude-sonnet-4-6",
+        input_tokens=None, output_tokens=None, duration_ms=300, ok=False,
+        error="vendor down",
+    ))
+    summary = _run(store.enhancements_summary())
+    assert summary["total"] == 2
+    assert summary["succeeded"] == 1
+    assert summary["failed"] == 1
+    assert summary["total_input_tokens"] == 100
+    assert summary["total_output_tokens"] == 40
+    assert summary["avg_duration_ms"] == 600
 
 
 def test_usage_payload_round_trips_through_update_and_get_attempt() -> None:
@@ -893,3 +963,30 @@ def test_capability_migration_adds_columns_and_queue_routing() -> None:
     # Reversible.
     assert "-- migrate:up" in sql and "-- migrate:down" in sql
     assert "DROP TABLE IF EXISTS nightshift.queue_routing;" in sql
+
+
+def test_enhance_tracking_migration_shape() -> None:
+    """Enhance-on-create tracking: the two attempt columns, the enhanced-vs-raw
+    comparison view, and the enhancement-request telemetry table — reversible."""
+    sql = ENHANCE_TRACKING_MIGRATION.read_text()
+    assert "-- migrate:up" in sql and "-- migrate:down" in sql
+    up = sql[sql.index("-- migrate:up"):sql.index("-- migrate:down")]
+    down = sql[sql.index("-- migrate:down"):]
+    # up: the attribution stamp + the operator's thumbs verdict on attempts.
+    assert "ADD COLUMN IF NOT EXISTS enhanced boolean NOT NULL DEFAULT false" in up
+    assert "ADD COLUMN IF NOT EXISTS rating   text" in up
+    # up: the comparison view groups by the stamp with the shared outcome
+    # vocabulary plus the thumbs tallies.
+    assert "CREATE VIEW nightshift.stats_by_enhanced" in up
+    assert "GROUP BY enhanced" in up
+    assert "rating = 'up'" in up and "rating = 'down'" in up
+    assert "state IN ('landed', 'no_change')" in up
+    assert "state IN ('failed', 'conflict')" in up
+    # up: one telemetry row per enhance request, task-linked when it succeeds.
+    assert "CREATE TABLE IF NOT EXISTS nightshift.enhancements" in up
+    assert "ok            boolean NOT NULL" in up
+    # down: everything comes back off.
+    assert "DROP TABLE IF EXISTS nightshift.enhancements;" in down
+    assert "DROP VIEW IF EXISTS nightshift.stats_by_enhanced;" in down
+    assert "DROP COLUMN IF EXISTS enhanced" in down
+    assert "DROP COLUMN IF EXISTS rating" in down

@@ -42,16 +42,19 @@ from nightshift.spawn_daily import (
     split_frontmatter,
 )
 from nightshift.task_files import (
+    ORIGINAL_BRIEF_MARKER,
     build_task_list,
     create_task,
     delete_task,
     drop_completed_task,
     harvest_split_output,
+    join_original,
     list_queue,
     live_ordered_queue,
     read_task,
     resolve_title,
     set_task_meta,
+    split_original,
     split_output_dir,
     task_is_evergreen,
 )
@@ -778,6 +781,72 @@ def test_create_task_rejects_empty_title_and_collision(tmp_path: Path) -> None:
     create_task(tasks_root, "Dup", "body")
     with pytest.raises(FileExistsError):
         create_task(tasks_root, "Dup", "body")
+
+
+# --------------------------------------------------------------------------- #
+# original brief (the preserved pre-enhancement text)
+# --------------------------------------------------------------------------- #
+
+
+def test_split_join_original_round_trips() -> None:
+    # A body without the marker has no original.
+    assert split_original("Just the brief.") == ("Just the brief.", "")
+    # join/split are inverses, and both halves come back stripped.
+    joined = join_original("Enhanced spec.\n", "\nraw typed text\n")
+    assert ORIGINAL_BRIEF_MARKER in joined
+    assert split_original(joined) == ("Enhanced spec.", "raw typed text")
+    # An empty original writes no marker (byte-for-byte legacy body).
+    assert join_original("Enhanced spec.", "") == "Enhanced spec."
+
+
+def test_create_task_with_original_preserves_both(tmp_path: Path) -> None:
+    tasks_root = _seed(tmp_path)
+    created = create_task(
+        tasks_root, "Enhance me", "The enhanced spec.", original="the raw ask",
+    )
+    text = (tasks_root / "main" / f"{created['task']}.md").read_text()
+    assert ORIGINAL_BRIEF_MARKER in text
+
+    brief = read_task(tasks_root, created["task"])
+    assert brief["body"] == "The enhanced spec."
+    assert brief["original_brief"] == "the raw ask"
+    # The marker never leaks into the effective body the UI edits.
+    assert ORIGINAL_BRIEF_MARKER not in brief["body"]
+
+
+def test_create_task_without_original_writes_no_marker(tmp_path: Path) -> None:
+    tasks_root = _seed(tmp_path)
+    created = create_task(tasks_root, "Plain create", "Just do it.")
+    text = (tasks_root / "main" / f"{created['task']}.md").read_text()
+    assert ORIGINAL_BRIEF_MARKER not in text
+    assert read_task(tasks_root, created["task"])["original_brief"] == ""
+
+
+def test_set_task_meta_edits_each_half_independently(tmp_path: Path) -> None:
+    tasks_root = _seed(tmp_path)
+    create_task(tasks_root, "Halves", "Enhanced spec.", original="raw ask")
+
+    # Editing the body leaves the preserved original untouched.
+    brief = set_task_meta(tasks_root, "halves", {"body": "Better spec."})
+    assert brief["body"] == "Better spec."
+    assert brief["original_brief"] == "raw ask"
+
+    # Editing the original leaves the body untouched.
+    brief = set_task_meta(tasks_root, "halves", {"original_brief": "raw ask v2"})
+    assert brief["body"] == "Better spec."
+    assert brief["original_brief"] == "raw ask v2"
+
+    # Clearing the original drops the marker section from the file.
+    brief = set_task_meta(tasks_root, "halves", {"original_brief": ""})
+    assert brief["original_brief"] == ""
+    assert ORIGINAL_BRIEF_MARKER not in (tasks_root / "main/halves.md").read_text()
+    assert brief["body"] == "Better spec."
+
+
+def test_set_task_meta_enhanced_flag_round_trips(tmp_path: Path) -> None:
+    tasks_root = _seed(tmp_path, tasks={"a": "---\ntitle: A\n---\nDo a."})
+    set_task_meta(tasks_root, "a", {"enhanced": True})
+    assert read_task(tasks_root, "a")["frontmatter"]["enhanced"] is True
 
 
 # --------------------------------------------------------------------------- #

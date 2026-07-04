@@ -48,9 +48,9 @@ _TS_COLUMNS = frozenset({
     "registered_at", "last_checkin_at", "last_heartbeat_at",
     "started_at", "finished_at", "acquired_at", "heartbeat_at",
     "deadline_at", "released_at", "updated_at", "next_eligible_at",
-    "ts", "last_run_at",
+    "ts", "last_run_at", "created_at",
 })
-_BOOL_COLUMNS = frozenset({"pushed", "retry_eligible"})
+_BOOL_COLUMNS = frozenset({"pushed", "retry_eligible", "enhanced", "ok"})
 
 
 def _now_iso() -> str:
@@ -122,7 +122,7 @@ def _adapt_row(row: sqlite3.Row) -> dict[str, Any]:
 
 
 # DDL mirroring the CURRENT post-migration Postgres schema (through
-# 20260731000004_nightshift_attempts.sql) in SQLite types: jsonb → text
+# 20260801000001_nightshift_enhance_tracking.sql) in SQLite types: jsonb → text
 # holding JSON, timestamptz → text holding UTC ISO-8601, boolean → integer,
 # numeric → real. The ``nightshift`` schema arrives via ATTACH so the shared
 # SQL's qualified names run verbatim. Keep the attempts_live_task_uniq
@@ -176,6 +176,8 @@ CREATE TABLE nightshift.attempts (
     body           text,
     remote         text,
     pushed         integer,
+    enhanced       integer NOT NULL DEFAULT 0,
+    rating         text,
     started_at     text NOT NULL,
     finished_at    text,
     base_ref       text,
@@ -233,6 +235,19 @@ CREATE TABLE nightshift.queue_state (
     paused_reason   text,
     mode            text,
     updated_at      text NOT NULL
+);
+
+CREATE TABLE nightshift.enhancements (
+    id            text PRIMARY KEY,
+    queue         text NOT NULL DEFAULT '',
+    task          text,
+    model         text,
+    input_tokens  integer,
+    output_tokens integer,
+    duration_ms   integer,
+    ok            integer NOT NULL,
+    error         text,
+    created_at    text NOT NULL
 );
 
 CREATE VIEW nightshift.stats_overall AS
@@ -330,6 +345,31 @@ SELECT
 FROM attempts
 WHERE model IS NOT NULL
 GROUP BY model;
+
+CREATE VIEW nightshift.stats_by_enhanced AS
+SELECT
+    enhanced,
+    count(*)                                          AS total_runs,
+    count(*) FILTER (WHERE state = 'landed')          AS landed,
+    count(*) FILTER (WHERE state IN ('landed', 'no_change')) AS completed,
+    count(*) FILTER (WHERE state IN ('failed', 'conflict'))  AS errored,
+    count(*) FILTER (WHERE state = 'aborted')         AS aborted,
+    count(*) FILTER (WHERE rating = 'up')             AS rated_up,
+    count(*) FILTER (WHERE rating = 'down')           AS rated_down,
+    coalesce(sum(loc) FILTER (WHERE state IN ('landed', 'no_change')), 0) AS total_loc,
+    coalesce(
+        avg((julianday(finished_at) - julianday(started_at)) * 86400.0)
+            FILTER (WHERE finished_at IS NOT NULL),
+        0
+    )                                                 AS avg_seconds,
+    coalesce(sum(turns), 0)                           AS total_turns,
+    coalesce(avg(turns) FILTER (WHERE turns IS NOT NULL), 0) AS avg_turns,
+    coalesce(sum(input_tokens), 0)                    AS total_input_tokens,
+    coalesce(sum(output_tokens), 0)                   AS total_output_tokens,
+    coalesce(sum(coalesce(input_tokens, 0) + coalesce(output_tokens, 0)), 0) AS total_tokens,
+    coalesce(sum(cost_usd), 0)                        AS total_cost_usd
+FROM attempts
+GROUP BY enhanced;
 
 CREATE VIEW nightshift.stats_by_queue AS
 SELECT

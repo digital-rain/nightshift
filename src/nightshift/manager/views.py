@@ -28,6 +28,9 @@ RUN_VIEW_KEYS = (
     "cache_read_input_tokens", "cache_creation_input_tokens", "usage",
     "cost_usd", "failure_kind", "failure_reason", "validate_cmd", "worktree",
     "title", "body", "started_at", "finished_at",
+    # Additive (post-Phase-8): enhance-on-create attribution + the operator's
+    # thumbs verdict on the run.
+    "enhanced", "rating",
 )
 
 # The exact pre-Phase-8 lease-row key set and order (the retired store's acquire_lease
@@ -63,6 +66,7 @@ ANALYTICS_RUN_KEYS = (
     "input_tokens", "output_tokens",
     "cache_read_input_tokens", "cache_creation_input_tokens",
     "cost_usd", "usage", "failure_kind", "started_at", "finished_at",
+    "enhanced", "rating",
 )
 
 

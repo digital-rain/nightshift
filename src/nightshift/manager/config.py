@@ -38,6 +38,8 @@ class ManagerConfig:
     port: int = 8800
     landing_mode: LandingMode = LandingMode.NONE
     default_model: str = "auto"
+    # Model for the enhance-on-create brief rewrite (bare <vendor>/<model>).
+    enhance_brief_model: str = "anthropic/claude-sonnet-4-6"
     shared_secret: str | None = None
     dsn: str | None = None
     tasks_repo: str = "nightshift-tasks"
@@ -71,6 +73,7 @@ def load_manager_config(workspace: Path) -> ManagerConfig:
         port=settings.port,
         landing_mode=settings.operator.landing_mode,
         default_model=settings.operator.default_model,
+        enhance_brief_model=settings.operator.enhance_brief_model,
         shared_secret=settings.shared_secret,
         dsn=settings.dsn,
         tasks_repo=settings.operator.tasks_repo,

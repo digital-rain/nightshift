@@ -539,6 +539,8 @@ body {
 .badge.quarantined { color: #e6ac40; border-color: #e6ac40; }
 .badge.completed { color: var(--ok); border-color: var(--ok); }
 .badge.now { color: var(--accent); border-color: var(--accent); }
+/* Thumbs verdict on the task's latest run (read-only glyph on queue rows). */
+.badge.rating { border: none; padding: 1px 2px; font-size: 13px; }
 /* Priority chip (P0..P5): a monospace-ish pill whose tint runs from urgent
    (P0, error/red) through warn to muted (P5), so urgency reads at a glance. */
 .badge.priority { font-variant-numeric: tabular-nums; font-weight: 600; }
@@ -903,6 +905,25 @@ body {
 .settings-row .seg-group { align-items: center; gap: 8px; border: none; border-radius: 0; overflow: visible; }
 .seg-group-label { color: var(--text-dim); font-size: 13px; }
 .seg-group .segmented { border: none; }
+/* Thumbs up/down rating row (task + history detail panes). */
+.rating-row { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
+.rate-btn {
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 10px;
+  font-size: 15px;
+  cursor: pointer;
+  filter: grayscale(1);
+  opacity: 0.65;
+}
+.rate-btn:hover { opacity: 1; }
+.rate-btn.on {
+  filter: none;
+  opacity: 1;
+  border-color: var(--accent);
+  background: var(--bg-raised, var(--bg-sunken));
+}
 /* The model dropdown sits in line with the segmented controls. */
 .model-select { display: inline-flex; align-items: center; gap: 8px; }
 .model-label { color: var(--text-dim); font-size: 13px; }

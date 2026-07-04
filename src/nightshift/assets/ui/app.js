@@ -1408,6 +1408,17 @@ function queueItemRow(item) {
   main.append(title, file);
 
   li.append(handle, spinner, main, queueRowAside(item, isNow));
+  // Thumbs glyph: the operator's verdict on the task's latest run (read-only
+  // here; rate from the task/history detail panes).
+  const ratedRec = latestRecordFor(item.task);
+  const rating = ratedRec && ratedRec.rec ? ratedRec.rec.rating : null;
+  if (rating === "up" || rating === "down") {
+    const badge = document.createElement("span");
+    badge.className = "badge rating";
+    badge.textContent = rating === "up" ? "\u{1F44D}" : "\u{1F44E}";
+    badge.title = rating === "up" ? "Rated: good result" : "Rated: poor result";
+    li.append(badge);
+  }
   if (typeof item.priority === "number") {
     const chip = document.createElement("span");
     chip.className = "badge priority p" + item.priority;
@@ -3331,7 +3342,7 @@ async function rescanPlaylists(btn) {
 // wrap into a left-aligned two-column flow (switches / model / priority).
 // Edits are blocked while the task is the live track (its spec mustn't change
 // under a running worker).
-function settingsControls(brief, draft, rerender, locked) {
+function settingsControls(brief, draft, rerender, locked, creating) {
   const wrap = document.createElement("div");
 
   const row = document.createElement("div");
@@ -3362,6 +3373,12 @@ function settingsControls(brief, draft, rerender, locked) {
     prioritySegment(draft, rerender, locked),
     repoOverride(draft, locked),
   );
+  // ENHANCE BRIEF — create flavour only: On runs the manager-side rewrite of
+  // the original brief before the task file is written; Off queues the
+  // original text verbatim.
+  if (creating) {
+    row.append(enhanceSegment(draft, rerender, locked));
+  }
   wrap.append(row);
 
   if (draft.loop) {
@@ -3418,6 +3435,38 @@ function labeledSegment(label, ariaLabel, locked, rerender, switches) {
       if (typeof rerender === "function") rerender();
     });
     seg.append(seg_btn);
+  }
+  group.append(lbl, seg);
+  return group;
+}
+
+// The create pane's ENHANCE BRIEF Off/On switch (mirrors the Turns-limit
+// pattern): On (the default) runs the AI rewrite on create.
+function enhanceSegment(draft, rerender, locked) {
+  const group = document.createElement("div");
+  group.className = "seg-group";
+  const lbl = document.createElement("span");
+  lbl.className = "seg-group-label";
+  lbl.textContent = "Enhance brief";
+  const seg = document.createElement("div");
+  seg.className = "segmented";
+  seg.setAttribute("role", "group");
+  seg.setAttribute("aria-label", "Enhance brief on create");
+  for (const [text, val] of [["Off", false], ["On", true]]) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "seg-opt";
+    b.textContent = text;
+    const on = val === !!draft.enhance;
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+    b.disabled = locked;
+    b.title = "Rewrite the original brief with AI for a higher worker success rate";
+    b.addEventListener("click", () => {
+      draft.enhance = val;
+      if (typeof rerender === "function") rerender();
+    });
+    seg.append(b);
   }
   group.append(lbl, seg);
   return group;
@@ -3579,6 +3628,11 @@ function draftFromBrief(brief) {
     // which an <input>.value would render as the literal text "undefined".
     title: brief.title || brief.task || "",
     body: brief.body || "",
+    // The operator's pre-enhancement text, preserved in the file below the
+    // original-brief marker. In the create pane this is the field being typed.
+    original_brief: brief.original_brief || "",
+    // Enhance-on-create: on by default for new tasks (ignored when editing).
+    enhance: true,
     disabled: !!brief.disabled,
     quarantined: !!brief.quarantined,
     failed: !!brief.failed,
@@ -3655,10 +3709,53 @@ async function openTaskDetail(task) {
 // The FILE / STATUS header that opens both flavours of the detail pane.
 // When `blockedReason` is provided a MESSAGE row is appended below STATUS so
 // the reason is visually grouped with FILE & STATUS and separated from TITLE.
-function detailStatusHead(task, status, blockedReason) {
+// `enhanced` marks briefs that went through the enhance-on-create rewrite.
+function detailStatusHead(task, status, blockedReason, enhanced) {
   const pairs = [["File", `${task}.md`], ["Status", stateLabel(status)]];
+  if (enhanced) pairs.push(["Brief", "AI-enhanced"]);
   if (blockedReason) pairs.push(["Message", blockedReason]);
   return metaGrid(pairs);
+}
+
+// Thumbs up/down rating for a run — the operator's manual quality verdict,
+// stored on the run row (PATCH /api/runs/{id}/rating; clicking the active
+// thumb clears it). `onSaved` lets the caller refresh its local copy.
+function ratingControls(runId, current, { onSaved = () => {} } = {}) {
+  const wrap = document.createElement("div");
+  wrap.className = "rating-row";
+  const label = document.createElement("span");
+  label.className = "seg-group-label";
+  label.textContent = "Result";
+  wrap.append(label);
+  for (const [value, glyph, title] of [
+    ["up", "\u{1F44D}", "Good result"],
+    ["down", "\u{1F44E}", "Poor result"],
+  ]) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "rate-btn" + (current === value ? " on" : "");
+    btn.textContent = glyph;
+    btn.title = title;
+    btn.setAttribute("aria-pressed", current === value ? "true" : "false");
+    btn.addEventListener("click", async () => {
+      const next = current === value ? null : value;
+      const { ok, data } = await sendJSON(
+        `/api/runs/${encodeURIComponent(runId)}/rating`, "PATCH", { rating: next });
+      if (!ok) { alert((data && data.error) || "could not save rating"); return; }
+      onSaved(next);
+    });
+    wrap.append(btn);
+  }
+  return wrap;
+}
+
+// Apply a saved rating to the local run history (so re-renders reflect it
+// without waiting for the next /api/runs reload).
+function applyLocalRating(runId, rating) {
+  for (const run of state.runs) {
+    if (run.id !== runId) continue;
+    for (const t of run.tasks) t.rating = rating;
+  }
 }
 
 // The RUN DETAILS metaGrid pairs for a run + its task record: per-task window,
@@ -3919,7 +4016,16 @@ function taskDetailContent(brief, draft, opts = {}) {
   if (creating) {
     frag.append(metaGrid([["File", "new task"], ["Status", "Not yet created"]]));
   } else {
-    frag.append(detailStatusHead(task, status, blockedReason));
+    const enhanced = !!(brief.frontmatter_raw && brief.frontmatter_raw.enhanced);
+    frag.append(detailStatusHead(task, status, blockedReason, enhanced));
+    // Thumbs verdict on the latest run — the task-level satisfaction signal
+    // the enhanced-vs-raw stats aggregate.
+    if (rec && run && run.id) {
+      const runId = run.id;
+      frag.append(ratingControls(runId, rec.rating || null, {
+        onSaved: (next) => { applyLocalRating(runId, next); rerender(); },
+      }));
+    }
     // Reset button for non-conflict blocked tasks (validation-failed,
     // unroutable, bad-repo-reference). Conflicts keep their own Resolve flow.
     if (status === "blocked" && state.blockedTasks && state.blockedTasks[task]) {
@@ -3962,12 +4068,20 @@ function taskDetailContent(brief, draft, opts = {}) {
   // BRIEF — the spec prose, with a MARKDOWN | PREVIEW segmented control pinned to
   // the right of the expando bar. MARKDOWN shows the editable textarea; PREVIEW
   // renders the buffered markdown read-only.
+  //
+  // In the CREATE flavour the pane leads with the ORIGINAL brief instead: the
+  // operator types their raw request here and the effective "Brief" is written
+  // by the server (verbatim, or the enhance-on-create rewrite) — so the Brief
+  // panel is hidden entirely and this editor binds to draft.original_brief.
+  const briefText = creating
+    ? { get: () => draft.original_brief, set: (v) => { draft.original_brief = v; } }
+    : { get: () => draft.body, set: (v) => { draft.body = v; } };
   const briefArea = document.createElement("textarea");
   briefArea.rows = 10;
-  briefArea.value = draft.body;
+  briefArea.value = briefText.get();
   briefArea.disabled = locked;
-  if (creating) briefArea.placeholder = "what should the worker do?";
-  briefArea.addEventListener("input", () => { draft.body = briefArea.value; });
+  if (creating) briefArea.placeholder = "what should the worker do? (your words — enhancement rewrites this for the worker)";
+  briefArea.addEventListener("input", () => { briefText.set(briefArea.value); });
   wireEditKeydown(briefArea);
   briefArea.className = "detail-brief-edit";
 
@@ -3985,7 +4099,7 @@ function taskDetailContent(brief, draft, opts = {}) {
     draft.briefView = view;
     briefArea.hidden = previewing;
     preview.hidden = !previewing;
-    if (previewing) preview.innerHTML = renderMarkdown(draft.body);
+    if (previewing) preview.innerHTML = renderMarkdown(briefText.get());
     for (const b of seg.children) {
       const on = b.dataset.view === view;
       b.classList.toggle("on", on);
@@ -4001,10 +4115,25 @@ function taskDetailContent(brief, draft, opts = {}) {
     b.addEventListener("click", () => setView(view));
     seg.append(b);
   }
-  const brf = expando("Brief", { open: true, accessory: seg });
+  const brf = expando(creating ? "Original brief" : "Brief", { open: true, accessory: seg });
   brf.body.append(briefArea, preview);
   setView(draft.briefView === "preview" ? "preview" : "markdown");
   frag.append(brf.panel);
+
+  // ORIGINAL BRIEF — edit flavour only: the preserved pre-enhancement text,
+  // collapsed by default (reference material, not the spec the worker runs).
+  if (!creating && (draft.original_brief || "").length) {
+    const origArea = document.createElement("textarea");
+    origArea.rows = 8;
+    origArea.value = draft.original_brief;
+    origArea.disabled = locked;
+    origArea.addEventListener("input", () => { draft.original_brief = origArea.value; });
+    wireEditKeydown(origArea);
+    origArea.className = "detail-brief-edit";
+    const org = expando("Original brief", { open: false });
+    org.body.append(origArea);
+    frag.append(org.panel);
+  }
 
   // RUN DETAILS / LOG — when the task has a run record (live or historical).
   // RUN DETAILS is shown even before final timings exist so fields like the
@@ -4029,7 +4158,7 @@ function taskDetailContent(brief, draft, opts = {}) {
   set.className = "xpanel";
   const setBody = document.createElement("div");
   setBody.className = "xpanel-body";
-  setBody.append(settingsControls(brief, draft, rerender, locked));
+  setBody.append(settingsControls(brief, draft, rerender, locked, creating));
   set.append(setBody);
   frag.append(set);
 
@@ -4044,8 +4173,20 @@ function taskDetailContent(brief, draft, opts = {}) {
   saveBtn.className = "btn primary";
   saveBtn.textContent = creating ? "Create" : "Save";
   saveBtn.disabled = locked;
-  saveBtn.addEventListener("click", () =>
-    creating ? createDetail(draft, err) : saveDetail(brief, draft, err));
+  saveBtn.addEventListener("click", async () => {
+    if (!creating) { saveDetail(brief, draft, err); return; }
+    // Creating with enhancement runs a server-side model call; hold the
+    // button in a busy state so the wait is visible and double-submits are
+    // impossible. On failure the draft (and pane) survive for a retry.
+    const prevLabel = saveBtn.textContent;
+    saveBtn.disabled = true;
+    saveBtn.textContent = draft.enhance ? "Enhancing\u2026" : "Creating\u2026";
+    const ok = await createDetail(draft, err);
+    if (!ok) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = prevLabel;
+    }
+  });
   if (!creating) {
     const delBtn = document.createElement("button");
     delBtn.className = "btn danger";
@@ -4095,6 +4236,11 @@ async function saveDetail(brief, draft, errEl) {
   const repoNow = (draft.repo || "").trim();
   const repoWas = ((brief.frontmatter_raw && brief.frontmatter_raw.repo) || "").trim();
   if (repoNow !== repoWas) payload.repo = repoNow || null;
+  // The preserved original brief is only sent when actually edited (PATCH
+  // semantics); an emptied value drops the marker section from the file.
+  const origNow = draft.original_brief || "";
+  const origWas = brief.original_brief || "";
+  if (origNow !== origWas) payload.original_brief = origNow;
   if (!payload.title) {
     if (errEl) { errEl.textContent = "title is required"; errEl.hidden = false; }
     return;
@@ -4116,11 +4262,14 @@ async function createDetail(draft, errEl) {
   const title = draft.title.trim();
   if (!title) {
     if (errEl) { errEl.textContent = "title is required"; errEl.hidden = false; }
-    return;
+    return false;
   }
   const payload = {
     title,
-    text: draft.body,
+    // The create pane's editor is the ORIGINAL brief; the server writes the
+    // effective body (verbatim, or the enhance-on-create rewrite when asked).
+    text: draft.original_brief,
+    enhance: !!draft.enhance,
     disabled: !!draft.disabled,
     quarantined: !!draft.quarantined,
     completed: !!draft.completed,
@@ -4138,10 +4287,11 @@ async function createDetail(draft, errEl) {
   const { ok, data } = await sendJSON(`/api/tasks${queueParam()}`, "POST", payload);
   if (!ok) {
     if (errEl) { errEl.textContent = (data && data.error) || "could not create task"; errEl.hidden = false; }
-    return;
+    return false;
   }
   await loadQueue();
   closeDetailScreen();
+  return true;
 }
 
 // ----- full-area detail pane (view "detail") -----------------------------
@@ -4305,7 +4455,18 @@ function renderHistoryDetail() {
   $("detail-screen-title").textContent = rec.title || rec.task;
   body.innerHTML = "";
 
-  body.append(detailStatusHead(rec.task, rec.status));
+  body.append(detailStatusHead(rec.task, rec.status, undefined, !!rec.enhanced));
+
+  // Thumbs verdict on this run (the enhanced-vs-raw satisfaction signal).
+  if (run && run.id) {
+    body.append(ratingControls(run.id, rec.rating || null, {
+      onSaved: (next) => {
+        applyLocalRating(run.id, next);
+        rec.rating = next;
+        renderHistoryDetail();
+      },
+    }));
+  }
 
   // Run outcome — the worker's result line + any classified failure reason.
   if (rec.result_line) {
@@ -4534,7 +4695,7 @@ function handleEngineEvent(ev) {
       if (slog) slog.textContent = state.logCache[key];
     }
   }
-  if (["task_started", "task_status", "task_result", "run_finished", "run_started"].includes(ev.type)) {
+  if (["task_started", "task_status", "task_result", "run_finished", "run_started", "run_rated"].includes(ev.type)) {
     scheduleRefresh();
   } else if (ev.type === "task_log") {
     scheduleRefresh();

@@ -16,7 +16,7 @@ from nightshift.manager.scheduler import parse_required_mcps, queue_label
 from nightshift.preflight import resolve_preflight_cmd
 from nightshift.queue_config import format_validate_cmd, resolve_validate_cmd
 from nightshift.spawn_daily import resolve_config, split_frontmatter
-from nightshift.task_files import resolve_title
+from nightshift.task_files import resolve_title, split_original
 
 
 def task_meta(tasks_root: Path, task: str, queue: str | None) -> dict[str, Any]:
@@ -54,6 +54,9 @@ def build_work_order(
     path = tasks_root / tasks_rel / f"{task}.md"
     text = path.read_text(errors="replace") if path.exists() else ""
     meta, body = split_frontmatter(text)
+    # Workers only ever see the effective brief: the preserved pre-enhancement
+    # original (the marker tail) is operator-side context, not spec.
+    body, _original = split_original(body)
     merged = resolve_config(workspace, tasks_root, tasks_rel)
 
     model = meta.get("model") or cfg.default_model
@@ -94,6 +97,9 @@ def build_work_order(
         "priority": int(meta.get("priority", 5)) if str(meta.get("priority", "")).strip() != "" else 5,
         "title": resolve_title(task, meta),
         "body": body.strip(),
+        # Whether this brief went through the enhance-on-create pass; carried
+        # onto the attempt row so outcomes can be compared enhanced-vs-raw.
+        "enhanced": bool(meta.get("enhanced", False)),
         "repo": repo,
         "task_path": f"{tasks_repo}/{tasks_rel}/{task}.md",
         "base_ref": base_ref,

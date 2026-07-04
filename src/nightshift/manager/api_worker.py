@@ -414,6 +414,7 @@ def register_worker_api(
             required_mcps=list(chosen.required_mcps),
             repo=repo,
             validate_cmd=planned_validate or None,
+            enhanced=bool(order.get("enhanced", False)),
         )
         if attempt is None:
             # Lost a race for this task; let the worker poll again shortly.

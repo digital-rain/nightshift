@@ -76,6 +76,14 @@ class OperatorConfig:
         desc="Model a brief inherits when it sets no model:.",
         env="NIGHTSHIFT_DEFAULT_MODEL",
         validate="model_id_or_keyword"))
+    enhance_brief_model: str = field(
+        default="anthropic/claude-sonnet-4-6", metadata=meta(
+            category="Scheduling", label="Enhance brief model",
+            desc=(
+                "Model for the enhance-on-create brief rewrite (a one-shot "
+                "manager-side completion; bare <vendor>/<model> id)."),
+            env="NIGHTSHIFT_ENHANCE_MODEL",
+            validate="model_id"))
 
     landing_mode: LandingMode = field(default=LandingMode.NONE, metadata=meta(
         category="Landing & Git", label="Landing mode",
@@ -308,6 +316,10 @@ def load_manager_settings(workspace: Path) -> ManagerSettings:
             os.environ.get("NIGHTSHIFT_DEFAULT_MODEL")
             or data.get("default_model")
             or "auto"),
+        enhance_brief_model=(
+            os.environ.get("NIGHTSHIFT_ENHANCE_MODEL")
+            or data.get("enhance_brief_model")
+            or "anthropic/claude-sonnet-4-6"),
         landing_mode=landing_mode,
         rendezvous_remote=rendezvous_remote,
         wip_ref_prefix=wip_ref_prefix,
@@ -380,6 +392,7 @@ def save_manager_settings(workspace: Path, settings: ManagerSettings) -> None:
             "git_refresh_seconds": settings.cadences.git_refresh_seconds,
         },
         "default_model": settings.operator.default_model,
+        "enhance_brief_model": settings.operator.enhance_brief_model,
         "scheduled_models_allow": list(settings.operator.scheduled_models_allow),
         "max_per_day": settings.operator.max_per_day,
         "max_concurrent_queues": settings.operator.max_concurrent_queues,

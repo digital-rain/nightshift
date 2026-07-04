@@ -41,6 +41,38 @@ def resolve_title(task: str, meta: dict) -> str:
     return task
 
 
+# Delimits the operator's original (pre-enhancement) brief at the END of a
+# task file's body. Everything after this line, to EOF, is the original text
+# as typed; everything before it is the effective brief the worker runs.
+# Workers never see the original: build_work_order strips it from the body.
+ORIGINAL_BRIEF_MARKER = "<!-- nightshift:original-brief -->"
+
+
+def split_original(body: str) -> tuple[str, str]:
+    """Split a brief body into ``(effective_brief, original_brief)``.
+
+    The original-brief section is the tail of the body after
+    :data:`ORIGINAL_BRIEF_MARKER`; a body without the marker has no original
+    (``("", ...)`` empty second half). Both halves come back stripped.
+    """
+    if ORIGINAL_BRIEF_MARKER not in body:
+        return body.strip(), ""
+    brief, original = body.split(ORIGINAL_BRIEF_MARKER, 1)
+    return brief.strip(), original.strip()
+
+
+def join_original(body: str, original: str) -> str:
+    """Reassemble a brief body with its original-brief tail section.
+
+    An empty ``original`` yields just the body (no marker is written).
+    """
+    body = body.strip()
+    original = original.strip()
+    if not original:
+        return body
+    return f"{body}\n\n{ORIGINAL_BRIEF_MARKER}\n{original}"
+
+
 def build_task_list(tasks_root: Path, task_arg: str, tasks_rel: str = "main") -> list[str]:
     """Build the ordered list of tasks to run for a queue.
 
@@ -172,12 +204,22 @@ def find_autosplit_tasks(tasks_dir: Path) -> set[str]:
 TASK_TEMPLATE = asset("templates", "task.md")
 
 
-def create_task(tasks_root: Path, title: str, text: str, tasks_rel: str = "main") -> dict:
+def create_task(
+    tasks_root: Path,
+    title: str,
+    text: str,
+    tasks_rel: str = "main",
+    original: str | None = None,
+) -> dict:
     """Create a new task file `<tasks_rel>/<slug(title)>.md` from the template.
 
     Tasks are no longer numbered: the filename is the slugified title and the
     new task is appended to the queue's `config.json` execution order (so it
     lands at the end of the queue, where the operator can drag it into place).
+
+    ``original`` (the operator's pre-enhancement brief) is preserved verbatim
+    below :data:`ORIGINAL_BRIEF_MARKER` at the end of the body; ``None``/empty
+    writes no marker section (the pre-enhancement behavior, byte-for-byte).
 
     Raises ``ValueError`` for an empty title and ``FileExistsError`` if the
     target name is already taken.
@@ -193,11 +235,12 @@ def create_task(tasks_root: Path, title: str, text: str, tasks_rel: str = "main"
     if dest.exists():
         raise FileExistsError(name)
 
+    body = join_original(text.strip() or title_clean, original or "")
     template = TASK_TEMPLATE.read_text()
     content = template.replace(
         "title: short descriptive title for the PR", f"title: {title_clean}", 1
     )
-    content = content.replace("Task description goes here.", text.strip() or title_clean, 1)
+    content = content.replace("Task description goes here.", body, 1)
     dest.write_text(content)
     save_order(tasks_root, [*load_order(tasks_root, tasks_rel), name], tasks_rel)
     return {"task": name, "title": title_clean}
@@ -292,11 +335,13 @@ def read_task(tasks_root: Path, task: str, tasks_rel: str = "main") -> dict:
     """Read a single queue brief ``<tasks_root>/<tasks_rel>/<task>.md`` for the
     detail view.
 
-    Returns ``{task, title, body, frontmatter, evergreen, disabled}`` where
-    ``frontmatter`` is the parsed YAML block merged with resolved defaults
-    (model/draft/automerge) so the brief shows the effective values, and
-    ``body`` is the spec prose with the frontmatter fence stripped. Read-only:
-    it neither spawns subtasks nor mutates the queue.
+    Returns ``{task, title, body, original_brief, frontmatter, evergreen,
+    disabled}`` where ``frontmatter`` is the parsed YAML block merged with
+    resolved defaults (model/draft/automerge) so the brief shows the effective
+    values, ``body`` is the spec prose with the frontmatter fence and any
+    original-brief tail stripped, and ``original_brief`` is the preserved
+    pre-enhancement text ("" when the file has none). Read-only: it neither
+    spawns subtasks nor mutates the queue.
 
     Guards against path traversal the same way :func:`delete_task` does: ``task``
     must resolve to a direct child of the queue dir. Raises ``FileNotFoundError``
@@ -309,6 +354,7 @@ def read_task(tasks_root: Path, task: str, tasks_rel: str = "main") -> dict:
 
     text = dest.read_text(errors="replace")
     meta, body = split_frontmatter(text) if text.startswith("---") else ({}, text)
+    body, original = split_original(body)
     # ``tasks_root`` is ``<workspace>/<tasks_repo>`` by construction, so its
     # parent is the workspace — resolve the layered queue config from both roots.
     config = resolve_config(tasks_root.parent, tasks_root, tasks_rel)
@@ -331,6 +377,7 @@ def read_task(tasks_root: Path, task: str, tasks_rel: str = "main") -> dict:
         "task": task,
         "title": resolve_title(task, meta),
         "body": body.strip(),
+        "original_brief": original,
         "frontmatter": frontmatter,
         # The raw, file-only frontmatter (before defaults are layered in) so the
         # editor can tell whether a field is explicitly set vs inherited — e.g.
@@ -355,13 +402,14 @@ def read_task(tasks_root: Path, task: str, tasks_rel: str = "main") -> dict:
 _EDITABLE_META_KEYS = {
     "disabled", "quarantined", "quarantine_reason", "failed", "failed_reason",
     "completed", "evergreen", "automerge", "draft", "model", "priority", "repo",
-    "loop", "loop_max_iterations", "split",
+    "loop", "loop_max_iterations", "split", "enhanced",
 }
 
-# The detail-view editor may also rewrite the spec prose (``body``) and the
-# headline (``title``); these aren't plain frontmatter scalars so they're
+# The detail-view editor may also rewrite the spec prose (``body``), the
+# headline (``title``), and the preserved pre-enhancement text
+# (``original_brief``); these aren't plain frontmatter scalars so they're
 # handled separately from :data:`_EDITABLE_META_KEYS`.
-_EDITABLE_CONTENT_KEYS = {"title", "body"}
+_EDITABLE_CONTENT_KEYS = {"title", "body", "original_brief"}
 
 
 def _render_meta_value(value: object) -> str:
@@ -392,10 +440,14 @@ def set_task_meta(
     falls back to the config default). A file without a frontmatter fence gains
     one. Booleans serialise as ``true``/``false``.
 
-    ``title`` (the headline, stored as a frontmatter key) and ``body`` (the spec
-    prose below the fence) are content edits: ``title`` is written/updated as the
-    leading frontmatter key, and ``body`` replaces the prose verbatim. Both are
-    optional; omitting them leaves the existing content untouched.
+    ``title`` (the headline, stored as a frontmatter key), ``body`` (the spec
+    prose below the fence), and ``original_brief`` (the preserved
+    pre-enhancement text after :data:`ORIGINAL_BRIEF_MARKER`) are content
+    edits: ``title`` is written/updated as the leading frontmatter key, and
+    ``body``/``original_brief`` each replace their half of the prose while
+    leaving the other half untouched (an empty ``original_brief`` drops the
+    marker section). All are optional; omitting them leaves the existing
+    content untouched.
 
     Only keys in :data:`_EDITABLE_META_KEYS` ∪ :data:`_EDITABLE_CONTENT_KEYS` are
     accepted. Guards against path traversal exactly like :func:`read_task`.
@@ -411,7 +463,6 @@ def set_task_meta(
         raise FileNotFoundError(task)
 
     new_title = changes.get("title") if "title" in changes else None
-    new_body = changes.get("body") if "body" in changes else None
     if new_title is not None and not str(new_title).strip():
         raise ValueError("title is required")
     meta_changes = {k: v for k, v in changes.items() if k in _EDITABLE_META_KEYS}
@@ -456,10 +507,15 @@ def set_task_meta(
         if value is not None:
             new_fence.append(f"{key}: {_render_meta_value(value)}")
 
+    # Content edits operate on the two body halves independently: the spec
+    # prose and the original-brief tail each replace their own half, so an
+    # edit to one never clobbers the other.
+    brief, original = split_original("\n".join(body_lines))
     if "body" in changes:
-        body = _strip_leading_blanks(str(new_body or "").splitlines())
-    else:
-        body = _strip_leading_blanks(body_lines)
+        brief = str(changes.get("body") or "").strip()
+    if "original_brief" in changes:
+        original = str(changes.get("original_brief") or "").strip()
+    body = _strip_leading_blanks(join_original(brief, original).splitlines())
     if new_fence:
         out = ["---", *new_fence, "---", "", *body]
     else:
