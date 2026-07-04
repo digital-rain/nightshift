@@ -21,6 +21,7 @@ import logging
 import os
 import subprocess
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -60,9 +61,14 @@ class GitRunner:
     def __init__(self, repo_root: Path) -> None:
         self.repo_root = repo_root
 
-    def run(self, *args: str) -> GitResult:
+    def run(self, *args: str, env: Mapping[str, str] | None = None) -> GitResult:
         """Run git, returning the result regardless of exit code. Never raises
-        on a non-zero exit (a missing ``git`` binary still raises ``OSError``)."""
+        on a non-zero exit (a missing ``git`` binary still raises ``OSError``).
+
+        ``env`` overlays the process environment for this one invocation — the
+        seam for index-redirection plumbing (``GIT_INDEX_FILE``) so tree
+        surgery never touches the repo's real index.
+        """
         argv = ("git", *args)
         start = time.monotonic()
         proc = subprocess.run(  # noqa: S603 — fixed "git" executable
@@ -70,6 +76,7 @@ class GitRunner:
             cwd=self.repo_root,
             capture_output=True,
             text=True,
+            env={**os.environ, **env} if env else None,
         )
         result = GitResult(
             argv=argv,

@@ -119,6 +119,7 @@
             <div id="add-menu" class="add-menu" hidden role="menu">
               <button class="add-menu-item" data-act="new" role="menuitem">New task…</button>
               <button class="add-menu-item" data-act="from" role="menuitem">Add from playlist…</button>
+              <button class="add-menu-item" data-act="import-repo" role="menuitem">Import from repository…</button>
             </div>
           </div>
         </div>
@@ -381,6 +382,25 @@
         <p id="addto-status" class="field-desc addfrom-status" hidden></p>
         <ul id="addto-list" class="addfrom-list"></ul>
         <p id="addto-empty" class="empty" hidden>No other playlists to add to.</p>
+      </div>
+    </div>
+
+    <!-- Import-from-repository: drains briefs published in the bound repo's
+         .tasks/ inbox into this queue, removing them from the repo's main
+         (docs/spec/2026-07-04-repo-task-import.md). -->
+    <div id="repoimport-modal" class="modal" hidden>
+      <div class="modal-card">
+        <div class="detail-head">
+          <h3>Import from repository</h3>
+          <button id="repoimport-close" class="abtn" title="Close">&#10005;</button>
+        </div>
+        <p id="repoimport-desc" class="field-desc"></p>
+        <p id="repoimport-status" class="field-desc addfrom-status" hidden></p>
+        <ul id="repoimport-list" class="addfrom-list"></ul>
+        <p id="repoimport-empty" class="empty" hidden></p>
+        <div class="modal-actions">
+          <button id="repoimport-go" class="btn primary" hidden>Import</button>
+        </div>
       </div>
     </div>
 

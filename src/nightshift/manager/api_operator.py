@@ -32,6 +32,7 @@ from nightshift.git.store import commit_tasks
 from nightshift.lifecycle import AttemptRef, AttemptState, TaskHoldKind
 from nightshift.manager import failure_policy
 from nightshift.manager.api_playlists import register_playlist_api
+from nightshift.manager.api_repo_tasks import register_repo_tasks_api
 from nightshift.manager.config import ManagerConfig
 from nightshift.manager.registry import Registry
 from nightshift.manager.scheduler import queue_label
@@ -787,6 +788,18 @@ def register_operator_api(
         _all_queues=_all_queues,
         _queue_repo=_queue_repo,
         _commit=_commit,
+    )
+
+    register_repo_tasks_api(
+        app,
+        workspace=workspace,
+        tasks_root=tasks_root,
+        _resolve_queue=_resolve_queue,
+        _queue_exists=_queue_exists,
+        _queue_repo=_queue_repo,
+        _commit=_commit,
+        _emit=_emit,
+        _executors=_executors,
     )
 
     @app.get("/api/runs")

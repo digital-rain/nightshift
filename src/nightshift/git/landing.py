@@ -31,7 +31,8 @@ through :class:`~nightshift.git.runner.GitRunner` exclusively.
 from __future__ import annotations
 
 import subprocess
-from collections.abc import Callable
+import tempfile
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import assert_never
@@ -279,6 +280,57 @@ def cherry_produce(
                 f"cannot replay resolved commit {resolved_sha[:8]}: {replayed.detail}"
             )
         return ProduceResult(sha=replayed.sha)
+
+    return produce
+
+
+def delete_produce(
+    repo_root: Path, paths: Sequence[str], message: str
+) -> Callable[[str], ProduceResult]:
+    """The repo-task-import producer: a commit object that deletes ``paths``
+    from the base tree (the drained ``.tasks/`` inbox files), built in a
+    temporary index so no checkout or real index is ever touched.
+
+    Paths absent from the base are ignored; when none are present the
+    production collapses to the base itself — the idempotent replay path
+    (:func:`~nightshift.git.landing.integrate_and_push_locked` then moves
+    nothing and reports success).
+    """
+
+    def produce(base: str) -> ProduceResult:
+        git = GitRunner(repo_root)
+
+        def failure(detail: str) -> ProduceResult:
+            return ProduceResult(failure=LandOutcome(
+                kind=LandKind.CONFLICT, detail=f"inbox removal failed:\n{detail}",
+            ))
+
+        present = git.run("ls-tree", "-r", "--name-only", base, "--", *paths)
+        if not present.ok:
+            return failure(present.detail)
+        existing = [p for p in present.stdout.splitlines() if p.strip()]
+        if not existing:
+            return ProduceResult(
+                sha=base, display_sha=git.out("rev-parse", "--short", base) or base,
+            )
+        with tempfile.TemporaryDirectory(prefix="nightshift-delete-") as tmp:
+            env = {"GIT_INDEX_FILE": str(Path(tmp) / "index")}
+            for step in (
+                git.run("read-tree", base, env=env),
+                git.run("update-index", "--force-remove", "--", *existing, env=env),
+            ):
+                if not step.ok:
+                    return failure(step.detail)
+            tree = git.run("write-tree", env=env)
+        if not tree.ok:
+            return failure(tree.detail)
+        commit = git.run("commit-tree", tree.stdout.strip(), "-p", base, "-m", message)
+        if not commit.ok:
+            return failure(commit.detail)
+        sha = commit.stdout.strip()
+        return ProduceResult(
+            sha=sha, display_sha=git.out("rev-parse", "--short", sha) or sha,
+        )
 
     return produce
 
