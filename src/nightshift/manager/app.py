@@ -35,6 +35,7 @@ from fastapi.staticfiles import StaticFiles
 
 from nightshift import playlists as playlists_mod
 from nightshift._paths import UI_DIR
+from nightshift.config.manager import ManagerConfig, load_manager_config
 from nightshift.events import new_run_id
 from nightshift.git.executor import ExecutorPool
 from nightshift.git.sync import SyncThrottle, sync_main_locked
@@ -42,7 +43,6 @@ from nightshift.lifecycle import RESOLVE_WORKER_ID, AttemptState, FailureKind
 from nightshift.manager import failure_policy
 from nightshift.manager.api_operator import register_operator_api
 from nightshift.manager.api_worker import register_worker_api
-from nightshift.manager.config import ManagerConfig, load_manager_config
 from nightshift.manager.hub import Hub
 from nightshift.manager.reconciler import Reconciler, reap_finished_resolves
 from nightshift.manager.registry import Registry

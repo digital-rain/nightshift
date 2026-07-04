@@ -29,7 +29,7 @@ from typing import Any
 
 import httpx
 
-from nightshift.backends import _httpx_timeout
+from nightshift.backends import httpx_timeout
 
 
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
@@ -194,7 +194,7 @@ def _complete_anthropic(
 
     try:
         resp = httpx.post(
-            ANTHROPIC_URL, json=body, headers=headers, timeout=_httpx_timeout(timeout)
+            ANTHROPIC_URL, json=body, headers=headers, timeout=httpx_timeout(timeout)
         )
     except httpx.HTTPError as exc:
         raise TransportError(f"anthropic request failed: {exc}") from exc
@@ -275,7 +275,7 @@ def _complete_ollama(
 
     try:
         resp = httpx.post(
-            f"{host}/api/chat", json=body, headers=headers, timeout=_httpx_timeout(timeout)
+            f"{host}/api/chat", json=body, headers=headers, timeout=httpx_timeout(timeout)
         )
     except httpx.HTTPError as exc:
         raise TransportError(f"ollama request failed: {exc}") from exc

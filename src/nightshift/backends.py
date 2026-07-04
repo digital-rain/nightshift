@@ -57,7 +57,7 @@ OnWorkerStart = Callable[[int], None]
 LAUNCH_FAILED = 127
 
 
-def _httpx_timeout(seconds: float | None) -> Any:
+def httpx_timeout(seconds: float | None) -> Any:
     """An httpx timeout: a finite per-op bound, or no timeout when unset/<=0."""
     return httpx.Timeout(seconds) if seconds and seconds > 0 else None
 
@@ -640,7 +640,7 @@ class AnthropicBackend:
                 "https://api.anthropic.com/v1/messages",
                 json=body,
                 headers=headers,
-                timeout=_httpx_timeout(spec.timeout),
+                timeout=httpx_timeout(spec.timeout),
             ) as resp:
                 if resp.status_code >= 400:
                     resp.read()
@@ -717,7 +717,7 @@ def _ollama_generate(
     try:
         with httpx.stream(
             "POST", f"{host}/api/generate", json=body, headers=headers,
-            timeout=_httpx_timeout(timeout),
+            timeout=httpx_timeout(timeout),
         ) as resp:
             if resp.status_code >= 400:
                 resp.read()
@@ -841,7 +841,7 @@ class NightshiftAgentBackend:
     SEARCH/REPLACE applier — no apply-model round-trip. Heavy code lives in
     :mod:`nightshift.agent`; this class is the thin backend-contract wiring and
     imports it lazily to stay clear of the ``backends``↔``agent`` cycle (agent
-    imports ``_usage_tokens``/``_httpx_timeout`` from here).
+    imports ``_usage_tokens``/``httpx_timeout`` from here).
     """
 
     name = "nightshift"

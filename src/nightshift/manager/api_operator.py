@@ -25,6 +25,7 @@ from pydantic import BaseModel
 
 from nightshift import playlists as playlists_mod
 from nightshift import repos
+from nightshift.config.manager import ManagerConfig
 from nightshift.config.validate import build_get_response, validate_delta, write_delta
 from nightshift.enhance import EnhanceError, enhance_brief
 from nightshift.git.executor import ExecutorPool
@@ -33,7 +34,6 @@ from nightshift.lifecycle import AttemptRef, AttemptState, TaskHoldKind
 from nightshift.manager import failure_policy
 from nightshift.manager.api_playlists import register_playlist_api
 from nightshift.manager.api_repo_tasks import register_repo_tasks_api
-from nightshift.manager.config import ManagerConfig
 from nightshift.manager.registry import Registry
 from nightshift.manager.scheduler import queue_label
 from nightshift.manager.store import NightshiftStore
@@ -1050,4 +1050,9 @@ def register_operator_api(
         # The operator UI is shared with the single-process server; this lets the
         # frontend retitle itself "Nightshift Manager" when served by the manager
         # (the single-process server has no /api/info, so it keeps "Nightshift").
-        return JSONResponse({"brand_name": "Nightshift Manager"})
+        # refresh_ms drives the UI's safety-poll cadence (AGENTS.md: cadences are
+        # config-driven, never hardcoded) — same value workers get at checkin.
+        return JSONResponse({
+            "brand_name": "Nightshift Manager",
+            "refresh_ms": cfg.cadences.refresh_ms,
+        })

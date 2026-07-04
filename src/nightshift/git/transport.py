@@ -48,11 +48,11 @@ def normalize_wip_prefix(value: object) -> str:
     return text
 
 
-def _wip_ref(task: str, queue: str | None, prefix: str = WIP_REF_PREFIX) -> str:
-    """Remote ref a worker publishes its task branch to (transport-only). The
-    ``prefix`` (the WIP namespace) defaults to :data:`WIP_REF_PREFIX` and is
-    operator-configurable (manager ``wip_ref_prefix``, threaded via the work
-    order)."""
+def wip_ref(task: str, queue: str | None, prefix: str = WIP_REF_PREFIX) -> str:
+    """Remote ref a worker publishes its task branch to. The ``prefix`` (the
+    WIP namespace) defaults to :data:`WIP_REF_PREFIX` and is operator-
+    configurable (manager ``wip_ref_prefix``, threaded via the work order).
+    Public: the reconciler derives the same ref when pruning."""
     return f"refs/heads/{prefix or WIP_REF_PREFIX}/{queue_slug(queue)}/{task}"
 
 
@@ -77,18 +77,18 @@ def publish_task_branch(
     """
     repo_root = workspace / repo
     branch = worktree_branch(task, queue)
-    wip_ref = _wip_ref(task, queue, prefix or WIP_REF_PREFIX)
+    ref = wip_ref(task, queue, prefix or WIP_REF_PREFIX)
 
     head_sha = rev_parse(repo_root, branch)
     if head_sha is None:
         raise RuntimeError(f"no task branch '{branch}' to publish")
 
-    push = GitRunner(repo_root).run("push", "-f", remote, f"{branch}:{wip_ref}")
+    push = GitRunner(repo_root).run("push", "-f", remote, f"{branch}:{ref}")
     if not push.ok:
         raise RuntimeError(
-            f"publish of '{branch}' to {remote} {wip_ref} failed: {push.detail}"
+            f"publish of '{branch}' to {remote} {ref} failed: {push.detail}"
         )
-    return wip_ref, head_sha
+    return ref, head_sha
 
 
 def fetch_rendezvous_branch(

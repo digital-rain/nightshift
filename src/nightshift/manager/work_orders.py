@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from nightshift import playlists as playlists_mod
-from nightshift.manager.config import ManagerConfig
+from nightshift.config.manager import ManagerConfig
 from nightshift.manager.scheduler import parse_required_mcps, queue_label
 from nightshift.preflight import resolve_preflight_cmd
 from nightshift.queue_config import format_validate_cmd, resolve_validate_cmd

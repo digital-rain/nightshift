@@ -31,7 +31,7 @@ Push detail into the linked docs below.
    Any feature or capability you add MUST be surfaced in the UI, whether or not the request says so explicitly.
    If how it should be surfaced is unclear, stop and clarify — and recommend an approach.
    The operator UI is served by the manager (`src/nightshift/manager/app.py`): static assets live in `src/nightshift/assets/ui/` and talk only to the manager's HTTP API — no SQL and no third-party REST from the frontend JS.
-   Refresh/polling cadence is config-driven (`manager.cadences.refresh_ms` in `config.json`), never hardcoded.
+   Refresh/polling cadence is config-driven (`cadences.refresh_ms` in `.nightshift/manager.json`), never hardcoded.
 
 3. **Parallel lanes — the operator owns the runtime.**
    Several agents share one VM; worktrees isolate the source, but the runtime is global.
@@ -49,8 +49,8 @@ Push detail into the linked docs below.
 - **Manager is the sole git authority.** Only the manager writes to `main`; workers submit via the API (or push to the WIP ref namespace for cross-machine landing) and the manager squash-lands under its lock.
 - **Pull-based routing.** Workers poll the manager and advertise capabilities; the manager never pushes work. Task-to-worker matching is entirely capability-driven (queues, models, MCPs).
 - **One DSN, one schema.** Nightshift owns `NIGHTSHIFT_PG_DSN`; it never reuses another project's database connection. Migrations live in `src/nightshift/assets/migrations/` and are applied by `just migrate`.
-- **Assets are package-relative.** Shipped UI, templates, prompts, and migrations resolve from the installed `nightshift` package (`src/nightshift/assets/`). Operator state (`config.json`, `.nightshift/`, `.worktrees/`) resolves from the workspace root.
-- **Workers are stateless between tasks.** A worker's only durable identity is its `worker_id` + `config.json.local`; all task state lives in the manager's Postgres (or in-memory store).
+- **Assets are package-relative.** Shipped UI, templates, prompts, and migrations resolve from the installed `nightshift` package (`src/nightshift/assets/`). Operator state (`.nightshift/*.json`, `.worktrees/`) resolves from the workspace root.
+- **Workers are stateless between tasks.** A worker's only durable identity is its `worker_id` + `.nightshift/worker.json`; all task state lives in the manager's Postgres (or in-memory store).
 
 ## Working norms
 

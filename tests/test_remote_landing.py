@@ -28,6 +28,7 @@ from _workspace import (
     make_bare_remote,
 )
 from nightshift.backends import WorkerResult
+from nightshift.config.manager import load_manager_config
 from nightshift.git import GitRunner
 from nightshift.git.refs import is_ancestor
 from nightshift.git.sync import (
@@ -44,7 +45,6 @@ from nightshift.git.transport import (
 from nightshift.git.worktrees import setup_worktree, worktree_branch, worktree_dir
 from nightshift.lifecycle import LandKind, LandOutcome
 from nightshift.manager.app import create_app
-from nightshift.manager.config import load_manager_config
 from nightshift.manager.landing import canonical_head, land
 from nightshift.manager.store_sqlite import SqliteStore
 from nightshift.worker.config import WorkerConfig, load_worker_config

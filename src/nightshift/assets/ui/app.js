@@ -4660,45 +4660,32 @@ function scheduleRefresh() {
   }, 250);
 }
 
-function connectEvents() {
-  const es = new EventSource("/api/events");
-  es.onmessage = (msg) => {
-    let data;
-    try { data = JSON.parse(msg.data); } catch { return; }
-    if (data.kind === "state") {
-      ingestState(data);
-    } else if (data.kind === "event") {
-      handleEngineEvent(data);
-    }
-  };
-  es.onerror = () => { /* EventSource auto-reconnects */ };
-}
+// SSE is handled by manager-events.js (one EventSource per page); it drives
+// the debounced scheduleRefresh() above and the live task_log tail via
+// applyTaskLog below.
 
-function handleEngineEvent(ev) {
-  // Frames are tagged with their queue; only the *focused* queue's events drive
-  // the single-context Now log/cursor. A background queue's run still triggers a
-  // refresh (so its history/badges update), but never hijacks the live view.
-  const focused = (ev.queue || "main") === focusedQueueKey();
-  if (focused && ev.run_id) state.currentRunId = ev.run_id;
-  if (focused && ev.type === "task_log" && ev.task) {
-    const key = `${state.currentRunId}/${ev.task}`;
-    state.logCache[key] = (state.logCache[key] || "") + (ev.line || "");
-    // Snappy live tail on the Now screen without waiting for the debounce.
-    if (state.view === "now" && ev.task === state.player.now_playing) {
-      const log = $("now-log");
-      if (log) log.textContent = logTail(state.logCache[key], 12);
-    }
-    // Keep the editable detail pane's read-only live log current too.
-    if (state.detailScreenTask && ev.task === state.detailScreenTask &&
-        state.detailScreenTask === state.player.now_playing) {
-      const slog = $("detail-screen-log");
-      if (slog) slog.textContent = state.logCache[key];
-    }
+// Append a live log line from a manager task_log frame and repaint the Now /
+// detail-screen tails without waiting for the polled fetchLog. Frames are
+// tagged with their queue; only the *focused* queue's frames drive the
+// single-context Now log/cursor.
+function applyTaskLog(frame) {
+  if ((frame.queue || "main") !== focusedQueueKey()) return;
+  if (frame.run_id) state.currentRunId = frame.run_id;
+  const task = frame.task;
+  const line = frame.payload && frame.payload.line;
+  if (!task || !line) return;
+  const key = `${frame.run_id || state.currentRunId}/${task}`;
+  state.logCache[key] = (state.logCache[key] || "") + line;
+  // Snappy live tail on the Now screen without waiting for the debounce.
+  if (state.view === "now" && task === state.player.now_playing) {
+    const log = $("now-log");
+    if (log) log.textContent = logTail(state.logCache[key], 12);
   }
-  if (["task_started", "task_status", "task_result", "run_finished", "run_started", "run_rated"].includes(ev.type)) {
-    scheduleRefresh();
-  } else if (ev.type === "task_log") {
-    scheduleRefresh();
+  // Keep the editable detail pane's read-only live log current too.
+  if (state.detailScreenTask && task === state.detailScreenTask &&
+      state.detailScreenTask === state.player.now_playing) {
+    const slog = $("detail-screen-log");
+    if (slog) slog.textContent = state.logCache[key];
   }
 }
 
@@ -5920,20 +5907,23 @@ function wire() {
   window.addEventListener("hashchange", applyHash);
 }
 
-// Periodic safety refresh: SSE drives live updates, but this also triggers the
-// server's stale-run reconcile (phantom "running" → aborted) every 20s.
-const REFRESH_MS = 20000;
+// Periodic safety refresh: SSE drives live updates; this polled pass is the
+// fallback for missed frames. Cadence is config-driven (manager.cadences.
+// refresh_ms via /api/info, captured in applyBranding); the constant only
+// covers the case where /api/info is unavailable.
+const FALLBACK_REFRESH_MS = 20000;
+let refreshMs = FALLBACK_REFRESH_MS;
 function startAutoRefresh() {
   setInterval(() => {
     loadRuns();
     loadQueue();
     loadPlaylists();
-  }, REFRESH_MS);
+  }, refreshMs);
 }
 
-// Retitle the shared operator UI when it's served by the manager. The manager
-// exposes /api/info with a brand_name; the single-process server has no such
-// endpoint, so the static "Nightshift" branding stands.
+// Retitle the shared operator UI when it's served by the manager, and pick up
+// the config-driven refresh cadence. The manager exposes /api/info with
+// brand_name + refresh_ms; without it the static branding and fallback stand.
 async function applyBranding() {
   try {
     const info = await getJSON("/api/info");
@@ -5942,12 +5932,16 @@ async function applyBranding() {
       if (el) el.textContent = info.brand_name;
       document.title = info.brand_name;
     }
+    if (info && typeof info.refresh_ms === "number" && info.refresh_ms > 0) {
+      refreshMs = info.refresh_ms;
+    }
   } catch { /* no /api/info (single-process server): keep static branding */ }
 }
 
 async function init() {
   wire();
-  applyBranding();
+  // Await so the config-driven refresh_ms lands before startAutoRefresh reads it.
+  await applyBranding();
   setView("now");
   let defaultTheme = "dark";
   try {
@@ -5981,7 +5975,6 @@ async function init() {
   applyFocusedState();
   // Restore a deep-linked detail view (#task=<id>) once data is loaded.
   applyHash();
-  connectEvents();
   startAutoRefresh();
   setInterval(tickElapsed, 1000);
 }

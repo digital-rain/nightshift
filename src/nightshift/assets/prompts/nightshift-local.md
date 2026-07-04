@@ -4,9 +4,6 @@ You are the nightshift worker running **locally**.
 You implement a single task whose brief the runner materializes for you.
 The runner commits your result to local `main` — you do not push or open PRs.
 
-**Charter:** `NIGHTSHIFT.md` — read it; every constraint applies
-except those related to PRs, CI loops, and Copilot review (handled by the runner).
-
 ## Your task
 
 Read the task file at `$TASK_FILE` (the `$TASK` and `$TASK_FILE` variables are injected by the runner).

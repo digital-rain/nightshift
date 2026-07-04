@@ -174,6 +174,11 @@ def test_operator_endpoints(tmp_path: Path) -> None:
         assert landing_field["effective"] == "none"
         assert client.get("/api/workers").json() == []
         assert client.get("/api/leases").json() == []
+        # /api/info carries the config-driven UI refresh cadence (AGENTS.md:
+        # cadences are never hardcoded client-side).
+        info = client.get("/api/info").json()
+        assert info["brand_name"] == "Nightshift Manager"
+        assert info["refresh_ms"] == 20000
 
 
 def test_settings_wip_ref_prefix_roundtrip(tmp_path: Path) -> None:
@@ -2014,7 +2019,7 @@ def _write_manager_block(tmp_path: Path, manager: dict) -> Path:
 
 
 def test_dsn_unset_is_none(tmp_path: Path, monkeypatch) -> None:
-    from nightshift.manager.config import load_manager_config
+    from nightshift.config.manager import load_manager_config
 
     monkeypatch.delenv("NIGHTSHIFT_PG_DSN", raising=False)
     root = _write_manager_block(tmp_path, {})
@@ -2022,7 +2027,7 @@ def test_dsn_unset_is_none(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_dsn_from_env(tmp_path: Path, monkeypatch) -> None:
-    from nightshift.manager.config import load_manager_config
+    from nightshift.config.manager import load_manager_config
 
     monkeypatch.setenv("NIGHTSHIFT_PG_DSN", "postgresql://db/nightshift")
     root = _write_manager_block(tmp_path, {})
@@ -2030,7 +2035,7 @@ def test_dsn_from_env(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_dsn_env_overrides_block(tmp_path: Path, monkeypatch) -> None:
-    from nightshift.manager.config import load_manager_config
+    from nightshift.config.manager import load_manager_config
 
     monkeypatch.setenv("NIGHTSHIFT_PG_DSN", "postgresql://env-host/nightshift")
     root = _write_manager_block(tmp_path, {"dsn": "postgresql://db/nightshift"})
@@ -2038,7 +2043,7 @@ def test_dsn_env_overrides_block(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_dsn_absent_is_none(tmp_path: Path, monkeypatch) -> None:
-    from nightshift.manager.config import load_manager_config
+    from nightshift.config.manager import load_manager_config
 
     monkeypatch.delenv("NIGHTSHIFT_PG_DSN", raising=False)
     root = _write_manager_block(tmp_path, {})

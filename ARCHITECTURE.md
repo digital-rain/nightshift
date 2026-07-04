@@ -37,12 +37,14 @@ The workspace parents:
 
 ```
 <workspace>/
-  config.json              operator policy (read by the manager)
-  config.json.local        worker identity + capabilities (gitignored)
+  .nightshift/
+    manager.json           manager + task-policy config (committed)
+    worker.json            this box's worker identity + capabilities (committed)
+    player.json            operator UI/player preferences (committed)
+  .env                     secrets only (gitignored): NIGHTSHIFT_PG_DSN, …
   nightshift-tasks/        content-store repo: queues → briefs + per-queue config.json
   <repo>/                  one or more target repos (direct children)
   .worktrees/<repo>/       git worktrees for in-progress tasks
-  .nightshift/             runtime state (UI settings, etc.)
 ```
 
 Nightshift resolves repos as bare child slugs of the workspace — never absolute paths.
@@ -94,7 +96,6 @@ sequenceDiagram
 | Module | Responsibility |
 |--------|---------------|
 | `app.py` | FastAPI app — worker API (`/api/worker/*`), operator API (`/api/*`), SSE (`/api/events`), static UI |
-| `config.py` | Load + validate `config.json` into `ManagerConfig` |
 | `store.py` | State protocol (`NightshiftStore`) + the shared SQL query layer + `PgStore` |
 | `store_sqlite.py` | `SqliteStore` — the same query layer on in-memory SQLite (tests / no-DB fallback) |
 | `scheduler.py` | Cross-queue next-task arbitration: capability matching, priority, round-robin tiebreak |
@@ -111,7 +112,7 @@ The manager serves the operator UI as static files from `src/nightshift/assets/u
 | `loop.py` | `WorkerLoop`: checkin → poll → execute → submit cycle |
 | `execute.py` | Per-task execution: worktree, prompt, backend, validate — stops before landing |
 | `client.py` | HTTP client for the manager API (checkin, poll, heartbeat, submit) |
-| `config.py` | Load `config.json.local` + `NIGHTSHIFT_*` env into `WorkerConfig` |
+| `config.py` | Load `.nightshift/worker.json` + `NIGHTSHIFT_*` env into `WorkerConfig` |
 | `local_store.py` | Worker-local run history (for the worker UI) |
 | `ui_app.py` | Minimal worker UI (Now + History) on `:8810` |
 
@@ -119,6 +120,7 @@ The manager serves the operator UI as static files from `src/nightshift/assets/u
 
 | Module | Responsibility |
 |--------|---------------|
+| `config/` | The config models: `ManagerSettings`/`ManagerConfig`, `WorkerConfig`, `PlayerConfig`, field metadata, `.nightshift/*.json` + `.env` I/O |
 | `git/` | The git seam: `GitRunner` subprocess boundary, worktrees, squash landing, sync, transport |
 | `task_files.py`, `queue_config.py` | Task lists, brief round-trips, queue order/priorities |
 | `repo_tasks.py` | Repo task import: drain a target repo's `.tasks/` publishing inbox into its queue (scan the `main` tree in both legacy layouts, copy to the content store, remove from repo `main` via the landing pipeline) |
@@ -207,22 +209,24 @@ A pinned explicit model routes only to workers advertising it.
 
 ## Configuration
 
-Precedence (highest wins): environment → `config.json.local` → `config.json` → built-in defaults.
+Precedence (highest wins): environment → `.nightshift/*.json` file → built-in dataclass defaults.
 
 | File | Scope | Committed |
 |------|-------|-----------|
-| `config.json` | Manager policy: models, cadences, forbidden paths, diff caps, landing mode | Yes (example in repo) |
-| `config.json.local` | Worker identity: `worker_id`, `backend`, `models`, `mcps`, `manager_url` | No (gitignored) |
-| `.env` | `NIGHTSHIFT_*` vars, `NIGHTSHIFT_PG_DSN`, API keys | No (gitignored) |
+| `.nightshift/manager.json` | Manager + task policy: models, cadences, forbidden paths, diff caps, landing mode | Yes |
+| `.nightshift/worker.json` | Worker identity: `worker_id`, `backend`, `models`, `mcps`, `manager_url` | Yes |
+| `.nightshift/player.json` | Operator UI/player preferences: theme, transport mode | Yes |
+| `.env` | Secrets only: `NIGHTSHIFT_PG_DSN`, `NIGHTSHIFT_SHARED_SECRET`, API keys | No (gitignored) |
 | Per-queue `config.json` | Queue order, repo binding, validate cmd, priority overrides | Yes (in `nightshift-tasks/`) |
 
-Key `config.json` blocks:
-- `manager.cadences` — `poll_seconds`, `heartbeat_seconds`, `lease_ttl_seconds`, `refresh_ms`
+Key `manager.json` blocks:
+- `cadences` — `poll_seconds`, `heartbeat_seconds`, `lease_ttl_seconds`, `refresh_ms`
 - `scheduled_models_allow` — filter for auto-scheduled recurring tasks (not the UI dropdown source)
 - `forbidden_paths` / `forbidden_template_paths` — paths workers may not modify
-- `worker_backend`, `default_model` — fallback policy
+- `default_model` — fallback policy (the backend selector is `worker.json`'s `backend`)
 
-Full reference: `docs/configuration-reference.md`.
+Scaffold a fresh workspace with `just init` (copies the shipped templates from `src/nightshift/assets/config/`).
+Full reference: [`docs/user/configuration-reference.md`](docs/user/configuration-reference.md).
 
 ## Frontend
 
@@ -233,7 +237,7 @@ The manager mounts them via FastAPI `StaticFiles`.
 The operator UI:
 - Connects to `/api/events` (SSE) for live state convergence.
 - Calls `/api/*` for mutations (add task, reorder, settings, etc.).
-- Refresh cadence is driven by `manager.cadences.refresh_ms`.
+- Refresh cadence is driven by `cadences.refresh_ms` in `.nightshift/manager.json` (served via `/api/info`).
 
 **Shared analytics module.** The Statistics page in both UIs is one shared,
 self-contained module (`assets/ui/analytics.js` + `analytics.css`) — the manager

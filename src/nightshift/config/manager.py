@@ -371,6 +371,68 @@ def load_manager_settings(workspace: Path) -> ManagerSettings:
     )
 
 
+# Default instances the flat projection derives its defaults from, so every
+# default is declared exactly once (on the canonical field metadata above).
+_DEFAULT_SETTINGS = ManagerSettings()
+_DEFAULT_OPERATOR = OperatorConfig()
+
+
+@dataclass(frozen=True)
+class ManagerConfig:
+    """Resolved manager settings — the flat projection callers consume.
+
+    Callers access ``cfg.host``, ``cfg.landing_mode``, ``cfg.default_model``,
+    ``cfg.tasks_repo``, etc. directly. Field defaults are derived from
+    ``ManagerSettings`` / ``OperatorConfig`` so they exist in one place.
+    Build one with ``load_manager_config`` (file + env) or construct directly
+    in tests.
+    """
+
+    host: str = _DEFAULT_SETTINGS.host
+    port: int = _DEFAULT_SETTINGS.port
+    landing_mode: LandingMode = _DEFAULT_OPERATOR.landing_mode
+    default_model: str = _DEFAULT_OPERATOR.default_model
+    enhance_brief_model: str = _DEFAULT_OPERATOR.enhance_brief_model
+    shared_secret: str | None = _DEFAULT_SETTINGS.shared_secret
+    dsn: str | None = _DEFAULT_SETTINGS.dsn
+    tasks_repo: str = _DEFAULT_OPERATOR.tasks_repo
+    rendezvous_remote: str | None = _DEFAULT_OPERATOR.rendezvous_remote
+    wip_ref_prefix: str = _DEFAULT_OPERATOR.wip_ref_prefix
+    quarantine_threshold: int = _DEFAULT_OPERATOR.quarantine_threshold
+    retry_backoff_seconds: float = _DEFAULT_OPERATOR.retry_backoff_seconds
+    max_push_retries: int = _DEFAULT_OPERATOR.max_push_retries
+    validate_on_integrate: bool = _DEFAULT_OPERATOR.validate_on_integrate
+    auto_resolve: bool = _DEFAULT_OPERATOR.auto_resolve
+    max_concurrent_resolves: int = _DEFAULT_OPERATOR.max_concurrent_resolves
+    cadences: Cadences = field(default_factory=Cadences)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+def load_manager_config(workspace: Path) -> ManagerConfig:
+    """Resolve the flat manager config from ``.nightshift/manager.json`` + env."""
+    settings = load_manager_settings(workspace)
+    return ManagerConfig(
+        host=settings.host,
+        port=settings.port,
+        landing_mode=settings.operator.landing_mode,
+        default_model=settings.operator.default_model,
+        enhance_brief_model=settings.operator.enhance_brief_model,
+        shared_secret=settings.shared_secret,
+        dsn=settings.dsn,
+        tasks_repo=settings.operator.tasks_repo,
+        rendezvous_remote=settings.operator.rendezvous_remote,
+        wip_ref_prefix=settings.operator.wip_ref_prefix,
+        quarantine_threshold=settings.operator.quarantine_threshold,
+        retry_backoff_seconds=settings.operator.retry_backoff_seconds,
+        max_push_retries=settings.operator.max_push_retries,
+        validate_on_integrate=settings.operator.validate_on_integrate,
+        auto_resolve=settings.operator.auto_resolve,
+        max_concurrent_resolves=settings.operator.max_concurrent_resolves,
+        cadences=settings.cadences,
+        raw=settings.raw,
+    )
+
+
 def save_manager_settings(workspace: Path, settings: ManagerSettings) -> None:
     """Persist a ManagerSettings to ``.nightshift/manager.json``.
 

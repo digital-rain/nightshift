@@ -1,14 +1,14 @@
-// Manager SSE convergence. The manager's /api/events stream is snapshot-on-
-// connect then a live delta stream ({type:"snapshot",...} / {type:"event",
-// kind,...}). This client keeps every open browser converged: structural and
-// lifecycle deltas (queue reorder, settings, worker/lease/run changes) trigger
-// a refetch of the affected surfaces so two operators watching the same manager
-// see the same thing without a manual reload.
+// Manager SSE convergence — the page's single EventSource. The manager's
+// /api/events stream is snapshot-on-connect then a live delta stream
+// ({type:"snapshot",...} / {type:"event", kind,...}). This client keeps every
+// open browser converged: structural and lifecycle deltas (queue reorder,
+// settings, worker/lease/run changes) trigger a refetch of the affected
+// surfaces so two operators watching the same manager see the same thing
+// without a manual reload. task_log frames stream to app.js's live Now-view
+// tail (applyTaskLog) without a refetch.
 //
-// app.js opens its own EventSource too, but it speaks the legacy frame shape and
-// silently ignores these frames; this module is the manager-aware path. We lean
-// on app.js's debounced scheduleRefresh() global where present (queue / runs /
-// now), and always repaint the manager-only Workers page.
+// We lean on app.js's debounced scheduleRefresh() global where present
+// (queue / runs / now), and always repaint the manager-only Workers page.
 
 (() => {
   "use strict";
@@ -59,6 +59,11 @@
     }
     if (frame.type !== "event") return;
     const kind = frame.kind || "";
+    if (kind === "task_log" && typeof window.applyTaskLog === "function") {
+      // Live log tail: append + repaint directly, no refetch.
+      window.applyTaskLog(frame);
+      return;
+    }
     if (REFRESH_KINDS_WORKERS.has(kind)) refreshWorkers();
     if (REFRESH_KINDS_APP.has(kind)) refreshApp();
   }

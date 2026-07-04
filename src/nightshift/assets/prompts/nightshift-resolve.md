@@ -5,8 +5,7 @@ task could not be squash-merged onto `main` because its branch and `main` made
 overlapping edits. The runner has started a `git rebase main` in this worktree and
 it has paused on conflicts. Your job is to land that already-reviewed work cleanly.
 
-**Charter:** `NIGHTSHIFT.md` applies, except PR/CI concerns. The
-specific failure is described above under "Why the merge to main failed".
+The specific failure is described above under "Why the merge to main failed".
 
 ## Scope — this is a merge resolution, not a re-implementation
 

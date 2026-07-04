@@ -5,10 +5,9 @@ Two distinct kinds of path:
 * **Shipped assets** — the operator UI, worker UI, task templates, agent prompt
   charters, and DB migrations. These ride inside the installed package and are
   resolved relative to *this* module, never relative to the working tree.
-* **Operator state** — ``config.json``, ``config.json.local``, ``.tasks/``,
-  ``.worktrees/`` and the like. These live under the *root* handed to each entry
-  point (defaults to the current working directory) and are read/written at run
-  time.
+* **Operator state** — ``.nightshift/*.json``, ``.tasks/``, ``.worktrees/`` and
+  the like. These live under the *root* handed to each entry point (defaults to
+  the current working directory) and are read/written at run time.
 
 Keeping the split explicit is what lets Nightshift run from an installed package
 while still managing an arbitrary working tree passed as ``--root``.

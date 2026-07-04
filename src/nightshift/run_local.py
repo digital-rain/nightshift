@@ -35,9 +35,9 @@ import httpx
 import uvicorn
 
 from nightshift import playlists, repos
+from nightshift.config.manager import load_manager_config
 from nightshift.lifecycle import Outcome, RunStatus
 from nightshift.manager.app import create_app
-from nightshift.manager.config import load_manager_config
 from nightshift.manager.store_sqlite import SqliteStore
 from nightshift.preflight import acquire_lock, check_preconditions
 from nightshift.spawn_daily import load_queue_config

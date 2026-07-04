@@ -2,7 +2,7 @@
 
 Starts the poll loop (background thread) and the minimal worker UI (foreground
 uvicorn). The only required setting is ``NIGHTSHIFT_MANAGER_URL`` (in ``.env`` or
-``config.json.local``); backend + routing are worker-owned.
+``.nightshift/worker.json``); backend + routing are worker-owned.
 """
 
 from __future__ import annotations

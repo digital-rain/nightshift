@@ -26,15 +26,17 @@ src/nightshift/            the package (run as `python -m nightshift.<entry>`)
   git/                     the git seam: runner, worktrees, squash, landing, sync, transport
   pg.py                    the only asyncpg seam (structural pool type + open_pool)
   _paths.py                shipped-asset vs. operator-state path resolution
-  assets/                  shipped, package-relative: ui/, ui-worker/, templates/, prompts/, migrations/
-config.json                operator-editable runner config (repo root)
-config.json.local          worker-owned local config (gitignored)
+  assets/                  shipped, package-relative: ui/, ui-worker/, templates/, prompts/, config/, migrations/
+.nightshift/manager.json   manager + task-policy config (committed)
+.nightshift/worker.json    this box's worker identity + capabilities (committed)
+.nightshift/player.json    operator UI/player preferences (committed)
 docs/                      setup guide + configuration reference + specs
 tests/                     the scoped test suite
 ```
 
 Shipped assets are resolved relative to the installed package.
-Operator state — `config.json`, `config.json.local`, and runtime dirs (`.tasks/`, `.worktrees/`, `.nightshift/`) — lives under the **root** passed to each entry point (defaults to the current working directory; `just` passes the repo root).
+Operator state — `.nightshift/*.json` and runtime dirs (`.tasks/`, `.worktrees/`) — lives under the **workspace** passed to each entry point (defaults to the current working directory; `just` passes the repo root).
+Secrets live only in `.env` (gitignored); scaffold a fresh workspace with `just init`.
 
 ## Quickstart
 
@@ -42,13 +44,16 @@ Operator state — `config.json`, `config.json.local`, and runtime dirs (`.tasks
 # 1. Install (creates .venv via uv, installs the package editable).
 just install            # == uv sync
 
-# 2. Point at a database in .env (an in-memory store is used if omitted):
+# 2. Scaffold .nightshift/{manager,worker,player}.json + .env (idempotent).
+just init
+
+# 3. Point at a database in .env (an in-memory store is used if omitted):
 #    NIGHTSHIFT_PG_DSN=postgresql://nightshift:nightshift@127.0.0.1:5432/nightshift
 
-# 3. Create the schema (Postgres only; idempotent).
+# 4. Create the schema (Postgres only; idempotent).
 just migrate
 
-# 4. Start the manager — operator UI + API on :8800.
+# 5. Start the manager — operator UI + API on :8800.
 just manager            # override port: just manager 8801
 ```
 
@@ -56,7 +61,7 @@ Open <http://localhost:8800> for the operator UI.
 
 ### Run a worker
 
-Declare the worker's backend and capabilities in `config.json.local` (gitignored):
+Declare the worker's backend and capabilities in `.nightshift/worker.json` (scaffolded by `just init`):
 
 ```json
 {
@@ -72,13 +77,14 @@ Declare the worker's backend and capabilities in `config.json.local` (gitignored
 just worker             # polls the manager; worker UI on :8810
 ```
 
-The same settings can come from `NIGHTSHIFT_*` environment variables (env wins over `config.json.local`); see `docs/configuration-reference.md`.
+The same settings can come from `NIGHTSHIFT_*` environment variables (env wins over `worker.json`); see [`docs/user/configuration-reference.md`](docs/user/configuration-reference.md).
 
 ## Common operations
 
 | Goal | Command |
 |---|---|
 | Install deps | `just install` |
+| Scaffold workspace config | `just init` |
 | Apply DB schema | `NIGHTSHIFT_PG_DSN=… just migrate` |
 | Roll back DB schema | `NIGHTSHIFT_PG_DSN=… just rollback` |
 | Start the manager | `just manager [port]` |
@@ -105,4 +111,4 @@ Nightshift was extracted from a larger monorepo. A few defaults still assume tha
 
 - `engine._attempt_repair` runs `.venv/bin/ruff check --fix` and `ruff format` over the worktree during a post-failure repair pass. This assumes the target repo uses `ruff` (from a `.venv`) and carries its own `ruff` config; drop or adjust the repair pass if that doesn't match your project.
 - The default validate command is `just validate`; the queue's `config.json` (`validate`) overrides it per queue.
-- `config.json` `forbidden_paths` / `forbidden_template_paths` ship with the original project's protected paths; edit them to match your repo.
+- `.nightshift/manager.json` `forbidden_paths` / `forbidden_template_paths` ship with the original project's protected paths; edit them to match your repo.

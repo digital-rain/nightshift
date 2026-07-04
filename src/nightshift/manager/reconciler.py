@@ -59,12 +59,13 @@ from typing import Any
 
 from nightshift import playlists as playlists_mod
 from nightshift import repos
+from nightshift.config.manager import ManagerConfig
 from nightshift.git import GitRunner
 from nightshift.git.executor import ExecutorPool
 from nightshift.git.landing import find_landed_attempt
 from nightshift.git.refs import branch_exists
 from nightshift.git.sync import SyncThrottle
-from nightshift.git.transport import _wip_ref, prune_rendezvous_branch
+from nightshift.git.transport import prune_rendezvous_branch, wip_ref
 from nightshift.git.worktrees import cleanup_task_worktree, worktree_branch
 from nightshift.lifecycle import (
     AttemptRef,
@@ -80,7 +81,6 @@ from nightshift.lifecycle import (
     TaskHoldKind,
     Transition,
 )
-from nightshift.manager.config import ManagerConfig
 from nightshift.manager.landing import land_locked
 from nightshift.manager.registry import Registry
 from nightshift.manager.scheduler import (
@@ -627,7 +627,7 @@ class Reconciler:
                 # this catches refs orphaned by an abandoned/reset task.
                 prune_rendezvous_branch(
                     self._workspace, repo, remote,
-                    _wip_ref(task, queue, self._cfg.wip_ref_prefix),
+                    wip_ref(task, queue, self._cfg.wip_ref_prefix),
                 )
 
         return job

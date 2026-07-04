@@ -44,6 +44,7 @@ from fastapi.responses import JSONResponse
 
 from nightshift import playlists as playlists_mod
 from nightshift import repos
+from nightshift.config.manager import ManagerConfig
 from nightshift.events import new_run_id
 from nightshift.git.executor import ExecutorPool
 from nightshift.git.squash import compute_code_loc
@@ -68,7 +69,6 @@ from nightshift.lifecycle import (
     Transition,
 )
 from nightshift.manager import failure_policy
-from nightshift.manager.config import ManagerConfig
 from nightshift.manager.landing import (
     adopt_or_nothing_locked,
     canonical_head,
