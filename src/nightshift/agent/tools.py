@@ -69,13 +69,20 @@ def _truncate(text: str) -> str:
     return text[:_MAX_OUTPUT_CHARS] + _TRUNCATION_NOTE
 
 
+def _was_truncated(text: str) -> bool:
+    return len(text) > _MAX_OUTPUT_CHARS
+
+
 @dataclass(frozen=True)
 class ToolResult:
     """A dispatch outcome. ``is_error`` true means the model should retry — e.g.
-    an :class:`~nightshift.agent.apply.ApplyError` surfaced as text, not a crash."""
+    an :class:`~nightshift.agent.apply.ApplyError` surfaced as text, not a crash.
+    ``truncated`` true means the content was clipped at the output cap
+    (``_MAX_OUTPUT_CHARS``) — telemetry for tuning the cap, not a failure."""
 
     content: str
     is_error: bool = False
+    truncated: bool = False
 
 
 # A handler takes the validated input dict and returns a ToolResult.
@@ -185,7 +192,7 @@ def _read_file(root: Path, context_policy: str) -> Handler:
             )
             end = min(total, 400)
         body = _number_lines("\n".join(lines[start - 1 : end]), start)
-        return ToolResult(_truncate(body) + hint)
+        return ToolResult(_truncate(body) + hint, truncated=_was_truncated(body))
 
     return handler
 
@@ -198,7 +205,8 @@ def _list_dir(root: Path) -> Handler:
         entries = []
         for child in sorted(path.iterdir()):
             entries.append(child.name + ("/" if child.is_dir() else ""))
-        return ToolResult(_truncate("\n".join(entries)))
+        listing = "\n".join(entries)
+        return ToolResult(_truncate(listing), truncated=_was_truncated(listing))
 
     return handler
 
@@ -226,7 +234,10 @@ def _grep(root: Path, timeout: float | None) -> Handler:
             # rg exit 1 = "no matches" (not an error); >1 is a real failure.
             if proc.returncode > 1:
                 return ToolResult(f"grep failed: {proc.stderr.strip()}", is_error=True)
-            return ToolResult(_truncate(proc.stdout) or "(no matches)")
+            return ToolResult(
+                _truncate(proc.stdout) or "(no matches)",
+                truncated=_was_truncated(proc.stdout),
+            )
         return _grep_python(search_root, pattern, literal, args.get("glob"))
 
     return handler
@@ -258,7 +269,10 @@ def _grep_python(
                     out.append(f"{f}:{lineno}:{line}")
         except OSError:
             continue
-    return ToolResult(_truncate("\n".join(out)) or "(no matches)")
+    matches = "\n".join(out)
+    return ToolResult(
+        _truncate(matches) or "(no matches)", truncated=_was_truncated(matches)
+    )
 
 
 def _edit_file(root: Path) -> Handler:
@@ -308,7 +322,11 @@ def _run_bash(
             return ToolResult(f"command timed out after {timeout}s", is_error=True)
         body = (proc.stdout or "") + (proc.stderr or "")
         prefix = f"[exit {proc.returncode}]\n"
-        return ToolResult(prefix + _truncate(body), is_error=proc.returncode != 0)
+        return ToolResult(
+            prefix + _truncate(body),
+            is_error=proc.returncode != 0,
+            truncated=_was_truncated(body),
+        )
 
     return handler
 

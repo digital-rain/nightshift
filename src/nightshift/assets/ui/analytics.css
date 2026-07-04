@@ -184,6 +184,43 @@
 .an-ok { color: var(--ok); }
 .an-bad { color: var(--err); }
 
+/* Stacked share bars (time split, turn composition) */
+.an-stack-wrap { display: flex; flex-direction: column; gap: 6px; margin: 4px 0 10px; }
+
+.an-stack {
+  display: flex;
+  height: 14px;
+  border-radius: 7px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+
+.an-stack-seg { flex-basis: 0; min-width: 2px; }
+
+.an-stack-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.an-stack-item { display: inline-flex; align-items: center; gap: 5px; }
+
+.an-stack-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  display: inline-block;
+}
+
+.an-stack-c0 { background: var(--accent); }
+.an-stack-c1 { background: color-mix(in srgb, var(--accent) 55%, var(--ok)); }
+.an-stack-c2 { background: var(--ok); }
+.an-stack-c3 { background: color-mix(in srgb, var(--ok) 45%, var(--text-dim)); }
+.an-stack-c4 { background: var(--text-dim); }
+.an-stack-c5 { background: color-mix(in srgb, var(--err) 60%, var(--text-dim)); }
+
 .an-empty {
   color: var(--text-dim);
   font-size: 13px;

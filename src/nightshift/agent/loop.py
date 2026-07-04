@@ -50,24 +50,46 @@ class LoopResult:
     controller asked us to stop. ``input_tokens``/``output_tokens`` are summed
     across turns (cache splits folded in by the caller via ``_usage_tokens``).
 
-    ``per_turn_usage`` is one record per turn: ``{"turn": N, "usage": {...},
-    "tool_calls": [{"name": ..., "result_chars": ...}, ...]}``. ``usage`` is
-    that turn's raw completion usage (pre-fold, so cache splits survive);
-    ``tool_calls`` are the tools dispatched off that turn's completion, whose
-    rendered ``tool_result`` blocks get prepended to the *next* turn's input —
-    which is what makes this enough to attribute input growth after the fact
-    with no extra API calls: turn N's input minus turn (N-1)'s output is
-    (approximately) the tokens turn (N-1)'s tool_calls added to the
-    transcript, split proportionally across them by ``result_chars`` when a
-    turn ran more than one tool.
+    ``per_turn_usage`` is one record per turn (harness-telemetry spec):
+    ``{"turn": N, "usage": {...}, "stop": ..., "ms_model": ...,
+    "transcript_chars": ..., "tool_calls": [...], ["ms_tools": ...]}``.
+
+    * ``usage`` is that turn's raw completion usage **verbatim** (pre-fold, so
+      cache splits survive per turn — load-bearing for the delta-attribution
+      method and the cache-efficiency-by-turn view).
+    * ``stop`` is the vendor's ``stop_reason`` as-is (``None`` if omitted).
+    * ``ms_model`` is wall-clock ms around the one ``transport_complete`` call.
+    * ``ms_tools`` (present only when tools ran) sums the per-call ``ms``.
+    * ``transcript_chars`` is the accumulated post-brief conversation size (in
+      serialized chars) *sent with this turn's request* — the growing prompt
+      region, vs the byte-stable system prefix sized once in ``prompt_chars``.
+    * ``tool_calls`` are the tools dispatched off that turn's completion:
+      ``{"name", "result_chars", "ms"}`` plus ``"err": true`` / ``"trunc":
+      true`` only when the call errored / had its result clipped at the output
+      cap (omitted-when-false keeps the common case byte-cheap). Rendered
+      ``tool_result`` blocks get prepended to the *next* turn's input — which
+      is what makes this enough to attribute input growth after the fact with
+      no extra API calls: turn N's input minus turn (N-1)'s output is
+      (approximately) the tokens turn (N-1)'s tool_calls added to the
+      transcript, split proportionally across them by ``result_chars`` when a
+      turn ran more than one tool.
+
+    ``exit_reason`` is the honest loop outcome — ``"completed"`` (model
+    finished), ``"max_turns"``, ``"timeout"``, ``"aborted"``, or
+    ``"transport_error"`` — recorded explicitly so downstream consumers never
+    re-parse the free-text ``error``. ``prompt_chars`` sizes the run-constant
+    prompt regions once: ``{"system": chars(charter+tool specs), "brief":
+    chars(brief)}``.
     """
 
     turns: int = 0
     text: str = ""
     error: str | None = None
     aborted: str | None = None
+    exit_reason: str | None = None
     usage: dict[str, Any] = field(default_factory=dict)
     per_turn_usage: list[dict[str, Any]] = field(default_factory=list)
+    prompt_chars: dict[str, int] = field(default_factory=dict)
     honoured: dict[str, Any] = field(default_factory=dict)
 
 
@@ -151,15 +173,28 @@ def run_loop(
     system_blocks = [{"type": "text", "text": charter}]
     messages: list[dict[str, Any]] = [{"role": "user", "content": brief}]
     result = LoopResult()
+    # The system prefix (tools + charter) and the brief are byte-stable for the
+    # whole run, so their sizes are recorded once, not per turn.
+    result.prompt_chars = {
+        "system": len(charter) + len(registry.specs_json()),
+        "brief": len(brief),
+    }
+    # Serialized chars of the accumulated post-brief conversation — the only
+    # prompt region that grows. Tracked incrementally (only newly-appended
+    # messages are serialized) so instrumentation stays O(run), and recorded
+    # per turn as "what this request carried beyond the stable prefix".
+    transcript_chars = 0
     deadline = (time.monotonic() + timeout) if timeout and timeout > 0 else None
 
     while result.turns < limit:
         reason = abort()
         if reason is not None:
             result.aborted = reason
+            result.exit_reason = "aborted"
             return result
         if deadline is not None and time.monotonic() >= deadline:
             result.aborted = "timeout"
+            result.exit_reason = "timeout"
             return result
 
         _apply_cache_breakpoints(
@@ -168,6 +203,7 @@ def run_loop(
         remaining = (
             max(0.0, deadline - time.monotonic()) if deadline is not None else timeout
         )
+        model_started = time.monotonic()
         try:
             completion = transport_complete(
                 messages,
@@ -180,12 +216,19 @@ def run_loop(
             )
         except TransportError as exc:
             result.error = str(exc)
+            result.exit_reason = "transport_error"
             return result
+        ms_model = int((time.monotonic() - model_started) * 1000)
 
         result.turns += 1
         _sum_usage(result.usage, completion.usage)
         turn_record: dict[str, Any] = {
-            "turn": result.turns, "usage": completion.usage, "tool_calls": [],
+            "turn": result.turns,
+            "usage": completion.usage,
+            "stop": completion.stop_reason,
+            "ms_model": ms_model,
+            "transcript_chars": transcript_chars,
+            "tool_calls": [],
         }
         result.per_turn_usage.append(turn_record)
         result.honoured = completion.honoured
@@ -194,6 +237,7 @@ def run_loop(
             emit(completion.text + "\n")
 
         if not completion.tool_calls and completion.stop_reason != _STOP_TOOL_USE:
+            result.exit_reason = "completed"
             return result  # model is done — success
 
         # Append the assistant turn, then a user turn of tool_result blocks.
@@ -212,8 +256,12 @@ def run_loop(
         messages.append({"role": "assistant", "content": assistant_content})
 
         tool_results: list[dict[str, Any]] = []
+        ms_tools = 0
         for call in completion.tool_calls:
+            dispatch_started = time.monotonic()
             outcome = registry.dispatch(call.name, call.input)
+            ms_call = int((time.monotonic() - dispatch_started) * 1000)
+            ms_tools += ms_call
             emit(f"  [{call.name}] {'error' if outcome.is_error else 'ok'}\n")
             block: dict[str, Any] = {
                 "type": "tool_result",
@@ -226,10 +274,28 @@ def run_loop(
             # result_chars measures the rendered block, not just outcome.content,
             # so it tracks what actually re-enters the transcript (incl. the
             # is_error/tool_use_id wrapping) for the next turn's input delta.
-            turn_record["tool_calls"].append(
-                {"name": call.name, "result_chars": len(json.dumps(block))}
-            )
+            call_record: dict[str, Any] = {
+                "name": call.name,
+                "result_chars": len(json.dumps(block)),
+                "ms": ms_call,
+            }
+            # err/trunc present only when true — omitted-when-false keeps the
+            # common case byte-cheap and their presence unambiguous.
+            if outcome.is_error:
+                call_record["err"] = True
+            if outcome.truncated:
+                call_record["trunc"] = True
+            turn_record["tool_calls"].append(call_record)
+        turn_record["ms_tools"] = ms_tools
         messages.append({"role": "user", "content": tool_results})
+        # Both appended messages (assistant turn + tool results) re-enter every
+        # subsequent request; sizing them here keeps transcript_chars exact
+        # (incl. tool_use args — the model's own output pushed into context)
+        # without re-serializing the whole conversation each turn.
+        transcript_chars += len(json.dumps(assistant_content)) + len(
+            json.dumps(tool_results)
+        )
 
     result.error = f"reached max_turns ({limit}) without completing"
+    result.exit_reason = "max_turns"
     return result

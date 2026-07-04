@@ -123,6 +123,151 @@ def test_per_turn_usage_empty_when_transport_errors_before_any_turn(
         model="anthropic/x",
     )
     assert res.per_turn_usage == []
+    assert res.exit_reason == "transport_error"
+
+
+# --------------------------------------------------------------------------- #
+# Harness telemetry — per-turn instrumentation (measure-forward metrics)
+# --------------------------------------------------------------------------- #
+
+
+def test_per_turn_record_carries_stop_timing_and_transcript_chars(
+    tmp_path: Path,
+) -> None:
+    """Each turn records the vendor stop reason, model/tool wall-clock, and the
+    accumulated transcript size sent with the request — the raw signals the
+    analytics module's cache/time/composition views aggregate."""
+    calls = iter(
+        [
+            Completion(
+                "reading",
+                [ToolCall("t1", "read_file", {"path": "f.txt"})],
+                {"input_tokens": 10, "output_tokens": 3},
+                "tool_use",
+            ),
+            Completion("done", [], {"input_tokens": 25, "output_tokens": 2}, "end_turn"),
+        ]
+    )
+
+    def fake(messages, tools, knobs, **kw):
+        return next(calls)
+
+    res = run_loop(
+        transport_complete=fake,
+        registry=_registry(tmp_path),
+        charter="CHARTER",
+        brief="read f.txt",
+        model="anthropic/claude-opus-4-8",
+    )
+    t1, t2 = res.per_turn_usage
+    assert t1["stop"] == "tool_use" and t2["stop"] == "end_turn"
+    assert isinstance(t1["ms_model"], int) and t1["ms_model"] >= 0
+    # turn 1 dispatched one tool: ms_tools sums its per-call ms
+    assert t1["ms_tools"] == t1["tool_calls"][0]["ms"]
+    assert isinstance(t1["tool_calls"][0]["ms"], int)
+    # the ok call carries no err/trunc markers (present only when true)
+    assert "err" not in t1["tool_calls"][0]
+    assert "trunc" not in t1["tool_calls"][0]
+    # turn 1's request is just the brief (no accumulated transcript yet);
+    # turn 2 carries the appended assistant turn + tool results
+    assert t1["transcript_chars"] == 0
+    assert t2["transcript_chars"] > 0
+    # the run-constant prompt regions are sized once, not per turn
+    assert res.prompt_chars["brief"] == len("read f.txt")
+    assert res.prompt_chars["system"] > len("CHARTER")
+    assert res.exit_reason == "completed"
+
+
+def test_tool_error_flag_present_only_when_true(tmp_path: Path) -> None:
+    calls = iter(
+        [
+            Completion(
+                "",
+                [ToolCall("t1", "read_file", {"path": "missing.txt"})],
+                {},
+                "tool_use",
+            ),
+            Completion("done", [], {}, "end_turn"),
+        ]
+    )
+
+    def fake(messages, tools, knobs, **kw):
+        return next(calls)
+
+    res = run_loop(
+        transport_complete=fake,
+        registry=_registry(tmp_path),
+        charter="C",
+        brief="b",
+        model="anthropic/x",
+    )
+    (call,) = res.per_turn_usage[0]["tool_calls"]
+    assert call["err"] is True
+
+
+def test_truncated_tool_result_flagged(tmp_path: Path) -> None:
+    (tmp_path / "big.txt").write_text("x" * 30_000 + "\n", encoding="utf-8")
+    calls = iter(
+        [
+            Completion(
+                "",
+                [ToolCall("t1", "read_file", {"path": "big.txt", "start": 1, "end": 1})],
+                {},
+                "tool_use",
+            ),
+            Completion("done", [], {}, "end_turn"),
+        ]
+    )
+
+    def fake(messages, tools, knobs, **kw):
+        return next(calls)
+
+    res = run_loop(
+        transport_complete=fake,
+        registry=_registry(tmp_path),
+        charter="C",
+        brief="b",
+        model="anthropic/x",
+    )
+    (call,) = res.per_turn_usage[0]["tool_calls"]
+    assert call["trunc"] is True
+
+
+def test_exit_reasons_for_cap_timeout_and_abort(tmp_path: Path) -> None:
+    def always_tool(messages, tools, knobs, **kw):
+        return Completion("", [ToolCall("t", "read_file", {"path": "f.txt"})], {}, "tool_use")
+
+    capped = run_loop(
+        transport_complete=always_tool,
+        registry=_registry(tmp_path),
+        charter="C",
+        brief="b",
+        model="anthropic/x",
+        max_turns=2,
+    )
+    assert capped.exit_reason == "max_turns"
+
+    timed = run_loop(
+        transport_complete=always_tool,
+        registry=_registry(tmp_path),
+        charter="C",
+        brief="b",
+        model="anthropic/x",
+        timeout=1e-9,
+    )
+    assert timed.exit_reason == "timeout"
+    assert timed.aborted == "timeout"
+
+    stopped = run_loop(
+        transport_complete=always_tool,
+        registry=_registry(tmp_path),
+        charter="C",
+        brief="b",
+        model="anthropic/x",
+        should_abort=lambda: "stopped",
+    )
+    assert stopped.exit_reason == "aborted"
+    assert stopped.aborted == "stopped"
 
 
 def test_max_turns_honoured(tmp_path: Path) -> None:

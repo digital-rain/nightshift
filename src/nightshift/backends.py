@@ -923,16 +923,16 @@ class NightshiftAgentBackend:
         except TransportError as exc:
             return WorkerResult(returncode=1, error=str(exc))
 
-        if loop.error is not None:
-            return WorkerResult(returncode=1, error=loop.error, turns=loop.turns)
         input_tokens, output_tokens = _usage_tokens(loop.usage)
         cache_read, cache_creation = _usage_cache_tokens(loop.usage)
         usage_payload = dict(loop.usage)
         if loop.per_turn_usage:
             usage_payload["per_turn"] = loop.per_turn_usage
-        return WorkerResult(
-            returncode=0,
-            aborted=loop.aborted,
+        if loop.exit_reason:
+            usage_payload["exit_reason"] = loop.exit_reason
+        if loop.prompt_chars:
+            usage_payload["prompt_chars"] = loop.prompt_chars
+        telemetry: dict[str, Any] = dict(
             turns=loop.turns,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -943,6 +943,12 @@ class NightshiftAgentBackend:
             # Anthropic path; unknown/Ollama vendors return None (honest).
             cost_usd=price.cost_of(upstream, loop.usage),
         )
+        if loop.error is not None:
+            # An errored loop (max_turns, transport failure) still burned real
+            # turns and tokens — exactly the tail the tuning KPI must see.
+            # Telemetry rides along with the honest failure.
+            return WorkerResult(returncode=1, error=loop.error, **telemetry)
+        return WorkerResult(returncode=0, aborted=loop.aborted, **telemetry)
 
 
 _BACKENDS: tuple[Any, ...] = (

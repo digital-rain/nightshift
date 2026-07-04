@@ -160,11 +160,16 @@ def test_backend_captures_cache_splits_and_per_turn_usage_payload(
     assert len(per_turn) == 2
     assert per_turn[0]["turn"] == 1
     assert per_turn[0]["usage"]["cache_read_input_tokens"] == 5
-    assert per_turn[0]["tool_calls"] == [
-        {"name": "edit_file", "result_chars": per_turn[0]["tool_calls"][0]["result_chars"]}
-    ]
-    assert per_turn[0]["tool_calls"][0]["result_chars"] > 0
+    (call,) = per_turn[0]["tool_calls"]
+    assert call["name"] == "edit_file"
+    assert call["result_chars"] > 0
+    assert isinstance(call["ms"], int)
+    assert "err" not in call  # present only when the call errored
     assert per_turn[1]["tool_calls"] == []  # no tools dispatched on the final turn
+    # run-level harness telemetry rides in the usage payload (jsonb — no schema change)
+    assert res.usage["exit_reason"] == "completed"
+    assert res.usage["prompt_chars"]["brief"] == len("make an edit")
+    assert res.usage["prompt_chars"]["system"] > 0
     # cost_usd is now computed from the owned price table (sonnet-4-6: 3/M in,
     # 15/M out; cache read 0.1x, write 1.25x) over the accumulated usage:
     #   uncached 60*3 + read 5*3*0.1 + write 3*3*1.25 + out 8*15 = 312.75 / 1e6
@@ -188,7 +193,37 @@ def test_backend_transport_error_is_honest_failure(
     assert res.returncode == 1
     assert res.error == "upstream 500"
     # nothing was written
-    assert not any(tmp_path.iterdir())
+    assert not any(p for p in tmp_path.iterdir())
+
+
+def test_backend_error_path_keeps_telemetry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A loop that dies at max_turns burned real turns and tokens — the most
+    expensive failure mode must stay visible to the tuning KPI, not vanish from
+    the run record. The error result carries usage, per-turn detail, exit_reason,
+    and the price-table cost alongside the honest failure."""
+    def always_tool(messages, tools, knobs, **kw):
+        return Completion(
+            "",
+            [ToolCall("t", "list_dir", {})],
+            {"input_tokens": 100, "output_tokens": 10},
+            "tool_use",
+        )
+
+    monkeypatch.setattr(transport, "complete", always_tool)
+    backend = backends_mod.NightshiftAgentBackend()
+    spec = _spec(tmp_path, "anthropic/claude-sonnet-4-6")
+    spec.max_turns = 3
+    res = backend.run(spec, lambda _s: None, lambda: None)
+    assert res.returncode == 1
+    assert res.error is not None and "max_turns" in res.error
+    assert res.turns == 3
+    assert (res.input_tokens, res.output_tokens) == (300, 30)
+    assert res.usage is not None
+    assert len(res.usage["per_turn"]) == 3
+    assert res.usage["exit_reason"] == "max_turns"
+    assert res.cost_usd is not None and res.cost_usd > 0
 
 
 def test_backend_reads_knobs_from_spec_config(

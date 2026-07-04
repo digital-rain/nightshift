@@ -178,6 +178,13 @@ def test_run_bash_truncation(sandbox: Path) -> None:
     reg = build_registry(sandbox)
     out = reg.dispatch("run_bash", {"command": "yes x | head -c 100000"})
     assert out.content.endswith(tools_mod._TRUNCATION_NOTE)
+    assert out.truncated is True  # telemetry for tuning the output cap
+
+
+def test_untruncated_result_not_flagged(sandbox: Path) -> None:
+    reg = build_registry(sandbox)
+    out = reg.dispatch("run_bash", {"command": "echo ok"})
+    assert out.truncated is False
 
 
 def test_run_bash_respects_should_abort(sandbox: Path) -> None:

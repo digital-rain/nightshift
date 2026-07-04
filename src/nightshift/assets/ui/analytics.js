@@ -430,86 +430,397 @@
     container.append(panel);
   }
 
-  // ---- run-shape (harness per-turn attribution) -------------------------- //
+  // ---- harness telemetry (usage.per_turn detail) -------------------------- //
 
-  // Only harness runs carry usage.per_turn. Compute, across those runs, the
-  // median input-delta by turn index and the per-tool token attribution, using
-  // the documented delta method: input(N) - output(N-1) ≈ tokens turn (N-1)'s
-  // tool_calls appended, split by result_chars.
-  function renderRunShape(container, runs) {
-    const shaped = runs.filter(
-      (r) => r.usage && Array.isArray(r.usage.per_turn) && r.usage.per_turn.length > 1
+  // Only harness runs carry usage.per_turn (one record per loop turn). Legacy
+  // records hold {turn, usage, tool_calls:[{name, result_chars}]}; instrumented
+  // records add stop / ms_model / ms_tools / transcript_chars per turn, ms and
+  // err/trunc (present-only-when-true) per tool call, and run-level
+  // usage.exit_reason + usage.prompt_chars. Every stat below skips absent
+  // fields (null ≠ 0), so old runs still render with fewer rows.
+  function shapedRuns(runs) {
+    return runs.filter(
+      (r) => r.usage && Array.isArray(r.usage.per_turn) && r.usage.per_turn.length > 0
     );
-    if (!shaped.length) return;
+  }
 
-    const deltasByTurn = new Map(); // turn index -> [delta, ...]
-    const toolTokens = new Map(); // tool name -> total attributed tokens
-    let toolFallback = false;
+  // Classify a turn by what it dispatched. Precedence: a turn that edits is an
+  // edit turn no matter what else it ran.
+  const TURN_KINDS = ["edit", "bash", "search", "read", "text"];
+
+  function turnKind(rec) {
+    const names = (Array.isArray(rec.tool_calls) ? rec.tool_calls : []).map((c) => c.name);
+    if (names.includes("edit_file") || names.includes("write_file")) return "edit";
+    if (names.includes("run_bash")) return "bash";
+    if (names.includes("grep")) return "search";
+    if (names.includes("read_file") || names.includes("list_dir")) return "read";
+    return "text";
+  }
+
+  // One pass over the shaped runs computing everything both harness panels
+  // need. Estimated figures (delta attribution) are labeled estimated in the
+  // UI; everything else is measured.
+  function harnessStats(shaped) {
+    const stats = {
+      deltasByTurn: new Map(), // turn idx -> [input-delta, ...] (estimated)
+      uncachedByTurn: new Map(), // turn idx -> [uncached input fraction, ...]
+      modelMsByTurn: new Map(), // turn idx -> [ms_model, ...]
+      tools: new Map(), // name -> {calls, chars, tokensEst, msList, errs, truncs}
+      kindCounts: { edit: 0, bash: 0, search: 0, read: 0, text: 0 },
+      msModelTotal: 0,
+      msToolsTotal: 0,
+      hasTiming: false,
+      cacheRead: 0,
+      cacheCreation: 0,
+      cacheFold: 0,
+      warmTurns: [], // per run: first turn idx with a cache read
+      maxTokenStops: 0,
+      toolFallback: false,
+    };
+
+    const tool = (name) => {
+      if (!stats.tools.has(name)) {
+        stats.tools.set(name, {
+          calls: 0, chars: 0, tokensEst: 0, msList: [], errs: 0, truncs: 0,
+        });
+      }
+      return stats.tools.get(name);
+    };
 
     for (const r of shaped) {
       const pt = r.usage.per_turn;
-      for (let i = 1; i < pt.length; i++) {
-        const cur = pt[i].usage || {};
-        const prev = pt[i - 1].usage || {};
-        const curIn = foldInput(cur);
-        const prevOut = num(prev.output_tokens);
-        const delta = Math.max(0, curIn - prevOut);
-        if (!deltasByTurn.has(i)) deltasByTurn.set(i, []);
-        deltasByTurn.get(i).push(delta);
+      let warm = null;
+      const runHasCacheKeys = pt.some((rec) => {
+        const u = rec.usage || {};
+        return "cache_read_input_tokens" in u || "cache_creation_input_tokens" in u;
+      });
 
-        // Attribute this delta to turn (i-1)'s tool calls by result_chars.
-        const calls = Array.isArray(pt[i - 1].tool_calls) ? pt[i - 1].tool_calls : [];
-        const totalChars = calls.reduce((s, c) => s + num(c.result_chars), 0);
-        if (calls.length && totalChars > 0) {
-          for (const c of calls) {
-            const share = (num(c.result_chars) / totalChars) * delta;
-            toolTokens.set(c.name || "?", (toolTokens.get(c.name || "?") || 0) + share);
+      for (let i = 0; i < pt.length; i++) {
+        const rec = pt[i];
+        const u = rec.usage || {};
+        const fold = foldInput(u);
+
+        stats.kindCounts[turnKind(rec)]++;
+        if (rec.stop === "max_tokens") stats.maxTokenStops++;
+        if (hasNum(rec.ms_model)) {
+          stats.msModelTotal += rec.ms_model;
+          stats.hasTiming = true;
+          if (!stats.modelMsByTurn.has(i + 1)) stats.modelMsByTurn.set(i + 1, []);
+          stats.modelMsByTurn.get(i + 1).push(rec.ms_model);
+        }
+        if (hasNum(rec.ms_tools)) stats.msToolsTotal += rec.ms_tools;
+
+        // Cache accounting from the raw (pre-fold) per-turn splits — only for
+        // runs whose vendor reports them, so Ollama never fakes a 100% miss.
+        if (runHasCacheKeys && fold > 0) {
+          stats.cacheRead += num(u.cache_read_input_tokens);
+          stats.cacheCreation += num(u.cache_creation_input_tokens);
+          stats.cacheFold += fold;
+          if (!stats.uncachedByTurn.has(i + 1)) stats.uncachedByTurn.set(i + 1, []);
+          stats.uncachedByTurn.get(i + 1).push(num(u.input_tokens) / fold);
+          if (warm === null && num(u.cache_read_input_tokens) > 0) warm = i + 1;
+        }
+
+        // Per-tool measured stats (exact, from the call records).
+        const calls = Array.isArray(rec.tool_calls) ? rec.tool_calls : [];
+        for (const c of calls) {
+          const t = tool(c.name || "?");
+          t.calls++;
+          t.chars += num(c.result_chars);
+          if (hasNum(c.ms)) t.msList.push(c.ms);
+          if (c.err) t.errs++;
+          if (c.trunc) t.truncs++;
+        }
+
+        // Delta attribution (estimated): input(N) - output(N-1) ≈ tokens turn
+        // (N-1)'s tool results appended, split by result_chars.
+        if (i > 0) {
+          const prev = pt[i - 1];
+          const delta = Math.max(0, fold - num((prev.usage || {}).output_tokens));
+          if (!stats.deltasByTurn.has(i)) stats.deltasByTurn.set(i, []);
+          stats.deltasByTurn.get(i).push(delta);
+          const prevCalls = Array.isArray(prev.tool_calls) ? prev.tool_calls : [];
+          const totalChars = prevCalls.reduce((s, c) => s + num(c.result_chars), 0);
+          if (prevCalls.length && totalChars > 0) {
+            for (const c of prevCalls) {
+              tool(c.name || "?").tokensEst += (num(c.result_chars) / totalChars) * delta;
+            }
+          } else if (prevCalls.length) {
+            for (const c of prevCalls) {
+              tool(c.name || "?").tokensEst += delta / prevCalls.length;
+            }
+            stats.toolFallback = true;
           }
-        } else if (calls.length) {
-          const even = delta / calls.length;
-          for (const c of calls) {
-            toolTokens.set(c.name || "?", (toolTokens.get(c.name || "?") || 0) + even);
-          }
-          toolFallback = true;
         }
       }
+      if (warm !== null) stats.warmTurns.push(warm);
     }
+    return stats;
+  }
 
-    const turns = Array.from(deltasByTurn.keys()).sort((a, b) => a - b);
-    const medians = turns.map((t) => median(deltasByTurn.get(t)));
+  // A single horizontal stacked bar with a legend (shares of a whole).
+  function stackBar(segments) {
+    const total = segments.reduce((s, seg) => s + seg.value, 0);
+    const wrap = el("div", "an-stack-wrap");
+    const bar = el("div", "an-stack");
+    const legend = el("div", "an-stack-legend");
+    segments.forEach((seg, i) => {
+      if (seg.value <= 0) return;
+      const piece = el("div", "an-stack-seg an-stack-c" + (i % 6));
+      piece.style.flexGrow = String(seg.value);
+      piece.title = seg.label + ": " + seg.text;
+      bar.append(piece);
+      const item = el("span", "an-stack-item");
+      item.append(el("span", "an-stack-dot an-stack-c" + (i % 6)));
+      item.append(
+        el("span", null, seg.label + " " + (total > 0 ? fmtPct(seg.value / total) : "—"))
+      );
+      legend.append(item);
+    });
+    wrap.append(bar, legend);
+    return wrap;
+  }
+
+  function renderRunShape(container, runs) {
+    const shaped = shapedRuns(runs).filter((r) => r.usage.per_turn.length > 1);
+    if (!shaped.length) return;
+    const s = harnessStats(shaped);
 
     const panel = el("div", "an-panel");
     panel.append(el("h3", "an-panel-title", "Run shape (harness runs)"));
     panel.append(
-      el("div", "an-note", shaped.length + " harness run(s) with per-turn detail" + (toolFallback ? " · some tool splits estimated evenly" : ""))
+      el(
+        "div",
+        "an-note",
+        shaped.length +
+          " harness run(s) with per-turn detail · token attribution estimated" +
+          (s.toolFallback ? " (some splits estimated evenly)" : "")
+      )
     );
 
     const grid = el("div", "an-trend-grid");
-    const cell = el("div", "an-trend-cell");
-    cell.append(el("div", "an-trend-label", "Median input added by turn"));
-    cell.append(barChart(medians, turns.map((t) => "turn " + t), { format: fmtTokens }));
-    grid.append(cell);
+    const turns = Array.from(s.deltasByTurn.keys()).sort((a, b) => a - b);
+    grid.append(
+      trendCell(
+        "Median input added by turn (est.)",
+        turns.map((t) => median(s.deltasByTurn.get(t))),
+        turns.map((t) => "turn " + t),
+        fmtTokens
+      )
+    );
+
+    // Where cache efficiency breaks down: the uncached (full-price) share of
+    // each turn's input. Rising late in the run = the rolling breakpoint fell
+    // out of range; high on turn 1 is expected (cold prefill).
+    if (s.cacheFold > 0) {
+      const cTurns = Array.from(s.uncachedByTurn.keys()).sort((a, b) => a - b);
+      grid.append(
+        trendCell(
+          "Uncached input share by turn",
+          cTurns.map((t) => median(s.uncachedByTurn.get(t)) * 100),
+          cTurns.map((t) => "turn " + t),
+          (v) => v.toFixed(0) + "%"
+        )
+      );
+    }
+
+    // Model latency growth with context strengthens the eviction case: the
+    // transcript costs wall-clock, not just dollars.
+    if (s.modelMsByTurn.size > 1) {
+      const mTurns = Array.from(s.modelMsByTurn.keys()).sort((a, b) => a - b);
+      grid.append(
+        trendCell(
+          "Median model ms by turn",
+          mTurns.map((t) => median(s.modelMsByTurn.get(t))),
+          mTurns.map((t) => "turn " + t),
+          (v) => fmtNum(v, 0) + " ms"
+        )
+      );
+    }
     panel.append(grid);
 
-    const toolRows = Array.from(toolTokens.entries()).sort((a, b) => b[1] - a[1]);
+    if (s.cacheFold > 0) {
+      panel.append(
+        el(
+          "div",
+          "an-note",
+          "cache: " + fmtPct(s.cacheRead / s.cacheFold) + " read · write tax " +
+            fmtPct(s.cacheCreation / s.cacheFold) +
+            (s.warmTurns.length ? " · warms at turn " + fmtNum(median(s.warmTurns), 0) : " · never warms")
+        )
+      );
+    }
+
+    // Wall-clock split: model latency vs tool execution — decides whether the
+    // time lever is routing/effort or tool timeouts/pagination.
+    if (s.hasTiming && s.msModelTotal + s.msToolsTotal > 0) {
+      panel.append(el("div", "an-subhead", "Where the time goes"));
+      panel.append(
+        stackBar([
+          { label: "model", value: s.msModelTotal, text: fmtMs(s.msModelTotal) },
+          { label: "tools", value: s.msToolsTotal, text: fmtMs(s.msToolsTotal) },
+        ])
+      );
+    }
+
+    const toolRows = Array.from(s.tools.entries()).sort(
+      (a, b) => b[1].tokensEst - a[1].tokensEst
+    );
     if (toolRows.length) {
       const table = el("table", "an-table");
       const thead = el("thead");
       const htr = el("tr");
-      ["Tool", "Input tokens added (total)"].forEach((h) => htr.append(el("th", null, h)));
+      ["Tool", "Calls", "Tokens added (est.)", "Result chars", "p50 ms", "Err %", "Trunc %"].forEach(
+        (h) => htr.append(el("th", null, h))
+      );
       thead.append(htr);
       table.append(thead);
       const tbody = el("tbody");
-      for (const [name, tokens] of toolRows) {
+      for (const [name, t] of toolRows) {
         const tr = el("tr");
         tr.append(el("td", "an-td-key", name));
-        tr.append(el("td", null, fmtTokens(tokens)));
+        tr.append(el("td", null, String(t.calls)));
+        tr.append(el("td", null, fmtTokens(t.tokensEst)));
+        tr.append(el("td", null, fmtTokens(t.chars)));
+        tr.append(el("td", null, t.msList.length ? fmtNum(median(t.msList), 0) : "—"));
+        tr.append(el("td", null, t.calls ? fmtPct(t.errs / t.calls) : "—"));
+        tr.append(el("td", null, t.calls ? fmtPct(t.truncs / t.calls) : "—"));
         tbody.append(tr);
       }
       table.append(tbody);
       panel.append(el("div", "an-subhead", "Context added per tool"), table);
     }
     container.append(panel);
+  }
+
+  // Marginal-turn-yield buckets: where extra turns stop buying landed changes
+  // (informs the turn-cap / token stop-loss knobs).
+  const TURN_BUCKETS = [
+    { label: "1–10", lo: 1, hi: 10 },
+    { label: "11–20", lo: 11, hi: 20 },
+    { label: "21–30", lo: 21, hi: 30 },
+    { label: "31–40", lo: 31, hi: 40 },
+    { label: "41–50", lo: 41, hi: 50 },
+    { label: "51+", lo: 51, hi: Infinity },
+  ];
+
+  function renderTurnComposition(container, runs) {
+    const shaped = shapedRuns(runs);
+    if (!shaped.length) return;
+    const s = harnessStats(shaped);
+
+    const panel = el("div", "an-panel");
+    panel.append(el("h3", "an-panel-title", "Turn composition & exits (harness runs)"));
+
+    // What the turns are spending on: hunting (read/search), changing (edit),
+    // validating (bash), or stalling (text).
+    let sections = 0;
+    const totalTurns = TURN_KINDS.reduce((n, k) => n + s.kindCounts[k], 0);
+    if (totalTurns > 0) {
+      sections++;
+      panel.append(el("div", "an-subhead", "Turns doing what"));
+      panel.append(
+        stackBar(
+          TURN_KINDS.map((k) => ({
+            label: k,
+            value: s.kindCounts[k],
+            text: s.kindCounts[k] + " turns",
+          }))
+        )
+      );
+    }
+    if (s.maxTokenStops > 0) {
+      panel.append(
+        el(
+          "div",
+          "an-note",
+          s.maxTokenStops + " turn(s) stopped at max_tokens — output clipped mid-turn (raise max_tokens)"
+        )
+      );
+    }
+
+    // Why runs ended, weighted by what they cost. "We cut it off" exits
+    // (max_turns / timeout) carrying a big spend share are the stop-loss signal.
+    const exits = new Map(); // reason -> {runs, cost, hasCost}
+    for (const r of shaped) {
+      const reason = r.usage.exit_reason || "—";
+      if (!exits.has(reason)) exits.set(reason, { runs: 0, cost: 0, hasCost: false });
+      const e = exits.get(reason);
+      e.runs++;
+      if (hasNum(r.cost_usd)) {
+        e.cost += r.cost_usd;
+        e.hasCost = true;
+      }
+    }
+    if (exits.size > 1 || !exits.has("—")) {
+      const table = el("table", "an-table");
+      const thead = el("thead");
+      const htr = el("tr");
+      ["Exit", "Runs", "Spend"].forEach((h) => htr.append(el("th", null, h)));
+      thead.append(htr);
+      table.append(thead);
+      const tbody = el("tbody");
+      const rows = Array.from(exits.entries()).sort((a, b) => b[1].runs - a[1].runs);
+      for (const [reason, e] of rows) {
+        const tr = el("tr");
+        tr.append(el("td", "an-td-key", reason));
+        tr.append(el("td", null, String(e.runs)));
+        tr.append(el("td", null, e.hasCost ? fmtMoney(e.cost) : "—"));
+        tbody.append(tr);
+      }
+      table.append(tbody);
+      panel.append(el("div", "an-subhead", "Exit reasons"), table);
+      sections++;
+    }
+
+    // Marginal turn yield: of the runs that reached each turn bucket, how many
+    // landed, and what the bucket's turns burned (measured throughput).
+    const buckets = TURN_BUCKETS.map((b) => ({ ...b, runs: 0, landed: 0, tokens: [] }));
+    for (const r of shaped) {
+      const pt = r.usage.per_turn;
+      for (const b of buckets) {
+        if (pt.length < b.lo) continue;
+        b.runs++;
+        if (r.landed) b.landed++;
+        let burned = 0;
+        for (let i = b.lo - 1; i < Math.min(pt.length, b.hi); i++) {
+          burned += foldInput(pt[i].usage || {});
+        }
+        b.tokens.push(burned);
+      }
+    }
+    const reached = buckets.filter((b) => b.runs > 0);
+    if (reached.length > 1) {
+      const table = el("table", "an-table");
+      const thead = el("thead");
+      const htr = el("tr");
+      ["Turns reached", "Runs", "Land %", "Median tokens in bucket"].forEach((h) =>
+        htr.append(el("th", null, h))
+      );
+      thead.append(htr);
+      table.append(thead);
+      const tbody = el("tbody");
+      for (const b of reached) {
+        const tr = el("tr");
+        tr.append(el("td", "an-td-key", b.label));
+        tr.append(el("td", null, String(b.runs)));
+        tr.append(el("td", null, fmtPct(b.landed / b.runs)));
+        tr.append(el("td", null, fmtTokens(median(b.tokens))));
+        tbody.append(tr);
+      }
+      table.append(tbody);
+      panel.append(el("div", "an-subhead", "Marginal turn yield"), table);
+      sections++;
+    }
+
+    if (sections > 0) container.append(panel);
+  }
+
+  function fmtMs(n) {
+    if (!hasNum(n)) return "—";
+    if (n >= 60000) return (n / 60000).toFixed(1) + "m";
+    if (n >= 1000) return (n / 1000).toFixed(1) + "s";
+    return Math.round(n) + "ms";
   }
 
   function foldInput(usage) {
@@ -643,6 +954,7 @@
       }
       renderWaste(body, current);
       renderRunShape(body, current);
+      renderTurnComposition(body, current);
     }
 
     async function reload() {
