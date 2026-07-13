@@ -3443,7 +3443,7 @@ function labeledSegment(label, ariaLabel, locked, rerender, switches) {
 }
 
 // The create pane's ENHANCE BRIEF Off/On switch (mirrors the Turns-limit
-// pattern): On (the default) runs the AI rewrite on create.
+// pattern): Off by default; On runs the AI rewrite on create.
 function enhanceSegment(draft, rerender, locked) {
   const group = document.createElement("div");
   group.className = "seg-group";
@@ -3633,8 +3633,8 @@ function draftFromBrief(brief) {
     // The operator's pre-enhancement text, preserved in the file below the
     // original-brief marker. In the create pane this is the field being typed.
     original_brief: brief.original_brief || "",
-    // Enhance-on-create: on by default for new tasks (ignored when editing).
-    enhance: true,
+    // Enhance-on-create: off by default for new tasks (ignored when editing).
+    enhance: false,
     disabled: !!brief.disabled,
     quarantined: !!brief.quarantined,
     failed: !!brief.failed,
