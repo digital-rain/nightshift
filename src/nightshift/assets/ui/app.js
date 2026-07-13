@@ -3411,9 +3411,9 @@ function statusOptions(draft) {
     ["Ready",      () => !draft.disabled && !draft.quarantined && !draft.failed
                           && !draft.completed && !draft.blocked],
     ["Disabled",   () => !!draft.disabled],
-    ["Quarantine", () => !!draft.quarantined],
     ["Failed",     () => !!draft.failed],
     ["Blocked",    () => !!draft.blocked],
+    ["Quarantine", () => !!draft.quarantined],
     ["Completed",  () => !!draft.completed],
   ];
   return statuses.map(([label, isOn]) => [label, isOn, (on) => {
