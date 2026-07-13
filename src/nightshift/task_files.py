@@ -45,6 +45,7 @@ def resolve_title(task: str, meta: dict) -> str:
 # task file's body. Everything after this line, to EOF, is the original text
 # as typed; everything before it is the effective brief the worker runs.
 # Workers never see the original: build_work_order strips it from the body.
+NOTES_MARKER = "<!-- nightshift:notes -->"
 ORIGINAL_BRIEF_MARKER = "<!-- nightshift:original-brief -->"
 
 
@@ -59,6 +60,31 @@ def split_original(body: str) -> tuple[str, str]:
         return body.strip(), ""
     brief, original = body.split(ORIGINAL_BRIEF_MARKER, 1)
     return brief.strip(), original.strip()
+
+
+def split_notes(body: str) -> tuple[str, str]:
+    """Split a brief body into ``(brief, notes)``.
+
+    The notes section is the tail of the body after :data:`NOTES_MARKER`;
+    a body without the marker has no notes (empty second half). Both halves
+    come back stripped.
+    """
+    if NOTES_MARKER not in body:
+        return body.strip(), ""
+    brief, notes = body.split(NOTES_MARKER, 1)
+    return brief.strip(), notes.strip()
+
+
+def join_notes(body: str, notes: str) -> str:
+    """Reassemble a brief body with its notes section.
+
+    An empty ``notes`` yields just the body (no marker is written).
+    """
+    body = body.strip()
+    notes = notes.strip()
+    if not notes:
+        return body
+    return f"{body}\n\n{NOTES_MARKER}\n{notes}"
 
 
 def join_original(body: str, original: str) -> str:
@@ -355,6 +381,7 @@ def read_task(tasks_root: Path, task: str, tasks_rel: str = "main") -> dict:
     text = dest.read_text(errors="replace")
     meta, body = split_frontmatter(text) if text.startswith("---") else ({}, text)
     body, original = split_original(body)
+    body, notes = split_notes(body)
     # ``tasks_root`` is ``<workspace>/<tasks_repo>`` by construction, so its
     # parent is the workspace — resolve the layered queue config from both roots.
     config = resolve_config(tasks_root.parent, tasks_root, tasks_rel)
@@ -377,6 +404,7 @@ def read_task(tasks_root: Path, task: str, tasks_rel: str = "main") -> dict:
         "task": task,
         "title": resolve_title(task, meta),
         "body": body.strip(),
+        "notes": notes,
         "original_brief": original,
         "frontmatter": frontmatter,
         # The raw, file-only frontmatter (before defaults are layered in) so the
@@ -409,7 +437,7 @@ _EDITABLE_META_KEYS = {
 # headline (``title``), and the preserved pre-enhancement text
 # (``original_brief``); these aren't plain frontmatter scalars so they're
 # handled separately from :data:`_EDITABLE_META_KEYS`.
-_EDITABLE_CONTENT_KEYS = {"title", "body", "original_brief"}
+_EDITABLE_CONTENT_KEYS = {"title", "body", "notes", "original_brief"}
 
 
 def _render_meta_value(value: object) -> str:
@@ -507,15 +535,20 @@ def set_task_meta(
         if value is not None:
             new_fence.append(f"{key}: {_render_meta_value(value)}")
 
-    # Content edits operate on the two body halves independently: the spec
-    # prose and the original-brief tail each replace their own half, so an
-    # edit to one never clobbers the other.
-    brief, original = split_original("\n".join(body_lines))
+    # Content edits operate on the three body sections independently: the spec
+    # prose, the notes section, and the original-brief tail each replace their
+    # own section, so an edit to one never clobbers the others.
+    brief_and_notes, original = split_original("\n".join(body_lines))
+    brief, notes = split_notes(brief_and_notes)
     if "body" in changes:
         brief = str(changes.get("body") or "").strip()
+    if "notes" in changes:
+        notes = str(changes.get("notes") or "").strip()
     if "original_brief" in changes:
         original = str(changes.get("original_brief") or "").strip()
-    body = _strip_leading_blanks(join_original(brief, original).splitlines())
+    body = _strip_leading_blanks(
+        join_original(join_notes(brief, notes), original).splitlines()
+    )
     if new_fence:
         out = ["---", *new_fence, "---", "", *body]
     else:

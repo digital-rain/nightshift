@@ -3628,6 +3628,7 @@ function draftFromBrief(brief) {
     // which an <input>.value would render as the literal text "undefined".
     title: brief.title || brief.task || "",
     body: brief.body || "",
+    notes: brief.notes || "",
     // The operator's pre-enhancement text, preserved in the file below the
     // original-brief marker. In the create pane this is the field being typed.
     original_brief: brief.original_brief || "",
@@ -4138,6 +4139,21 @@ function taskDetailContent(brief, draft, opts = {}) {
     frag.append(org.panel);
   }
 
+  // NOTES — free-form, multi-line editable text area for operator notes.
+  {
+    const notesArea = document.createElement("textarea");
+    notesArea.rows = 4;
+    notesArea.value = draft.notes || "";
+    notesArea.disabled = locked;
+    notesArea.placeholder = "Add notes…";
+    notesArea.addEventListener("input", () => { draft.notes = notesArea.value; });
+    wireEditKeydown(notesArea);
+    notesArea.className = "detail-brief-edit";
+    const nt = expando("Notes", { open: !!(draft.notes) });
+    nt.body.append(notesArea);
+    frag.append(nt.panel);
+  }
+
   // RUN DETAILS / LOG — when the task has a run record (live or historical).
   // RUN DETAILS is shown even before final timings exist so fields like the
   // validate command are visible while a run is in progress.
@@ -4228,6 +4244,7 @@ async function saveDetail(brief, draft, errEl) {
   const payload = {
     title: draft.title.trim(),
     body: draft.body,
+    notes: draft.notes || "",
     disabled: !!draft.disabled,
     quarantined: !!draft.quarantined,
     failed: !!draft.failed,
@@ -4524,6 +4541,44 @@ function renderHistoryDetail() {
   }
   brf.body.append(brief);
   body.append(brf.panel);
+
+  // NOTES — editable free-form text area for operator notes on this run.
+  {
+    const notesArea = document.createElement("textarea");
+    notesArea.rows = 4;
+    notesArea.value = rec.notes || "";
+    notesArea.placeholder = "Add notes…";
+    notesArea.className = "detail-brief-edit";
+    wireEditKeydown(notesArea);
+    const nt = expando("Notes", { open: !!(rec.notes) });
+    nt.body.append(notesArea);
+    body.append(nt.panel);
+
+    const notesSaveRow = document.createElement("div");
+    notesSaveRow.className = "detail-actions";
+    const notesErr = document.createElement("p");
+    notesErr.className = "error detail-save-error";
+    notesErr.hidden = true;
+    const notesSave = document.createElement("button");
+    notesSave.className = "btn primary";
+    notesSave.textContent = "Save notes";
+    notesSave.addEventListener("click", async () => {
+      notesSave.disabled = true;
+      const { ok, data } = await sendJSON(
+        `/api/runs/${encodeURIComponent(run.id)}/notes`, "PATCH",
+        { notes: notesArea.value || null });
+      notesSave.disabled = false;
+      if (!ok) {
+        notesErr.textContent = (data && data.error) || "could not save notes";
+        notesErr.hidden = false;
+        return;
+      }
+      notesErr.hidden = true;
+      rec.notes = notesArea.value || null;
+    });
+    notesSaveRow.append(notesErr, notesSave);
+    body.append(notesSaveRow);
+  }
 
   // RUN DETAILS — only meaningful for tasks that have run, so it's history-only.
   const rd = expando("Run details", { open: true });

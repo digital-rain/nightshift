@@ -2160,7 +2160,7 @@ RUN_WIRE_KEYS = [
     "remote", "pushed", "turns", "input_tokens", "output_tokens",
     "cache_read_input_tokens", "cache_creation_input_tokens", "usage",
     "cost_usd", "failure_kind", "failure_reason", "validate_cmd", "worktree",
-    "title", "body", "started_at", "finished_at", "enhanced", "rating",
+    "title", "body", "started_at", "finished_at", "enhanced", "rating", "notes",
 ]
 
 # The exact pre-Phase-8 lease-row wire keys.

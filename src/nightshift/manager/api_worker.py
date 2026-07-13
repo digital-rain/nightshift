@@ -411,6 +411,7 @@ def register_worker_api(
             ttl_seconds=cfg.cadences.lease_ttl_seconds,
             title=order["title"],
             body=order["body"],
+            notes=order.get("notes"),
             required_mcps=list(chosen.required_mcps),
             repo=repo,
             validate_cmd=planned_validate or None,

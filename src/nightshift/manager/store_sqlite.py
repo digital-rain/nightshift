@@ -174,6 +174,7 @@ CREATE TABLE nightshift.attempts (
     worktree       text,
     title          text,
     body           text,
+    notes          text,
     remote         text,
     pushed         integer,
     enhanced       integer NOT NULL DEFAULT 0,

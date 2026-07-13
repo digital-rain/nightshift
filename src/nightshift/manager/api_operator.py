@@ -154,6 +154,7 @@ class TaskUpdate(BaseModel):
     loop: bool | None = None
     loop_max_iterations: int | None = None
     split: bool | None = None
+    notes: str | None = None
     # The preserved pre-enhancement text ("" drops the marker section).
     original_brief: str | None = None
 
@@ -162,6 +163,12 @@ class RunRating(BaseModel):
     """The operator's thumbs verdict on a run: 'up', 'down', or null (clear)."""
 
     rating: str | None = None
+
+
+class RunNotes(BaseModel):
+    """Free-form notes on a run record."""
+
+    notes: str | None = None
 
 
 def _validate_priority(value: object) -> int:
@@ -380,6 +387,7 @@ def register_operator_api(
                 "task": None,
                 "title": "",
                 "body": "",
+                "notes": "",
                 "original_brief": "",
                 "frontmatter": {
                     "model": resolved["model"],
@@ -943,6 +951,16 @@ def register_operator_api(
             payload={"rating": body.rating},
         )
         return JSONResponse({"id": run_id, "rating": body.rating})
+
+    @app.patch("/api/runs/{run_id}/notes")
+    async def patch_run_notes(run_id: str, body: RunNotes) -> JSONResponse:
+        """Update the free-form notes on a run record."""
+        store = _store()
+        attempt = await store.get_attempt(run_id)
+        if attempt is None:
+            return JSONResponse({"error": "unknown run"}, status_code=404)
+        await store.update_attempt(run_id, notes=body.notes)
+        return JSONResponse({"id": run_id, "notes": body.notes})
 
     @app.get("/api/runs/{run_id}/events")
     async def get_run_events(run_id: str) -> JSONResponse:

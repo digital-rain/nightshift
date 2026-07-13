@@ -43,7 +43,7 @@ from nightshift.pg import PgPoolLike
 # must not.
 ATTEMPT_UPDATABLE_FIELDS = frozenset(
     set(Outcome.model_fields) - {"landable", "status"}
-) | {"state", "phase", "commit_sha", "loc", "remote", "pushed", "rating"}
+) | {"state", "phase", "commit_sha", "loc", "remote", "pushed", "rating", "notes"}
 
 
 def _check_attempt_fields(fields: dict[str, Any], *, allow_state: bool) -> None:
@@ -227,6 +227,7 @@ class NightshiftStore(Protocol):
         ttl_seconds: float,
         title: str | None = None,
         body: str | None = None,
+        notes: str | None = None,
         required_mcps: list[str] | None = None,
         repo: str | None = None,
         validate_cmd: str | None = None,
@@ -499,6 +500,7 @@ class SqlStoreBase:
         ttl_seconds: float,
         title: str | None = None,
         body: str | None = None,
+        notes: str | None = None,
         required_mcps: list[str] | None = None,
         repo: str | None = None,
         validate_cmd: str | None = None,
@@ -515,19 +517,20 @@ class SqlStoreBase:
                 f"""
                 INSERT INTO nightshift.attempts
                     (id, task, queue, worker_id, backend, model, repo,
-                     required_mcps, validate_cmd, state, title, body, enhanced,
-                     base_ref, started_at, acquired_at, heartbeat_at, deadline_at)
+                     required_mcps, validate_cmd, state, title, body, notes,
+                     enhanced, base_ref, started_at, acquired_at, heartbeat_at,
+                     deadline_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11,
-                        $12, $13, $14, now(), now(), now(),
+                        $12, $13, $14, $15, now(), now(), now(),
                         CASE WHEN $10 IN ({_ATTEMPT_LIVE_SQL})
-                             THEN now() + ($15 || ' seconds')::interval END)
+                             THEN now() + ($16 || ' seconds')::interval END)
                 ON CONFLICT (queue, task) WHERE state IN ({_ATTEMPT_LIVE_SQL})
                 DO NOTHING
                 RETURNING *
                 """,
                 attempt_id, task, _qkey(queue), worker_id, backend, model, repo,
                 json.dumps(required_mcps or []), validate_cmd, state, title, body,
-                enhanced, base_ref, str(int(ttl_seconds)),
+                notes, enhanced, base_ref, str(int(ttl_seconds)),
             )
         return _attempt_row(row) if row else None
 
