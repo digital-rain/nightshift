@@ -620,9 +620,10 @@ function applyFocusedState() {
 }
 
 // Sequence counter for activatePlaylist: only the most-recently-started call
-// applies its final setView so that a rapid click→dblclick sequence doesn't
-// leave the UI on the wrong screen (click fires before dblclick, so without
-// the guard the two concurrent activations race and "playlists" often wins).
+// mutates state or applies setView. A rapid click→dblclick sequence, or a
+// quick library-click then playlist-dblclick, can produce overlapping POSTs;
+// the guard ensures the stale one is abandoned before it can overwrite the
+// winning activation's state.
 let _activationSeq = 0;
 
 // Switch the active queue server-side, then refresh everything and land on a
@@ -634,15 +635,16 @@ async function activatePlaylist(name, targetView = "now") {
     alert((data && data.error) || "could not switch queue");
     return;
   }
+  // Abandon early if a newer activation started while the POST was in-flight,
+  // BEFORE mutating any client state — a late-returning stale POST must not
+  // overwrite the queue/activePlaylist that the winning activation already set.
+  if (seq !== _activationSeq) return;
   syncActivePlaylist(name);
   state.selectedTask = null;
   state.selectedTasks = new Set();
   document.body.classList.remove("has-detail");
   await Promise.all([loadQueue(), loadRuns(), refreshQueues()]);
-  // Abandon if a newer activation started while we were loading (e.g. the
-  // click half of a double-click — the dblclick fires last so its seq wins).
   if (seq !== _activationSeq) return;
-  // Reflect the queue we just focused (it may be idle while another runs).
   applyFocusedState();
   setView(targetView);
 }
@@ -2983,7 +2985,7 @@ function playlistRow(pl) {
   const li = document.createElement("li");
   li.className = "pl-item";
   li.dataset.playlist = pl.name;
-  li.title = "Click to select · shift-click to multi-select · double-click to open queue";
+  li.title = "Click to select · shift-click to multi-select · double-click to view playlist";
   const active = state.activePlaylist === pl.name;
   if (active) li.classList.add("active");
   if (pl.disabled) li.classList.add("pl-hidden");
