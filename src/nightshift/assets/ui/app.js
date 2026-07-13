@@ -1339,11 +1339,14 @@ function queueRowAside(item, isNow) {
   else if (item.completed) status = "completed";
   else if (item.quarantined) status = "quarantined";
   else if (item.failed) status = "failed";
-  else if (rec) status = rec.status;
+  // A blocked overlay is the task's current, actionable state — it must win
+  // over a stale prior run record (an earlier attempt that got the task
+  // blocked would otherwise mask the "Blocked" badge behind its "Error").
   else if (state.blockedTasks && item.task in state.blockedTasks) {
     const overlay = state.blockedTasks[item.task];
     status = (overlay && overlay.state) || "blocked";
   }
+  else if (rec) status = rec.status;
   else status = "pending";
 
   const status_box = document.createElement("div");
@@ -2662,19 +2665,21 @@ async function resolveTask(runId, task, btn) {
 }
 
 async function resetTask(task, btn) {
-  if (btn) { btn.disabled = true; btn.textContent = "Resetting\u2026"; }
-  const q = queueParam();
+  const label = btn ? btn.textContent : null;
+  if (btn) { btn.disabled = true; btn.textContent = "Clearing\u2026"; }
+  // queueParam() already yields the full "?queue=<q>" (or "") query string —
+  // append it directly (double-wrapping it once caused a 404 on the reset).
   const { ok, data } = await sendJSON(
-    `/api/tasks/${encodeURIComponent(task)}/reset${q ? "?queue=" + encodeURIComponent(q) : ""}`,
+    `/api/tasks/${encodeURIComponent(task)}/reset${queueParam()}`,
     "POST",
   );
   if (!ok) {
-    alert((data && data.error) || "could not reset task");
-    if (btn) { btn.disabled = false; btn.textContent = "Reset"; }
+    alert((data && data.error) || "could not clear blocked status");
+    if (btn) { btn.disabled = false; btn.textContent = label || "Clear"; }
     return;
   }
-  loadBlocked();
-  loadQueue();
+  await loadBlocked();
+  await loadQueue();
 }
 
 // Inline bot glyph + label for the Resolve button (shared by the markup and the
@@ -3397,19 +3402,30 @@ function settingsControls(brief, draft, rerender, locked, creating) {
 }
 
 function statusOptions(draft) {
+  // "Ready" means no hold of any kind — neither a frontmatter flag nor the
+  // manager's blocked overlay. "Blocked" is manager-owned (a DB hold): it can
+  // only be *shown* selected, never set by hand, so its setter is a no-op.
+  // Selecting Ready (or any other status) clears the blocked overlay locally;
+  // Save then issues the release (see saveDetail).
   const statuses = [
-    ["Ready",      () => !draft.disabled && !draft.quarantined && !draft.failed && !draft.completed],
+    ["Ready",      () => !draft.disabled && !draft.quarantined && !draft.failed
+                          && !draft.completed && !draft.blocked],
     ["Disabled",   () => !!draft.disabled],
     ["Quarantine", () => !!draft.quarantined],
     ["Failed",     () => !!draft.failed],
+    ["Blocked",    () => !!draft.blocked],
     ["Completed",  () => !!draft.completed],
   ];
   return statuses.map(([label, isOn]) => [label, isOn, (on) => {
     if (!on) return;
+    // Blocked is not hand-settable; clicking it is inert (it stays whatever the
+    // manager overlay says). Any other selection moves off Blocked.
+    if (label === "Blocked") return;
     draft.disabled = label === "Disabled";
     draft.quarantined = label === "Quarantine";
     draft.failed = label === "Failed";
     draft.completed = label === "Completed";
+    draft.blocked = false;
   }]);
 }
 
@@ -3639,6 +3655,13 @@ function draftFromBrief(brief) {
     quarantined: !!brief.quarantined,
     failed: !!brief.failed,
     completed: !!brief.completed,
+    // The manager-owned blocked overlay (a DB hold, not frontmatter). Seeded
+    // so the STATUS control can show "Blocked" as the selected status and a
+    // Ready selection can release the hold on Save. `blockedInitial` records
+    // the seed value so Save only issues a release when the operator actually
+    // moved OFF Blocked (rather than on every save of a blocked task).
+    blocked: !!(state.blockedTasks && brief.task && state.blockedTasks[brief.task]),
+    blockedInitial: !!(state.blockedTasks && brief.task && state.blockedTasks[brief.task]),
     evergreen: !!brief.evergreen,
     automerge: !!(brief.frontmatter && brief.frontmatter.automerge),
     draft: !!(brief.frontmatter && brief.frontmatter.draft),
@@ -3709,14 +3732,34 @@ async function openTaskDetail(task) {
 // ----- shared detail-pane building blocks (editable + history) -----------
 
 // The FILE / STATUS header that opens both flavours of the detail pane.
-// When `blockedReason` is provided a MESSAGE row is appended below STATUS so
-// the reason is visually grouped with FILE & STATUS and separated from TITLE.
+// The blocked reason is no longer shown here: it lives in its own expandable
+// BLOCKED section below the LOG panel (see taskDetailContent).
 // `enhanced` marks briefs that went through the enhance-on-create rewrite.
-function detailStatusHead(task, status, blockedReason, enhanced) {
+function detailStatusHead(task, status, enhanced) {
   const pairs = [["File", `${task}.md`], ["Status", stateLabel(status)]];
   if (enhanced) pairs.push(["Brief", "AI-enhanced"]);
-  if (blockedReason) pairs.push(["Message", blockedReason]);
   return metaGrid(pairs);
+}
+
+// The BLOCKED expando for a blocked task: collapsed by default, it reveals the
+// blocked reason and a Clear button that releases the DB hold (making the task
+// runnable again). Rendered below LOG and only while the task is blocked.
+function blockedSection(task, overlay, rerender) {
+  const bl = expando("Blocked", { open: false });
+  const reason = document.createElement("p");
+  reason.className = "blocked-reason";
+  reason.textContent = (overlay && overlay.reason) || "This task is blocked.";
+  bl.body.append(reason);
+  const clearBtn = document.createElement("button");
+  clearBtn.className = "btn primary";
+  clearBtn.textContent = "Clear";
+  clearBtn.title = "Release the block so this task can run again";
+  clearBtn.addEventListener("click", async () => {
+    await resetTask(task, clearBtn);
+    if (typeof rerender === "function") rerender();
+  });
+  bl.body.append(clearBtn);
+  return bl.panel;
 }
 
 // Thumbs up/down rating for a run — the operator's manual quality verdict,
@@ -3999,18 +4042,19 @@ function taskDetailContent(brief, draft, opts = {}) {
   const run = found ? found.run : null;
   const isNow = locked;
   let status;
-  let blockedReason;
   if (creating) status = "pending";
   else if (isNow) status = state.player.state === "paused" ? "paused" : "running";
   else if (brief.completed) status = "completed";
   else if (brief.quarantined) status = "quarantined";
   else if (brief.failed) status = "failed";
-  else if (rec) status = rec.status;
+  // The blocked overlay is the current, actionable state — surfaced ahead of a
+  // stale prior run record so the pane reflects "Blocked" (its reason lives in
+  // the BLOCKED section below LOG) rather than the earlier attempt's outcome.
   else if (state.blockedTasks && task in state.blockedTasks) {
     const overlay = state.blockedTasks[task];
     status = (overlay && overlay.state) || "blocked";
-    blockedReason = (overlay && overlay.reason) || undefined;
   }
+  else if (rec) status = rec.status;
   else status = "pending";
 
   // The new-task pane leads with a "new task" line in place of the File/Status
@@ -4019,7 +4063,7 @@ function taskDetailContent(brief, draft, opts = {}) {
     frag.append(metaGrid([["File", "new task"], ["Status", "Not yet created"]]));
   } else {
     const enhanced = !!(brief.frontmatter_raw && brief.frontmatter_raw.enhanced);
-    frag.append(detailStatusHead(task, status, blockedReason, enhanced));
+    frag.append(detailStatusHead(task, status, enhanced));
     // Thumbs verdict on the latest run — the task-level satisfaction signal
     // the enhanced-vs-raw stats aggregate.
     if (rec && run && run.id) {
@@ -4027,22 +4071,6 @@ function taskDetailContent(brief, draft, opts = {}) {
       frag.append(ratingControls(runId, rec.rating || null, {
         onSaved: (next) => { applyLocalRating(runId, next); rerender(); },
       }));
-    }
-    // Reset button for non-conflict blocked tasks (validation-failed,
-    // unroutable, bad-repo-reference). Conflicts keep their own Resolve flow.
-    if (status === "blocked" && state.blockedTasks && state.blockedTasks[task]) {
-      const overlay = state.blockedTasks[task];
-      const isConflict = overlay && (
-        overlay.failure_kind === "merge_conflict" ||
-        overlay.failure_kind === "merge_rejected"
-      );
-      if (!isConflict) {
-        const resetBtn = document.createElement("button");
-        resetBtn.className = "btn primary";
-        resetBtn.textContent = "Reset";
-        resetBtn.addEventListener("click", () => resetTask(task, resetBtn));
-        frag.append(resetBtn);
-      }
     }
   }
 
@@ -4154,6 +4182,15 @@ function taskDetailContent(brief, draft, opts = {}) {
     frag.append(lg.panel);
   }
 
+  // BLOCKED — an expandable section, directly below LOG, shown only while the
+  // task carries a blocked overlay. Expanding it reveals the blocked reason;
+  // a Clear button releases the DB hold so the task is dispatchable again
+  // (the same release the STATUS → Ready selection performs on Save).
+  if (!creating && status === "blocked") {
+    const overlay = (state.blockedTasks && state.blockedTasks[task]) || {};
+    frag.append(blockedSection(task, overlay, rerender));
+  }
+
   // Settings — segmented switches (left) + model dropdown (right). A plain
   // (always-open, unlabelled) panel below the log, not an expando.
   const set = document.createElement("section");
@@ -4252,6 +4289,22 @@ async function saveDetail(brief, draft, errEl) {
   if (!ok) {
     if (errEl) { errEl.textContent = (data && data.error) || "could not save task"; errEl.hidden = false; }
     return;
+  }
+  // Releasing the block is a separate action from the frontmatter PATCH: the
+  // blocked overlay is a manager-owned DB hold, not a task flag. When the
+  // operator moved the STATUS control off Blocked (e.g. to Ready), clear the
+  // hold so the task is dispatchable again.
+  if (draft.blockedInitial && !draft.blocked) {
+    const rel = await sendJSON(
+      `/api/tasks/${encodeURIComponent(brief.task)}/reset${queueParam()}`, "POST");
+    if (!rel.ok) {
+      if (errEl) {
+        errEl.textContent = (rel.data && rel.data.error) || "could not clear blocked status";
+        errEl.hidden = false;
+      }
+      return;
+    }
+    await loadBlocked();
   }
   await loadQueue();  // title/enable/evergreen changes alter the queue rows
   closeDetailScreen();
@@ -4457,7 +4510,7 @@ function renderHistoryDetail() {
   $("detail-screen-title").textContent = rec.title || rec.task;
   body.innerHTML = "";
 
-  body.append(detailStatusHead(rec.task, rec.status, undefined, !!rec.enhanced));
+  body.append(detailStatusHead(rec.task, rec.status, !!rec.enhanced));
 
   // Thumbs verdict on this run (the enhanced-vs-raw satisfaction signal).
   if (run && run.id) {

@@ -1037,6 +1037,18 @@ body {
 /* `display: flex` above outranks the UA `[hidden]` rule, so restate the hide. */
 .xpanel-body[hidden] { display: none; }
 
+/* The blocked reason inside the detail pane's BLOCKED section: a wrapping,
+   monospace block so multi-line validate/resolve output stays legible. */
+.blocked-reason {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--err);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* The detail pane treats every label as a caption — UPPERCASE across the page. */
 #screen-detail .meta-k,
 #screen-detail .detail-field-label,
