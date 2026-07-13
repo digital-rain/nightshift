@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any, Protocol, assert_never
 
 from nightshift.lifecycle import (
@@ -336,6 +337,19 @@ def _qkey(queue: str | None) -> str:
     return queue or ""
 
 
+def _parse_since(since: str) -> datetime:
+    """Parse an ISO-8601 ``since`` bound into a tz-aware datetime.
+
+    The analytics UI sends ``Date.toISOString()`` (e.g. ``2026-07-01T00:00:00.000Z``).
+    asyncpg binds to ``timestamptz`` only from a datetime, not a str; a naive
+    value is assumed UTC so the comparison matches how timestamps are stored.
+    """
+    dt = datetime.fromisoformat(since)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
+
 class SqlRunner(Protocol):
     """The statement-execution surface both dialects provide: asyncpg's
     connection satisfies it structurally; the SQLite runner translates the
@@ -560,8 +574,10 @@ class SqlStoreBase:
             clauses.append(f"worker_id = ${len(values)}")
         if since is not None:
             # ISO-8601 timestamp lower bound on the run's start; used by the
-            # analytics UI's time windows (24h / 7d / …).
-            values.append(since)
+            # analytics UI's time windows (24h / 7d / …). Parse to a datetime so
+            # asyncpg can bind it to timestamptz (it rejects a bare str); the
+            # SQLite seam re-serializes datetimes to the same ISO format.
+            values.append(_parse_since(since))
             clauses.append(f"started_at >= ${len(values)}")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         values.append(limit)

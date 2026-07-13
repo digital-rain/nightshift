@@ -11,6 +11,7 @@ directly against the merged ``attempts`` surface.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 
 import pytest
 
@@ -26,6 +27,7 @@ from nightshift.lifecycle import (
     Transition,
     TransitionEvent,
 )
+from nightshift.manager.store import _parse_since
 from nightshift.manager.store_sqlite import SqliteStore
 from nightshift.transitions import on_deadline, on_operator_stop
 
@@ -604,6 +606,30 @@ def test_invariant_4_every_terminal_attempt_has_finished_at() -> None:
     _run(scenario())
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2026-07-01T00:00:00.000Z",  # Date.toISOString() — what the UI sends
+        "2026-07-01T00:00:00+00:00",
+        "2026-07-01T00:00:00Z",
+    ],
+)
+def test_parse_since_returns_tz_aware_datetime(value: str) -> None:
+    """asyncpg binds `since` to timestamptz and rejects a bare str, so the store
+    parses it to a tz-aware datetime before binding (regression for the analytics
+    500 on the PgStore)."""
+    parsed = _parse_since(value)
+    assert isinstance(parsed, datetime)
+    assert parsed.tzinfo is not None
+
+
+def test_parse_since_assumes_utc_when_naive() -> None:
+    """A naive ISO value is assumed UTC so the comparison matches stored UTC
+    timestamps."""
+    parsed = _parse_since("2026-07-01T00:00:00")
+    assert parsed.utcoffset() == UTC.utcoffset(None)
+
+
 def test_list_attempts_since_filter() -> None:
     """The analytics time-window filter: `since` restricts to attempts whose
     started_at is at or after the given ISO timestamp. A past bound returns
@@ -623,6 +649,13 @@ def test_list_attempts_since_filter() -> None:
         # A bound far in the future excludes everything.
         future = await store.list_attempts(since="2999-01-01T00:00:00+00:00")
         assert future == []
+        # The analytics UI sends Date.toISOString() ("…Z", milliseconds); the
+        # store must accept that format (regression: a bare str "…Z" reached
+        # asyncpg and 500'd the PgStore because timestamptz needs a datetime).
+        past_z = await store.list_attempts(since="2000-01-01T00:00:00.000Z")
+        assert len(past_z) == 3
+        future_z = await store.list_attempts(since="2999-01-01T00:00:00.000Z")
+        assert future_z == []
         # Combines with the existing worker_id filter.
         scoped = await store.list_attempts(
             worker_id="w1", since="2000-01-01T00:00:00+00:00"
