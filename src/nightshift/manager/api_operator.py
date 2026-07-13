@@ -62,6 +62,7 @@ from nightshift.spawn_daily import (
 from nightshift.task_files import (
     create_task,
     delete_task,
+    failed_tasks,
     frontmatter_held_tasks,
     import_task,
     list_queue,
@@ -509,6 +510,14 @@ def register_operator_api(
                     changes[key] = value
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
+        if "disabled" in changes and not changes.get("disabled"):
+            try:
+                current = read_task(tasks_root, task, target_rel)
+                if current.get("failed"):
+                    changes.setdefault("failed", False)
+                    changes.setdefault("failed_reason", None)
+            except FileNotFoundError:
+                pass
         try:
             updated = set_task_meta(tasks_root, task, changes, target_rel)
         except FileNotFoundError:
@@ -813,6 +822,17 @@ def register_operator_api(
         if req.action == "play":
             await store.set_queue_pause(key, None)
             _queue_failure_state[key] = failure_policy.QueueFailureState()
+            target_rel = playlists_mod.tasks_rel(target)
+            fm_failed = failed_tasks(tasks_root, target_rel)
+            if fm_failed:
+                for row in fm_failed:
+                    set_task_meta(
+                        tasks_root, row["task"],
+                        {"failed": False, "failed_reason": None},
+                        target_rel,
+                    )
+                    await store.clear_task_backoff(target, row["task"])
+                await _commit(f"nightshift: play {key} — release failed tasks")
         elif req.action == "pause":
             await store.set_queue_pause(key, "operator")
         elif req.action == "stop":

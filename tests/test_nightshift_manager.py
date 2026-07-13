@@ -1841,16 +1841,20 @@ def test_full_failure_lifecycle_drain_then_retry_then_quarantine(tmp_path: Path)
             "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
         ).json()["work"] is None
 
-        # Operator presses Play -> phase B: only failed tasks remain, earliest
-        # retries (once its backoff elapses).
+        # Operator presses Play -> clears failed flags on both tasks, unpauses.
         client.post("/api/transport", json={"action": "play", "queue": None})
-        _clear_backoff(store, "10.a")
+        assert client.get("/api/tasks/10.a").json()["failed"] is False
+        assert client.get("/api/tasks/20.b").json()["failed"] is False
+
+        # 10.a dispatches as a fresh attempt (not a Phase B retry).
         retry = client.post(
             "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
         ).json()["work"]
         assert retry is not None and retry["task"] == "10.a"
 
-        # It fails again -> quarantined + queue paused with retry_failed.
+        # Fails again -> quarantined (counter threshold: 2 consecutive
+        # no-progress runs). No retry_failed pause since this isn't tracked
+        # as a retry (play cleared the failed flag).
         client.post(
             f"/api/worker/runs/{retry['run_id']}/submit",
             json={
@@ -1860,19 +1864,14 @@ def test_full_failure_lifecycle_drain_then_retry_then_quarantine(tmp_path: Path)
                 "landable": False, "backend": "claude-code", "model": "claude-sonnet-4-6",
             },
         )
-        state = client.get("/api/state").json()
-        assert state["queues"]["main"]["pause_reason"] == "retry_failed"
         blocked = {b["task"]: b for b in client.get("/api/blocked").json()}
         assert blocked["10.a"]["state"] == "quarantined"
 
-        # Quarantine is also in frontmatter.
         brief = client.get("/api/tasks/10.a").json()
         assert brief["quarantined"] is True
         assert brief["quarantine_reason"]
 
-        # Play again -> phase B resumes with the next failed task (20.b).
-        client.post("/api/transport", json={"action": "play", "queue": None})
-        _clear_backoff(store, "20.b")
+        # 20.b dispatches next (also released by play).
         retry2 = client.post(
             "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
         ).json()["work"]
@@ -1960,6 +1959,90 @@ def test_toggle_failed_off_releases_for_dispatch(tmp_path: Path) -> None:
             "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
         ).json()["work"]
         assert work is not None and work["task"] == "10.a"
+
+
+def test_play_clears_failed_and_dispatches(tmp_path: Path) -> None:
+    """Pressing play on a queue with failed tasks clears the failed state
+    and makes them immediately dispatchable — no separate PATCH needed."""
+    root = _seed(tmp_path, {"10.a": "Do a thing.", "20.b": "Do another thing."})
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        _poll_and_submit_error(client, "10.a")
+        _poll_and_submit_error(client, "20.b")
+
+        assert client.get("/api/tasks/10.a").json()["failed"] is True
+        assert client.get("/api/tasks/20.b").json()["failed"] is True
+        assert client.get("/api/state").json()["queues"]["main"]["state"] == "paused"
+
+        client.post("/api/transport", json={"action": "play", "queue": None})
+
+        assert client.get("/api/tasks/10.a").json()["failed"] is False
+        assert client.get("/api/tasks/20.b").json()["failed"] is False
+
+        work = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        assert work is not None and work["task"] == "10.a"
+
+
+def test_reenable_disabled_failed_task_clears_failed(tmp_path: Path) -> None:
+    """Disabling a failed task and re-enabling it clears the failed state."""
+    root = _seed(tmp_path, {"10.a": "Do a thing.", "20.b": "Do another thing."})
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        _poll_and_submit_error(client, "10.a")
+
+        brief = client.get("/api/tasks/10.a").json()
+        assert brief["failed"] is True
+
+        client.patch("/api/tasks/10.a", json={"disabled": True})
+        brief2 = client.get("/api/tasks/10.a").json()
+        assert brief2["disabled"] is True
+        assert brief2["failed"] is True
+
+        client.patch("/api/tasks/10.a", json={"disabled": False})
+        brief3 = client.get("/api/tasks/10.a").json()
+        assert brief3["disabled"] is False
+        assert brief3["failed"] is False
+
+        work = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        assert work is not None and work["task"] == "10.a"
+
+
+def test_multiple_failed_tasks_independently_recoverable(tmp_path: Path) -> None:
+    """Two failed tasks in the same queue can each be independently recovered
+    via separate PATCH+play without leaving residual error state."""
+    root = _seed(tmp_path, {"10.a": "A.", "20.b": "B.", "30.c": "C."})
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        _poll_and_submit_error(client, "10.a")
+        _poll_and_submit_error(client, "20.b")
+
+        assert client.get("/api/tasks/10.a").json()["failed"] is True
+        assert client.get("/api/tasks/20.b").json()["failed"] is True
+
+        # Recover only 10.a via PATCH + play.
+        client.post("/api/transport", json={"action": "play", "queue": None})
+        client.patch("/api/tasks/10.a", json={"failed": False})
+
+        brief_a = client.get("/api/tasks/10.a").json()
+        assert brief_a["failed"] is False
+
+        # 20.b was also released by play.
+        brief_b = client.get("/api/tasks/20.b").json()
+        assert brief_b["failed"] is False
+
+        work = client.post(
+            "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+        ).json()["work"]
+        assert work is not None and work["task"] == "10.a"
+
+        # No residual blocked state for either task.
+        blocked = {b["task"]: b for b in client.get("/api/blocked").json()}
+        assert "10.a" not in blocked
+        assert "20.b" not in blocked
 
 
 def test_reset_clears_blocked_task(tmp_path: Path) -> None:
