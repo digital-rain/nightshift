@@ -2664,24 +2664,6 @@ async function resolveTask(runId, task, btn) {
   setView("now");
 }
 
-async function resetTask(task, btn) {
-  const label = btn ? btn.textContent : null;
-  if (btn) { btn.disabled = true; btn.textContent = "Clearing\u2026"; }
-  // queueParam() already yields the full "?queue=<q>" (or "") query string —
-  // append it directly (double-wrapping it once caused a 404 on the reset).
-  const { ok, data } = await sendJSON(
-    `/api/tasks/${encodeURIComponent(task)}/reset${queueParam()}`,
-    "POST",
-  );
-  if (!ok) {
-    alert((data && data.error) || "could not clear blocked status");
-    if (btn) { btn.disabled = false; btn.textContent = label || "Clear"; }
-    return;
-  }
-  await loadBlocked();
-  await loadQueue();
-}
-
 // Inline bot glyph + label for the Resolve button (shared by the markup and the
 // re-enable-on-error path).
 function resolveButtonInner() {
@@ -3742,23 +3724,14 @@ function detailStatusHead(task, status, enhanced) {
 }
 
 // The BLOCKED expando for a blocked task: collapsed by default, it reveals the
-// blocked reason and a Clear button that releases the DB hold (making the task
-// runnable again). Rendered below LOG and only while the task is blocked.
-function blockedSection(task, overlay, rerender) {
+// blocked reason. Rendered below LOG and only while the task is blocked.
+// To clear blocked status, set STATUS to Ready and save.
+function blockedSection(overlay) {
   const bl = expando("Blocked", { open: false });
   const reason = document.createElement("p");
   reason.className = "blocked-reason";
   reason.textContent = (overlay && overlay.reason) || "This task is blocked.";
   bl.body.append(reason);
-  const clearBtn = document.createElement("button");
-  clearBtn.className = "btn primary";
-  clearBtn.textContent = "Clear";
-  clearBtn.title = "Release the block so this task can run again";
-  clearBtn.addEventListener("click", async () => {
-    await resetTask(task, clearBtn);
-    if (typeof rerender === "function") rerender();
-  });
-  bl.body.append(clearBtn);
   return bl.panel;
 }
 
@@ -4183,12 +4156,11 @@ function taskDetailContent(brief, draft, opts = {}) {
   }
 
   // BLOCKED — an expandable section, directly below LOG, shown only while the
-  // task carries a blocked overlay. Expanding it reveals the blocked reason;
-  // a Clear button releases the DB hold so the task is dispatchable again
-  // (the same release the STATUS → Ready selection performs on Save).
+  // task carries a blocked overlay. Expanding it reveals the blocked reason.
+  // To clear blocked status, set STATUS to Ready and save.
   if (!creating && status === "blocked") {
     const overlay = (state.blockedTasks && state.blockedTasks[task]) || {};
-    frag.append(blockedSection(task, overlay, rerender));
+    frag.append(blockedSection(overlay));
   }
 
   // Settings — segmented switches (left) + model dropdown (right). A plain
