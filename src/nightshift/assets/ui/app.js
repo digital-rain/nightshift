@@ -4579,16 +4579,26 @@ function historyActions(run, rec) {
     resolve.addEventListener("click", () => resolveTask(run.id, rec.task, resolve));
     actions.append(resolve);
   }
-  if (state.queue.some((i) => i.task === rec.task)) {
-    const runNow = document.createElement("button");
-    runNow.className = "btn primary";
-    runNow.textContent = "Run now";
-    runNow.addEventListener("click", () => {
-      transport("play", { mode: "oneshot", task: rec.task });
-      clearDetailState();
-      setView("now");
-    });
-    actions.append(runNow);
+  const queueItem = state.queue.find((i) => i.task === rec.task);
+  if (queueItem) {
+    const btn = document.createElement("button");
+    btn.className = "btn primary";
+    if (queueItem.failed) {
+      btn.textContent = "Retry";
+      btn.addEventListener("click", () => {
+        transport("retry", { task: rec.task });
+        clearDetailState();
+        setView("now");
+      });
+    } else {
+      btn.textContent = "Run now";
+      btn.addEventListener("click", () => {
+        transport("play", { mode: "oneshot", task: rec.task });
+        clearDetailState();
+        setView("now");
+      });
+    }
+    actions.append(btn);
   }
   const del = document.createElement("button");
   del.className = "btn danger";

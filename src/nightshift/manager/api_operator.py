@@ -715,7 +715,7 @@ def register_operator_api(
 
     # ----- transport (play/pause/stop/skip) -------------------------------- #
 
-    _VALID_ACTIONS = {"play", "pause", "stop", "skip", "select"}
+    _VALID_ACTIONS = {"play", "pause", "stop", "skip", "select", "retry"}
     _VALID_MODES = {"oneshot", "auto", "repeat"}
 
     # Pause/mode state lives in the store since Phase 7 (a manager restart no
@@ -843,6 +843,33 @@ def register_operator_api(
             await _abort_live_attempts()
         elif req.action == "select":
             _queue_cursors[key] = req.task
+        elif req.action == "retry":
+            if not req.task:
+                return JSONResponse(
+                    {"error": "retry requires a task"}, status_code=400
+                )
+            target_rel = playlists_mod.tasks_rel(target)
+            try:
+                current = read_task(tasks_root, req.task, target_rel)
+            except FileNotFoundError:
+                return JSONResponse({"error": "task not found"}, status_code=404)
+            if current.get("failed"):
+                set_task_meta(
+                    tasks_root, req.task,
+                    {"failed": False, "failed_reason": None},
+                    target_rel,
+                )
+                _queue_failure_state.pop(key, None)
+                await store.clear_task_backoff(target, req.task)
+                await _emit(
+                    "task_released", queue=target, task=req.task,
+                    payload={"prior_state": "failed"},
+                )
+            order = reorder_queue(
+                tasks_root, [req.task], target_rel,
+            )
+            await _commit(f"nightshift: retry {req.task} in {key}")
+            await _emit("queue_changed", queue=target, task=req.task)
         return JSONResponse(await _state_payload())
 
     register_playlist_api(
