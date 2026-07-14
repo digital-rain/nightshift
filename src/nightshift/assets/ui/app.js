@@ -4148,7 +4148,19 @@ function taskDetailContent(brief, draft, opts = {}) {
     frag.append(org.panel);
   }
 
+  // RUN DETAILS / LOG — when the task has a run record (live or historical).
+  // RUN DETAILS is shown even before final timings exist so fields like the
+  // validate command are visible while a run is in progress.
+  if (rec) {
+    const rd = expando("Run details", { open: false });
+    rd.body.append(metaGrid(runDetailPairs(run, rec)));
+    frag.append(rd.panel);
+    const tb = tokenBreakdownPanel(rec);
+    if (tb) frag.append(tb);
+  }
+
   // NOTES — free-form, multi-line editable text area for operator notes.
+  // Positioned as the last section before LOG.
   {
     const notesArea = document.createElement("textarea");
     notesArea.rows = 4;
@@ -4163,16 +4175,6 @@ function taskDetailContent(brief, draft, opts = {}) {
     frag.append(nt.panel);
   }
 
-  // RUN DETAILS / LOG — when the task has a run record (live or historical).
-  // RUN DETAILS is shown even before final timings exist so fields like the
-  // validate command are visible while a run is in progress.
-  if (rec) {
-    const rd = expando("Run details", { open: false });
-    rd.body.append(metaGrid(runDetailPairs(run, rec)));
-    frag.append(rd.panel);
-    const tb = tokenBreakdownPanel(rec);
-    if (tb) frag.append(tb);
-  }
   if (isNow || rec) {
     const runId = isNow ? (state.player.run_id || state.currentRunId) : (run && run.id);
     const lg = expando(isNow ? "Live log" : "Log", { open: isNow });
@@ -4551,7 +4553,15 @@ function renderHistoryDetail() {
   brf.body.append(brief);
   body.append(brf.panel);
 
+  // RUN DETAILS — only meaningful for tasks that have run, so it's history-only.
+  const rd = expando("Run details", { open: true });
+  rd.body.append(metaGrid(runDetailPairs(run, rec)));
+  body.append(rd.panel);
+  const tb = tokenBreakdownPanel(rec);
+  if (tb) body.append(tb);
+
   // NOTES — editable free-form text area for operator notes on this run.
+  // Positioned as the last section before LOG.
   {
     const notesArea = document.createElement("textarea");
     notesArea.rows = 4;
@@ -4588,13 +4598,6 @@ function renderHistoryDetail() {
     notesSaveRow.append(notesErr, notesSave);
     body.append(notesSaveRow);
   }
-
-  // RUN DETAILS — only meaningful for tasks that have run, so it's history-only.
-  const rd = expando("Run details", { open: true });
-  rd.body.append(metaGrid(runDetailPairs(run, rec)));
-  body.append(rd.panel);
-  const tb = tokenBreakdownPanel(rec);
-  if (tb) body.append(tb);
 
   // LOG — the run's captured output (history-only).
   const lg = expando("Log", { open: false });
