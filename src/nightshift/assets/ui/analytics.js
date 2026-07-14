@@ -112,6 +112,8 @@
     let turnsSum = 0;
     let turnsCount = 0;
     let landedCost = 0;
+    const nonLanded = [];
+    const valFail = [];
     for (const r of terminal) {
       const c = num(r.cost_usd);
       cost += c;
@@ -124,7 +126,20 @@
         turnsCount++;
       }
       if (r.landed) landedCost += c;
+      else nonLanded.push(r);
+      if (r.failure_kind === "validation_error") valFail.push(r);
     }
+    const nonLandedCost = nonLanded.reduce((s, r) => s + num(r.cost_usd), 0);
+    const valFailCost = valFail.reduce((s, r) => s + num(r.cost_usd), 0);
+    const byTask = groupBy(terminal, (r) => r.task);
+    let neverLandedTasks = 0;
+    let neverLandedCost = 0;
+    byTask.forEach((list) => {
+      if (list.length >= 2 && !list.some((r) => r.landed)) {
+        neverLandedTasks++;
+        neverLandedCost += list.reduce((s, r) => s + num(r.cost_usd), 0);
+      }
+    });
     const landRate = terminal.length ? landed.length / terminal.length : null;
     return {
       runs: terminal.length,
@@ -140,6 +155,12 @@
       cacheHitRate: inTok > 0 ? cacheRead / inTok : null,
       avgTurns: turnsCount ? turnsSum / turnsCount : null,
       hasCost: costRuns > 0,
+      nonLandedCount: nonLanded.length,
+      nonLandedCost,
+      valFailCount: valFail.length,
+      valFailCost,
+      neverLandedTasks,
+      neverLandedCost,
     };
   }
 
@@ -275,6 +296,30 @@
         cur.cacheHitRate !== null ? fmtPct(cur.cacheHitRate) : "—",
         fmtTokens(cur.cacheRead) + " cached in",
         deltaBadge(cur.cacheHitRate, prior.cacheHitRate, { lowerIsBetter: false })
+      )
+    );
+    row.append(
+      kpiCard(
+        "Non-landed spend",
+        cur.hasCost ? fmtMoney(cur.nonLandedCost) : "—",
+        cur.nonLandedCount + " runs",
+        deltaBadge(cur.nonLandedCost, prior.nonLandedCost, { lowerIsBetter: true })
+      )
+    );
+    row.append(
+      kpiCard(
+        "Validation burn",
+        cur.hasCost ? fmtMoney(cur.valFailCost) : "—",
+        cur.valFailCount + " runs failed the gate",
+        deltaBadge(cur.valFailCost, prior.valFailCost, { lowerIsBetter: true })
+      )
+    );
+    row.append(
+      kpiCard(
+        "Never-landed retries",
+        String(cur.neverLandedTasks),
+        cur.hasCost ? fmtMoney(cur.neverLandedCost) + " burned" : "tasks retried, no land",
+        deltaBadge(cur.neverLandedTasks, prior.neverLandedTasks, { lowerIsBetter: true })
       )
     );
     container.append(row);
@@ -427,65 +472,34 @@
 
   function renderWaste(container, runs) {
     const terminal = runs.filter(isTerminal);
-    const nonLanded = terminal.filter((r) => !r.landed);
-    const nonLandedCost = nonLanded.reduce((s, r) => s + num(r.cost_usd), 0);
-
-    // Validation-failure burn: runs that ran an agent then failed the gate.
-    const valFail = terminal.filter((r) => r.failure_kind === "validation_error");
-    const valFailCost = valFail.reduce((s, r) => s + num(r.cost_usd), 0);
-
-    // Tasks attempted multiple times that never landed (grouped by task).
-    const byTask = groupBy(terminal, (r) => r.task);
-    let neverLandedTasks = 0;
-    let neverLandedCost = 0;
-    byTask.forEach((list) => {
-      if (list.length >= 2 && !list.some((r) => r.landed)) {
-        neverLandedTasks++;
-        neverLandedCost += list.reduce((s, r) => s + num(r.cost_usd), 0);
-      }
-    });
-
-    const anyCost = terminal.some((r) => hasNum(r.cost_usd));
-    const panel = el("div", "an-panel");
-    panel.append(el("h3", "an-panel-title", "Waste"));
-    const cards = el("div", "an-kpi-row");
-    cards.append(
-      kpiCard("Non-landed spend", anyCost ? fmtMoney(nonLandedCost) : "—", nonLanded.length + " runs")
-    );
-    cards.append(
-      kpiCard("Validation burn", anyCost ? fmtMoney(valFailCost) : "—", valFail.length + " runs failed the gate")
-    );
-    cards.append(
-      kpiCard("Never-landed retries", String(neverLandedTasks), anyCost ? fmtMoney(neverLandedCost) + " burned" : "tasks retried, no land")
-    );
-    panel.append(cards);
 
     // Top-5 most expensive runs.
     const priced = terminal.filter((r) => hasNum(r.cost_usd)).sort((a, b) => b.cost_usd - a.cost_usd);
-    if (priced.length) {
-      const table = el("table", "an-table");
-      const thead = el("thead");
-      const htr = el("tr");
-      ["Task", "Model", "Turns", "Tokens", "Cost", "Landed"].forEach((h) => htr.append(el("th", null, h)));
-      thead.append(htr);
-      table.append(thead);
-      const tbody = el("tbody");
-      for (const r of priced.slice(0, 5)) {
-        const tr = el("tr");
-        tr.append(el("td", "an-td-key", r.task || "—"));
-        tr.append(el("td", null, r.model || "—"));
-        tr.append(el("td", null, hasNum(r.turns) ? String(r.turns) : "—"));
-        tr.append(el("td", null, fmtTokens(totalInput(r) + num(r.output_tokens))));
-        tr.append(el("td", null, fmtMoney(r.cost_usd)));
-        const landedCell = el("td", null, r.landed ? "✓" : "✗");
-        landedCell.className = r.landed ? "an-ok" : "an-bad";
-        tr.append(landedCell);
-        tbody.append(tr);
-      }
-      table.append(tbody);
-      const label = el("div", "an-subhead", "Most expensive runs");
-      panel.append(label, table);
+    if (!priced.length) return;
+    const panel = el("div", "an-panel");
+    panel.append(el("h3", "an-panel-title", "Waste"));
+    const table = el("table", "an-table");
+    const thead = el("thead");
+    const htr = el("tr");
+    ["Task", "Model", "Turns", "Tokens", "Cost", "Landed"].forEach((h) => htr.append(el("th", null, h)));
+    thead.append(htr);
+    table.append(thead);
+    const tbody = el("tbody");
+    for (const r of priced.slice(0, 5)) {
+      const tr = el("tr");
+      tr.append(el("td", "an-td-key", r.task || "—"));
+      tr.append(el("td", null, r.model || "—"));
+      tr.append(el("td", null, hasNum(r.turns) ? String(r.turns) : "—"));
+      tr.append(el("td", null, fmtTokens(totalInput(r) + num(r.output_tokens))));
+      tr.append(el("td", null, fmtMoney(r.cost_usd)));
+      const landedCell = el("td", null, r.landed ? "✓" : "✗");
+      landedCell.className = r.landed ? "an-ok" : "an-bad";
+      tr.append(landedCell);
+      tbody.append(tr);
     }
+    table.append(tbody);
+    const label = el("div", "an-subhead", "Most expensive runs");
+    panel.append(label, table);
     container.append(panel);
   }
 
