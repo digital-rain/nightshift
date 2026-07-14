@@ -257,7 +257,13 @@ function isResolvable(task) {
 // API helpers
 // --------------------------------------------------------------------------
 async function getJSON(url) {
-  const r = await fetch(url);
+  const r = await fetch(url, { headers: { Accept: "application/json" } });
+  if (!r.ok) {
+    // Surface a clean HTTP error instead of letting r.json() choke on a
+    // non-JSON error body (e.g. a 500's plain-text "Internal Server Error").
+    const detail = (await r.text().catch(() => "")).trim();
+    throw new Error(`${url} -> ${r.status}` + (detail ? `: ${detail.slice(0, 200)}` : ""));
+  }
   return r.json();
 }
 async function sendJSON(url, method, body) {
@@ -2161,10 +2167,13 @@ function renderStats() {
   _analyticsMounted = true;
   Analytics.render(body, {
     title: "Analytics",
+    // Fetch FLEET-WIDE (no queue param): the module scopes client-side via its
+    // queue dropdown, seeded to the focused queue. Server-side scoping here
+    // once hid other queues' failures entirely, skewing land rate and cost.
+    defaultQueue: state.activePlaylist || "",
     fetchRuns: async (sinceIso) => {
       const params = new URLSearchParams();
       if (sinceIso) params.set("since", sinceIso);
-      if (state.activePlaylist) params.set("queue", state.activePlaylist);
       const qs = params.toString();
       return getJSON("/api/analytics/runs" + (qs ? "?" + qs : ""));
     },

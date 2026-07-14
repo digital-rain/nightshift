@@ -8,7 +8,13 @@
  *   Analytics.render(container, {
  *     title: "Analytics",
  *     fetchRuns: async (sinceIso) => [ <normalized run record>, ... ],
+ *     defaultQueue: "<queue>",   // optional initial queue scope ("" = main);
+ *                                // omit for "All queues"
  *   })
+ *
+ * fetchRuns must return FLEET-WIDE records (no server-side queue filter):
+ * queue scoping is a client-side dropdown here, so failures in another queue
+ * are one selection away instead of silently excluded from the stats.
  *
  * A normalized run record (both adapters must produce this shape):
  *   { task, queue, model, backend, worker_id, status, landed (bool),
@@ -903,6 +909,18 @@
     return Array.from(set).sort();
   }
 
+  // ---- queue scope ------------------------------------------------------- //
+
+  // The storage key of the main queue is "" (falsy), so it needs its own
+  // normalization and display label — distinct()/groupBy() would drop it.
+  function queueKey(r) {
+    return r.queue || "";
+  }
+
+  function queueLabel(key) {
+    return key === "" ? "main" : key;
+  }
+
   // ---- top-level render -------------------------------------------------- //
 
   function render(container, opts) {
@@ -913,7 +931,17 @@
     }
 
     // View state, kept locally on the container so re-render is cheap.
-    const view = { window: "7d", dimension: "all", value: "all", runs: [], loaded: false };
+    // `queue` is the client-side scope: null = all queues, else a queue key
+    // ("" = main). Seeded from opts.defaultQueue (the host's focused queue) so
+    // the page opens scoped, with "All queues" one selection away.
+    const view = {
+      window: "7d",
+      dimension: "all",
+      value: "all",
+      queue: typeof opts.defaultQueue === "string" ? opts.defaultQueue : null,
+      runs: [],
+      loaded: false,
+    };
 
     clear(container);
     container.classList.add("an-root");
@@ -934,6 +962,33 @@
         winGroup.append(btn);
       }
       controls.append(winGroup);
+
+      // Queue scope dropdown: every queue seen in the loaded (fleet-wide)
+      // runs, then a separator, then "All queues". Scoping is client-side so
+      // switching never refetches — and failures in another queue are one
+      // selection away instead of invisible.
+      const queueKeys = new Set(view.runs.map(queueKey));
+      if (view.queue !== null) queueKeys.add(view.queue);
+      const queueSel = el("select", "an-select");
+      for (const key of Array.from(queueKeys).sort()) {
+        const o = el("option", null, queueLabel(key));
+        o.value = "q:" + key;
+        if (view.queue === key) o.selected = true;
+        queueSel.append(o);
+      }
+      const sep = el("option", null, "───");
+      sep.disabled = true;
+      queueSel.append(sep);
+      const allQueues = el("option", null, "All queues");
+      allQueues.value = "all";
+      if (view.queue === null) allQueues.selected = true;
+      queueSel.append(allQueues);
+      queueSel.addEventListener("change", () => {
+        view.queue = queueSel.value === "all" ? null : queueSel.value.slice(2);
+        renderControls();
+        renderBody();
+      });
+      controls.append(queueSel);
 
       // Dimension filter (model / backend / queue), populated from loaded runs.
       const dims = [
@@ -979,8 +1034,10 @@
     }
 
     function filteredRuns() {
-      if (view.dimension === "all" || view.value === "all") return view.runs;
-      return view.runs.filter((r) => r[view.dimension] === view.value);
+      let runs = view.runs;
+      if (view.queue !== null) runs = runs.filter((r) => queueKey(r) === view.queue);
+      if (view.dimension === "all" || view.value === "all") return runs;
+      return runs.filter((r) => r[view.dimension] === view.value);
     }
 
     function renderBody() {
