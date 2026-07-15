@@ -174,7 +174,7 @@ class OperatorConfig:
 ### 3.3 The three surface models
 
 - **`ManagerSettings`** = the manager file model, composed of:
-  - server fields (`host`, `port`) [`Server & Network`],
+  - server fields (`host`, `port`) [`Identity & connection`],
   - `Cadences` (nested → `manager.json` `"cadences": {…}`) [`Cadences`],
   - the existing `tasks_repo`, `wip_ref_prefix`, `landing_mode`, `rendezvous_remote`,
   - `OperatorConfig` (the ~22 absorbed keys), flattened to the top level of `manager.json`.
@@ -232,10 +232,10 @@ Source of truth for Parts 2–3. `apply` is the initial classification (verify p
 
 | Field (JSON key) | Category | Type | Default | apply | Notes |
 |---|---|---|---|---|---|
-| `host` | Server & Network | string | `0.0.0.0` | restart | env `NIGHTSHIFT_MANAGER_HOST` |
-| `port` | Server & Network | int | `8800` | restart | env `NIGHTSHIFT_MANAGER_PORT` |
-| `shared_secret` | Server & Network | string (secret) | `null` | restart | **→ `.env`** `NIGHTSHIFT_SHARED_SECRET` |
-| `dsn` | Server & Network | string (secret) | `null` | restart | **→ `.env`** `NIGHTSHIFT_PG_DSN` |
+| `host` | Identity & connection | string | `0.0.0.0` | restart | env `NIGHTSHIFT_MANAGER_HOST` |
+| `port` | Identity & connection | int | `8800` | restart | env `NIGHTSHIFT_MANAGER_PORT` |
+| `shared_secret` | Identity & connection | string (secret) | `null` | restart | **→ `.env`** `NIGHTSHIFT_SHARED_SECRET` |
+| `dsn` | Identity & connection | string (secret) | `null` | restart | **→ `.env`** `NIGHTSHIFT_PG_DSN` |
 | `cadences.poll_seconds` | Cadences | float | `5.0` | restart | nested |
 | `cadences.heartbeat_seconds` | Cadences | float | `10.0` | restart | nested |
 | `cadences.lease_ttl_seconds` | Cadences | float | `120.0` | restart | nested |

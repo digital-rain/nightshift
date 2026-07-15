@@ -202,19 +202,19 @@ class ManagerSettings:
     """
 
     host: str = field(default="0.0.0.0", metadata=meta(
-        category="Server & Network", label="Host",
+        category="Identity & connection", label="Host",
         desc="Bind address for the manager HTTP server.",
         apply="restart", env="NIGHTSHIFT_MANAGER_HOST"))
     port: int = field(default=8800, metadata=meta(
-        category="Server & Network", label="Port",
+        category="Identity & connection", label="Port",
         desc="Bind port (operator UI + worker/operator API).",
         apply="restart", env="NIGHTSHIFT_MANAGER_PORT"))
     shared_secret: str | None = field(default=None, metadata=meta(
-        category="Server & Network", label="Shared secret",
+        category="Identity & connection", label="Shared secret",
         desc="If set, every worker call must send a matching header.",
         apply="restart", secret=True, env="NIGHTSHIFT_SHARED_SECRET"))
     dsn: str | None = field(default=None, metadata=meta(
-        category="Server & Network", label="Database DSN",
+        category="Identity & connection", label="Database DSN",
         desc="Nightshift's own Postgres DSN; unset = in-memory store.",
         apply="restart", secret=True, env="NIGHTSHIFT_PG_DSN"))
 

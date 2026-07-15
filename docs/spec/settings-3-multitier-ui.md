@@ -18,7 +18,7 @@ The current Settings is a cramped modal with a flat field list and a Raw-JSON te
 
 - The gear menu's **Settings…** switches the main pane to `view="settings"` (peer of the existing `workers`/`repos` views), rather than opening `#settings-modal`. Remove the old modal markup/handlers once the view is in.
 - Layout:
-  - **Left sidebar (tiers):** top-level groups `Manager` / `Player` (manager app) — each expands to its categories (`Server & Network`, `Cadences`, `Scheduling`, `Landing & Git`, `Worker execution policy`, `Conflict resolution`, …). Worker app shows the single `Worker` tier with its categories.
+  - **Left sidebar (tiers):** top-level groups `Manager` / `Player` (manager app) — each expands to its categories (`Identity & connection`, `Cadences`, `Scheduling`, `Landing & Git`, `Worker execution policy`, `Conflict resolution`, …). Worker app shows the single `Worker` tier with its categories.
   - **Right pane:** the selected category's fields rendered as labeled rows (label + description + control + per-field affordances). A top **search box** filters fields across all categories by label/key/description (VS Code behavior); a match jumps/scrolls and highlights.
   - **Sticky Save bar** (bottom): "N unsaved changes", **Discard**, **Save**. Disabled when clean.
 

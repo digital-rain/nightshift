@@ -68,7 +68,7 @@ class TestRegistryProjection:
         for s in manager_specs:
             if not categories or categories[-1] != s.category:
                 categories.append(s.category)
-        assert categories[0] == "Server & Network"
+        assert categories[0] == "Identity & connection"
         assert "Cadences" in categories
 
     def test_store_correct_for_non_secret(self):
