@@ -94,6 +94,28 @@ restart port="":
     fi
     just manager "{{port}}"
 
+# Kill every nightshift manager/worker/slackd process (SIGTERM then SIGKILL). Use to clear zombies orphaned by an editor restart.
+expunge:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pids=$(pgrep -f 'nightshift\.(manager|worker|slack\.slackd)' || true)
+    if [ -z "$pids" ]; then
+        echo "no nightshift processes running"
+        exit 0
+    fi
+    echo "stopping nightshift processes: $pids"
+    kill $pids 2>/dev/null || true
+    for _ in $(seq 1 20); do
+        pgrep -f 'nightshift\.(manager|worker|slack\.slackd)' >/dev/null || break
+        sleep 0.25
+    done
+    stragglers=$(pgrep -f 'nightshift\.(manager|worker|slack\.slackd)' || true)
+    if [ -n "$stragglers" ]; then
+        echo "still alive after SIGTERM; sending SIGKILL to: $stragglers"
+        kill -9 $stragglers 2>/dev/null || true
+    fi
+    printf "{{GREEN}}expunged{{ENDCOLOR}}\n"
+
 # ----- database -----
 
 # Apply Nightshift's migrations to NIGHTSHIFT_PG_DSN (idempotent).

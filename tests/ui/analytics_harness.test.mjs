@@ -209,4 +209,23 @@ test("marginal turn yield renders bucket rows", () => {
   assert.match(text, /11–20/);
 });
 
+// ---- queue-scope fallback ----------------------------------------------------
+// The host seeds defaultQueue with its focused queue, but that queue may have
+// no runs at all (e.g. the manager's main queue while all work happens in
+// playlists). The module must widen to "All queues" instead of rendering an
+// empty "No runs in this window" over a fleet that has plenty of data.
+
+const scoped = new FakeNode("div");
+window.Analytics.render(scoped, {
+  defaultQueue: "", // main queue — none of the synthetic runs live there
+  fetchRuns: async () => [runA, runB, runLegacy],
+});
+await new Promise((r) => setTimeout(r, 0));
+const scopedText = textOf(scoped);
+
+test("empty seeded queue scope falls back to all queues", () => {
+  assert.doesNotMatch(scopedText, /No runs in this window/);
+  assert.match(scopedText, /Cost \/ landed change/);
+});
+
 console.log(`\n${passed} passed`);

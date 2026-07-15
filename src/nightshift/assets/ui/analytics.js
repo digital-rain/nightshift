@@ -953,6 +953,10 @@
       dimension: "all",
       value: "all",
       queue: typeof opts.defaultQueue === "string" ? opts.defaultQueue : null,
+      // The seeded queue is a guess (the host's focused queue may have no runs
+      // at all — e.g. an unused main queue). Until the operator explicitly
+      // picks a scope, an empty seed falls back to "All queues" on load.
+      queueTouched: false,
       runs: [],
       loaded: false,
     };
@@ -999,6 +1003,7 @@
       queueSel.append(allQueues);
       queueSel.addEventListener("change", () => {
         view.queue = queueSel.value === "all" ? null : queueSel.value.slice(2);
+        view.queueTouched = true;
         renderControls();
         renderBody();
       });
@@ -1101,6 +1106,16 @@
         return;
       }
       view.loaded = true;
+      // If the seeded queue scope matches nothing in the loaded fleet-wide
+      // runs, showing "No runs in this window" would be a lie of scoping, not
+      // data. Widen to "All queues" until the operator picks a scope herself.
+      if (
+        !view.queueTouched &&
+        view.queue !== null &&
+        !view.runs.some((r) => queueKey(r) === view.queue)
+      ) {
+        view.queue = null;
+      }
       renderControls();
       renderBody();
     }
