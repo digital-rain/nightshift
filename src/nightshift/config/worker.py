@@ -15,6 +15,7 @@ from typing import Any
 from nightshift import backends as backends_mod
 from nightshift.config.io import load_dotenv, load_json, save_json, worker_json_path
 from nightshift.config.meta import meta
+from nightshift.config.player import parse_si_int
 from nightshift.model_id import is_qualified, join_model, provider_of
 
 
@@ -54,7 +55,8 @@ class NightshiftBackendConfig:
         ))
     max_tokens: int = field(default=4096, metadata=meta(
         category="Nightshift harness", label="Max output tokens",
-        desc="Per-request output cap."))
+        desc="Per-request output cap (accepts SI suffixes: k, Mi, Gi, Ti).",
+        type="si_int"))
     effort: str = field(default="off", metadata=meta(
         category="Nightshift harness", label="Thinking effort",
         desc="Extended-thinking effort (off disables thinking).",
@@ -373,7 +375,7 @@ def _load_nightshift(data: Any) -> NightshiftBackendConfig:
         enabled=_parse_bool(None, d.get("enabled", defaults.enabled)),
         vendor=str(d.get("vendor", defaults.vendor)),
         model=str(d.get("model", defaults.model)),
-        max_tokens=int(d.get("max_tokens", defaults.max_tokens)),
+        max_tokens=parse_si_int(d.get("max_tokens", defaults.max_tokens)),
         effort=str(d.get("effort", defaults.effort)),
         enable_cache=_parse_bool(None, d.get("enable_cache", defaults.enable_cache)),
         cache_ttl=str(d.get("cache_ttl", defaults.cache_ttl)),

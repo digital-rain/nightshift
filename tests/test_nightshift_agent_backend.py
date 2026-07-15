@@ -295,6 +295,17 @@ def test_load_nightshift_defaults_when_absent() -> None:
     assert ns == NightshiftBackendConfig()
 
 
+def test_load_nightshift_si_max_tokens() -> None:
+    ns = _load_nightshift({"max_tokens": "16k"})
+    assert ns.max_tokens == 16 * 1024
+
+    ns = _load_nightshift({"max_tokens": "1Mi"})
+    assert ns.max_tokens == 1024 ** 2
+
+    ns = _load_nightshift({"max_tokens": 8000})
+    assert ns.max_tokens == 8000
+
+
 def test_validate_delta_accepts_enabled_toggle() -> None:
     resolved, errors = validate_delta(
         {"worker": {"nightshift.enabled": True}}, {"worker"}

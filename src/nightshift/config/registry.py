@@ -14,7 +14,7 @@ from typing import Any, Literal, Never, get_type_hints
 
 
 FieldType = Literal[
-    "string", "int", "float", "bool", "enum", "duration",
+    "string", "int", "float", "bool", "enum", "duration", "si_int",
     "string_list", "int_list", "regex_list", "str_map",
 ]
 ApplyMode = Literal["live", "next-task", "restart"]
@@ -174,6 +174,11 @@ def _json_schema_for_type(spec: FieldSpec) -> dict[str, Any]:
             schema = {"type": "string", "enum": spec.options or []}
         case "duration":
             schema = {"type": "string", "pattern": r"^(\d+[smh]\s*)+$"}
+        case "si_int":
+            schema = {"oneOf": [
+                {"type": "integer"},
+                {"type": "string", "pattern": r"^\d+\s*(k|K|Mi|Gi|Ti)$"},
+            ]}
         case "string_list":
             schema = {"type": "array", "items": {"type": "string"}}
         case "int_list":

@@ -22,6 +22,39 @@ from nightshift.config.meta import meta
 _DURATION_RE = re.compile(r"(\d{1,9})\s{0,10}([smh])", re.IGNORECASE)
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600}
 
+_SI_RE = re.compile(r"(\d{1,15})\s{0,10}([kKMGT]i?)\b")
+_SI_MULTIPLIERS = {
+    "k": 1024, "K": 1024,
+    "Mi": 1024 ** 2, "Gi": 1024 ** 3, "Ti": 1024 ** 4,
+}
+
+
+def parse_si_int(value: str | int) -> int:
+    """Parse a value like ``16k``, ``1Mi``, or a plain integer into an int.
+
+    Raises :class:`ValueError` on unrecognised input.
+    """
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if not text:
+        raise ValueError("value is empty")
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    m = _SI_RE.fullmatch(text)
+    if not m:
+        raise ValueError(f"invalid SI value: {value!r} (use e.g. 16k, 1Mi, 2Gi)")
+    digits, suffix = m.group(1), m.group(2)
+    multiplier = _SI_MULTIPLIERS.get(suffix)
+    if multiplier is None:
+        raise ValueError(f"unknown SI suffix: {suffix!r} (use k, K, Mi, Gi, Ti)")
+    result = int(digits) * multiplier
+    if result <= 0:
+        raise ValueError("value must be greater than zero")
+    return result
+
 
 def parse_duration(value: str) -> int:
     """Parse a duration like ``30m`` or ``1h30m`` into seconds. Raises on junk."""

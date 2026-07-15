@@ -19,7 +19,7 @@ from nightshift.config.io import (
     save_json,
     worker_json_path,
 )
-from nightshift.config.player import parse_duration
+from nightshift.config.player import parse_duration, parse_si_int
 from nightshift.config.registry import (
     FieldSpec,
     Store,
@@ -59,6 +59,15 @@ def _validate_field(spec: FieldSpec, value: Any) -> str | None:
                 return "expected duration string"
             try:
                 parse_duration(value)
+            except ValueError as exc:
+                return str(exc)
+        case "si_int":
+            if isinstance(value, bool):
+                return "expected integer or SI string (e.g. 16k, 1Mi)"
+            if not isinstance(value, (int, str)):
+                return "expected integer or SI string (e.g. 16k, 1Mi)"
+            try:
+                parse_si_int(value)
             except ValueError as exc:
                 return str(exc)
         case "string_list":
@@ -147,6 +156,8 @@ def _validate_semantic(spec: FieldSpec, value: Any) -> str | None:
 
 def _normalize_field(spec: FieldSpec, value: Any) -> Any:
     """Apply field-specific normalization after validation passes."""
+    if spec.type == "si_int":
+        return parse_si_int(value)
     if spec.key == "wip_ref_prefix" and isinstance(value, str):
         try:
             return normalize_wip_prefix(value)

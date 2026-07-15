@@ -108,6 +108,7 @@ class TestRegistryProjection:
         assert by_key[("manager", "scheduled_models_allow")].type == "string_list"
         assert by_key[("player", "theme")].type == "enum"
         assert by_key[("player", "repeat_interval")].type == "duration"
+        assert by_key[("worker", "nightshift.max_tokens")].type == "si_int"
         assert by_key[("worker", "model_aliases")].type == "str_map"
 
     def test_dotted_keys_for_cadences(self):
@@ -229,6 +230,68 @@ class TestPutValidation:
         delta = {"player": {"repeat_interval": "xyz"}}
         _, errors = validate_delta(delta, {"player"})
         assert "player.repeat_interval" in errors
+
+    def test_si_int_accepts_plain_int(self):
+        from nightshift.config.validate import validate_delta
+
+        delta = {"worker": {"nightshift.max_tokens": 8192}}
+        resolved, errors = validate_delta(delta, {"worker"})
+        assert not errors
+        assert resolved["worker"]["nightshift.max_tokens"] == 8192
+
+    def test_si_int_accepts_k_suffix(self):
+        from nightshift.config.validate import validate_delta
+
+        delta = {"worker": {"nightshift.max_tokens": "16k"}}
+        resolved, errors = validate_delta(delta, {"worker"})
+        assert not errors
+        assert resolved["worker"]["nightshift.max_tokens"] == 16 * 1024
+
+    def test_si_int_accepts_K_suffix(self):
+        from nightshift.config.validate import validate_delta
+
+        delta = {"worker": {"nightshift.max_tokens": "16K"}}
+        resolved, errors = validate_delta(delta, {"worker"})
+        assert not errors
+        assert resolved["worker"]["nightshift.max_tokens"] == 16 * 1024
+
+    def test_si_int_accepts_Mi_suffix(self):
+        from nightshift.config.validate import validate_delta
+
+        delta = {"worker": {"nightshift.max_tokens": "1Mi"}}
+        resolved, errors = validate_delta(delta, {"worker"})
+        assert not errors
+        assert resolved["worker"]["nightshift.max_tokens"] == 1024 ** 2
+
+    def test_si_int_accepts_Gi_suffix(self):
+        from nightshift.config.validate import validate_delta
+
+        delta = {"worker": {"nightshift.max_tokens": "2Gi"}}
+        resolved, errors = validate_delta(delta, {"worker"})
+        assert not errors
+        assert resolved["worker"]["nightshift.max_tokens"] == 2 * 1024 ** 3
+
+    def test_si_int_accepts_Ti_suffix(self):
+        from nightshift.config.validate import validate_delta
+
+        delta = {"worker": {"nightshift.max_tokens": "1Ti"}}
+        resolved, errors = validate_delta(delta, {"worker"})
+        assert not errors
+        assert resolved["worker"]["nightshift.max_tokens"] == 1024 ** 4
+
+    def test_bad_si_int_rejected(self):
+        from nightshift.config.validate import validate_delta
+
+        delta = {"worker": {"nightshift.max_tokens": "garbage"}}
+        _, errors = validate_delta(delta, {"worker"})
+        assert "worker.nightshift.max_tokens" in errors
+
+    def test_si_int_rejects_bool(self):
+        from nightshift.config.validate import validate_delta
+
+        delta = {"worker": {"nightshift.max_tokens": True}}
+        _, errors = validate_delta(delta, {"worker"})
+        assert "worker.nightshift.max_tokens" in errors
 
     def test_bad_regex_rejected(self):
         from nightshift.config.validate import validate_delta
