@@ -3,7 +3,7 @@
 **Subject:** A task frontmatter field that runs a brief through a named, declarative multi-step *workflow* — a small state machine of agent steps, each its own attempt with its own model, prompt, inputs, and budget — instead of the single-shot brief→run→land path. The first shipped workflow is `plan-review-implement`: a planning model writes an implementation plan, the implementing model reviews it, the planner reconciles the feedback, and a fresh instance of the implementing model implements the revised plan.
 **Status:** Proposed — for implementation. Where this doc and the code disagree once implemented, the code governs and this doc should be updated.
 **Default:** No workflow. Existing paths — single-shot, `enhance`, `split`, retry/resolve — are untouched; a task without `workflow:` frontmatter behaves byte-identically to today.
-**Relationship:** `enhance` remains the light rewrite for small tasks (a workflow task skips create-time enhance — the plan step subsumes it). `split` remains brief decomposition. The goal-loop spec (`2026-07-04-loop-tasks.md`) is a *different* iteration axis (one goal, N runs, done-check); workflows may later express it, but this spec neither depends on nor changes it.
+**Relationship:** `enhance` remains the light rewrite for small tasks (a workflow task skips create-time enhance — the plan step subsumes it). Standalone `split: true` keeps its meaning; workflows can also *end* in a decomposition (`kind: "split"` step, §3.1) so children are cut from a reviewed plan. `evergreen` composes: the brief survives completion and the workflow resets each cycle (§6.5) — the janitor shape. The goal-loop spec (`2026-07-04-loop-tasks.md`) is a *different* iteration axis (one goal, N runs, done-check); composition with workflows is deferred past v1.
 
 ---
 
@@ -67,7 +67,7 @@ Deliberately small, so every workflow stays inspectable and a future editor stay
 
 | Field | Meaning |
 |---|---|
-| `kind` | `"doc"` — no worktree, read-only, produces one artifact; `"code"` — today's full worktree→validate→land path. |
+| `kind` | `"doc"` — no worktree, read-only, produces one artifact; `"code"` — today's full worktree→validate→land path; `"split"` — today's decomposition run (the worker writes child briefs into the split output dir; the manager harvests them) with the step's declared `inputs` materialized, so the children are cut from the plan rather than from the raw brief. |
 | `role` | Model binding key resolved per §3.2. |
 | `prompt` | Asset name under `assets/prompts/` (doc steps). Code steps use the standard `nightshift-local.md` charter with artifact injection (§7.2). |
 | `inputs` | Artifact names materialized for the step. `"brief"` is always available; others must be a prior step's `output`. |
@@ -77,7 +77,7 @@ Deliberately small, so every workflow stays inspectable and a future editor stay
 | `next` | Explicit successor (defaults to the following step in the list; the last step's default is `"$end"`). |
 | `max_visits` | Optional int: how many times this step may be *entered* before the task quarantines (§6.4). Default 1 for steps not on a cycle; required (validation error if absent) for any step reachable from itself. |
 
-`$end` from a code step means land-and-consume as today. `$end` from a doc step terminates the task without a land: the brief is marked `completed` (retained for operator review, like the loop spec's completion shape) and the final artifact is kept with it — the shape a verify step needs when it finds no gaps (§10). A workflow whose *default* path never reaches a code step is a definition error (there would be nothing to implement).
+`$end` from a code step means land-and-consume as today. `$end` from a split step consumes the parent exactly like today's decomposition (`on_split_result`) — the children carry the work forward. `$end` from a doc step terminates the task without a land: the brief is marked `completed` (retained for operator review, like the loop spec's completion shape) and the final artifact is kept with it — the shape a verify step needs when it finds no gaps (§10). A workflow whose *default* path never reaches a code or split step is a definition error (there would be nothing to implement). Split steps must route to `$end` (a decomposition mid-workflow has no meaningful successor — the parent's work now lives in the children).
 
 ### 3.2 Role → model resolution
 
@@ -100,7 +100,13 @@ The resolved id lands in the work order's existing `config.model` slot, so the w
 | `workflow_step` | string | **engine** | Current step id. Written as a transition effect through the tasks-repo executor (the `FrontmatterFlag` lane, extended to string fields). Absent until first dispatch. |
 | `workflow_visits` | string | **engine** | Compact visit counters, e.g. `plan:1,review:1,implement:2`. Operator-visible progress; never hand-edited. |
 
-Exclusions (UI-prevented, engine-ignored): `workflow` + `split`, `workflow` + `loop`, `workflow` + `evergreen`. `enhance` on create is skipped for workflow tasks (the plan step subsumes it); the create UI's segment becomes **Off | Enhance | Workflow** with a workflow picker.
+Compositions:
+
+- `workflow` + `evergreen` — **supported**: the brief survives workflow completion and the workflow *resets* for the next cycle (§6.5). This is the janitor shape: a recurring diagnose→plan→execute workflow whose plan differs every cycle because the diagnosis does (errors in the logs, drifted docs, flaky tests).
+- `workflow` + decomposition — **supported as a step kind**, not a frontmatter combination: a `kind: "split"` terminal step (§3.1) harvests child briefs from the plan. The `split: true` frontmatter flag keeps its existing single-shot meaning and is ignored on a workflow task (the definition, not the flag, says where decomposition happens).
+- `workflow` + `loop` — **not in v1** (UI-prevented, engine-ignored). The goal-loop's across-run iteration axis and the workflow cursor need a deliberate composition design first.
+
+`enhance` on create is skipped for workflow tasks (the plan step subsumes it); the create UI's segment becomes **Off | Enhance | Workflow** with a workflow picker.
 
 ## 5. Artifacts
 
@@ -113,7 +119,7 @@ Exclusions (UI-prevented, engine-ignored): `workflow` + `split`, `workflow` + `l
 
 Materialization on the worker mirrors the brief: each input artifact's text is embedded in the work order and written to the run-scratch dir (`materialize_brief`'s sibling, `materialize_artifacts`) — read-only files outside any worktree, paths injected into the prompt header.
 
-Artifacts are deleted with the brief on terminal consumption (land of the final step / operator delete), and retained alongside it on quarantine.
+Artifacts are deleted with the brief on terminal consumption (land or split-harvest of the final step / operator delete), deleted-and-reset on an evergreen cycle's completion (§6.5), and retained alongside the brief on quarantine.
 
 **Repo convention note:** operators who keep specs in-repo (e.g. `docs/specs/`) get that by *authoring it in the plan prompt's charter* ("include copying the plan to docs/specs/<task>.md in the implementation") — a convention, not engine machinery.
 
@@ -136,7 +142,7 @@ Artifacts are deleted with the brief on terminal consumption (land of the final 
 }
 ```
 
-plus the step's `max_turns` overriding the blob's. `kind: "code"` steps omit `prompt`/`output` and carry only `artifacts`.
+plus the step's `max_turns` overriding the blob's. `kind: "code"` steps omit `prompt`/`output` and carry only `artifacts`. `kind: "split"` steps set the blob's existing `split: true` (the worker's decomposition path is reused verbatim) and carry `artifacts` so the plan is materialized for the decomposing agent.
 
 ### 6.3 Step transitions
 
@@ -145,14 +151,26 @@ New pure function `transitions.on_workflow_step` (fed by `on_submit`, which bran
 - **Doc step, completed** with a document → attempt `NO_CHANGE`-analog terminal state (`AttemptState.NO_CHANGE`, `result_line` = the step + signal), effects: commit artifact, advance `workflow_step` per the extracted signal (§7.3) or `next`, increment `workflow_visits`, `Progress.RESET`. Brief retained. `queue_changed` + `task_result` events as usual.
 - **Doc step, completed without a document** → `worker_error` through the normal retry ladder; the cursor does not move.
 - **Doc step, blocked / error** → today's `_blocked_transition` / `_error_transition` verbatim; the cursor does not move; retry/hold/quarantine ladders apply per failure kind.
-- **Code step, completed & landable** → `GitPhase.LAND` as today. On a confirmed land: if the step's route is `$end`, the standard `_landed_transition` with `drop_brief=True` (artifacts dropped with it); otherwise (a mid-workflow code step, e.g. inside a verify loop) the landed transition runs with `drop_brief=False` and the cursor advances.
+- **Code step, completed & landable** → `GitPhase.LAND` as today. On a confirmed land: if the step's route is `$end`, the standard `_landed_transition` (brief consumption per §6.5); otherwise (a mid-workflow code step, e.g. inside a verify loop) the landed transition runs with `drop_brief=False` and the cursor advances.
 - **Code step, validation failure** → today's `VALIDATION_ERROR` → HOLD, branch preserved, cursor unmoved.
+- **Split step, completed** → `GitPhase.HARVEST_SPLIT` → `on_split_result` as today: children enqueued, parent consumed (evergreen: retained and reset per §6.5). Children are ordinary tasks — each may carry its own `model:`, `after:` dependencies for sequencing, or even its own `workflow:`.
 
 ### 6.4 Budgets and termination
 
 - Entering a step past its `max_visits` quarantines the task with reason `workflow budget exhausted at '<step>' after N visits` — quarantine, not `failed`, for the same reason as the loop spec: budget exhaustion is an operator decision, not a retry.
 - Step-level failures consume the *existing* ladders (`attempts_without_progress`, backoff, quarantine threshold) — `max_visits` counts successful entries, not retries of a failing step.
 - Operator delete / quarantine-clear behave as today; clearing a quarantined workflow task resumes at its recorded `workflow_step`.
+
+### 6.5 Completion — consume or reset
+
+When the cursor routes to `$end`:
+
+- **Non-evergreen** (the default): the brief is consumed exactly as today's land/split consumes it (`drop_brief=True` on land; `on_split_result`'s parent consumption); artifacts are deleted with it.
+- **Evergreen**: the brief is retained and the workflow **resets** — the engine clears `workflow_step` and `workflow_visits` and deletes the cycle's artifacts, in the same tasks-repo commit that today flips evergreen state back to runnable. The next dispatch starts a fresh cycle at the first step with a clean slate; the previous cycle's artifacts remain recoverable in the tasks repo's git history, and its attempts/telemetry remain in the store.
+
+The full-reset rule is deliberate: a janitor workflow's plan is a function of *this cycle's* diagnosis (the errors in the logs today), so stale artifacts must never leak into the next cycle as inputs. Anything a cycle should remember, it lands (in the target repo) — memory travels through the repo, not through artifacts, the same principle the goal-loop spec uses for its state note.
+
+Evergreen composes with either terminal kind: an evergreen workflow ending in a code step is the recurring janitor (diagnose → plan → fix); ending in a split step it is a recurring *dispatcher* (diagnose → plan → cut child tasks each cycle, e.g. one child per subsystem found drifting).
 
 ## 7. Worker semantics
 
@@ -232,15 +250,16 @@ with `implement.next = "verify"` and `max_visits` on `implement`/`verify`. Mid-w
 - **A workflow editor.** The JSON format is designed to make one tractable later; v1 ships definitions as files.
 - **Free-form predicates.** Decisions branch on declared sentinel tokens and the engine's own outcomes (validation, land) — never on engine-evaluated expressions over artifacts.
 - **Cross-task or manager-tracked sessions.** §7.5 is the entire session story.
-- **Replacing enhance / split / loop / the single-shot path.** Converging defaults onto the workflow engine is a possible later cleanup, after the engine earns trust; nothing in v1 rewrites a working path.
+- **Replacing enhance / single-shot split / loop / the single-shot path.** The `kind: "split"` step reuses the decomposition machinery; it does not replace the standalone `split: true` task shape. Converging defaults onto the workflow engine is a possible later cleanup, after the engine earns trust; nothing in v1 rewrites a working path.
+- **Workflow + goal-loop composition.** Deferred past v1 (§4); evergreen cycling covers the recurring case.
 - **Non-markdown artifacts.** Artifacts are named markdown documents, only.
 
 ## 12. Touch points (implementation checklist)
 
-- New `src/nightshift/workflows.py` — definition load/validate/resolve (roles, steps, edges), pure; `assets/workflows/plan-review-implement.json`.
+- New `src/nightshift/workflows.py` — definition load/validate/resolve (roles, steps, edges), pure; shipped definitions `assets/workflows/plan-review-implement.json` and `assets/workflows/plan-split.json` (plan → review → revise → split: the reviewed plan becomes child briefs executed as ordinary tasks — the large-feature decomposition shape).
 - `config/manager.py` — `planner_model` field (settings registry, env `NIGHTSHIFT_PLANNER_MODEL`); queue `config.json` keys `workflow`, `workflow_models` (documented, no schema change needed).
 - `lifecycle.py` — `Outcome.document`, `Outcome.signal`; `SubmitPolicy` gains the step context (or a sibling `WorkflowPolicy`).
-- `transitions.py` — `on_workflow_step` + the `drop_brief` generalization (`terminal and not evergreen`); artifact-commit and frontmatter-cursor effects on `TaskEffects`.
+- `transitions.py` — `on_workflow_step` + the `drop_brief` generalization (`terminal and not evergreen`); the evergreen workflow-reset effect (§6.5); artifact-commit and frontmatter-cursor effects on `TaskEffects`; split-step routing to `HARVEST_SPLIT`/`on_split_result` with evergreen retention.
 - `manager/scheduler.py` — per-step model on `TaskCandidate` for workflow tasks.
 - `manager/work_orders.py` — the `workflow` config block, artifact embedding.
 - `manager/api_worker.py` — submit: signal honoring, artifact commit dispatch, cursor advance, `next_order` chaining against the registry.
@@ -249,7 +268,7 @@ with `implement.next = "verify"` and `max_visits` on `implement`/`verify`. Mid-w
 - `prompts.py` — `extract_signal`; header injection for artifacts/`$OUTPUT_FILE`; new assets `workflow-plan.md`, `workflow-review.md`, `workflow-revise.md`; the conditional plan paragraph in `nightshift-local.md`.
 - `assets/ui/app.js` — create segment + picker, step badge, artifact viewer.
 - `docs/user/configuration-reference.md` — frontmatter (`workflow`, `planner_model`, engine fields) + queue keys.
-- Tests — definition validation (cycle requires `max_visits`; doc `$end` rejected); role resolution ladder; scheduler per-step routing + unroutable; doc-step execute (output file, clean-checkout guard, missing doc); signal extraction and undeclared-token ignore; cursor transitions incl. every failure shape leaving the cursor unmoved; chaining handoff + affinity miss; artifact commit/overwrite/drop; budget quarantine; verify-loop definition runs end-to-end on the engine unmodified.
+- Tests — definition validation (cycle requires `max_visits`; default path must reach code/split; split step must route `$end`); role resolution ladder; scheduler per-step routing + unroutable; doc-step execute (output file, clean-checkout guard, missing doc); split-step execute with plan materialized; signal extraction and undeclared-token ignore; cursor transitions incl. every failure shape leaving the cursor unmoved; chaining handoff + affinity miss; artifact commit/overwrite/drop; evergreen completion resets cursor/visits/artifacts and the next dispatch starts at step one; budget quarantine; verify-loop definition runs end-to-end on the engine unmodified.
 
 ## 13. Implementation order
 
