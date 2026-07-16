@@ -1,4 +1,4 @@
-# <img src="src/nightshift/assets/ui/logos/winged-moon.png" alt="Nightshift logo" width="64" align="center" /> Nightshift
+# <img src="src/nightshift/assets/ui/logos/winged-moon.png" alt="Nightshift logo" width="48" align="center" /> Nightshift
 
 A pull-based overnight agent task runner.
 
