@@ -131,15 +131,6 @@
     }
     const nonLandedCost = nonLanded.reduce((s, r) => s + num(r.cost_usd), 0);
     const valFailCost = valFail.reduce((s, r) => s + num(r.cost_usd), 0);
-    const byTask = groupBy(terminal, (r) => r.task);
-    let neverLandedTasks = 0;
-    let neverLandedCost = 0;
-    byTask.forEach((list) => {
-      if (list.length >= 2 && !list.some((r) => r.landed)) {
-        neverLandedTasks++;
-        neverLandedCost += list.reduce((s, r) => s + num(r.cost_usd), 0);
-      }
-    });
     const landRate = terminal.length ? landed.length / terminal.length : null;
     return {
       runs: terminal.length,
@@ -159,8 +150,6 @@
       nonLandedCost,
       valFailCount: valFail.length,
       valFailCost,
-      neverLandedTasks,
-      neverLandedCost,
     };
   }
 
@@ -260,18 +249,18 @@
     const row = el("div", "an-kpi-row");
     row.append(
       kpiCard(
-        "Cost / landed change",
-        cur.hasCost ? fmtMoney(cur.costPerLanded) : "—",
-        cur.landedRuns + " landed",
-        deltaBadge(cur.costPerLanded, prior.costPerLanded, { lowerIsBetter: true })
-      )
-    );
-    row.append(
-      kpiCard(
         "Total spend",
         cur.hasCost ? fmtMoney(cur.cost) : "—",
         cur.hasCost ? fmtMoney(cur.landedCost) + " on landed" : cur.runs + " runs",
         deltaBadge(cur.cost, prior.cost, { lowerIsBetter: true })
+      )
+    );
+    row.append(
+      kpiCard(
+        "Cost / landed change",
+        cur.hasCost ? fmtMoney(cur.costPerLanded) : "—",
+        cur.landedRuns + " landed",
+        deltaBadge(cur.costPerLanded, prior.costPerLanded, { lowerIsBetter: true })
       )
     );
     row.append(
@@ -320,14 +309,6 @@
         cur.hasCost ? fmtMoney(cur.valFailCost) : "—",
         cur.valFailCount + " runs failed the gate",
         deltaBadge(cur.valFailCost, prior.valFailCost, { lowerIsBetter: true })
-      )
-    );
-    row.append(
-      kpiCard(
-        "Never-landed retries",
-        String(cur.neverLandedTasks),
-        cur.hasCost ? fmtMoney(cur.neverLandedCost) + " burned" : "tasks retried, no land",
-        deltaBadge(cur.neverLandedTasks, prior.neverLandedTasks, { lowerIsBetter: true })
       )
     );
     container.append(row);
