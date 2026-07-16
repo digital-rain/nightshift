@@ -231,7 +231,7 @@ A step receives **only** its declared `inputs` — implement gets brief + revise
 - Queue rows / detail: a workflow task shows a step badge — `plan → review → revise → implement` with the cursor highlighted and `workflow_visits` counts (e.g. `implement 2/4`); artifacts are viewable from the detail pane (rendered markdown, read-only).
 - Quarantine reasons and blocked reasons surface as today.
 
-## 10. Verify and gap-plan steps — `refine` (v1) and the verify loop (post-v1)
+## 10. Verify and gap-plan steps — `verify-refine` (v1) and the verify loop (post-v1)
 
 Steps 6–9 of the operator pattern are **definition data only** — no engine change. The looping form:
 
@@ -245,7 +245,7 @@ Steps 6–9 of the operator pattern are **definition data only** — no engine c
 
 with `implement.next = "verify"` and `max_visits` on `implement`/`verify`. Mid-workflow implement steps land per §6.3 (brief retained until `$end`). Gap analysis is mechanical enough that `gap-plan` could bind a cheaper role — the vocabulary already allows it. If the engine cannot express this without code changes, the vocabulary is wrong; this section is the acceptance test for §3.
 
-**Non-looping cousin — `refine` (ships in v1, §12):** the same two steps *without* the back-edge make a standalone audit workflow: verify a landed implementation against its brief/spec → plan the gaps → implement once → `$end` (`verify-clear` short-circuits to `$end` when nothing is missing). Its brief points at the spec to audit against; "plan" here is the gap-fix plan. This is the natural acceptance pass for any large landed feature — including, reflexively, this spec's own implementation, whose first real dogfood should be a `refine` run against this document. Only the *looping* variant above (the back-edge and its `max_visits`) stays post-v1.
+**Non-looping cousin — `verify-refine` (ships in v1, §12):** the same two steps *without* the back-edge make a standalone audit workflow: verify a landed implementation against its brief/spec → plan the gaps → implement once → `$end` (`verify-clear` short-circuits to `$end` when nothing is missing). Its brief points at the spec to audit against; "plan" here is the gap-fix plan. This is the natural acceptance pass for any large landed feature — including, reflexively, this spec's own implementation, whose first real dogfood should be a `verify-refine` run against this document. Only the *looping* variant above (the back-edge and its `max_visits`) stays post-v1.
 
 ## 11. Non-goals
 
@@ -260,7 +260,7 @@ with `implement.next = "verify"` and `max_visits` on `implement`/`verify`. Mid-w
 
 - New `src/nightshift/workflows.py` — definition load/validate/resolve (roles, steps, edges), pure. Shipped definitions, all v1:
   - `assets/workflows/plan-review-implement.json` — the reference workflow (§3.1).
-  - `assets/workflows/refine.json` — verify → gap-plan → implement, non-looping (§10): audit landed work against the brief/spec it names, plan the gaps, fix once. `verify` is `role: implementor`, signals `verify-clear → $end`; `gap-plan` is `role: planner`.
+  - `assets/workflows/verify-refine.json` — verify → gap-plan → implement, non-looping (§10): audit landed work against the brief/spec it names, plan the gaps, fix once. `verify` is `role: implementor`, signals `verify-clear → $end`; `gap-plan` is `role: planner`.
   - `assets/workflows/plan-split.json` — plan → review → revise → split: the reviewed plan becomes child briefs executed as ordinary tasks (the large-feature decomposition shape).
 - `config/manager.py` — `planner_model` field (settings registry, env `NIGHTSHIFT_PLANNER_MODEL`); queue `config.json` keys `workflow`, `workflow_models` (documented, no schema change needed).
 - `lifecycle.py` — `Outcome.document`, `Outcome.signal`; `SubmitPolicy` gains the step context (or a sibling `WorkflowPolicy`).
