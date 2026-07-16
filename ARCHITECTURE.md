@@ -30,9 +30,32 @@ flowchart LR
   end
 ```
 
+## Repository layout
+
+The package is run as `python -m nightshift.<entry>` (the `just` recipes wrap this):
+
+```
+src/nightshift/            the package
+  manager/                 operator + worker HTTP API, operator UI, store, landing, scheduler
+  worker/                  poll loop, per-task execution, worker UI, manager client
+  agent/                   the in-house agentic harness (loop, tools, transport)
+  slack/                   optional inbound capture daemon + outbound notifications
+  git/                     the git seam: runner, worktrees, squash, landing, sync, transport
+  config/                  typed config models + .nightshift/*.json and .env I/O
+  pg.py                    the only asyncpg seam (structural pool type + open_pool)
+  _paths.py                shipped-asset vs. operator-state path resolution
+  assets/                  shipped, package-relative: ui/, ui-worker/, templates/, prompts/, config/, migrations/
+docs/                      setup guide + configuration reference + topics + specs
+tests/                     the scoped test suite
+tools/                     the end-to-end smoke driver + maintenance janitors
+```
+
+Shipped assets are resolved relative to the installed package (`_paths.py`).
+Operator state lives under the **workspace** (below), never inside the package.
+
 ## The workspace
 
-Everything Nightshift touches lives under a single **workspace** directory (the `--workspace` arg, defaulting to `NIGHTSHIFT_WORKSPACE` or the repo root).
+Everything Nightshift touches at run time lives under a single **workspace** directory (the `--workspace` arg, defaulting to `NIGHTSHIFT_WORKSPACE` or the current directory; the `just` recipes forward `NIGHTSHIFT_WORKSPACE`, falling back to the repo dir).
 The workspace parents:
 
 ```
@@ -72,11 +95,11 @@ sequenceDiagram
   W->>W: validate (just validate or per-queue cmd)
 
   alt validated
-    W->>M: POST /api/worker/submit (branch, sha, outcome)
+    W->>M: POST /api/worker/runs/{run_id}/submit (branch, sha, outcome)
     M->>M: Landing lock: squash to main
     M->>G: fast-forward main (+ optional push/PR)
   else blocked / error
-    W->>M: POST /api/worker/submit (outcome=blocked|error)
+    W->>M: POST /api/worker/runs/{run_id}/submit (outcome=blocked|error)
   end
 ```
 
@@ -95,11 +118,21 @@ sequenceDiagram
 
 | Module | Responsibility |
 |--------|---------------|
-| `app.py` | FastAPI app — worker API (`/api/worker/*`), operator API (`/api/*`), SSE (`/api/events`), static UI |
+| `app.py` | FastAPI app assembly — mounts the APIs, SSE, static UI, background loops |
+| `api_worker.py` | Worker-facing API (`/api/worker/*`): checkin, poll, heartbeat, events, submit |
+| `api_operator.py` | Operator-facing API (`/api/*`): queues, tasks, runs, workers, stats, settings, SSE |
+| `api_playlists.py` | Playlist + repo endpoints (`/api/playlists*`, `/api/repos*`) |
+| `api_repo_tasks.py` | Repo-task import endpoints (`/api/queue/repo-tasks*`) |
 | `store.py` | State protocol (`NightshiftStore`) + the shared SQL query layer + `PgStore` |
 | `store_sqlite.py` | `SqliteStore` — the same query layer on in-memory SQLite (tests / no-DB fallback) |
 | `scheduler.py` | Cross-queue next-task arbitration: capability matching, priority, round-robin tiebreak |
+| `work_orders.py` | Work-order assembly — the JSON contract handed to a polling worker |
 | `landing.py` | Git authority — conflict detection, squash, remote policy (none/push/pr) |
+| `reconciler.py` | Periodic recovery/hygiene loop: stale leases, orphan runs, retry state |
+| `failure_policy.py` | Per-queue failure/retry state (quarantine, backoff) — pure, no I/O |
+| `resolve_job.py` | Out-of-process conflict resolver the manager spawns as a separate process |
+| `views.py` | API-compat projections over `attempts` rows (`/api/runs*`, `/api/leases`, SSE) |
+| `wire.py` | Shared wire shapes for the worker- and operator-facing APIs |
 | `hub.py` | SSE broadcast hub for live operator UI updates |
 | `registry.py` | Worker registration and liveness tracking |
 
@@ -112,7 +145,7 @@ The manager serves the operator UI as static files from `src/nightshift/assets/u
 | `loop.py` | `WorkerLoop`: checkin → poll → execute → submit cycle |
 | `execute.py` | Per-task execution: worktree, prompt, backend, validate — stops before landing |
 | `client.py` | HTTP client for the manager API (checkin, poll, heartbeat, submit) |
-| `config.py` | Load `.nightshift/worker.json` + `NIGHTSHIFT_*` env into `WorkerConfig` |
+| `config.py` | Re-export of `config/worker.py`: `.nightshift/worker.json` + `NIGHTSHIFT_*` env → `WorkerConfig` |
 | `local_store.py` | Worker-local run history (for the worker UI) |
 | `ui_app.py` | Minimal worker UI (Now + History) on `:8810` |
 
@@ -126,7 +159,12 @@ The manager serves the operator UI as static files from `src/nightshift/assets/u
 | `repo_tasks.py` | Repo task import: drain a target repo's `.tasks/` publishing inbox into its queue (scan the `main` tree in both legacy layouts, copy to the content store, remove from repo `main` via the landing pipeline) |
 | `preflight.py`, `prompts.py` | Run preconditions, env sync, prompt building |
 | `resolve_runner.py` | Conflict-resolve driver run by the manager's out-of-process resolve job |
-| `backends.py` | Pluggable backend shims: `claude-code`, `cursor`, `gemini`, `anthropic`, `ollama` |
+| `backends.py` | Pluggable backend shims: `claude-code`, `cursor`, `gemini`, `anthropic`, `ollama`, `ollama-cloud`, `nightshift` |
+| `agent/` | The in-house `nightshift` agentic harness: tool loop, tools, API transport |
+| `model_id.py` | Provider-qualified model id parsing (`provider/model`) |
+| `price.py` | Owned price table — per-run `cost_usd` for harness/Anthropic runs |
+| `enhance.py` | Enhance-on-create brief rewrite (one-shot manager-side completion) |
+| `lifecycle.py`, `transitions.py` | Run/task state enums and legal state transitions |
 | `events.py` | Observable event types (`RUN_STARTED`, `TASK_RESULT`, etc.) |
 | `repos.py` | Workspace repo addressing, slug validation, availability checks |
 | `playlists.py` | Queue/playlist management |
@@ -175,7 +213,7 @@ Workers never touch `main`; they produce commits on isolated task branches.
 ### Co-located workers
 
 Share the workspace's repo clones.
-The manager squashes the worker's branch directly via `engine.squash_to_main`.
+The manager squashes the worker's branch directly through the landing pipeline (`git/landing.py`, `git/squash.py`).
 
 ### Remote workers (cross-machine)
 
@@ -185,7 +223,8 @@ See `docs/spec/remote-landing.md`.
 
 ### Landing lock
 
-A process-wide lock (`engine.landing_lock`) serializes all landing operations.
+Every mutation of a canonical repo — landing, origin sync, transport fetch/prune — serializes on one `RepoLock` per `(workspace, repo)` (`git/locks.py`), held by that repo's executor thread (`git/executor.py`).
+Locks are keyed per repo, so lands on different repos never serialize against each other; a cross-process `flock` guards against a separate process touching the same repo.
 Under the lock the manager:
 1. Checks for base-ref drift / content conflict (`git merge-tree`).
 2. Squashes the task branch onto `main`.
@@ -214,7 +253,7 @@ Precedence (highest wins): environment → `.nightshift/*.json` file → built-i
 | File | Scope | Committed |
 |------|-------|-----------|
 | `.nightshift/manager.json` | Manager + task policy: models, cadences, forbidden paths, diff caps, landing mode | Yes |
-| `.nightshift/worker.json` | Worker identity: `worker_id`, `backend`, `models`, `mcps`, `manager_url` | Yes |
+| `.nightshift/worker.json` | Worker identity: `worker_id`, `models`, `mcps`, `manager_url` | Yes |
 | `.nightshift/player.json` | Operator UI/player preferences: theme, transport mode | Yes |
 | `.env` | Secrets only: `NIGHTSHIFT_PG_DSN`, `NIGHTSHIFT_SHARED_SECRET`, API keys | No (gitignored) |
 | Per-queue `config.json` | Queue order, repo binding, validate cmd, priority overrides | Yes (in `nightshift-tasks/`) |
@@ -223,7 +262,7 @@ Key `manager.json` blocks:
 - `cadences` — `poll_seconds`, `heartbeat_seconds`, `lease_ttl_seconds`, `refresh_ms`
 - `scheduled_models_allow` — filter for auto-scheduled recurring tasks (not the UI dropdown source)
 - `forbidden_paths` / `forbidden_template_paths` — paths workers may not modify
-- `default_model` — fallback policy (the backend selector is `worker.json`'s `backend`)
+- `default_model` — the model a brief inherits when it pins none (there is no manager-side backend selector: the provider half of each resolved `provider/model` id picks the backend on the worker)
 
 Scaffold a fresh workspace with `just init` (copies the shipped templates from `src/nightshift/assets/config/`).
 Full reference: [`docs/user/configuration-reference.md`](docs/user/configuration-reference.md).
@@ -267,10 +306,14 @@ No live Postgres required — tests exercise the same SQL query layer through `S
 
 Key test scopes:
 - Manager API and worker protocol (`test_nightshift_manager.py`, `test_nightshift_worker.py`)
-- Landing and conflict detection (`test_nightshift_landing.py`, `test_remote_landing.py`)
+- Landing and conflict detection (`test_nightshift_landing.py`, `test_remote_landing.py`, `test_land_recovery.py`)
 - Scheduler and capability routing (`test_nightshift_scheduler.py`)
 - End-to-end workflow (`test_nightshift_workflow.py`)
-- UI endpoints (`test_nightshift_ui.py`)
+- The git seam (`test_git_seam.py`, `test_git_executor.py`, `test_local_git_ops.py`)
+- The in-house harness (`test_agent_loop.py`, `test_agent_tools.py`, `test_agent_transport.py`)
+- Config models and the settings API (`test_config_model.py`, `test_settings_api.py`)
+
+An end-to-end smoke driver (`tools/smoke.py`, `just smoke`) runs a real manager + worker as subprocesses in an isolated temp workspace; see `docs/topics/smoke-test.md`.
 
 ## Migrations
 
