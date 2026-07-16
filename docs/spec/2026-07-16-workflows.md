@@ -245,6 +245,8 @@ Steps 6–9 of the operator pattern are **definition data only** — no engine c
 
 with `implement.next = "verify"` and `max_visits` on `implement`/`verify`. Mid-workflow implement steps land per §6.3 (brief retained until `$end`). Gap analysis is mechanical enough that `gap-plan` could bind a cheaper role — the vocabulary already allows it. If the engine cannot express this without code changes, the vocabulary is wrong; this section is the acceptance test for §3.
 
+**Non-looping cousin — `verify-fix`:** the same two steps *without* the back-edge make a standalone audit workflow: verify a landed implementation against its brief/spec → plan the gaps → implement once → `$end` (`verify-clear` short-circuits to `$end` when nothing is missing). Its brief points at the spec to audit against; "plan" here is the gap-fix plan. This is the natural acceptance pass for any large landed feature — including, reflexively, this spec's own implementation, whose first real dogfood should be a `verify-fix` run against this document.
+
 ## 11. Non-goals
 
 - **A workflow editor.** The JSON format is designed to make one tractable later; v1 ships definitions as files.
