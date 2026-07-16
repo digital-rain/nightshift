@@ -268,6 +268,14 @@
     );
     row.append(
       kpiCard(
+        "Total spend",
+        cur.hasCost ? fmtMoney(cur.cost) : "—",
+        cur.hasCost ? fmtMoney(cur.landedCost) + " on landed" : cur.runs + " runs",
+        deltaBadge(cur.cost, prior.cost, { lowerIsBetter: true })
+      )
+    );
+    row.append(
+      kpiCard(
         "Land rate",
         cur.landRate !== null ? fmtPct(cur.landRate) : "—",
         cur.runs + " runs",
