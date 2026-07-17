@@ -65,15 +65,15 @@ function wfProvenanceBadge(info) {
   const badge = document.createElement("span");
   if (info && info.shadows_shipped) {
     badge.className = "wf-prov shadow";
-    badge.textContent = "shadows shipped";
-    badge.title = "An operator file overrides the shipped definition of the same name";
+    badge.textContent = "shadows live";
+    badge.title = "An operator file overrides the live definition of the same name";
   } else if (info && info.source === "operator") {
     badge.className = "wf-prov operator";
     badge.textContent = "operator";
   } else {
     badge.className = "wf-prov shipped";
-    badge.textContent = "shipped";
-    badge.title = "Shipped package asset — read-only; duplicate to edit";
+    badge.textContent = "live";
+    badge.title = "Live package asset — read-only; duplicate to edit";
   }
   return badge;
 }
@@ -119,7 +119,7 @@ function renderWorkflowsScreen() {
       const del = document.createElement("button");
       del.type = "button";
       del.className = "ghost-btn danger";
-      del.textContent = info.shadows_shipped ? "Delete (restores shipped)" : "Delete";
+      del.textContent = info.shadows_shipped ? "Delete (restores live)" : "Delete";
       del.addEventListener("click", () => wfDeleteDefinition(name));
       actions.append(del);
     }
@@ -150,7 +150,7 @@ function renderWorkflowsScreen() {
   hint.className = "field-desc";
   hint.textContent =
     "Prompt charters for doc steps. Operator prompts live in " +
-    ".nightshift/prompts/ and shadow shipped ones by filename.";
+    ".nightshift/prompts/ and shadow live ones by filename.";
   body.append(hint);
 
   const pList = document.createElement("ul");
@@ -179,7 +179,7 @@ function renderWorkflowsScreen() {
       const del = document.createElement("button");
       del.type = "button";
       del.className = "ghost-btn danger";
-      del.textContent = info.shadows_shipped ? "Delete (restores shipped)" : "Delete";
+      del.textContent = info.shadows_shipped ? "Delete (restores live)" : "Delete";
       del.addEventListener("click", () => wfDeletePrompt(name));
       actions.append(del);
     }
@@ -201,7 +201,7 @@ async function wfDeleteDefinition(name) {
   const info = wfEd.defs[name] || {};
   const refs = wfTasksReferencing(name);
   let msg = `Delete workflow definition '${name}'?`;
-  if (info.shadows_shipped) msg += "\n\nThis restores the shipped definition of the same name.";
+  if (info.shadows_shipped) msg += "\n\nThis restores the live definition of the same name.";
   if (refs.length) {
     msg += `\n\n${refs.length} queued/blocked task(s) reference it (` +
       refs.slice(0, 5).join(", ") + (refs.length > 5 ? ", …" : "") +
@@ -222,7 +222,7 @@ async function wfDeleteDefinition(name) {
 async function wfDeletePrompt(name) {
   const info = wfEd.prompts[name] || {};
   let msg = `Delete prompt '${name}'?`;
-  if (info.shadows_shipped) msg += "\n\nThis restores the shipped prompt of the same name.";
+  if (info.shadows_shipped) msg += "\n\nThis restores the live prompt of the same name.";
   if (!window.confirm(msg)) return;
   const { ok, data } = await sendJSON(
     `/api/workflow-prompts/${encodeURIComponent(name)}`, "DELETE",
@@ -443,7 +443,7 @@ function renderWorkflowEditor() {
     const del = document.createElement("button");
     del.type = "button";
     del.className = "ghost-btn danger";
-    del.textContent = ed.shadowsShipped ? "Delete (restores shipped)" : "Delete";
+    del.textContent = ed.shadowsShipped ? "Delete (restores live)" : "Delete";
     del.addEventListener("click", async () => {
       await wfDeleteDefinition(ed.name);
       wfEd.editor = null;
@@ -464,7 +464,7 @@ function renderWorkflowEditor() {
     const note = document.createElement("div");
     note.className = "wf-ed-readonly-note";
     note.textContent =
-      "Shipped definitions are read-only package assets. Duplicate to make an editable copy.";
+      "Live definitions are read-only package assets. Duplicate to make an editable copy.";
     body.append(note);
   }
 
@@ -522,7 +522,7 @@ function renderWorkflowEditor() {
     const tgl = document.createElement("button");
     tgl.type = "button";
     tgl.className = "ghost-btn wf-ed-shipped-toggle";
-    tgl.textContent = ed.showShipped ? "Hide shipped original" : "View shipped original";
+    tgl.textContent = ed.showShipped ? "Hide live original" : "View live original";
     tgl.addEventListener("click", () => {
       ed.showShipped = !ed.showShipped;
       renderWorkflowEditor();
@@ -1005,7 +1005,7 @@ function wfUpdateValidationStrip() {
   if (!ed || !strip) return;
   strip.classList.remove("ok", "err", "pending");
   if (ed.readOnly) {
-    strip.textContent = "Read-only (shipped definition).";
+    strip.textContent = "Read-only (live definition).";
     strip.classList.add("pending");
   } else if (ed.validating || ed.valid === null) {
     strip.textContent = "Validating…";
@@ -1034,7 +1034,7 @@ function wfUpdateShadowNote() {
     || (!!info && info.shadows_shipped && !ed.readOnly);
   note.hidden = !shadows;
   note.textContent = shadows
-    ? `Saving as '${name}' shadows the shipped definition of the same name ` +
+    ? `Saving as '${name}' shadows the live definition of the same name ` +
       "(deleting the operator file later restores it)."
     : "";
 }
@@ -1370,7 +1370,7 @@ function renderPromptEditor() {
     const del = document.createElement("button");
     del.type = "button";
     del.className = "ghost-btn danger";
-    del.textContent = pm.shadowsShipped ? "Delete (restores shipped)" : "Delete";
+    del.textContent = pm.shadowsShipped ? "Delete (restores live)" : "Delete";
     del.addEventListener("click", async () => {
       const before = pm.name;
       await wfDeletePrompt(before);
@@ -1396,7 +1396,7 @@ function renderPromptEditor() {
   if (pm.readOnly) {
     const note = document.createElement("div");
     note.className = "wf-ed-readonly-note";
-    note.textContent = "Shipped prompts are read-only package assets. Duplicate to edit.";
+    note.textContent = "Live prompts are read-only package assets. Duplicate to edit.";
     body.append(note);
   }
 
@@ -1452,7 +1452,7 @@ function wfPromptRefreshBar() {
     const shadows = !pm.readOnly && !!target && !!(wfEd.prompts || {})[target]
       && wfEd.prompts[target].source === "shipped";
     status.textContent = shadows
-      ? `Saving shadows the shipped prompt '${target}'.` : "";
+      ? `Saving shadows the live prompt '${target}'.` : "";
   }
 }
 
