@@ -154,13 +154,20 @@ class _OneShotLoop(WorkerLoop):
             blocked_reason="run_local: already attempted",
         ))
 
-    def _process(self, order: dict[str, Any]) -> None:
+    def _process(self, order: dict[str, Any]) -> dict[str, Any]:
         key = (order.get("queue") or "main", order["task"])
         if key in self.attempted:
             self._decline(order)
-            return
+            return {}
         self.attempted.add(key)
-        super()._process(order)
+        # A workflow chain (``next_order``) is the *same* task advancing its
+        # cursor, not a re-offer: follow it inline before the attempted guard
+        # would otherwise decline the next step. Each chained step re-marks the
+        # key (a no-op) and the drain re-polls once the chain ends.
+        result = super()._process(order)
+        while (chained := result.get("next_order")) is not None:
+            result = super()._process(chained)
+        return {}
 
 
 def _free_port() -> int:

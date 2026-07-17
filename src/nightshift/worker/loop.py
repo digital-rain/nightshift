@@ -103,7 +103,12 @@ class WorkerLoop:
         work = resp.get("work")
         if not work:
             return False
-        self._process(work)
+        # Phase 7 chaining (spec §7.4): a doc-step submit may hand back the
+        # next step as ``next_order`` in its response. Process the chain inline
+        # — same lease semantics, no re-poll — until the manager stops chaining.
+        while work is not None:
+            result = self._process(work)
+            work = result.get("next_order")
         return True
 
     def _note_submit_outcome(self, queue_label: str, status: str) -> None:
@@ -127,7 +132,7 @@ class WorkerLoop:
 
     # ------------------------------------------------------------------ #
 
-    def _process(self, order: dict[str, Any]) -> None:
+    def _process(self, order: dict[str, Any]) -> dict[str, Any]:
         run_id = order["run_id"]
         lease_id = order["lease_id"]
         task = order["task"]
@@ -193,13 +198,13 @@ class WorkerLoop:
             hb_stop.set()
             hb.join(timeout=1)
 
-        self._submit(order, outcome)
+        return self._submit(order, outcome)
 
     def _heartbeat_loop(self, lease_id: str, stop: threading.Event) -> None:
         while not stop.wait(self.heartbeat_seconds):
             self.client.heartbeat(self.cfg.worker_id, lease_id=lease_id)
 
-    def _submit(self, order: dict[str, Any], outcome: Outcome) -> None:
+    def _submit(self, order: dict[str, Any], outcome: Outcome) -> dict[str, Any]:
         run_id = order["run_id"]
         task = order["task"]
         # The wire body is the lease/task envelope plus the unified Outcome,
@@ -247,6 +252,7 @@ class WorkerLoop:
                 "quarantined": bool(result.get("quarantined")),
             }
         )
+        return result
 
 
 def _safe_pid() -> int:

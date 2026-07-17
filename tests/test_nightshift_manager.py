@@ -2355,6 +2355,16 @@ def _submit_doc(
     ).json()
 
 
+def _next_order(client: TestClient, resp: dict[str, Any], task: str) -> dict[str, Any]:
+    """The worker's next order for ``task`` after a doc submit: the chained
+    ``next_order`` when present (Phase 7 affinity), else a fresh poll."""
+    chained = resp.get("next_order")
+    if chained is not None:
+        assert chained["task"] == task, chained
+        return chained
+    return _poll(client, task)
+
+
 def _step_of(root: Path, task: str) -> tuple[str | None, str | None]:
     fm = read_task(root / _TASKS_ROOT_NAME, task)["frontmatter"]
     return fm.get("workflow_step"), fm.get("workflow_visits")
@@ -2389,8 +2399,9 @@ def test_workflow_doc_step_commits_artifact_and_advances_cursor(
         # Entry-based counting: the visit map accumulates every step entered.
         assert _step_of(root, "10.feature") == ("review", "plan:1,review:1")
 
-        # The next poll dispatches step 2 with the plan artifact embedded.
-        order2 = _poll(client, "10.feature")
+        # The capable worker gets step 2 in the submit response (Phase 7
+        # chaining) with the plan artifact embedded — no re-poll needed.
+        order2 = resp["next_order"]
         wf2 = order2["config"]["workflow"]
         assert wf2["step"] == "review"
         assert wf2["artifacts"]["plan"].startswith("# The Plan")
@@ -2460,14 +2471,14 @@ def test_workflow_code_step_lands_and_consumes_at_end(tmp_path: Path) -> None:
         client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
 
         # Walk the three doc steps to reach the implement (code, $end) step.
+        # Doc steps chain to the next order in the submit response.
         order = _poll(client, "10.feature")
-        _submit_doc(client, order, document="Plan.")
-        order = _poll(client, "10.feature")
-        _submit_doc(client, order, document="Review.")
-        order = _poll(client, "10.feature")
-        _submit_doc(client, order, document="Revised plan.")
-
-        order = _poll(client, "10.feature")
+        resp = _submit_doc(client, order, document="Plan.")
+        order = _next_order(client, resp, "10.feature")
+        resp = _submit_doc(client, order, document="Review.")
+        order = _next_order(client, resp, "10.feature")
+        resp = _submit_doc(client, order, document="Revised plan.")
+        order = _next_order(client, resp, "10.feature")
         assert order["config"]["workflow"]["step"] == "implement"
         assert order["config"]["workflow"]["kind"] == "code"
         # The implement step embeds the plan artifact for the implementor.
@@ -2545,22 +2556,23 @@ def test_workflow_verify_loop_round_trip(tmp_path: Path) -> None:
         _drain_git(client)
         assert _step_of(root, "10.feature") == ("verify", "implement:1,verify:1")
 
-        # Verify finds gaps (no clear signal) → routes to gap-plan.
+        # Verify finds gaps (no clear signal) → routes to gap-plan (chained).
         order = _poll(client, "10.feature")
         assert order["config"]["workflow"]["step"] == "verify"
-        _submit_doc(client, order, document="Gap: missing tests.")
+        resp = _submit_doc(client, order, document="Gap: missing tests.")
         assert _step_of(root, "10.feature")[0] == "gap-plan"
 
-        # gap-plan's default next re-enters implement (second entry).
-        order = _poll(client, "10.feature")
+        # gap-plan's default next re-enters implement (second entry). A doc step
+        # may chain to a code step order.
+        order = _next_order(client, resp, "10.feature")
         assert order["config"]["workflow"]["step"] == "gap-plan"
-        _submit_doc(client, order, document="Plan: add tests.")
+        resp = _submit_doc(client, order, document="Plan: add tests.")
         step, visits = _step_of(root, "10.feature")
         assert step == "implement"
         assert "implement:2" in visits
 
         # A second verify pass that clears routes to $end and consumes the brief.
-        order = _poll(client, "10.feature")
+        order = _next_order(client, resp, "10.feature")
         assert order["config"]["workflow"]["step"] == "implement"
         wt = setup_worktree(root, order["repo"], "10.feature")
         (wt / "GENERATED.txt").write_text("v2\n")
@@ -2605,8 +2617,8 @@ def test_workflow_budget_quarantine_on_entry(tmp_path: Path) -> None:
         # (max_visits=1) is already spent → entering it again quarantines.
         order = _poll(client, "10.feature")
         assert order["config"]["workflow"]["step"] == "plan"
-        _submit_doc(client, order, document="Plan.")
-        order = _poll(client, "10.feature")
+        resp = _submit_doc(client, order, document="Plan.")
+        order = _next_order(client, resp, "10.feature")
         assert order["config"]["workflow"]["step"] == "implement"
         wt = setup_worktree(root, order["repo"], "10.feature")
         (wt / "GENERATED.txt").write_text("v1\n")
@@ -2629,8 +2641,8 @@ def test_workflow_quarantine_clear_resumes_at_recorded_step(tmp_path: Path) -> N
         client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
         # Advance to review, then quarantine the task there via the worker flag.
         order = _poll(client, "10.feature")
-        _submit_doc(client, order, document="Plan.")
-        order = _poll(client, "10.feature")
+        resp = _submit_doc(client, order, document="Plan.")
+        order = _next_order(client, resp, "10.feature")
         assert order["config"]["workflow"]["step"] == "review"
         client.post(
             f"/api/worker/runs/{order['run_id']}/submit",
@@ -2686,6 +2698,102 @@ def test_workflow_evergreen_end_resets_cursor_and_artifacts(tmp_path: Path) -> N
         order = _poll(client, "10.feature")
         assert order["config"]["workflow"]["step"] == "implement"
         assert _step_of(root, "10.feature") == ("implement", "implement:1")
+
+
+def test_workflow_chain_doc_to_doc_carries_next_order(tmp_path: Path) -> None:
+    """A capable worker's doc submit carries the next step in the response
+    (Phase 7 affinity) — no second poll, and the attempt row exists."""
+    root = _wf_seed(tmp_path, "plan-review-implement")
+    store = SqliteStore()
+    with _client(root, store) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        order = _poll(client, "10.feature")
+        resp = _submit_doc(client, order, document="Plan.")
+        nxt = resp["next_order"]
+        assert nxt["task"] == "10.feature"
+        assert nxt["config"]["workflow"]["step"] == "review"
+        # The chained order is a real leased attempt.
+        attempt = asyncio.run(store.get_attempt(nxt["run_id"]))
+        assert attempt is not None and attempt["state"] == "running"
+
+
+def test_workflow_chain_suppressed_by_paused_queue(tmp_path: Path) -> None:
+    """A dispatch guard (queue pause) suppresses chaining; the cursor still
+    advanced, so the step reaches workers on the next (unpaused) poll."""
+    root = _wf_seed(tmp_path, "plan-review-implement")
+    store = SqliteStore()
+    with _client(root, store) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        order = _poll(client, "10.feature")
+        asyncio.run(store.set_queue_pause("main", "manual"))
+        resp = _submit_doc(client, order, document="Plan.")
+        assert "next_order" not in resp
+        assert _step_of(root, "10.feature")[0] == "review"
+
+
+def test_workflow_chain_suppressed_for_incapable_worker(tmp_path: Path) -> None:
+    """When the next step's resolved model isn't advertised by the submitting
+    worker, chaining is suppressed (affinity, not stickiness)."""
+    # A definition whose review step pins a concrete model via the queue's
+    # workflow_models, so an ``auto``-only worker can't chain into it.
+    definition = {
+        "name": "pinned-review",
+        "steps": [
+            {
+                "id": "plan", "kind": "doc", "role": "planner",
+                "prompt": "workflow-plan.md", "inputs": ["brief"],
+                "output": "plan", "max_turns": 30, "next": "review",
+            },
+            {
+                "id": "review", "kind": "doc", "role": "reviewer",
+                "prompt": "workflow-review.md", "inputs": ["brief", "plan"],
+                "output": "review", "max_turns": 20, "next": "implement",
+            },
+            {
+                "id": "implement", "kind": "code", "role": "implementor",
+                "inputs": ["brief", "plan"], "max_turns": None,
+            },
+        ],
+    }
+    root = _seed(
+        tmp_path,
+        {"10.feature": "---\nworkflow: pinned-review\npriority: 1\n---\nBuild it."},
+    )
+    _install_workflow(root, definition)
+    # Pin the reviewer role to a concrete model in the main queue config.
+    cfg_path = root / _TASKS_ROOT_NAME / "main" / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["workflow_models"] = {"reviewer": "claude-code/some-exotic-model"}
+    cfg_path.write_text(json.dumps(cfg))
+    with _client(root) as client:
+        # The worker advertises only a different concrete model.
+        client.post("/api/worker/checkin", json={
+            "worker_id": "w1", "backend": "claude-code",
+            "models": ["claude-code/claude-sonnet-4-6"],
+        })
+        order = _poll(client, "10.feature")
+        resp = _submit_doc(client, order, document="Plan.")
+        # review pins an unadvertised model → no chain; cursor still advanced.
+        assert "next_order" not in resp
+        assert _step_of(root, "10.feature")[0] == "review"
+
+
+def test_workflow_code_step_submit_has_no_next_order(tmp_path: Path) -> None:
+    """A code step submits its land asynchronously ({"queued": true}) and never
+    chains (the cursor only advances in the land completion)."""
+    root = _wf_seed(tmp_path, "verify-loop")
+    _install_workflow(root, _VERIFY_LOOP_DEF)
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        order = _poll(client, "10.feature")
+        assert order["config"]["workflow"]["step"] == "implement"
+        wt = setup_worktree(root, order["repo"], "10.feature")
+        (wt / "GENERATED.txt").write_text("v1\n")
+        subprocess.run(["git", "add", "-A"], cwd=wt, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "v1"], cwd=wt, check=True, capture_output=True)
+        resp = _submit_completed(client, order).json()
+        assert resp.get("queued") is True
+        assert "next_order" not in resp
 
 
 def test_workflow_unknown_definition_blocks_task(tmp_path: Path) -> None:

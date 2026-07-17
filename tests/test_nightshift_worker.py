@@ -351,6 +351,71 @@ def test_worker_lands_a_task_via_manager(tmp_path: Path, monkeypatch) -> None:
         assert loop.run_once() is False
 
 
+def test_worker_loop_processes_chained_doc_steps(tmp_path: Path, monkeypatch) -> None:
+    """Phase 7: a single ``run_once`` walks the chained doc steps a workflow's
+    submit responses hand back (``next_order``) — no re-poll per step."""
+    workspace = _seed(tmp_path, {
+        "10.wf": "---\nworkflow: plan-review-implement\nmodel: auto\n---\nBuild it.",
+    })
+
+    seen_steps: list[str] = []
+
+    class _DocBackend:
+        name = "claude-code"
+        agentic = True
+        tool_capable = True
+
+        def available(self, config=None) -> bool:
+            return True
+
+        def run(self, spec, emit_log, should_abort, on_worker_start=None):
+            out = None
+            for line in spec.prompt.splitlines():
+                if line.startswith("The OUTPUT_FILE variable is: "):
+                    out = line.split(": ", 1)[1]
+            if out is not None:  # a doc step
+                Path(out).write_text("# Artifact\nbody.\n")
+            else:  # a code step: leave a landable commit in the worktree
+                wt = Path(spec.cwd)
+                (wt / "GENERATED.txt").write_text("done\n")
+                subprocess.run(["git", "add", "-A"], cwd=wt, check=True, capture_output=True)
+                subprocess.run(
+                    ["git", "commit", "-m", "impl"], cwd=wt, check=True, capture_output=True,
+                )
+            return WorkerResult(returncode=0, turns=1)
+
+    monkeypatch.setattr(backends_mod, "require_backend", lambda p: _DocBackend())
+
+    with TestClient(create_app(workspace, store=SqliteStore())) as tc:
+        cfg = WorkerConfig(
+            workspace=workspace, worker_id="w1", manager_url="http://test",
+            models=["claude-code/claude-sonnet-4-6"],
+        )
+        local = LocalStore(workspace)
+
+        class _RecordingClient(_LoopClient):
+            def submit(self, run_id, payload):
+                resp = super().submit(run_id, payload)
+                # The submit response's workflow_step is the next step the
+                # cursor advanced to (review → revise → implement).
+                seen_steps.append(resp.get("workflow_step") or "")
+                return resp
+
+        loop = WorkerLoop(cfg, _RecordingClient(tc), local)
+        loop.checkin()
+
+        # One run_once walks plan → review → revise (chained doc steps) and on
+        # into the implement code step (a doc step may chain to a code order);
+        # the code step lands async and does not chain further.
+        did = loop.run_once()
+        assert did is True
+        tc.portal.call(tc.app.state.drain_git_jobs)
+        # Four steps executed+submitted in a single run_once (3 doc + 1 code).
+        assert len(local.history()) == 4
+        # The doc submits advanced the cursor; the final code submit queued.
+        assert seen_steps == ["review", "revise", "implement", ""]
+
+
 # --------------------------------------------------------------------------- #
 # Dispatch by provider
 # --------------------------------------------------------------------------- #

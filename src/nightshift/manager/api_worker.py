@@ -315,6 +315,185 @@ def register_worker_api(
         if cfg.shared_secret and x_nightshift_secret != cfg.shared_secret:
             raise HTTPException(status_code=401, detail="bad or missing worker secret")
 
+    async def _lease_and_build(
+        queue: str | None, task: str, repo: str | None,
+        required_mcps: tuple[str, ...],
+        *, worker_id: str, backend: str | None,
+    ) -> dict[str, Any] | None:
+        """Lease + work-order construction shared by the poll hot path and
+        Phase-7 chaining. Clears any stale repo/blocked overlay, resyncs origin
+        for remote landing, stamps a workflow first-step + visit when the brief
+        has no cursor yet, builds the order, and CAS-creates the attempt (with
+        the persisted workflow routing block). Returns the work order, or
+        ``None`` when the CAS lost the race for this task."""
+        store = _store()
+        # Clear any prior paused/blocked overlay (e.g. a now-resolved repo) so
+        # the dispatch is clean, and pin the target repo's HEAD as base_ref.
+        prior = await store.get_task_state(queue, task)
+        if prior and prior.get("state") in (
+            TaskHoldKind.REPO_UNAVAILABLE, TaskHoldKind.BLOCKED,
+        ):
+            await store.clear_task_state(queue, task)
+        # Origin-aware dispatch: for any remote-landing mode resync local main
+        # to origin/main before pinning base_ref. Best-effort.
+        d_meta = task_meta(tasks_root, task, queue)
+        d_mode = LandingMode.PR if d_meta.get("make_pr") else cfg.landing_mode
+        if (
+            repo
+            and d_mode.is_remote
+            and cfg.rendezvous_remote
+            and _sync_throttle.due(workspace, repo, cfg.cadences.git_refresh_seconds)
+        ):
+            with contextlib.suppress(Exception):
+                await asyncio.wrap_future(_executors.submit(repo, partial(
+                    sync_main_locked,
+                    workspace, repo, cfg.rendezvous_remote,
+                    min_interval_seconds=cfg.cadences.git_refresh_seconds,
+                    force=False,
+                    throttle=_sync_throttle,
+                )))
+        base_ref = canonical_head(workspace / repo) if repo else None
+        run_id = new_run_id()
+        # Workflow first-step stamp (§6.4): a workflow brief with no
+        # ``workflow_step`` yet gets the first step + its first visit written
+        # *before* the work order is built, so the order carries the correct
+        # step's artifacts + routing. (Chained steps already carry a cursor.)
+        wf_name = str(d_meta.get("workflow") or "").strip()
+        if wf_name:
+            wf_def = app.state.workflows.get(wf_name)
+            if wf_def is not None and not str(d_meta.get("workflow_step") or "").strip():
+                first_step = wf_def.first.id
+                with contextlib.suppress(Exception):
+                    await _run_tasks_repo_job(_executors, tasks_repo, partial(
+                        _set_engine_meta_job, queue, task,
+                        {
+                            "workflow_step": first_step,
+                            "workflow_visits": format_visits({first_step: 1}),
+                        },
+                    ))
+        order = build_work_order(
+            workspace, tasks_root, task, queue, repo,
+            run_id, run_id, base_ref, cfg,
+            workflow_defs=app.state.workflows,
+        )
+        planned_validate = order["config"].get("validate_cmd") or None
+        # The attempt row persists the work order's workflow block MINUS
+        # ``artifacts`` (context lives in the tasks repo; the row stores routing
+        # metadata only) so the submit path can compute the step policy.
+        wf_block = order["config"].get("workflow")
+        wf_persisted = (
+            {k: v for k, v in wf_block.items() if k != "artifacts"}
+            if wf_block else None
+        )
+        attempt = await store.create_attempt(
+            run_id,
+            task=task,
+            queue=queue,
+            worker_id=worker_id,
+            backend=provider_of(order["config"]["model"]) or backend,
+            model=order["config"]["model"],
+            base_ref=base_ref,
+            ttl_seconds=cfg.cadences.lease_ttl_seconds,
+            title=order["title"],
+            body=order["body"],
+            notes=order.get("notes"),
+            required_mcps=list(required_mcps),
+            repo=repo,
+            validate_cmd=planned_validate or None,
+            enhanced=bool(order.get("enhanced", False)),
+            workflow=wf_persisted,
+        )
+        if attempt is None:
+            return None
+        await _registry().set_busy(
+            worker_id, task=task, queue=queue, run_id=run_id
+        )
+        await _emit(
+            "lease_acquired", run_id=run_id, queue=queue, task=task,
+            payload={"worker_id": worker_id, "lease_id": run_id},
+        )
+        await _emit(
+            "run_started", run_id=run_id, queue=queue, task=task,
+            payload={"title": order["title"], "worker_id": worker_id},
+        )
+        return order
+
+    async def _dispatch_guards_ok(
+        queue: str | None, task: str, repo: str | None, worker_id: str,
+    ) -> bool:
+        """The dispatch guards the poll path applies, factored so Phase-7
+        chaining re-runs them (it bypasses ``worker_poll``): queue not paused,
+        dedication honored for *this* worker, task not backed off, repo present.
+        Capability matching is the caller's job (it holds the WorkerFilter)."""
+        store = _store()
+        label = queue_label(queue)
+        if label in await store.queue_pauses():
+            return False
+        # Queue dedication: a dedicated queue's tasks only go to its bound
+        # worker(s) — a chaining worker not in the owner set must not chain.
+        owners = (await store.queue_dedication()).get(label)
+        if owners and worker_id not in owners:
+            return False
+        if repo and not repos.repo_available(workspace, repo):
+            return False
+        if (queue, task) in {
+            (_queue_from_label(b["queue"]), b["task"])
+            for b in await store.tasks_backing_off()
+        }:
+            return False
+        return True
+
+    async def _maybe_chain(
+        t: Transition, body: SubmitBody, queue: str | None, tasks_rel: str,
+    ) -> dict[str, Any] | None:
+        """Phase-7 chaining (spec §7.4). When a doc step advanced the cursor to
+        a mid-workflow step, hand the submitting worker its next order in the
+        submit response — but only if the worker's registered capabilities
+        accept the next step's resolved model *and* every dispatch guard the
+        chain bypasses still passes. Any miss returns ``None`` (normal polling
+        picks the step up). Chaining chains the lease, never the context."""
+        # Only a cursor-advancing doc transition carries a real next step.
+        next_step = t.response.get("workflow_step")
+        if not next_step or next_step == END:
+            return None
+        # Rebuild the candidate for this task off the freshly-advanced cursor;
+        # it carries the next step's resolved model (or a workflow_error).
+        resolver = make_resolver(
+            app.state.workflows,
+            planner_model=cfg.planner_model,
+            default_model=cfg.default_model,
+        )
+        cands = build_candidates(
+            tasks_root, queue, default_model=cfg.default_model,
+            workflow_resolver=resolver,
+        )
+        cand = next((c for c in cands if c.task == body.task), None)
+        if cand is None or cand.workflow_error is not None:
+            return None
+        # Capability match: the submitting worker's registered filter must
+        # accept the next step's resolved model (affinity, not stickiness).
+        snap = {w["id"]: w for w in await _registry().snapshot()}
+        me = snap.get(body.worker_id)
+        if me is None or me.get("status") == "offline":
+            return None
+        worker = WorkerFilter(
+            worker_id=body.worker_id,
+            queues=me.get("queues"),
+            priorities=me.get("priorities"),
+            models=me.get("models"),
+            mcps=me.get("mcps"),
+        )
+        dedication = await _store().queue_dedication()
+        if not worker.accepts(cand, dedication=dedication):
+            return None
+        # Re-run the guards the poll path applies (chaining bypasses poll).
+        if not await _dispatch_guards_ok(queue, body.task, cand.repo, body.worker_id):
+            return None
+        return await _lease_and_build(
+            queue, body.task, cand.repo, cand.required_mcps,
+            worker_id=body.worker_id, backend=body.backend,
+        )
+
     # ===================================================================== #
     # Worker API
     # ===================================================================== #
@@ -480,112 +659,13 @@ def register_worker_api(
         if chosen is None:
             return JSONResponse({"work": None, "queue_pauses": dict(queue_pauses)}, status_code=200)
 
-        # The chosen candidate is repo-available by construction; clear any prior
-        # paused/blocked overlay it may carry (e.g. a now-resolved repo) so the
-        # dispatch is clean, and pin the target repo's HEAD as base_ref.
-        repo = chosen.repo
-        prior = await store.get_task_state(chosen.queue, chosen.task)
-        if prior and prior.get("state") in (
-            TaskHoldKind.REPO_UNAVAILABLE, TaskHoldKind.BLOCKED,
-        ):
-            await store.clear_task_state(chosen.queue, chosen.task)
-        # Origin-aware dispatch: for any remote-landing mode (push or pr), resync
-        # local main to origin/main before pinning base_ref so the worker starts
-        # from the freshest merged state in a multi-actor repo (and an orphaned
-        # ephemeral pr-mode squash is dropped). Best-effort: a transient fetch
-        # failure must not fail the poll — base_ref then pins the local HEAD and
-        # the land re-syncs anyway. See remote-landing.md.
-        poll_meta = task_meta(tasks_root, chosen.task, chosen.queue)
-        effective_mode = LandingMode.PR if poll_meta.get("make_pr") else cfg.landing_mode
-        if (
-            effective_mode.is_remote
-            and cfg.rendezvous_remote
-            # Throttle pre-check keeps the common (recently-synced) case from
-            # even enqueuing an executor job behind a possibly-slow land.
-            and _sync_throttle.due(workspace, repo, cfg.cadences.git_refresh_seconds)
-        ):
-            with contextlib.suppress(Exception):
-                await asyncio.wrap_future(_executors.submit(repo, partial(
-                    sync_main_locked,
-                    workspace, repo, cfg.rendezvous_remote,
-                    min_interval_seconds=cfg.cadences.git_refresh_seconds,
-                    force=False,
-                    throttle=_sync_throttle,
-                )))
-        base_ref = canonical_head(workspace / repo)
-        # Phase 8: the acquire_lease + create_run + set_lease_status triplet is
-        # ONE create_attempt (the row IS the lease and the run). The work order
-        # keeps both lease_id and run_id keys for wire compat — both carry the
-        # attempt id.
-        run_id = new_run_id()
-        # Workflow first-step stamp (§6.4): a workflow brief with no
-        # ``workflow_step`` yet gets the first step + its first visit written
-        # through the tasks-repo executor *before* the work order is built, so
-        # the order carries the correct step's artifacts + routing.
-        if chosen.workflow and chosen.workflow_step:
-            wf_def = app.state.workflows.get(chosen.workflow)
-            if wf_def is not None and not str(poll_meta.get("workflow_step") or "").strip():
-                first_step = wf_def.first.id
-                with contextlib.suppress(Exception):
-                    await _run_tasks_repo_job(_executors, tasks_repo, partial(
-                        _set_engine_meta_job, chosen.queue, chosen.task,
-                        {
-                            "workflow_step": first_step,
-                            "workflow_visits": format_visits({first_step: 1}),
-                        },
-                    ))
-        order = build_work_order(
-            workspace, tasks_root, chosen.task, chosen.queue, repo,
-            run_id, run_id, base_ref, cfg,
-            workflow_defs=app.state.workflows,
+        order = await _lease_and_build(
+            chosen.queue, chosen.task, chosen.repo, chosen.required_mcps,
+            worker_id=body.worker_id, backend=body.backend,
         )
-        planned_validate = order["config"].get("validate_cmd") or None
-        # The attempt row persists the work order's workflow block MINUS
-        # ``artifacts`` (context lives in the tasks repo; the row stores routing
-        # metadata only) so the submit path can compute the step policy.
-        wf_block = order["config"].get("workflow")
-        wf_persisted = (
-            {k: v for k, v in wf_block.items() if k != "artifacts"}
-            if wf_block else None
-        )
-        attempt = await store.create_attempt(
-            run_id,
-            task=chosen.task,
-            queue=chosen.queue,
-            worker_id=body.worker_id,
-            backend=provider_of(order["config"]["model"]) or body.backend,
-            model=order["config"]["model"],
-            base_ref=base_ref,
-            ttl_seconds=cfg.cadences.lease_ttl_seconds,
-            title=order["title"],
-            body=order["body"],
-            notes=order.get("notes"),
-            required_mcps=list(chosen.required_mcps),
-            repo=repo,
-            validate_cmd=planned_validate or None,
-            enhanced=bool(order.get("enhanced", False)),
-            workflow=wf_persisted,
-        )
-        if attempt is None:
+        if order is None:
             # Lost a race for this task; let the worker poll again shortly.
             return JSONResponse({"work": None}, status_code=200)
-        await _registry().set_busy(
-            body.worker_id, task=chosen.task, queue=chosen.queue, run_id=run_id
-        )
-        await _emit(
-            "lease_acquired",
-            run_id=run_id,
-            queue=chosen.queue,
-            task=chosen.task,
-            payload={"worker_id": body.worker_id, "lease_id": run_id},
-        )
-        await _emit(
-            "run_started",
-            run_id=run_id,
-            queue=chosen.queue,
-            task=chosen.task,
-            payload={"title": order["title"], "worker_id": body.worker_id},
-        )
         return JSONResponse({"work": order, "queue_pauses": dict(queue_pauses)})
 
     @app.post("/api/worker/heartbeat", dependencies=[Depends(_require_secret)])
@@ -803,6 +883,17 @@ def register_worker_api(
             response = await _finish(computed, set_idle=True)
             if response is None:
                 raise HTTPException(status_code=409, detail=_STALE_SUBMIT)
+            # Phase 7 chaining (spec §7.4): a doc step that advanced the cursor
+            # to a mid-workflow step hands the worker its next order in the
+            # submit response — no re-poll — when the worker's capabilities
+            # accept the next step's resolved model and the dispatch guards it
+            # bypasses still pass. Any miss simply omits ``next_order`` and the
+            # step reaches workers through normal polling.
+            next_order = await _maybe_chain(
+                computed, body, queue, tasks_rel,
+            )
+            if next_order is not None:
+                response["next_order"] = next_order
             return JSONResponse(response)
 
         match computed:
