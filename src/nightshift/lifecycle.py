@@ -411,6 +411,13 @@ class WorkflowStepPolicy:
     dest_kind: StepKind | None     # kind of route_to's step (None for $end)
     dest_visits_exhausted: bool    # would entering route_to exceed its max_visits?
     evergreen: bool
+    # Current visit counters (from parse_visits(meta)) — the transition emits
+    # the incremented map when it moves the cursor onto ``route_to`` (§6.4
+    # entry-based counting). Empty for a first-step dispatch (counted elsewhere).
+    visits: dict[str, int] = field(default_factory=dict)
+    # Reason string for a budget-exhausted quarantine (precomputed with the
+    # destination step id + its visit count).
+    exhausted_reason: str = ""
 
 
 @dataclass(frozen=True)

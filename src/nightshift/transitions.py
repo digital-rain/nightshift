@@ -32,9 +32,11 @@ from nightshift.lifecycle import (
     TaskHoldKind,
     Transition,
     TransitionEvent,
+    WorkflowStepPolicy,
     error_state_for,
     land_failure_kind,
 )
+from nightshift.workflows import END, StepKind, format_visits
 
 
 def _base_run_fields(outcome: Outcome) -> dict[str, Any]:
@@ -350,6 +352,8 @@ def on_submit(
     :class:`GitPhase` the caller must execute first for completed submits
     (whose result then feeds :func:`on_land_result` / :func:`on_split_result`).
     """
+    if policy.workflow_step is not None:
+        return on_workflow_step(ref, outcome, policy)
     match outcome.status:
         case RunStatus.BLOCKED:
             return _blocked_transition(ref, outcome, policy)
@@ -664,6 +668,337 @@ def on_operator_stop(ref: AttemptRef) -> Transition:
         ref=ref,
         fields={},
         state=AttemptState.ABORTED,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Workflow step transitions (spec §6.3–§6.5)
+# --------------------------------------------------------------------------- #
+
+
+def _advance_visits(step_policy: WorkflowStepPolicy) -> dict[str, object | None]:
+    """The engine_meta write that moves the cursor onto ``route_to`` and counts
+    that entry (§6.4 entry-based counting)."""
+    visits = dict(step_policy.visits)
+    visits[step_policy.route_to] = visits.get(step_policy.route_to, 0) + 1
+    return {
+        "workflow_step": step_policy.route_to,
+        "workflow_visits": format_visits(visits),
+    }
+
+
+def _workflow_budget_quarantine(
+    ref: AttemptRef, outcome: Outcome, step_policy: WorkflowStepPolicy,
+    *, write_artifact: tuple[str, str] | None,
+) -> Transition:
+    """Destination step's budget is exhausted: quarantine (the work was good,
+    so the artifact still commits). Reuses the ``_failure_ladder`` quarantine
+    shape (frontmatter flag + event)."""
+    reason = step_policy.exhausted_reason or (
+        f"workflow budget exhausted at '{step_policy.route_to}'"
+    )
+    flag = FrontmatterFlag("quarantined", True, "quarantine_reason", reason)
+    ev = [
+        TransitionEvent(
+            "task_quarantined", run_id=ref.id, queue=ref.queue, task=ref.task,
+            payload={"reason": reason},
+        ),
+        TransitionEvent(
+            "task_result", run_id=ref.id, queue=ref.queue, task=ref.task,
+            payload={"status": "completed", "result_line": outcome.result_line},
+        ),
+    ]
+    return Transition(
+        ref=ref,
+        fields=dict(result_line=outcome.result_line, **_base_run_fields(outcome)),
+        state=AttemptState.NO_CHANGE,
+        effects=TaskEffects(
+            frontmatter=(flag,),
+            write_artifact=write_artifact,
+        ),
+        events=tuple(ev),
+        response={"landed": False, "status": "completed", "quarantined": True},
+    )
+
+
+def _workflow_end(
+    ref: AttemptRef, outcome: Outcome, step_policy: WorkflowStepPolicy,
+    *, write_artifact: tuple[str, str] | None,
+) -> Transition:
+    """A doc step routing to $end: the workflow completes without a land. The
+    brief + final artifact are retained (``completed`` flag); evergreen resets
+    instead (clear meta + delete artifacts)."""
+    result_line = outcome.result_line or "workflow complete"
+    if step_policy.evergreen:
+        effects = TaskEffects(
+            progress=Progress.RESET,
+            write_artifact=write_artifact,
+            workflow_reset=True,
+        )
+    else:
+        effects = TaskEffects(
+            progress=Progress.RESET,
+            write_artifact=write_artifact,
+            frontmatter=(FrontmatterFlag("completed", True),),
+        )
+    return Transition(
+        ref=ref,
+        fields=dict(result_line=result_line, **_base_run_fields(outcome)),
+        state=AttemptState.NO_CHANGE,
+        effects=effects,
+        events=(
+            TransitionEvent(
+                "task_result", run_id=ref.id, queue=ref.queue, task=ref.task,
+                payload={"status": "completed", "result_line": result_line},
+            ),
+            TransitionEvent("queue_changed", queue=ref.queue),
+        ),
+        response={"landed": False, "status": "completed", "workflow_complete": True},
+    )
+
+
+def _workflow_doc_advance(
+    ref: AttemptRef, outcome: Outcome, step_policy: WorkflowStepPolicy,
+    *, write_artifact: tuple[str, str] | None,
+) -> Transition:
+    """A doc step completing and routing to a mid-workflow step: commit the
+    artifact, advance the cursor (counting the destination visit), reset the
+    no-progress counter, retain the brief."""
+    result_line = outcome.result_line or f"produced '{step_policy.output}'"
+    return Transition(
+        ref=ref,
+        fields=dict(result_line=result_line, **_base_run_fields(outcome)),
+        state=AttemptState.NO_CHANGE,
+        effects=TaskEffects(
+            progress=Progress.RESET,
+            write_artifact=write_artifact,
+            engine_meta=_advance_visits(step_policy),
+        ),
+        events=(
+            TransitionEvent(
+                "task_result", run_id=ref.id, queue=ref.queue, task=ref.task,
+                payload={"status": "completed", "result_line": result_line},
+            ),
+            TransitionEvent("queue_changed", queue=ref.queue),
+        ),
+        response={"landed": False, "status": "completed", "workflow_step": step_policy.route_to},
+    )
+
+
+def on_workflow_step(
+    ref: AttemptRef, outcome: Outcome, policy: SubmitPolicy
+) -> Transition | GitPhase:
+    """Handles every submit whose ``policy.workflow_step`` is set. ``on_submit``
+    delegates here. Doc steps advance the cursor / complete / quarantine; code
+    and split steps hand back the git phase the caller executes next (whose
+    result feeds :func:`on_workflow_land` / :func:`on_workflow_split`)."""
+    step = policy.workflow_step
+    assert step is not None
+
+    # Failures never move the cursor — delegate verbatim (no engine_meta).
+    match outcome.status:
+        case RunStatus.BLOCKED:
+            return _blocked_transition(ref, outcome, policy)
+        case RunStatus.ERROR:
+            return _error_transition(ref, outcome, policy)
+        case RunStatus.RUNNING | RunStatus.SKIPPED | RunStatus.ABORTED:
+            return _neutral_transition(ref, outcome)
+        case RunStatus.COMPLETED:
+            pass
+        case _:
+            assert_never(outcome.status)
+
+    match step.kind:
+        case StepKind.DOC:
+            if outcome.document is None:
+                err = Outcome(
+                    **{
+                        **outcome.model_dump(),
+                        "failure_kind": FailureKind.WORKER_ERROR,
+                        "failure_reason": "doc step produced no document",
+                        "result_line": "doc step produced no document",
+                    }
+                )
+                return _error_transition(ref, err, policy)
+            write_artifact = (
+                (step.output, outcome.document) if step.output else None
+            )
+            if step.route_to == END:
+                return _workflow_end(ref, outcome, step, write_artifact=write_artifact)
+            if step.dest_visits_exhausted:
+                return _workflow_budget_quarantine(
+                    ref, outcome, step, write_artifact=write_artifact,
+                )
+            return _workflow_doc_advance(
+                ref, outcome, step, write_artifact=write_artifact,
+            )
+        case StepKind.CODE:
+            # Landable code step → LAND (caller feeds on_workflow_land).
+            if outcome.landable:
+                return GitPhase.LAND
+            return GitPhase.ADOPT_CHECK
+        case StepKind.SPLIT:
+            return GitPhase.HARVEST_SPLIT
+        case _:
+            assert_never(step.kind)
+
+
+def on_workflow_land(
+    ref: AttemptRef, outcome: Outcome, land: LandOutcome, policy: SubmitPolicy
+) -> Transition:
+    """Land-result counterpart for workflow code steps (mirrors
+    :func:`on_land_result`). Successful lands advance the cursor or complete
+    the workflow; failures delegate to :func:`_land_failed_transition`."""
+    step = policy.workflow_step
+    assert step is not None
+
+    match land.kind:
+        case LandKind.NO_CHANGES:
+            return _no_change_transition(ref, outcome, policy)
+        case LandKind.LANDED | LandKind.CHECKOUT_BEHIND | LandKind.ADOPTED:
+            pass
+        case LandKind.CONFLICT | LandKind.PUSH_REJECTED | LandKind.TRANSPORT_FAILED:
+            return _land_failed_transition(ref, outcome, land, policy)
+        case _:
+            assert_never(land.kind)
+
+    result_line = outcome.result_line or land.detail or "landed"
+    base_fields = dict(
+        result_line=result_line,
+        commit_sha=land.sha,
+        loc=land.loc,
+        remote=land.remote,
+        pushed=land.pushed,
+        **_base_run_fields(outcome),
+    )
+    land_events = (
+        TransitionEvent(
+            "task_result", run_id=ref.id, queue=ref.queue, task=ref.task,
+            payload={
+                "status": "completed", "commit_sha": land.sha,
+                "remote": land.remote, "pushed": land.pushed, "pr_url": land.pr_url,
+            },
+        ),
+        TransitionEvent("queue_changed", queue=ref.queue),
+    )
+    land_response = {
+        "landed": True, "sha": land.sha, "remote": land.remote,
+        "pushed": land.pushed, "pr_url": land.pr_url,
+    }
+
+    if step.route_to == END:
+        # $end from a code step: land-and-consume (non-evergreen) or retain+reset.
+        effects = TaskEffects(
+            clear_hold=True,
+            progress=Progress.RESET,
+            watch_armed=False,
+            drop_brief=not step.evergreen,
+            workflow_reset=step.evergreen,
+        )
+    elif step.dest_visits_exhausted:
+        reason = step.exhausted_reason or (
+            f"workflow budget exhausted at '{step.route_to}'"
+        )
+        return Transition(
+            ref=ref,
+            fields=base_fields,
+            state=AttemptState.LANDED,
+            effects=TaskEffects(
+                clear_hold=True,
+                progress=Progress.RESET,
+                watch_armed=False,
+                drop_brief=False,
+                frontmatter=(
+                    FrontmatterFlag("quarantined", True, "quarantine_reason", reason),
+                ),
+            ),
+            events=land_events + (
+                TransitionEvent(
+                    "task_quarantined", run_id=ref.id, queue=ref.queue, task=ref.task,
+                    payload={"reason": reason},
+                ),
+            ),
+            response=land_response,
+        )
+    else:
+        # Mid-workflow code step: advance the cursor, retain the brief.
+        effects = TaskEffects(
+            clear_hold=True,
+            progress=Progress.RESET,
+            watch_armed=False,
+            drop_brief=False,
+            engine_meta=_advance_visits(step),
+        )
+
+    return Transition(
+        ref=ref,
+        fields=base_fields,
+        state=AttemptState.LANDED,
+        effects=effects,
+        events=land_events,
+        response=land_response,
+    )
+
+
+def on_workflow_split(
+    ref: AttemptRef, outcome: Outcome, created: list[str], policy: SubmitPolicy
+) -> Transition:
+    """Split-harvest counterpart for workflow split steps. Children created →
+    :func:`on_split_result` shape (parent consumed unless evergreen). Zero
+    children → parent retained, cursor stays put (no visit burned),
+    ``Progress.INCREMENT`` so the no-change ladder bounds repeated empty
+    splits."""
+    step = policy.workflow_step
+    assert step is not None
+
+    if not created:
+        result_line = "decomposition run produced no subtasks"
+        return Transition(
+            ref=ref,
+            fields=dict(result_line=result_line, **_base_run_fields(outcome)),
+            state=AttemptState.NO_CHANGE,
+            effects=TaskEffects(progress=Progress.INCREMENT),
+            events=(
+                TransitionEvent(
+                    "task_result", run_id=ref.id, queue=ref.queue, task=ref.task,
+                    payload={
+                        "status": "completed", "result_line": result_line,
+                        "subtasks": [],
+                    },
+                ),
+                TransitionEvent("queue_changed", queue=ref.queue),
+            ),
+            response={
+                "landed": False, "status": "completed",
+                "split": True, "subtasks": [],
+            },
+        )
+
+    result_line = f"decomposed into {len(created)} subtask(s): " + ", ".join(created)
+    effects = TaskEffects(
+        clear_hold=True,
+        progress=Progress.RESET,
+        workflow_reset=step.evergreen,
+    )
+    return Transition(
+        ref=ref,
+        fields=dict(result_line=result_line, **_base_run_fields(outcome)),
+        state=AttemptState.NO_CHANGE,
+        effects=effects,
+        events=(
+            TransitionEvent(
+                "task_result", run_id=ref.id, queue=ref.queue, task=ref.task,
+                payload={
+                    "status": "completed", "result_line": result_line,
+                    "subtasks": created,
+                },
+            ),
+            TransitionEvent("queue_changed", queue=ref.queue),
+        ),
+        response={
+            "landed": False, "status": "completed",
+            "split": True, "subtasks": created,
+        },
     )
 
 
