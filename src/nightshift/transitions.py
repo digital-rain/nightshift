@@ -811,14 +811,15 @@ def on_workflow_step(
     match step.kind:
         case StepKind.DOC:
             if outcome.document is None:
-                err = Outcome(
-                    **{
-                        **outcome.model_dump(),
-                        "failure_kind": FailureKind.WORKER_ERROR,
-                        "failure_reason": "doc step produced no document",
-                        "result_line": "doc step produced no document",
-                    }
-                )
+                # ``model_copy`` preserves the concrete outcome subclass (a
+                # ``SubmitBody`` here) so optional-on-the-wire fields such as
+                # ``backend`` don't fail a plain-``Outcome`` revalidation.
+                err = outcome.model_copy(update={
+                    "status": RunStatus.ERROR,
+                    "failure_kind": FailureKind.WORKER_ERROR,
+                    "failure_reason": "doc step produced no document",
+                    "result_line": "doc step produced no document",
+                })
                 return _error_transition(ref, err, policy)
             write_artifact = (
                 (step.output, outcome.document) if step.output else None

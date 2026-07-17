@@ -49,6 +49,7 @@ from nightshift.manager.registry import Registry
 from nightshift.manager.scheduler import SchedulerState
 from nightshift.manager.store import NightshiftStore, open_store
 from nightshift.spawn_daily import load_queue_config
+from nightshift.workflows import load_workflows
 
 
 # UI assets ship inside the package (see nightshift._paths.UI_DIR).
@@ -174,6 +175,10 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
     app.state.cfg = cfg
     app.state.hub = Hub()
     app.state.sched_state = SchedulerState()
+    # Workflow definitions (spec §3): shipped assets shadowed by operator
+    # ``.nightshift/workflows/*.json``. Loaded once at startup; a malformed
+    # definition fails the load loudly (WorkflowError propagates).
+    app.state.workflows = load_workflows(workspace)
     # One repo_unavailable warning per queue (deduped by queue key); cleared on
     # rescan so a re-cloned repo re-warns if it disappears again.
     app.state.repo_warnings = set()

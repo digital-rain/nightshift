@@ -67,6 +67,7 @@ from nightshift.lifecycle import (
     SubmitPolicy,
     TaskHoldKind,
     Transition,
+    WorkflowStepPolicy,
 )
 from nightshift.manager import failure_policy
 from nightshift.manager.landing import (
@@ -104,18 +105,31 @@ from nightshift.spawn_daily import (
     split_frontmatter,
 )
 from nightshift.task_files import (
+    delete_artifacts,
     drop_completed_task,
     failed_tasks,
     frontmatter_held_tasks,
     harvest_split_output,
+    set_engine_meta,
     set_task_meta,
     task_is_evergreen,
+    write_artifact,
 )
 from nightshift.transitions import (
     on_land_enqueued,
     on_land_result,
     on_split_result,
     on_submit,
+    on_workflow_land,
+    on_workflow_split,
+)
+from nightshift.workflows import (
+    END,
+    StepKind,
+    format_visits,
+    make_resolver,
+    parse_visits,
+    route,
 )
 
 
@@ -132,6 +146,67 @@ _log = logging.getLogger("nightshift.manager.api_worker")
 # queue (Phase 5): long enough that a broken box stops eating the queue,
 # short enough that a transient outage self-heals without operator action.
 WORKER_COOLDOWN_SECONDS = 300.0
+
+# A doc step's document rides the submit payload (spec §7.1): capped at 256 KB
+# so a runaway agent can't wedge the tasks repo with a multi-megabyte commit.
+_DOCUMENT_MAX_BYTES = 256 * 1024
+
+
+def _build_workflow_step_policy(
+    workflows: dict[str, Any],
+    attempt_workflow: dict[str, Any] | None,
+    meta: dict[str, Any],
+    outcome_signal: str | None,
+    *,
+    evergreen: bool,
+) -> WorkflowStepPolicy | None:
+    """Resolve the step policy the pure transition core acts on (§6.3).
+
+    The api layer owns definition-loading and graph routing; the transition
+    core only reads the precomputed verdict. Returns ``None`` for a non-workflow
+    attempt (no workflow block persisted on the row), leaving the classic
+    transitions in charge.
+    """
+    if not attempt_workflow:
+        return None
+    name = str(attempt_workflow.get("name") or "").strip()
+    step_id = str(attempt_workflow.get("step") or "").strip()
+    wf = workflows.get(name)
+    if wf is None or not step_id or not wf.has_step(step_id):
+        # An authoring error here would have blocked the task at dispatch; a
+        # missing definition at submit time (e.g. a hot-removed asset) is not
+        # ours to route — fall back to the classic transitions.
+        return None
+    step = wf.step(step_id)
+    route_to = route(step, outcome_signal)
+    visits = parse_visits(str(meta.get("workflow_visits") or ""))
+    dest_kind: StepKind | None = None
+    dest_exhausted = False
+    exhausted_reason = ""
+    if route_to != END:
+        dest = wf.step(route_to)
+        dest_kind = dest.kind
+        # Entry-based counting (§6.4): entering ``route_to`` would make its
+        # visit count ``current + 1``; exhausted iff that exceeds its budget.
+        prospective = visits.get(route_to, 0) + 1
+        if prospective > dest.max_visits:
+            dest_exhausted = True
+            exhausted_reason = (
+                f"workflow '{name}' budget exhausted at step '{route_to}' "
+                f"(max_visits={dest.max_visits})"
+            )
+    return WorkflowStepPolicy(
+        workflow=name,
+        step_id=step_id,
+        kind=step.kind,
+        output=step.output,
+        route_to=route_to,
+        dest_kind=dest_kind,
+        dest_visits_exhausted=dest_exhausted,
+        evergreen=evergreen,
+        visits=visits,
+        exhausted_reason=exhausted_reason,
+    )
 
 
 def _cooldown_exclusions(
@@ -191,6 +266,36 @@ def register_worker_api(
         tasks_rel = playlists_mod.tasks_rel(queue)
         set_task_meta(tasks_root, task, changes, tasks_rel)
         commit_tasks(tasks_root, f"nightshift: {key} {task}")
+
+    def _set_engine_meta_job(
+        queue: str | None, task: str, changes: dict[str, object | None],
+    ) -> None:
+        """Write engine-owned workflow meta (``workflow_step``/``workflow_visits``)
+        to the task's .md file and commit. The engine meta lane is separate from
+        operator meta: only :func:`set_engine_meta` may touch these keys."""
+        tasks_rel = playlists_mod.tasks_rel(queue)
+        set_engine_meta(tasks_root, task, changes, tasks_rel)
+        commit_tasks(tasks_root, f"nightshift: workflow step {task}")
+
+    def _write_artifact_job(
+        queue: str | None, task: str, name: str, text: str,
+    ) -> None:
+        """Persist a workflow artifact (doc-step output) into the task's
+        artifacts dir and commit it to the tasks repo."""
+        tasks_rel = playlists_mod.tasks_rel(queue)
+        write_artifact(tasks_root, task, name, text, tasks_rel)
+        commit_tasks(tasks_root, f"nightshift: artifact {name} {task}")
+
+    def _workflow_reset_job(queue: str | None, task: str) -> None:
+        """Evergreen ``$end`` reset (§6.5): clear the engine meta lane and drop
+        the workflow's artifacts, leaving the (evergreen) brief in place."""
+        tasks_rel = playlists_mod.tasks_rel(queue)
+        set_engine_meta(
+            tasks_root, task,
+            {"workflow_step": None, "workflow_visits": None}, tasks_rel,
+        )
+        delete_artifacts(tasks_root, task, tasks_rel)
+        commit_tasks(tasks_root, f"nightshift: workflow reset {task}")
 
     def _task_is_failed_in_frontmatter(queue: str | None, task: str) -> bool:
         """Check if a task is currently marked ``failed: true`` in frontmatter."""
@@ -256,8 +361,16 @@ def register_worker_api(
         # queue isn't offered that queue until the cooldown expires.
         exclude |= _cooldown_exclusions(app.state.worker_cooldowns, body.worker_id)
         queue_pauses = await store.queue_pauses()
+        workflow_resolver = make_resolver(
+            app.state.workflows,
+            planner_model=cfg.planner_model,
+            default_model=cfg.default_model,
+        )
         candidates_by_queue = {
-            q: build_candidates(tasks_root, q, default_model=cfg.default_model)
+            q: build_candidates(
+                tasks_root, q, default_model=cfg.default_model,
+                workflow_resolver=workflow_resolver,
+            )
             for q in _all_queues()
             if queue_label(q) not in queue_pauses and queue_label(q) not in exclude
         }
@@ -290,6 +403,16 @@ def register_worker_api(
                     cand.repo and not repos.repo_available(workspace, cand.repo)
                 ):
                     repo_excluded.add((cand.queue, cand.task))
+                # A workflow authoring error (unknown definition/step, or an
+                # unresolvable role) is an operator error: block the task with
+                # the error as reason, exactly like a repo_error.
+                elif cand.workflow_error is not None:
+                    repo_excluded.add((cand.queue, cand.task))
+                    with contextlib.suppress(Exception):
+                        await store.set_task_state(
+                            cand.queue, cand.task, TaskHoldKind.BLOCKED,
+                            blocked_reason=cand.workflow_error,
+                        )
 
         active = await store.live_attempts()
         leased = {(_queue_from_label(le["queue"]), le["task"]) for le in active}
@@ -395,11 +518,36 @@ def register_worker_api(
         # keeps both lease_id and run_id keys for wire compat — both carry the
         # attempt id.
         run_id = new_run_id()
+        # Workflow first-step stamp (§6.4): a workflow brief with no
+        # ``workflow_step`` yet gets the first step + its first visit written
+        # through the tasks-repo executor *before* the work order is built, so
+        # the order carries the correct step's artifacts + routing.
+        if chosen.workflow and chosen.workflow_step:
+            wf_def = app.state.workflows.get(chosen.workflow)
+            if wf_def is not None and not str(poll_meta.get("workflow_step") or "").strip():
+                first_step = wf_def.first.id
+                with contextlib.suppress(Exception):
+                    await _run_tasks_repo_job(_executors, tasks_repo, partial(
+                        _set_engine_meta_job, chosen.queue, chosen.task,
+                        {
+                            "workflow_step": first_step,
+                            "workflow_visits": format_visits({first_step: 1}),
+                        },
+                    ))
         order = build_work_order(
             workspace, tasks_root, chosen.task, chosen.queue, repo,
             run_id, run_id, base_ref, cfg,
+            workflow_defs=app.state.workflows,
         )
         planned_validate = order["config"].get("validate_cmd") or None
+        # The attempt row persists the work order's workflow block MINUS
+        # ``artifacts`` (context lives in the tasks repo; the row stores routing
+        # metadata only) so the submit path can compute the step policy.
+        wf_block = order["config"].get("workflow")
+        wf_persisted = (
+            {k: v for k, v in wf_block.items() if k != "artifacts"}
+            if wf_block else None
+        )
         attempt = await store.create_attempt(
             run_id,
             task=chosen.task,
@@ -416,6 +564,7 @@ def register_worker_api(
             repo=repo,
             validate_cmd=planned_validate or None,
             enhanced=bool(order.get("enhanced", False)),
+            workflow=wf_persisted,
         )
         if attempt is None:
             # Lost a race for this task; let the worker poll again shortly.
@@ -497,6 +646,48 @@ def register_worker_api(
         # row carries attempts_without_progress *before* this outcome; the
         # transition's Progress op adds the current outcome itself.
         task_row = await store.get_task_state(queue, body.task)
+        # Workflow step policy (§6.3): resolve routing from the attempt row's
+        # persisted workflow block + this outcome's signal. ``None`` for a
+        # non-workflow attempt keeps the classic transitions in charge.
+        evergreen = task_is_evergreen(
+            meta, body.task, resolve_config(workspace, tasks_root, tasks_rel)
+        )
+        workflow_step_policy = _build_workflow_step_policy(
+            app.state.workflows, run.get("workflow"), meta, body.signal,
+            evergreen=evergreen,
+        )
+        # Document size cap (spec §7.1): a doc step's document rides the submit
+        # payload capped at 256 KB — over-cap coerces the outcome to a
+        # WORKER_ERROR before it reaches the transition core (which then routes
+        # it through the normal failure ladder, cursor unmoved).
+        if (
+            body.document is not None
+            and len(body.document.encode("utf-8")) > _DOCUMENT_MAX_BYTES
+        ):
+            over = (
+                f"doc step document exceeds {_DOCUMENT_MAX_BYTES} bytes "
+                f"({len(body.document.encode('utf-8'))} bytes)"
+            )
+            body = body.model_copy(update={
+                "status": RunStatus.ERROR,
+                "failure_kind": FailureKind.WORKER_ERROR,
+                "failure_reason": over,
+                "result_line": over,
+                "document": None,
+            })
+        # An undeclared signal is honored by nobody — trace it (spec §7.3
+        # "logged and ignored"); ``route()`` already falls through to ``next``.
+        if (
+            workflow_step_policy is not None
+            and body.signal
+            and body.signal not in app.state.workflows[
+                workflow_step_policy.workflow
+            ].step(workflow_step_policy.step_id).signals
+        ):
+            _log.warning(
+                "task %s step %s emitted undeclared signal %r — ignored",
+                body.task, workflow_step_policy.step_id, body.signal,
+            )
         policy = SubmitPolicy(
             retry=RetryPolicy(
                 quarantine_after=cfg.quarantine_threshold,
@@ -510,11 +701,10 @@ def register_worker_api(
             watch_armed=_failure_state(label).watch_armed,
             queue_paused=label in await store.queue_pauses(),
             split=bool(meta.get("split")),
-            evergreen=task_is_evergreen(
-                meta, body.task, resolve_config(workspace, tasks_root, tasks_rel)
-            ),
+            evergreen=evergreen,
             auto_resolve=cfg.auto_resolve,
             pr_mode=effective_mode is LandingMode.PR,
+            workflow_step=workflow_step_policy,
         )
         ref = AttemptRef(id=run_id, queue=queue, task=body.task)
 
@@ -545,6 +735,23 @@ def register_worker_api(
                     _set_frontmatter_flag_job,
                     queue, body.task, flag.key, flag.value,
                     reason_key=flag.reason_key, reason=flag.reason,
+                ))
+            # Workflow effects (§6.3–§6.5), applied post-commit on the same
+            # tasks-repo executor lane as frontmatter flags. Order matters:
+            # persist the doc-step artifact BEFORE advancing the cursor so a
+            # crash between the two re-runs the step rather than skipping it.
+            if t.effects.write_artifact is not None:
+                art_name, art_text = t.effects.write_artifact
+                await _run_tasks_repo_job(_executors, tasks_repo, partial(
+                    _write_artifact_job, queue, body.task, art_name, art_text,
+                ))
+            if t.effects.workflow_reset:
+                await _run_tasks_repo_job(_executors, tasks_repo, partial(
+                    _workflow_reset_job, queue, body.task,
+                ))
+            elif t.effects.engine_meta is not None:
+                await _run_tasks_repo_job(_executors, tasks_repo, partial(
+                    _set_engine_meta_job, queue, body.task, t.effects.engine_meta,
                 ))
             if t.effects.watch_armed is not None:
                 _failure_state(label).watch_armed = t.effects.watch_armed
@@ -604,14 +811,26 @@ def register_worker_api(
                 # output dir and enqueue them, then retire the parent. A
                 # content-store mutation -> the tasks-repo executor,
                 # synchronous-wait (cheap, and the response reports `created`).
+                # An evergreen workflow split retains its parent (the
+                # ``workflow_reset`` effect clears it), so the harvest must not
+                # drop the brief; every other split consumes the parent as today.
+                retain_parent = (
+                    policy.workflow_step is not None
+                    and policy.workflow_step.evergreen
+                )
                 created = await asyncio.wrap_future(_executors.submit(
                     tasks_repo, partial(
                         harvest_split_output,
                         workspace, tasks_root, repo, body.task, meta,
                         queue=queue, tasks_rel=tasks_rel,
+                        retain_parent=retain_parent,
                     ),
                 ))
-                t = on_split_result(ref, body, created)
+                t = (
+                    on_workflow_split(ref, body, created, policy)
+                    if policy.workflow_step is not None
+                    else on_split_result(ref, body, created)
+                )
             case GitPhase.ADOPT_CHECK:
                 # Nothing landable: the cheap adopt-or-nothing detection (never
                 # an origin sync or squash attempt). Its adopt path applies
@@ -630,7 +849,12 @@ def register_worker_api(
                         draft=bool(meta.get("draft", False)),
                     ),
                 ))
-                t = on_land_result(ref, body, await _with_loc(result), policy)
+                landed = await _with_loc(result)
+                t = (
+                    on_workflow_land(ref, body, landed, policy)
+                    if policy.workflow_step is not None
+                    else on_land_result(ref, body, landed, policy)
+                )
             case GitPhase.LAND:
                 # Async land (Phase 7): move the attempt to LANDING, enqueue
                 # the serialized land job, and return immediately — heartbeats
@@ -679,8 +903,13 @@ def register_worker_api(
                         )
                     else:
                         result = await _with_loc(result)
+                    land_t = (
+                        on_workflow_land(ref, body, result, policy)
+                        if policy.workflow_step is not None
+                        else on_land_result(ref, body, result, policy)
+                    )
                     applied = await _finish(
-                        on_land_result(ref, body, result, policy),
+                        land_t,
                         set_idle=False,
                         expected=AttemptState.LANDING,
                     )

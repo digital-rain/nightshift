@@ -84,6 +84,13 @@ class OperatorConfig:
                 "manager-side completion; bare <vendor>/<model> id)."),
             env="NIGHTSHIFT_ENHANCE_MODEL",
             validate="model_id"))
+    planner_model: str = field(default="", metadata=meta(
+        category="Scheduling", label="Planner model",
+        desc=(
+            "Default model for a workflow's planner role (§3.2). Empty falls "
+            "through to the default model."),
+        apply="restart", env="NIGHTSHIFT_PLANNER_MODEL",
+        validate="model_id_or_keyword"))
 
     landing_mode: LandingMode = field(default=LandingMode.NONE, metadata=meta(
         category="Landing & Git", label="Landing mode",
@@ -320,6 +327,10 @@ def load_manager_settings(workspace: Path) -> ManagerSettings:
             os.environ.get("NIGHTSHIFT_ENHANCE_MODEL")
             or data.get("enhance_brief_model")
             or "anthropic/claude-sonnet-4-6"),
+        planner_model=(
+            os.environ.get("NIGHTSHIFT_PLANNER_MODEL")
+            or data.get("planner_model")
+            or ""),
         landing_mode=landing_mode,
         rendezvous_remote=rendezvous_remote,
         wip_ref_prefix=wip_ref_prefix,
@@ -393,6 +404,7 @@ class ManagerConfig:
     landing_mode: LandingMode = _DEFAULT_OPERATOR.landing_mode
     default_model: str = _DEFAULT_OPERATOR.default_model
     enhance_brief_model: str = _DEFAULT_OPERATOR.enhance_brief_model
+    planner_model: str = _DEFAULT_OPERATOR.planner_model
     shared_secret: str | None = _DEFAULT_SETTINGS.shared_secret
     dsn: str | None = _DEFAULT_SETTINGS.dsn
     tasks_repo: str = _DEFAULT_OPERATOR.tasks_repo
@@ -417,6 +429,7 @@ def load_manager_config(workspace: Path) -> ManagerConfig:
         landing_mode=settings.operator.landing_mode,
         default_model=settings.operator.default_model,
         enhance_brief_model=settings.operator.enhance_brief_model,
+        planner_model=settings.operator.planner_model,
         shared_secret=settings.shared_secret,
         dsn=settings.dsn,
         tasks_repo=settings.operator.tasks_repo,
@@ -455,6 +468,7 @@ def save_manager_settings(workspace: Path, settings: ManagerSettings) -> None:
         },
         "default_model": settings.operator.default_model,
         "enhance_brief_model": settings.operator.enhance_brief_model,
+        "planner_model": settings.operator.planner_model,
         "scheduled_models_allow": list(settings.operator.scheduled_models_allow),
         "max_per_day": settings.operator.max_per_day,
         "max_concurrent_queues": settings.operator.max_concurrent_queues,

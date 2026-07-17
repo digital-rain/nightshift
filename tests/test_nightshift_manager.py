@@ -29,7 +29,12 @@ from nightshift.manager.hub import Hub
 from nightshift.manager.landing import canonical_head
 from nightshift.manager.store_sqlite import SqliteStore
 from nightshift.manager.wire import jsonable
-from nightshift.task_files import ORIGINAL_BRIEF_MARKER
+from nightshift.task_files import (
+    ORIGINAL_BRIEF_MARKER,
+    artifacts_dir,
+    read_artifacts,
+    read_task,
+)
 
 
 def _find_field(
@@ -2315,3 +2320,397 @@ def test_sse_snapshot_frame_carries_the_same_run_and_lease_shapes(
         }
         for le in frame["leases"]:
             assert list(le) == LEASE_WIRE_KEYS
+
+
+# --------------------------------------------------------------------------- #
+# Workflows — Phase 6: submit wiring, artifact custody, cursor advance
+# --------------------------------------------------------------------------- #
+
+_TASKS_ROOT_NAME = "nightshift-tasks"
+
+
+def _poll(client: TestClient, task: str | None = None) -> dict[str, Any] | None:
+    order = client.post(
+        "/api/worker/poll", json={"worker_id": "w1", "backend": "claude-code"}
+    ).json()["work"]
+    if task is not None:
+        assert order is not None and order["task"] == task, order
+    return order
+
+
+def _submit_doc(
+    client: TestClient, order: dict[str, Any], *,
+    document: str, signal: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "worker_id": "w1", "lease_id": order["lease_id"], "task": order["task"],
+        "queue": "main", "title": order["task"], "status": "completed",
+        "landable": False, "backend": "claude-code", "model": "claude-sonnet-4-6",
+        "document": document,
+    }
+    if signal is not None:
+        payload["signal"] = signal
+    return client.post(
+        f"/api/worker/runs/{order['run_id']}/submit", json=payload,
+    ).json()
+
+
+def _step_of(root: Path, task: str) -> tuple[str | None, str | None]:
+    fm = read_task(root / _TASKS_ROOT_NAME, task)["frontmatter"]
+    return fm.get("workflow_step"), fm.get("workflow_visits")
+
+
+def _wf_seed(tmp_path: Path, workflow: str, task: str = "10.feature") -> Path:
+    brief = f"---\nworkflow: {workflow}\npriority: 1\n---\nBuild the feature."
+    return _seed(tmp_path, {task: brief})
+
+
+def test_workflow_doc_step_commits_artifact_and_advances_cursor(
+    tmp_path: Path,
+) -> None:
+    root = _wf_seed(tmp_path, "plan-review-implement")
+    tasks_root = root / _TASKS_ROOT_NAME
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+
+        # Dispatch stamps the first step + visit; the order embeds the doc block.
+        order = _poll(client, "10.feature")
+        wf = order["config"]["workflow"]
+        assert wf["name"] == "plan-review-implement"
+        assert wf["step"] == "plan" and wf["kind"] == "doc"
+        assert wf["output"] == "plan"
+        assert _step_of(root, "10.feature") == ("plan", "plan:1")
+
+        # A doc submit commits the artifact and advances the cursor to review.
+        resp = _submit_doc(client, order, document="# The Plan\nDo X then Y.")
+        assert resp["status"] == "completed" and resp["workflow_step"] == "review"
+        arts = read_artifacts(tasks_root, "10.feature", ["plan"])
+        assert arts["plan"].startswith("# The Plan")
+        # Entry-based counting: the visit map accumulates every step entered.
+        assert _step_of(root, "10.feature") == ("review", "plan:1,review:1")
+
+        # The next poll dispatches step 2 with the plan artifact embedded.
+        order2 = _poll(client, "10.feature")
+        wf2 = order2["config"]["workflow"]
+        assert wf2["step"] == "review"
+        assert wf2["artifacts"]["plan"].startswith("# The Plan")
+
+
+def test_workflow_doc_signal_skips_to_declared_destination(tmp_path: Path) -> None:
+    root = _wf_seed(tmp_path, "plan-review-implement")
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        order = _poll(client, "10.feature")
+        # plan emits `plan-trivial` → declared route to implement (skip review/revise).
+        resp = _submit_doc(
+            client, order, document="Trivial.", signal="plan-trivial",
+        )
+        assert resp["workflow_step"] == "implement"
+        assert _step_of(root, "10.feature")[0] == "implement"
+
+
+def test_workflow_undeclared_signal_is_ignored(tmp_path: Path) -> None:
+    root = _wf_seed(tmp_path, "plan-review-implement")
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        order = _poll(client, "10.feature")
+        # `review-clear` is not declared on the plan step → route via next (review).
+        resp = _submit_doc(
+            client, order, document="Plan.", signal="review-clear",
+        )
+        assert resp["workflow_step"] == "review"
+
+
+def test_workflow_doc_missing_document_is_worker_error(tmp_path: Path) -> None:
+    root = _wf_seed(tmp_path, "plan-review-implement")
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        order = _poll(client, "10.feature")
+        resp = client.post(
+            f"/api/worker/runs/{order['run_id']}/submit",
+            json={
+                "worker_id": "w1", "lease_id": order["lease_id"],
+                "task": "10.feature", "queue": "main", "title": "10.feature",
+                "status": "completed", "landable": False,
+            },
+        ).json()
+        # No document → coerced to a worker error; cursor stays on plan.
+        assert resp.get("landed") in (False, None)
+        assert _step_of(root, "10.feature")[0] == "plan"
+
+
+def test_workflow_oversized_document_is_worker_error(tmp_path: Path) -> None:
+    root = _wf_seed(tmp_path, "plan-review-implement")
+    tasks_root = root / _TASKS_ROOT_NAME
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        order = _poll(client, "10.feature")
+        resp = _submit_doc(client, order, document="x" * (256 * 1024 + 1))
+        # Over-cap coerces to worker_error before the transition: cursor unmoved,
+        # no artifact committed.
+        assert resp.get("landed") in (False, None)
+        assert _step_of(root, "10.feature")[0] == "plan"
+        assert not artifacts_dir(tasks_root, "10.feature").exists()
+
+
+def test_workflow_code_step_lands_and_consumes_at_end(tmp_path: Path) -> None:
+    root = _wf_seed(tmp_path, "plan-review-implement")
+    tasks_root = root / _TASKS_ROOT_NAME
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+
+        # Walk the three doc steps to reach the implement (code, $end) step.
+        order = _poll(client, "10.feature")
+        _submit_doc(client, order, document="Plan.")
+        order = _poll(client, "10.feature")
+        _submit_doc(client, order, document="Review.")
+        order = _poll(client, "10.feature")
+        _submit_doc(client, order, document="Revised plan.")
+
+        order = _poll(client, "10.feature")
+        assert order["config"]["workflow"]["step"] == "implement"
+        assert order["config"]["workflow"]["kind"] == "code"
+        # The implement step embeds the plan artifact for the implementor.
+        assert order["config"]["workflow"]["artifacts"]["plan"].strip() == "Revised plan."
+
+        # A landing code step at $end lands and consumes the brief + artifacts.
+        wt = setup_worktree(root, order["repo"], "10.feature")
+        (wt / "GENERATED.txt").write_text("done\n")
+        subprocess.run(["git", "add", "-A"], cwd=wt, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "impl"], cwd=wt, check=True, capture_output=True)
+        resp = _submit_completed(client, order).json()
+        # Async land: the response queues; draining runs the completion, which
+        # drops the brief + artifacts (non-evergreen $end from a code step).
+        assert resp.get("queued") is True
+        _drain_git(client)
+        assert not (tasks_root / "main" / "10.feature.md").exists()
+        assert not artifacts_dir(tasks_root, "10.feature").exists()
+
+
+def _install_workflow(root: Path, definition: dict[str, Any]) -> None:
+    """Drop an operator workflow definition so ``load_workflows`` picks it up
+    at ``create_app`` time (call before ``_client``)."""
+    wf_dir = root / ".nightshift" / "workflows"
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    (wf_dir / f"{definition['name']}.json").write_text(json.dumps(definition))
+
+
+# A looping-verify definition (spec §12): implement routes back to verify until
+# verify signals `verify-clear`. Every cyclic step declares max_visits.
+_VERIFY_LOOP_DEF = {
+    "name": "verify-loop",
+    "steps": [
+        {
+            "id": "implement", "kind": "code", "role": "implementor",
+            "inputs": ["brief"], "max_turns": None, "next": "verify",
+            "max_visits": 3,
+        },
+        {
+            "id": "verify", "kind": "doc", "role": "implementor",
+            "prompt": "workflow-verify.md", "inputs": ["brief"], "output": "gaps",
+            "max_turns": 30, "signals": {"verify-clear": "$end"},
+            "next": "gap-plan", "max_visits": 3,
+        },
+        {
+            "id": "gap-plan", "kind": "doc", "role": "planner",
+            "prompt": "workflow-gap-plan.md", "inputs": ["brief", "gaps"],
+            "output": "plan", "max_turns": 30, "next": "implement",
+            "max_visits": 3,
+        },
+    ],
+}
+
+
+def test_workflow_verify_loop_round_trip(tmp_path: Path) -> None:
+    """Spec §12: a looping-verify definition runs on the engine unmodified —
+    implement lands → verify → gap-plan → implement, with visits counted on
+    each cursor entry."""
+    root = _seed(tmp_path, {
+        "10.feature": "---\nworkflow: verify-loop\npriority: 1\n---\nBuild it.",
+    })
+    _install_workflow(root, _VERIFY_LOOP_DEF)
+    tasks_root = root / _TASKS_ROOT_NAME
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+
+        # First step is a code step (implement); land it → cursor enters verify.
+        order = _poll(client, "10.feature")
+        assert order["config"]["workflow"]["step"] == "implement"
+        assert _step_of(root, "10.feature") == ("implement", "implement:1")
+        wt = setup_worktree(root, order["repo"], "10.feature")
+        (wt / "GENERATED.txt").write_text("v1\n")
+        subprocess.run(["git", "add", "-A"], cwd=wt, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "v1"], cwd=wt, check=True, capture_output=True)
+        assert _submit_completed(client, order).json().get("queued") is True
+        _drain_git(client)
+        assert _step_of(root, "10.feature") == ("verify", "implement:1,verify:1")
+
+        # Verify finds gaps (no clear signal) → routes to gap-plan.
+        order = _poll(client, "10.feature")
+        assert order["config"]["workflow"]["step"] == "verify"
+        _submit_doc(client, order, document="Gap: missing tests.")
+        assert _step_of(root, "10.feature")[0] == "gap-plan"
+
+        # gap-plan's default next re-enters implement (second entry).
+        order = _poll(client, "10.feature")
+        assert order["config"]["workflow"]["step"] == "gap-plan"
+        _submit_doc(client, order, document="Plan: add tests.")
+        step, visits = _step_of(root, "10.feature")
+        assert step == "implement"
+        assert "implement:2" in visits
+
+        # A second verify pass that clears routes to $end and consumes the brief.
+        order = _poll(client, "10.feature")
+        assert order["config"]["workflow"]["step"] == "implement"
+        wt = setup_worktree(root, order["repo"], "10.feature")
+        (wt / "GENERATED.txt").write_text("v2\n")
+        subprocess.run(["git", "add", "-A"], cwd=wt, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "v2"], cwd=wt, check=True, capture_output=True)
+        assert _submit_completed(client, order).json().get("queued") is True
+        _drain_git(client)
+        order = _poll(client, "10.feature")
+        assert order["config"]["workflow"]["step"] == "verify"
+        _submit_doc(client, order, document="All good.", signal="verify-clear")
+        # $end from a doc step: non-evergreen → brief retained as completed,
+        # the final artifact kept (spec §6.3).
+        assert (tasks_root / "main" / "10.feature.md").exists()
+
+
+def test_workflow_budget_quarantine_on_entry(tmp_path: Path) -> None:
+    """Entering a step whose max_visits is exhausted quarantines the task
+    (the work still commits)."""
+    definition = {
+        "name": "tight-loop",
+        "steps": [
+            {
+                "id": "plan", "kind": "doc", "role": "planner",
+                "prompt": "workflow-plan.md", "inputs": ["brief"],
+                "output": "plan", "max_turns": 30, "next": "implement",
+                "max_visits": 1,
+            },
+            {
+                "id": "implement", "kind": "code", "role": "implementor",
+                "inputs": ["brief", "plan"], "max_turns": None, "next": "plan",
+                "max_visits": 2,
+            },
+        ],
+    }
+    root = _seed(tmp_path, {
+        "10.feature": "---\nworkflow: tight-loop\npriority: 1\n---\nBuild it.",
+    })
+    _install_workflow(root, definition)
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        # plan(1) → implement(1); implement's next loops to plan, whose budget
+        # (max_visits=1) is already spent → entering it again quarantines.
+        order = _poll(client, "10.feature")
+        assert order["config"]["workflow"]["step"] == "plan"
+        _submit_doc(client, order, document="Plan.")
+        order = _poll(client, "10.feature")
+        assert order["config"]["workflow"]["step"] == "implement"
+        wt = setup_worktree(root, order["repo"], "10.feature")
+        (wt / "GENERATED.txt").write_text("v1\n")
+        subprocess.run(["git", "add", "-A"], cwd=wt, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "v1"], cwd=wt, check=True, capture_output=True)
+        assert _submit_completed(client, order).json().get("queued") is True
+        _drain_git(client)
+        blocked = {b["task"]: b for b in client.get("/api/blocked").json()}
+        assert "10.feature" in blocked
+        assert "budget exhausted" in blocked["10.feature"]["blocked_reason"]
+
+
+def test_workflow_quarantine_clear_resumes_at_recorded_step(tmp_path: Path) -> None:
+    """A quarantine leaves the cursor untouched; clearing it re-dispatches the
+    task at its recorded ``workflow_step`` (spec §6.5)."""
+    root = _seed(tmp_path, {
+        "10.feature": "---\nworkflow: plan-review-implement\npriority: 1\n---\nBuild it.",
+    })
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        # Advance to review, then quarantine the task there via the worker flag.
+        order = _poll(client, "10.feature")
+        _submit_doc(client, order, document="Plan.")
+        order = _poll(client, "10.feature")
+        assert order["config"]["workflow"]["step"] == "review"
+        client.post(
+            f"/api/worker/runs/{order['run_id']}/submit",
+            json={
+                "worker_id": "w1", "lease_id": order["lease_id"],
+                "task": "10.feature", "queue": "main", "title": "10.feature",
+                "status": "error", "landable": False, "quarantine": True,
+                "failure_kind": "worker_error", "failure_reason": "boom",
+                "backend": "claude-code", "model": "claude-sonnet-4-6",
+            },
+        )
+        # Cursor unmoved by the failure; task not served while quarantined.
+        assert _step_of(root, "10.feature")[0] == "review"
+        assert _poll(client) is None
+
+        # Operator clears the quarantine → the task resumes at review.
+        client.patch("/api/tasks/10.feature", json={"quarantined": False})
+        order = _poll(client, "10.feature")
+        assert order["config"]["workflow"]["step"] == "review"
+
+
+def test_workflow_evergreen_end_resets_cursor_and_artifacts(tmp_path: Path) -> None:
+    """Evergreen $end (spec §6.5): the brief is retained, but the engine meta
+    lane is cleared and artifacts deleted, so the next dispatch restarts at
+    the first step."""
+    root = _seed(tmp_path, {
+        "10.feature": (
+            "---\nworkflow: verify-loop\nevergreen: true\npriority: 1\n---\nWatch it."
+        ),
+    })
+    _install_workflow(root, _VERIFY_LOOP_DEF)
+    tasks_root = root / _TASKS_ROOT_NAME
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        # implement(code) lands → verify.
+        order = _poll(client, "10.feature")
+        wt = setup_worktree(root, order["repo"], "10.feature")
+        (wt / "GENERATED.txt").write_text("v1\n")
+        subprocess.run(["git", "add", "-A"], cwd=wt, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "v1"], cwd=wt, check=True, capture_output=True)
+        _submit_completed(client, order)
+        _drain_git(client)
+        # verify clears immediately → $end from a doc step, evergreen reset.
+        order = _poll(client, "10.feature")
+        assert order["config"]["workflow"]["step"] == "verify"
+        _submit_doc(client, order, document="All good.", signal="verify-clear")
+
+        assert (tasks_root / "main" / "10.feature.md").exists()
+        # Engine meta cleared and artifacts gone → next dispatch restarts at
+        # the first step.
+        assert _step_of(root, "10.feature") == (None, None)
+        assert not artifacts_dir(tasks_root, "10.feature").exists()
+        order = _poll(client, "10.feature")
+        assert order["config"]["workflow"]["step"] == "implement"
+        assert _step_of(root, "10.feature") == ("implement", "implement:1")
+
+
+def test_workflow_unknown_definition_blocks_task(tmp_path: Path) -> None:
+    root = _wf_seed(tmp_path, "no-such-workflow")
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        # The candidate carries a workflow_error → the task is blocked, not served.
+        assert _poll(client) is None
+        blocked = {b["task"]: b for b in client.get("/api/blocked").json()}
+        assert "10.feature" in blocked
+        assert "no-such-workflow" in blocked["10.feature"]["blocked_reason"]
+
+
+def test_non_workflow_submit_untouched(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {"10.plain": "---\npriority: 1\n---\nDo a thing."})
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        order = _poll(client, "10.plain")
+        assert "workflow" not in order["config"]
+        resp = client.post(
+            f"/api/worker/runs/{order['run_id']}/submit",
+            json={
+                "worker_id": "w1", "lease_id": order["lease_id"], "task": "10.plain",
+                "queue": "main", "title": "10.plain", "status": "completed",
+                "landable": False, "backend": "claude-code", "model": "claude-sonnet-4-6",
+            },
+        ).json()
+        assert "workflow_step" not in resp
