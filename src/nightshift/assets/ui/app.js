@@ -2621,6 +2621,14 @@ function historyRow(run, task) {
     tag.textContent = run.playlist;
     title.append(tag);
   }
+  const wf = task.workflow;
+  if (wf && wf.step) {
+    const wtag = document.createElement("span");
+    wtag.className = "hrow-tag hrow-workflow";
+    wtag.textContent = `workflow:${wf.step}`;
+    wtag.title = `Workflow: ${wf.name || ""}`;
+    title.append(wtag);
+  }
   // The target repo this run ran against (workspace-relative child name), shown
   // as a neutral tag beside the title; absent on runs that predate the column.
   const repo = task.repo || run.repo;

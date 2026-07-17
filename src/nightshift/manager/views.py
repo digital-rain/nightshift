@@ -31,6 +31,9 @@ RUN_VIEW_KEYS = (
     # Additive (post-Phase-8): enhance-on-create attribution, the operator's
     # thumbs verdict on the run, and free-form notes.
     "enhanced", "rating", "notes",
+    # Workflow routing metadata (name/step/kind): added post-Phase-8 so the
+    # history view can badge workflow stages.
+    "workflow",
 )
 
 # The exact pre-Phase-8 lease-row key set and order (the retired store's acquire_lease

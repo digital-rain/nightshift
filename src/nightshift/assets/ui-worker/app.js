@@ -181,6 +181,14 @@ function historyRow(r) {
   const title = document.createElement("div");
   title.className = "hrow-title";
   title.textContent = r.title || r.task;
+  const wf = r.workflow;
+  if (wf && wf.step) {
+    const wtag = document.createElement("span");
+    wtag.className = "hrow-tag hrow-workflow";
+    wtag.textContent = `workflow:${wf.step}`;
+    wtag.title = `Workflow: ${wf.name || ""}`;
+    title.append(wtag);
+  }
   if (r.repo) {
     const rtag = document.createElement("span");
     rtag.className = "hrow-tag hrow-repo";

@@ -1526,6 +1526,19 @@ body[data-view="detail"] #screen-detail { display: flex; flex: 1; }
   font-weight: 600;
 }
 
+.hrow-workflow {
+  background: #2d2444;
+  color: #c4a5f7;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 600;
+}
+@media (prefers-color-scheme: light) {
+  .hrow-workflow {
+    background: #ede4ff;
+    color: #6b3fa0;
+  }
+}
+
 /* History playlist tag */
 .hrow-tag {
   display: inline-block;

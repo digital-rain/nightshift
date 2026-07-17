@@ -257,6 +257,8 @@ class WorkerLoop:
                 teardown_worktree(self.cfg.workspace, repo, task, queue=queue_internal)
         # The local history row derives from the same Outcome (minus the
         # transport-only fields), plus the manager's land result.
+        wf = (order.get("config") or {}).get("workflow") or {}
+        wf_tag = {"name": wf["name"], "step": wf["step"]} if wf.get("name") else None
         self.local.finish(
             {
                 "run_id": run_id,
@@ -268,6 +270,7 @@ class WorkerLoop:
                 "commit_sha": result.get("sha"),
                 "landed": bool(result.get("landed")),
                 "quarantined": bool(result.get("quarantined")),
+                **({"workflow": wf_tag} if wf_tag else {}),
             }
         )
         # Drop remembered sessions when the task reaches a terminal outcome
