@@ -36,6 +36,14 @@ Parse it first; resolve defaults for any missing fields:
 If the file has no frontmatter at all, use all defaults.
 The resolved values govern the rest of the lifecycle below.
 
+## Plan files
+
+If the header above names a PLAN file, that plan is the spec — follow it, and
+trust its context manifest before exploring the codebase. The plan lists the
+files, function-level changes, and per-item tests; read the manifest's files
+first rather than re-deriving the layout. When no PLAN file is named, this
+paragraph does not apply and the task file is your only spec.
+
 ## Split tasks (decomposition runs)
 
 When `$SPLIT` is `true`, **do not implement the spec.**

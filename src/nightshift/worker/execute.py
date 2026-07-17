@@ -34,13 +34,19 @@ from nightshift.preflight import (
     run_interruptible,
 )
 from nightshift.prompts import (
+    build_doc_prompt,
     build_prompt,
     extract_blocked_reason,
     extract_result_line,
+    extract_signal,
     worker_env,
 )
 from nightshift.queue_config import DEFAULT_VALIDATE_CMD, validate_cmd_from_blob
-from nightshift.task_files import materialize_brief, split_output_dir
+from nightshift.task_files import (
+    materialize_artifacts,
+    materialize_brief,
+    split_output_dir,
+)
 from nightshift.worker.config import WorkerConfig
 
 
@@ -64,6 +70,7 @@ def _finish_landable(
     wip_ref_prefix: str | None = None,
     validate_cmd: str | None = None,
     worktree: str | None = None,
+    signal: str | None = None,
 ) -> Outcome:
     """Finalize a validated (landable) run.
 
@@ -83,6 +90,7 @@ def _finish_landable(
             backend=backend,
             validate_cmd=validate_cmd,
             worktree=worktree,
+            signal=signal,
             **tele,
         )
     try:
@@ -119,8 +127,182 @@ def _finish_landable(
         head_sha=head_sha,
         validate_cmd=validate_cmd,
         worktree=worktree,
+        signal=signal,
         **tele,
     )
+
+
+def _execute_doc_step(
+    cfg: WorkerConfig,
+    order: dict[str, Any],
+    workflow: dict[str, Any],
+    *,
+    repo: str,
+    task: str,
+    queue: str | None,
+    model: str,
+    provider: str,
+    backend: Any,
+    bare_model: str,
+    wt_path: str,
+    config_blob: dict[str, Any],
+    on_phase: PhaseCb,
+    on_log: LogCb,
+    fail: Callable[..., Outcome],
+) -> Outcome:
+    """Run a workflow doc step (spec §7.1): a throwaway read-only worktree at
+    ``base_ref``, torn down **unconditionally**. The agent explores and writes
+    one markdown document to ``$OUTPUT_FILE``; nothing is validated, published,
+    or landed. Returns a completed Outcome carrying the document + any signal,
+    or a typed failure."""
+    from nightshift.backends import LAUNCH_FAILED, WorkerSpec
+
+    workspace = cfg.workspace
+
+    # Tool-capable backends only — a doc step needs an agent that explores a
+    # worktree and writes a file (spec §7.1). A tool-less backend is an
+    # environment failure (RETRY_ELSEWHERE), not a burned attempt.
+    if not getattr(backend, "tool_capable", False):
+        return fail(
+            FailureKind.BACKEND_UNAVAILABLE,
+            "doc step requires a tool-capable backend",
+        )
+
+    on_phase("worker")
+    scratch = materialize_brief(workspace, repo, task, order["body"], queue=queue)
+    wf_artifacts = workflow.get("artifacts") or {}
+    artifact_files = {
+        name: str(path)
+        for name, path in materialize_artifacts(
+            workspace, repo, task, wf_artifacts, queue=queue
+        ).items()
+    }
+    # The output file is a run-scratch sibling of the worktree (outside it).
+    from nightshift.git.worktrees import queue_slug
+
+    output_path = (
+        workspace / ".worktrees" / repo
+        / f"task-local-{queue_slug(queue)}-{task}.output.md"
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        output_path.unlink()
+
+    # Cut the worktree exactly as the code path does, but tear it down
+    # unconditionally (no preserve flag on this path).
+    base: str | None = None
+    if cfg.rendezvous_remote:
+        base = prepare_worktree_base(
+            workspace, repo, cfg.rendezvous_remote, order.get("base_ref")
+        )
+    try:
+        wt_dir = setup_worktree(workspace, repo, task, queue=queue, base=base)
+    except GitError as exc:
+        return fail(
+            FailureKind.WORKTREE_FAILED, str(exc), line="worktree setup failed",
+        )
+
+    captured: list[str] = []
+
+    def capture_log(line: str) -> None:
+        captured.append(line)
+        on_log(line)
+
+    try:
+        prompt = build_doc_prompt(
+            task,
+            prompt_asset=workflow["prompt"],
+            task_file=str(scratch),
+            artifact_files=artifact_files,
+            output_file=str(output_path),
+        )
+        env = worker_env(wt_dir)
+        max_turns = config_blob.get("max_turns")
+        spec = WorkerSpec(
+            task=task,
+            prompt=prompt,
+            model=bare_model,
+            max_turns=int(max_turns) if max_turns is not None else None,
+            cwd=wt_dir,
+            env=env,
+            config=config_blob,
+            timeout=cfg.model_timeout_seconds or None,
+        )
+        on_log(f"  running doc step [{provider}] ({bare_model})...\n")
+        result = backend.run(spec, capture_log, lambda: None)
+
+        tele: dict[str, Any] = {
+            "turns": result.turns,
+            "input_tokens": result.input_tokens,
+            "output_tokens": result.output_tokens,
+            "cache_read_input_tokens": result.cache_read_input_tokens,
+            "cache_creation_input_tokens": result.cache_creation_input_tokens,
+            "usage": result.usage,
+            "cost_usd": result.cost_usd,
+        }
+
+        if result.returncode == LAUNCH_FAILED:
+            return fail(
+                FailureKind.WORKER_LAUNCH, result.error,
+                line="worker executable not found",
+            )
+
+        captured_text = "".join(captured)
+        step_signal = extract_signal(captured_text)
+        blocked_reason = extract_blocked_reason(captured_text)
+        if blocked_reason:
+            return Outcome(
+                status=RunStatus.BLOCKED,
+                result_line=f"blocked: {blocked_reason}",
+                landable=False,
+                model=model,
+                backend=provider,
+                failure_kind=FailureKind.BLOCKED,
+                failure_reason=blocked_reason,
+                worktree=wt_path,
+                **tele,
+            )
+
+        if result.returncode != 0:
+            reason = result.error or f"doc step [{provider}] exited {result.returncode}"
+            return Outcome(
+                status=RunStatus.ERROR,
+                result_line=reason.splitlines()[0][:120] if reason else "doc step failed",
+                landable=False,
+                model=model,
+                backend=provider,
+                failure_kind=FailureKind.WORKER_ERROR,
+                failure_reason=reason,
+                worktree=wt_path,
+                **tele,
+            )
+
+        document = output_path.read_text(errors="replace") if output_path.is_file() else ""
+        if not document.strip():
+            return fail(
+                FailureKind.WORKER_ERROR, "doc step produced no document",
+                line="doc step produced no document",
+            )
+
+        step_id = workflow.get("step", "")
+        output_name = workflow.get("output", "")
+        result_line = f"doc step '{step_id}' produced '{output_name}'"
+        if step_signal:
+            result_line += f" (signal: {step_signal})"
+        return Outcome(
+            status=RunStatus.COMPLETED,
+            result_line=result_line,
+            landable=False,
+            model=model,
+            backend=provider,
+            document=document,
+            signal=step_signal,
+            worktree=wt_path,
+            **tele,
+        )
+    finally:
+        # Unconditional teardown — the run is read-only; nothing is preserved.
+        teardown_worktree(workspace, repo, task, queue=queue)
 
 
 def execute_work_order(
@@ -206,8 +388,29 @@ def execute_work_order(
             f"backend '{provider}' is not available on this worker",
         )
 
+    workflow = config_blob.get("workflow") or {}
+    if workflow.get("kind") == "doc":
+        return _execute_doc_step(
+            cfg, order, workflow,
+            repo=repo, task=task, queue=queue,
+            model=model, provider=provider, backend=backend, bare_model=bare_model,
+            wt_path=wt_path, config_blob=config_blob,
+            on_phase=on_phase, on_log=on_log, fail=fail,
+        )
+
     on_phase("worker")
     scratch = materialize_brief(workspace, repo, task, order["body"], queue=queue)
+    # Code/split steps materialize their declared input artifacts next to the
+    # brief scratch and name them in the prompt header (spec §7.2).
+    wf_artifacts = (config_blob.get("workflow") or {}).get("artifacts") or {}
+    artifact_files: dict[str, str] = {}
+    if wf_artifacts:
+        artifact_files = {
+            name: str(path)
+            for name, path in materialize_artifacts(
+                workspace, repo, task, wf_artifacts, queue=queue
+            ).items()
+        }
     is_split = bool(config_blob.get("split", False))
     sdir: str | None = None
     if is_split:
@@ -245,6 +448,7 @@ def execute_work_order(
             loop_max_iterations=int(config_blob.get("loop_max_iterations", 0)),
             split=is_split,
             split_dir=sdir,
+            artifact_files=artifact_files or None,
         )
         env = worker_env(wt_dir)
 
@@ -306,7 +510,9 @@ def execute_work_order(
 
         has_commits = worktree_has_commits(workspace, repo, task, queue=queue)
 
-        blocked_reason = extract_blocked_reason("".join(captured))
+        captured_text = "".join(captured)
+        step_signal = extract_signal(captured_text)
+        blocked_reason = extract_blocked_reason(captured_text)
         if blocked_reason and not has_commits:
             return Outcome(
                 status=RunStatus.BLOCKED,
@@ -336,6 +542,7 @@ def execute_work_order(
                 model=model,
                 backend=provider,
                 worktree=wt_path,
+                signal=step_signal,
                 **tele,
             )
 
@@ -350,6 +557,7 @@ def execute_work_order(
                 model=model,
                 backend=provider,
                 worktree=wt_path,
+                signal=step_signal,
                 **tele,
             )
 
@@ -368,6 +576,7 @@ def execute_work_order(
                 wip_ref_prefix=config_blob.get("wip_ref_prefix"),
                 validate_cmd=None,
                 worktree=wt_path,
+                signal=step_signal,
             )
         on_phase("validate")
         on_log(f"  running {validate_display}...\n")
@@ -406,6 +615,7 @@ def execute_work_order(
             wip_ref_prefix=config_blob.get("wip_ref_prefix"),
             validate_cmd=validate_display,
             worktree=wt_path,
+            signal=step_signal,
         )
     finally:
         if not preserve:

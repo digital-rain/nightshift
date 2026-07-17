@@ -491,6 +491,8 @@ def build_cursor_argv(prompt: str, model: str, config: dict[str, Any]) -> list[s
 class ClaudeCodeBackend:
     name = "claude-code"
     agentic = True
+    # Can explore a worktree and write a file — required for workflow doc steps.
+    tool_capable = True
     description = "Claude Code CLI — fully agentic (edits files, runs bash). Default."
 
     def available(self, config: dict[str, Any] | None = None) -> bool:
@@ -517,6 +519,7 @@ class ClaudeCodeBackend:
 class CursorAgentBackend:
     name = "cursor"
     agentic = True
+    tool_capable = True
     description = "Cursor headless agent (cursor-agent) — agentic. Requires the Cursor CLI."
 
     def available(self, config: dict[str, Any] | None = None) -> bool:
@@ -543,6 +546,7 @@ class CursorAgentBackend:
 class GeminiCLIBackend:
     name = "gemini"
     agentic = True
+    tool_capable = True
     description = (
         "Google Gemini CLI (gemini) — agentic (edits files, runs tools via "
         "--yolo). Direct vendor path for comparing against Gemini-via-Cursor. "
@@ -601,6 +605,7 @@ class GeminiCLIBackend:
 class AnthropicBackend:
     name = "anthropic"
     agentic = False
+    tool_capable = False
     description = (
         "Anthropic Messages API directly — single-shot completion "
         "(NOT agentic; no file edits). Latency baseline."
@@ -767,6 +772,7 @@ def _ollama_generate(
 class OllamaBackend:
     name = "ollama"
     agentic = False
+    tool_capable = False
     description = (
         "Local Ollama model — single-shot completion (NOT agentic). "
         "Requires a running `ollama serve`."
@@ -796,6 +802,7 @@ class OllamaBackend:
 class OllamaCloudBackend:
     name = "ollama-cloud"
     agentic = False
+    tool_capable = False
     description = (
         "Ollama Cloud (ollama.com) — single-shot completion (NOT agentic). "
         "Hosted models via the native Ollama API over HTTPS; requires OLLAMA_API_KEY."
@@ -846,6 +853,7 @@ class NightshiftAgentBackend:
 
     name = "nightshift"
     agentic = True
+    tool_capable = True
     description = (
         "In-process agentic harness (owned tool loop + deterministic "
         "SEARCH/REPLACE; vendor in the model half, e.g. "

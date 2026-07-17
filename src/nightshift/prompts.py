@@ -15,6 +15,18 @@ from pathlib import Path
 from nightshift._paths import asset
 
 
+def _artifact_header(artifact_files: dict[str, str] | None) -> str:
+    """Header lines naming each materialized input artifact by role, e.g.
+    ``The PLAN file is: <path>``. Empty when there are no artifacts."""
+    if not artifact_files:
+        return ""
+    lines = [
+        f"The {name.upper()} file is: {path}\n"
+        for name, path in artifact_files.items()
+    ]
+    return "".join(lines)
+
+
 def build_prompt(
     task: str,
     *,
@@ -24,6 +36,7 @@ def build_prompt(
     loop_max_iterations: int = 0,
     split: bool = False,
     split_dir: str | None = None,
+    artifact_files: dict[str, str] | None = None,
 ) -> str:
     """Build the worker prompt matching CI injection format.
 
@@ -62,11 +75,35 @@ def build_prompt(
         f"The TASK_FILE variable is: {task_file}\n"
         f"The VALIDATE command is: {validate_cmd}\n"
     )
+    header += _artifact_header(artifact_files)
     if split:
         header += (
             f"The SPLIT variable is: true\n"
             f"The SPLIT_DIR variable is: {split_dir}\n"
         )
+    return f"{header}\n{prompt_body}"
+
+
+def build_doc_prompt(
+    task: str,
+    *,
+    prompt_asset: str,
+    task_file: str,
+    artifact_files: dict[str, str],
+    output_file: str,
+) -> str:
+    """Build a workflow doc-step prompt: a task-varying header (task file,
+    artifact paths, ``$OUTPUT_FILE``) followed by the byte-stable charter body
+    from ``assets/prompts/<prompt_asset>``. The body is never interpolated, so
+    it caches across runs of the same step (spec §8.2)."""
+    prompt_body = asset("prompts", prompt_asset).read_text()
+    header = (
+        f"Your task file is: {task_file}\n"
+        f"The TASK variable is: {task}\n"
+        f"The TASK_FILE variable is: {task_file}\n"
+    )
+    header += _artifact_header(artifact_files)
+    header += f"The OUTPUT_FILE variable is: {output_file}\n"
     return f"{header}\n{prompt_body}"
 
 
@@ -212,3 +249,23 @@ def extract_blocked_reason(text: str) -> str | None:
         if match:
             reason = (match.group(1) or "").strip() or "blocked"
     return reason
+
+
+# Workflow routing sentinel (spec §7.3): an agent emits ``NIGHTSHIFT_SIGNAL:
+# <token>`` to route the workflow (e.g. ``plan-trivial``, ``review-clear``).
+# Same last-match-wins mechanics as ``NIGHTSHIFT_BLOCKED``.
+_SIGNAL_SENTINEL = re.compile(r"^\s*NIGHTSHIFT_SIGNAL:\s*(\S.*?)\s*$")
+
+
+def extract_signal(text: str) -> str | None:
+    """Return the token from the **last** ``NIGHTSHIFT_SIGNAL: <token>`` line in
+    ``text``, or ``None`` when the sentinel is absent. A bare
+    ``NIGHTSHIFT_SIGNAL:`` with no token is ignored (no routing)."""
+    token: str | None = None
+    for line in text.splitlines():
+        match = _SIGNAL_SENTINEL.match(line)
+        if match:
+            captured = (match.group(1) or "").strip()
+            if captured:
+                token = captured
+    return token

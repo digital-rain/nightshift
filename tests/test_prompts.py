@@ -20,8 +20,10 @@ from nightshift._paths import PROMPTS_DIR
 from nightshift.backends import AgentStreamParser
 from nightshift.prompts import (
     build_claude_argv,
+    build_doc_prompt,
     build_prompt,
     extract_result_line,
+    extract_signal,
     resolve_claude_bin,
     worker_env,
 )
@@ -47,6 +49,45 @@ def _full(
 # --------------------------------------------------------------------------- #
 # build_prompt — a pure formatter over the materialised brief path
 # --------------------------------------------------------------------------- #
+
+
+def test_extract_signal_present_absent_bare_lastwins() -> None:
+    assert extract_signal("foo\nNIGHTSHIFT_SIGNAL: plan-trivial\nbar") == "plan-trivial"
+    assert extract_signal("nothing here") is None
+    # bare (no token) yields no routing
+    assert extract_signal("NIGHTSHIFT_SIGNAL:") is None
+    assert extract_signal("NIGHTSHIFT_SIGNAL:   ") is None
+    # last match wins
+    assert extract_signal(
+        "NIGHTSHIFT_SIGNAL: review-clear\nlater\nNIGHTSHIFT_SIGNAL: plan-trivial"
+    ) == "plan-trivial"
+
+
+def test_build_doc_prompt_header_shape() -> None:
+    prompt = build_doc_prompt(
+        "10.wf",
+        prompt_asset="workflow-plan.md",
+        task_file="/scratch/brief.md",
+        artifact_files={"plan": "/scratch/plan.md"},
+        output_file="/scratch/out.md",
+    )
+    assert "The TASK variable is: 10.wf" in prompt
+    assert "The TASK_FILE variable is: /scratch/brief.md" in prompt
+    assert "The PLAN file is: /scratch/plan.md" in prompt
+    assert "The OUTPUT_FILE variable is: /scratch/out.md" in prompt
+    # byte-stable charter body is appended verbatim
+    charter = (PROMPTS_DIR / "workflow-plan.md").read_text()
+    assert prompt.endswith(charter)
+
+
+def test_build_prompt_names_plan_file() -> None:
+    prompt = build_prompt(
+        "10.wf",
+        task_file="/scratch/brief.md",
+        validate_cmd=DEFAULT_VALIDATE_CMD,
+        artifact_files={"plan": "/scratch/plan.md"},
+    )
+    assert "The PLAN file is: /scratch/plan.md" in prompt
 
 
 def test_build_prompt_matches_ci_format(tmp_path: Path) -> None:

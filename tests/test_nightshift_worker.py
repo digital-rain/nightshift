@@ -462,3 +462,126 @@ def test_backoff_clears_when_queue_absent_from_pauses(tmp_path: Path) -> None:
     loop._backoff_queues = {"main"}
     loop._sync_backoff_with_manager({})
     assert loop._backoff_queues == set()
+
+
+# --------------------------------------------------------------------------- #
+# Workflow doc steps (spec §7.1)
+# --------------------------------------------------------------------------- #
+
+
+def _doc_order(model: str = "claude-code/claude-sonnet-4-6") -> dict[str, Any]:
+    return {
+        "task": "10.wf", "repo": "longitude", "queue": "main",
+        "body": "Do the thing.", "base_ref": "HEAD",
+        "config": {
+            "model": model, "validate": "",
+            "workflow": {
+                "name": "plan-review-implement", "step": "plan", "kind": "doc",
+                "prompt": "workflow-plan.md", "output": "plan",
+                "artifacts": {}, "signals": ["plan-trivial"],
+            },
+        },
+    }
+
+
+def _worktree_gone(workspace: Path) -> bool:
+    from nightshift.git.worktrees import worktree_dir
+
+    return not worktree_dir(workspace, "longitude", "10.wf", None).exists()
+
+
+def test_doc_step_writes_document_and_tears_down(tmp_path: Path, monkeypatch) -> None:
+    workspace = build_workspace(tmp_path, tasks={"10.wf": "Do the thing."})
+
+    class _DocBackend:
+        name = "claude-code"
+        agentic = True
+        tool_capable = True
+
+        def available(self, config=None) -> bool:
+            return True
+
+        def run(self, spec, emit_log, should_abort, on_worker_start=None):
+            # The output file path is injected in the header.
+            out = None
+            for line in spec.prompt.splitlines():
+                if line.startswith("The OUTPUT_FILE variable is: "):
+                    out = line.split(": ", 1)[1]
+            assert out is not None
+            Path(out).write_text("# The Plan\nDo step 1.\n")
+            emit_log("NIGHTSHIFT_SIGNAL: plan-trivial\n")
+            return WorkerResult(returncode=0, turns=3)
+
+    monkeypatch.setattr(backends_mod, "require_backend", lambda p: _DocBackend())
+    cfg = WorkerConfig(
+        workspace=workspace, worker_id="w", manager_url="http://x",
+        models=["claude-code/claude-sonnet-4-6"],
+    )
+    outcome = execute_work_order(
+        cfg, _doc_order(), on_phase=lambda _p: None, on_log=lambda _l: None,
+    )
+    assert outcome.status.value == "completed"
+    assert outcome.landable is False
+    assert outcome.document.startswith("# The Plan")
+    assert outcome.signal == "plan-trivial"
+    assert "doc step 'plan' produced 'plan'" in outcome.result_line
+    assert _worktree_gone(workspace)
+
+
+def test_doc_step_missing_output_is_worker_error(tmp_path: Path, monkeypatch) -> None:
+    workspace = build_workspace(tmp_path, tasks={"10.wf": "Do the thing."})
+
+    class _NoOutputBackend:
+        name = "claude-code"
+        agentic = True
+        tool_capable = True
+
+        def available(self, config=None) -> bool:
+            return True
+
+        def run(self, spec, emit_log, should_abort, on_worker_start=None):
+            emit_log("did nothing useful\n")
+            return WorkerResult(returncode=0, turns=1)
+
+    monkeypatch.setattr(backends_mod, "require_backend", lambda p: _NoOutputBackend())
+    cfg = WorkerConfig(
+        workspace=workspace, worker_id="w", manager_url="http://x",
+        models=["claude-code/claude-sonnet-4-6"],
+    )
+    outcome = execute_work_order(
+        cfg, _doc_order(), on_phase=lambda _p: None, on_log=lambda _l: None,
+    )
+    assert outcome.status.value == "error"
+    assert outcome.failure_kind.value == "worker_error"
+    assert "no document" in outcome.failure_reason
+    # worktree still torn down even on failure
+    assert _worktree_gone(workspace)
+
+
+def test_doc_step_toolless_backend_fails_before_worktree(tmp_path: Path, monkeypatch) -> None:
+    workspace = build_workspace(tmp_path, tasks={"10.wf": "Do the thing."})
+
+    class _ToollessBackend:
+        name = "anthropic"
+        agentic = False
+        tool_capable = False
+
+        def available(self, config=None) -> bool:
+            return True
+
+        def run(self, spec, emit_log, should_abort, on_worker_start=None):
+            raise AssertionError("must not run a tool-less backend for a doc step")
+
+    monkeypatch.setattr(backends_mod, "require_backend", lambda p: _ToollessBackend())
+    cfg = WorkerConfig(
+        workspace=workspace, worker_id="w", manager_url="http://x",
+        models=["anthropic/claude-sonnet-4-6"],
+    )
+    outcome = execute_work_order(
+        cfg, _doc_order("anthropic/claude-sonnet-4-6"),
+        on_phase=lambda _p: None, on_log=lambda _l: None,
+    )
+    assert outcome.status.value == "error"
+    assert outcome.failure_kind.value == "backend_unavailable"
+    assert "tool-capable" in outcome.failure_reason
+    assert _worktree_gone(workspace)
