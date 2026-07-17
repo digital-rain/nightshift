@@ -55,14 +55,14 @@ class OperatorConfig:
     """Task-policy keys formerly scattered as top-level config.json values."""
 
     max_per_day: int = field(default=200, metadata=meta(
-        category="Scheduling", label="Max per day",
+        category="Scheduled Tasks", label="Max per day",
         desc="Dispatch cap for the daily-queue path.",
         env="NIGHTSHIFT_MAX_PER_DAY"))
     max_concurrent_queues: int = field(default=2, metadata=meta(
-        category="Scheduling", label="Max concurrent queues",
+        category="Scheduled Tasks", label="Max concurrent queues",
         desc="Max queues served concurrently."))
     max_nights_before_parking: int = field(default=2, metadata=meta(
-        category="Scheduling", label="Max nights before parking",
+        category="Scheduled Tasks", label="Max nights before parking",
         desc="Nights a failing task retries before being parked.",
         ))
     scheduled_models_allow: tuple[str, ...] = field(
@@ -233,7 +233,7 @@ class ManagerSettings:
     # OperatorConfig fields are flattened into the JSON — we compose them
     # as a nested object for code ergonomics, serialized flat.
     operator: OperatorConfig = field(default_factory=OperatorConfig, metadata=meta(
-        category="Scheduling", label="Operator config",
+        category="Scheduled Tasks", label="Operator config",
         desc="Task-policy keys.", editable=False, flatten=True))
 
     # Internal: the raw dict from disk for pass-through access by legacy readers.
