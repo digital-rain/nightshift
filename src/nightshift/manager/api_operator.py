@@ -398,17 +398,8 @@ def register_operator_api(
             {"task": task, "artifacts": read_artifacts(tasks_root, task, names, tasks_rel)}
         )
 
-    @app.get("/api/workflows")
-    async def get_workflows() -> JSONResponse:
-        """The loaded workflow definitions as ``{name: [ordered step ids]}`` —
-        the queue-row badge renders the full step path with the cursor
-        highlighted (spec §9)."""
-        return JSONResponse(
-            {
-                name: [s.id for s in wf.steps]
-                for name, wf in app.state.workflows.items()
-            }
-        )
+    # GET /api/workflows (and the rest of the workflow-editor surface) lives
+    # in manager/api_workflows.py, registered by create_app.
 
     @app.get("/api/task-defaults")
     async def get_task_defaults(queue: str | None = None) -> JSONResponse:

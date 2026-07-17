@@ -22,7 +22,12 @@ from nightshift.task_files import (
     split_notes,
     split_original,
 )
-from nightshift.workflows import StepKind, WorkflowDef, step_max_turns
+from nightshift.workflows import (
+    StepKind,
+    WorkflowDef,
+    resolve_prompt_text,
+    step_max_turns,
+)
 
 
 def task_meta(tasks_root: Path, task: str, queue: str | None) -> dict[str, Any]:
@@ -121,6 +126,15 @@ def build_work_order(
             if step.kind is StepKind.DOC:
                 wf_block["prompt"] = step.prompt
                 wf_block["output"] = step.output
+                # Prompt custody (workflow-editor spec §4): the body is
+                # resolved manager-side (operator file wins over the shipped
+                # asset) and rides the order, so remote workers never need a
+                # view of the manager's ``.nightshift/``. When resolution
+                # fails the key is omitted and the worker falls back to its
+                # own asset() read.
+                prompt_text = resolve_prompt_text(workspace, step.prompt or "")
+                if prompt_text is not None:
+                    wf_block["prompt_text"] = prompt_text
             config_blob["workflow"] = wf_block
             # A split step reuses the worker's decomposition path.
             if step.kind is StepKind.SPLIT:

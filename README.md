@@ -110,6 +110,7 @@ Install only the tooling for the providers you advertise:
 
 - [Setup Guide](docs/user/setup-guide.md) — bring-up from nothing on one box, then adding co-located and remote workers.
 - [Configuration Reference](docs/user/configuration-reference.md) — every config file, key, and environment variable.
+- [Authoring Workflows](docs/user/workflow-authoring.md) — creating and editing workflow definitions and prompts, in the visual editor or by hand.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — component map, data flow, state model, git model, and design rationale.
 - [`docs/topics/`](docs/topics/) — focused topics: the agentic harness, the smoke test, task state handling.
 - [`docs/spec/`](docs/spec/) — design documents behind the larger subsystems.

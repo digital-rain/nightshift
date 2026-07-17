@@ -91,12 +91,21 @@ def build_doc_prompt(
     task_file: str,
     artifact_files: dict[str, str],
     output_file: str,
+    prompt_text: str | None = None,
 ) -> str:
     """Build a workflow doc-step prompt: a task-varying header (task file,
-    artifact paths, ``$OUTPUT_FILE``) followed by the byte-stable charter body
-    from ``assets/prompts/<prompt_asset>``. The body is never interpolated, so
-    it caches across runs of the same step (spec §8.2)."""
-    prompt_body = asset("prompts", prompt_asset).read_text()
+    artifact paths, ``$OUTPUT_FILE``) followed by the byte-stable charter body.
+
+    ``prompt_text`` is the manager-resolved body riding the work order
+    (workflow-editor spec §4 — operator prompts shadow shipped ones and remote
+    workers cannot read the manager's ``.nightshift/``); when absent the body
+    is read from the shipped ``assets/prompts/<prompt_asset>`` (wire compat
+    with orders from an older manager). The body is never interpolated, so it
+    caches across runs of the same step (spec §8.2)."""
+    prompt_body = (
+        prompt_text if prompt_text is not None
+        else asset("prompts", prompt_asset).read_text()
+    )
     header = (
         f"Your task file is: {task_file}\n"
         f"The TASK variable is: {task}\n"

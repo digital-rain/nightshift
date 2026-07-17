@@ -43,6 +43,7 @@ from nightshift.lifecycle import RESOLVE_WORKER_ID, AttemptState, FailureKind
 from nightshift.manager import failure_policy
 from nightshift.manager.api_operator import register_operator_api
 from nightshift.manager.api_worker import register_worker_api
+from nightshift.manager.api_workflows import register_workflow_editor_api
 from nightshift.manager.hub import Hub
 from nightshift.manager.reconciler import Reconciler, reap_finished_resolves
 from nightshift.manager.registry import Registry
@@ -176,8 +177,10 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
     app.state.hub = Hub()
     app.state.sched_state = SchedulerState()
     # Workflow definitions (spec §3): shipped assets shadowed by operator
-    # ``.nightshift/workflows/*.json``. Loaded once at startup; a malformed
-    # definition fails the load loudly (WorkflowError propagates).
+    # ``.nightshift/workflows/*.json``. Loaded at startup — a malformed
+    # definition or dangling prompt reference fails the load loudly
+    # (WorkflowError propagates) — and hot-reloaded by the workflow-editor
+    # API on every successful definition write/delete (editor spec §3.1).
     app.state.workflows = load_workflows(workspace)
     # One repo_unavailable warning per queue (deduped by queue key); cleared on
     # rescan so a re-cloned repo re-warns if it disappears again.
@@ -411,6 +414,11 @@ def create_app(workspace: Path, *, store: NightshiftStore | None = None) -> Fast
         _queue_failure_state=_queue_failure_state,
         _start_resolve=_start_resolve,
         _executors=executors,
+    )
+    register_workflow_editor_api(
+        app,
+        workspace=workspace,
+        _emit=_emit,
     )
 
     # ----- static UI ------------------------------------------------------- #

@@ -549,6 +549,166 @@ body {
 /* Create-pane workflow controls. */
 .wf-picker, .wf-planner { margin-left: 8px; }
 .wf-steps-hint { margin-left: 8px; color: var(--text-dim); font-size: 12px; }
+.wf-edit-btn { margin-left: 6px; }
+
+/* ---- Workflows library (workflow-editor spec §5) ---- */
+.workflows-list-body { display: flex; flex-direction: column; gap: 6px; max-width: 860px; }
+.wf-lib-list { list-style: none; margin: 0 0 10px; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.wf-lib-row {
+  display: flex; align-items: center; gap: 8px;
+  background: var(--bg-elev); border: 1px solid var(--border); border-radius: 10px;
+  padding: 8px 10px;
+}
+.wf-lib-main {
+  flex: 1; display: flex; align-items: center; gap: 10px; min-width: 0;
+  background: none; border: none; color: var(--text);
+  font: inherit; text-align: left; cursor: pointer; padding: 2px 0;
+}
+.wf-lib-name { font-weight: 600; white-space: nowrap; }
+.wf-lib-path { color: var(--text-dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-lib-actions { display: flex; gap: 6px; flex: none; }
+.wf-prompts-head { margin-top: 18px; }
+.ghost-btn.danger { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, var(--border)); }
+
+/* Provenance badges (shipped / operator / shadows shipped) */
+.wf-prov {
+  flex: none; font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em;
+  border-radius: 999px; padding: 2px 8px; border: 1px solid var(--border);
+  color: var(--text-dim); background: var(--bg-sunken);
+}
+.wf-prov.operator { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.wf-prov.shadow { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
+
+/* ---- Workflow editor takeover ---- */
+.wf-editor-body { display: flex; flex-direction: column; gap: 10px; flex: 1; min-height: 0; }
+.wf-ed-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.wf-ed-name {
+  font-size: 15px; font-weight: 600; padding: 6px 10px; min-width: 220px;
+  background: var(--bg-sunken); border: 1px solid var(--border); border-radius: 8px; color: var(--text);
+}
+.wf-ed-name-static { font-size: 15px; font-weight: 600; }
+.wf-ed-spacer { flex: 1; }
+.wf-ed-modeseg { margin-left: 4px; }
+.wf-ed-shadow-note, .wf-ed-readonly-note {
+  font-size: 12px; border-radius: 8px; padding: 6px 10px;
+}
+.wf-ed-shadow-note { color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); }
+.wf-ed-shadow-note[hidden] { display: none; }
+.wf-ed-shadow-note:empty { display: none; }
+.wf-ed-readonly-note { color: var(--text-dim); background: var(--bg-sunken); }
+.wf-ed-split { display: flex; gap: 14px; flex: 1; min-height: 0; align-items: stretch; }
+.wf-ed-left { flex: 1 1 55%; min-width: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+.wf-ed-right { flex: 1 1 45%; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+@media (max-width: 900px) { .wf-ed-split { flex-direction: column; } }
+.wf-ed-cards { display: flex; flex-direction: column; gap: 10px; }
+.wf-ed-addstep { align-self: flex-start; }
+.wf-ed-raw {
+  flex: 1; min-height: 320px; resize: vertical; padding: 10px;
+  background: var(--bg-sunken); color: var(--text); border: 1px solid var(--border);
+  border-radius: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px; line-height: 1.5;
+}
+
+/* Step cards */
+.wf-card {
+  background: var(--bg-elev); border: 1px solid var(--border); border-radius: 12px;
+  padding: 10px 12px;
+}
+.wf-card.dragging { opacity: 0.5; }
+.wf-card.dragover { border-color: var(--accent); }
+.wf-card-error { border-color: var(--err); box-shadow: 0 0 0 1px var(--err); }
+.wf-card-flash { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.wf-card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.wf-card-handle { cursor: grab; color: var(--text-dim); font-size: 14px; user-select: none; }
+.wf-card-id {
+  flex: 1; min-width: 90px; font-weight: 600; padding: 5px 8px;
+  background: var(--bg-sunken); border: 1px solid var(--border); border-radius: 7px; color: var(--text);
+}
+.wf-card-remove { padding: 2px 8px; }
+.wf-card-grid { display: flex; flex-direction: column; gap: 7px; }
+.wf-field { display: flex; align-items: baseline; gap: 8px; font-size: 12px; }
+.wf-field-cap {
+  flex: none; width: 74px; color: var(--text-dim); font-size: 10px;
+  text-transform: uppercase; letter-spacing: 0.06em;
+}
+.wf-field input[type="text"], .wf-field input[type="number"], .wf-field select {
+  background: var(--bg-sunken); border: 1px solid var(--border); border-radius: 7px;
+  color: var(--text); padding: 4px 8px; font-size: 12px;
+}
+.wf-field input[type="text"] { flex: 1; min-width: 0; }
+.wf-field-required input { border-color: var(--warn); box-shadow: 0 0 0 1px color-mix(in srgb, var(--warn) 55%, transparent); }
+.wf-prompt-wrap { display: flex; gap: 6px; align-items: center; flex: 1; min-width: 0; }
+.wf-prompt-wrap select { flex: 1; min-width: 0; }
+.wf-inputs { display: flex; flex-wrap: wrap; gap: 10px; }
+.wf-input-choice { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; }
+.wf-turns { display: flex; align-items: center; gap: 8px; }
+.wf-turns-n { width: 76px; }
+.wf-signals { display: flex; flex-direction: column; gap: 5px; flex: 1; min-width: 0; }
+.wf-signal-row { display: flex; align-items: center; gap: 6px; }
+.wf-signal-row input[type="text"] { flex: 1; min-width: 0; }
+.wf-signal-arrow { color: var(--text-dim); }
+.wf-signal-add, .wf-signal-rm { align-self: flex-start; padding: 2px 8px; }
+
+/* Graph preview */
+.wf-ed-graph-cap { font-size: 10px; letter-spacing: 0.08em; color: var(--text-dim); }
+.wf-ed-graph {
+  background: var(--bg-sunken); border: 1px solid var(--border); border-radius: 12px;
+  padding: 6px; overflow-x: auto;
+}
+.wf-graph-svg { width: 100%; min-width: 320px; display: block; }
+.wf-graph-note { color: var(--text-dim); font-size: 12px; padding: 16px; }
+.wf-node { cursor: pointer; }
+.wf-node-rect { fill: var(--bg-elev); stroke: var(--border); stroke-width: 1.2; }
+.wf-node.kind-doc .wf-node-rect { stroke: var(--accent); }
+.wf-node.kind-code .wf-node-rect { stroke: var(--ok); }
+.wf-node.kind-split .wf-node-rect { stroke: var(--warn); }
+.wf-node-label { fill: var(--text); font-size: 12px; font-weight: 600; text-anchor: middle; }
+.wf-node-label.end { fill: var(--text-dim); font-weight: 400; }
+.wf-node-kind { fill: var(--text-dim); font-size: 9px; text-anchor: middle; }
+.wf-node-end { fill: none; stroke: var(--text-dim); stroke-width: 1.2; stroke-dasharray: 3 3; }
+.wf-edge.next { stroke: var(--text-dim); stroke-width: 1.4; }
+.wf-edge.signal { stroke: var(--accent); stroke-width: 1.2; stroke-dasharray: 5 4; }
+.wf-edge.back { stroke: var(--warn); stroke-width: 1.4; }
+.wf-arrow-head { fill: var(--text-dim); }
+.wf-arrow-signal-head { fill: var(--accent); }
+.wf-arrow-back-head { fill: var(--warn); }
+.wf-edge-label { fill: var(--accent); font-size: 9px; text-anchor: middle; }
+.wf-edge-label.back-badge { fill: var(--warn); }
+.wf-ed-shipped-toggle { align-self: flex-start; }
+.wf-ed-shipped-json {
+  background: var(--bg-sunken); border: 1px solid var(--border); border-radius: 10px;
+  padding: 10px; font-size: 11px; overflow: auto; max-height: 300px; margin: 0;
+}
+
+/* Validation strip + save bar */
+.wf-ed-validation {
+  font-size: 12px; border-radius: 8px; padding: 7px 10px;
+  border: 1px solid var(--border); background: var(--bg-sunken); color: var(--text-dim);
+}
+.wf-ed-validation.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); }
+.wf-ed-validation.err { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, var(--border)); }
+.wf-ed-savebar { display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding-bottom: 6px; }
+
+/* ---- Prompt editor ---- */
+.prompt-editor-body { display: flex; flex-direction: column; gap: 10px; flex: 1; min-height: 0; }
+.wf-prompt-callout {
+  font-size: 12px; color: var(--text-dim); background: var(--bg-sunken);
+  border: 1px dashed var(--border); border-radius: 8px; padding: 7px 10px;
+}
+.wf-prompt-split { display: flex; gap: 12px; flex: 1; min-height: 0; }
+@media (max-width: 900px) { .wf-prompt-split { flex-direction: column; } }
+.wf-prompt-source {
+  flex: 1 1 50%; min-height: 320px; resize: vertical; padding: 10px;
+  background: var(--bg-sunken); color: var(--text); border: 1px solid var(--border);
+  border-radius: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px; line-height: 1.55;
+}
+.wf-prompt-preview {
+  flex: 1 1 50%; min-width: 0; overflow-y: auto; max-height: 70vh;
+  background: var(--bg-elev); border: 1px solid var(--border); border-radius: 10px;
+  padding: 12px 14px; font-size: 13px;
+}
+.wf-prompt-status { color: var(--text-dim); font-size: 12px; flex: 1; }
 /* Thumbs verdict on the task's latest run (read-only glyph on queue rows). */
 .badge.rating { border: none; padding: 1px 2px; font-size: 13px; }
 /* Priority chip (P0..P5): a monospace-ish pill whose tint runs from urgent
@@ -801,6 +961,7 @@ body {
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
 .btn { padding: 8px 14px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-sunken); color: var(--text); cursor: pointer; }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn:disabled { opacity: 0.45; cursor: default; }
 .btn-resolve { display: inline-flex; align-items: center; gap: 6px; }
 .btn-resolve .bot-icon { display: block; }
 .btn-resolve:disabled { opacity: 0.6; cursor: default; }
@@ -1080,6 +1241,9 @@ body[data-view="stats"] #screen-stats,
 body[data-view="repos"] #screen-repos,
 body[data-view="settings"] #screen-settings,
 body[data-view="playlist-info"] #screen-playlist-info,
+body[data-view="workflows"] #screen-workflows,
+body[data-view="workflow-editor"] #screen-workflow-editor,
+body[data-view="prompt-editor"] #screen-prompt-editor,
 body[data-view="detail"] #screen-detail { display: flex; flex: 1; }
 
 /* ---- full-area task detail takeover ---- */

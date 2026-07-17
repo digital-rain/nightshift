@@ -11,6 +11,7 @@ Spec: ``docs/spec/2026-07-16-workflows.md`` §3 (vocabulary, role resolution).
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -308,25 +309,92 @@ def _check_cycles_declare_visits(wf: WorkflowDef) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Prompt custody (workflow-editor spec §4)
+# --------------------------------------------------------------------------- #
+# Workflow doc-step prompts follow the same shipped-shadowed-by-operator
+# convention as definitions: ``assets/prompts/<name>`` shadowed by
+# ``<workspace>/.nightshift/prompts/<name>``. Bodies are resolved manager-side
+# and ride the work order (``prompt_text``), so remote workers never need a
+# view of the manager's ``.nightshift/``.
+
+
+def operator_prompts_dir(workspace: Path) -> Path:
+    return workspace / ".nightshift" / "prompts"
+
+
+def operator_workflows_dir(workspace: Path) -> Path:
+    return workspace / ".nightshift" / "workflows"
+
+
+def prompt_path(workspace: Path, name: str) -> Path | None:
+    """The file backing prompt ``name`` — operator file first, shipped asset
+    fallback — or ``None`` when neither exists."""
+    op = operator_prompts_dir(workspace) / name
+    if op.is_file():
+        return op
+    shipped = asset("prompts", name)
+    if shipped.is_file():
+        return shipped
+    return None
+
+
+def prompt_exists(workspace: Path, name: str) -> bool:
+    return prompt_path(workspace, name) is not None
+
+
+def resolve_prompt_text(workspace: Path, name: str) -> str | None:
+    """The prompt body for ``name`` (operator wins over shipped), or ``None``
+    when the file is missing/unreadable — the worker then falls back to its
+    own ``asset()`` read (wire compat with orders from an older manager)."""
+    path = prompt_path(workspace, name)
+    if path is None:
+        return None
+    try:
+        return path.read_text()
+    except OSError:
+        return None
+
+
+def check_prompt_refs(wf: WorkflowDef, exists: Callable[[str], bool]) -> None:
+    """Raise :class:`WorkflowError` when a doc step's ``prompt`` names no
+    existing prompt (shipped or operator). Kept out of :func:`parse_workflow`
+    so the parser stays pure and file-agnostic; the loader and the editor's
+    validate/save endpoints both run this check."""
+    for step in wf.steps:
+        if step.kind is StepKind.DOC and step.prompt and not exists(step.prompt):
+            raise WorkflowError(
+                f"step {step.id!r}: prompt {step.prompt!r} names no known "
+                "prompt (shipped or operator)"
+            )
+
+
+# --------------------------------------------------------------------------- #
 # Loading (shipped + operator shadow)
 # --------------------------------------------------------------------------- #
 
 
-def load_workflows(workspace: Path) -> dict[str, WorkflowDef]:
+def load_workflows(workspace: Path, *, check_prompts: bool = True) -> dict[str, WorkflowDef]:
     """Load shipped ``assets/workflows/*.json`` shadowed by
     ``<workspace>/.nightshift/workflows/*.json``. Operator files override
-    shipped ones of the same name."""
+    shipped ones of the same name.
+
+    ``check_prompts`` (default on) verifies every doc step's ``prompt`` names
+    an existing prompt file — shipped or operator — failing loud like every
+    other definition error (workflow-editor spec §3)."""
     defs: dict[str, WorkflowDef] = {}
     shipped_dir = asset("workflows")
     if shipped_dir.is_dir():
         for path in sorted(shipped_dir.glob("*.json")):
             wf = _load_file(path)
             defs[wf.name] = wf
-    op_dir = workspace / ".nightshift" / "workflows"
+    op_dir = operator_workflows_dir(workspace)
     if op_dir.is_dir():
         for path in sorted(op_dir.glob("*.json")):
             wf = _load_file(path)
             defs[wf.name] = wf
+    if check_prompts:
+        for wf in defs.values():
+            check_prompt_refs(wf, lambda name: prompt_exists(workspace, name))
     return defs
 
 
@@ -468,11 +536,17 @@ __all__ = [
     "WorkflowDef",
     "WorkflowError",
     "WorkflowStep",
+    "check_prompt_refs",
     "format_visits",
     "load_workflows",
     "make_resolver",
+    "operator_prompts_dir",
+    "operator_workflows_dir",
     "parse_visits",
     "parse_workflow",
+    "prompt_exists",
+    "prompt_path",
+    "resolve_prompt_text",
     "resolve_role_model",
     "route",
     "step_max_turns",

@@ -77,6 +77,7 @@
             <button class="add-menu-item" data-act="settings" role="menuitem">Settings…</button>
             <button class="add-menu-item" data-act="workers" role="menuitem">Workers</button>
             <button class="add-menu-item" data-act="repos" role="menuitem">Repos</button>
+            <button class="add-menu-item" data-act="workflows" role="menuitem">Workflows</button>
           </div>
         </div>
       </div>
@@ -295,6 +296,51 @@
           <th>Turns</th><th>Tokens</th><th>Cost</th>
         </tr></thead><tbody id="by-queue-body"></tbody></table>
       </section>
+
+      <!-- Workflows: the definition + prompt library (workflow-editor spec §5).
+           Lists shipped and operator workflow definitions with provenance
+           (operator files shadow shipped ones) and the prompt charters doc
+           steps run under. Rows open the visual editor / prompt editor. -->
+      <section id="screen-workflows" class="screen screen-workflows" aria-label="Workflows">
+        <div class="pane-head">
+          <h2>Workflows</h2>
+          <button id="btn-new-workflow" class="ghost-btn" title="Create a workflow definition">+ New workflow</button>
+        </div>
+        <div id="workflows-list-body" class="workflows-list-body"></div>
+      </section>
+
+      <!-- Workflow editor: full-area takeover — ordered step cards (left) +
+           a render-only SVG graph preview (right), a live validation strip
+           driven by the manager's own parse_workflow, and a raw-JSON toggle.
+           Edges are picked from a closed set, never drawn by hand. -->
+      <section id="screen-workflow-editor" class="screen screen-workflow-editor" aria-label="Workflow editor">
+        <div class="detail-takeover-head">
+          <button id="wf-editor-back" class="detail-back" title="Back" aria-label="Back">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M15 5l-7 7 7 7" />
+            </svg>
+          </button>
+          <h2 id="wf-editor-title">Workflow</h2>
+        </div>
+        <div id="wf-editor-body" class="wf-editor-body"></div>
+      </section>
+
+      <!-- Prompt editor: markdown source + rendered preview side by side.
+           Shipped prompts are read-only with Duplicate; operator prompts live
+           in .nightshift/prompts/ and shadow shipped ones by filename. -->
+      <section id="screen-prompt-editor" class="screen screen-prompt-editor" aria-label="Prompt editor">
+        <div class="detail-takeover-head">
+          <button id="prompt-editor-back" class="detail-back" title="Back" aria-label="Back">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M15 5l-7 7 7 7" />
+            </svg>
+          </button>
+          <h2 id="prompt-editor-title">Prompt</h2>
+        </div>
+        <div id="prompt-editor-body" class="prompt-editor-body"></div>
+      </section>
     </main>
 
     <!-- Bottom region: two strips, iPhone-Music style. Upper = mini-player
@@ -450,6 +496,9 @@
          page mounts. -->
     <script src="analytics.js"></script>
     <script src="app.js"></script>
+    <!-- Workflow editor panel (workflow-editor spec §5): loaded after app.js so
+         it can reuse its globals (getJSON, expando, renderMarkdown, setView). -->
+    <script src="workflow-editor.js"></script>
     <!-- Manager-era additions: Workers fleet page + snapshot/delta SSE so all
          browsers converge live (reorder / status / leases / workers). Loaded
          after app.js so they can reuse its globals where present. -->

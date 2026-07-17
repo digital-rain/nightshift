@@ -263,7 +263,7 @@ with `implement.next = "verify"` and `max_visits` on every step on the cycle —
 
 ## 11. Non-goals
 
-- **A workflow editor.** The JSON format is designed to make one tractable later; v1 ships definitions as files.
+- **A workflow editor.** ~~The JSON format is designed to make one tractable later; v1 ships definitions as files.~~ *Since implemented — see the workflow-editor spec (`2026-07-17-workflow-editor.md`) and the [authoring guide](../user/workflow-authoring.md).*
 - **Free-form predicates.** Decisions branch on declared sentinel tokens and the engine's own outcomes (validation, land) — never on engine-evaluated expressions over artifacts.
 - **Cross-task or manager-tracked sessions.** §7.5 is the entire session story.
 - **Replacing enhance / single-shot split / loop / the single-shot path.** The `kind: "split"` step reuses the decomposition machinery; it does not replace the standalone `split: true` task shape. Converging defaults onto the workflow engine is a possible later cleanup, after the engine earns trust; nothing in v1 rewrites a working path.

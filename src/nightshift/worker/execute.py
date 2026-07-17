@@ -216,6 +216,7 @@ def _execute_doc_step(
             task_file=str(scratch),
             artifact_files=artifact_files,
             output_file=str(output_path),
+            prompt_text=workflow.get("prompt_text"),
         )
         env = worker_env(wt_dir)
         max_turns = config_blob.get("max_turns")

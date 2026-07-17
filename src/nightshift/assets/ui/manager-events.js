@@ -64,6 +64,12 @@
       window.applyTaskLog(frame);
       return;
     }
+    if (kind === "workflows_changed" && typeof window.onWorkflowsChanged === "function") {
+      // Definition/prompt library changed (editor save/delete, any browser):
+      // refetch the workflow lists so pickers, badges, and the library view
+      // converge without a reload.
+      window.onWorkflowsChanged();
+    }
     if (REFRESH_KINDS_WORKERS.has(kind)) refreshWorkers();
     if (REFRESH_KINDS_APP.has(kind)) refreshApp();
   }

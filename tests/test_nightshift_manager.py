@@ -2893,11 +2893,15 @@ def test_workflow_unknown_definition_blocks_task(tmp_path: Path) -> None:
 
 
 def test_api_workflows_lists_step_ids(tmp_path: Path) -> None:
+    # Extended in place by the workflow editor (its spec §3): each definition
+    # carries its ordered step ids plus provenance.
     root = _seed(tmp_path, {})
     with _client(root) as client:
         defs = client.get("/api/workflows").json()
-        assert defs["plan-review-implement"] == ["plan", "review", "revise", "implement"]
-        assert defs["verify-refine"][0] == "verify"
+        pri = defs["plan-review-implement"]
+        assert pri["steps"] == ["plan", "review", "revise", "implement"]
+        assert pri["source"] == "shipped" and pri["shadows_shipped"] is False
+        assert defs["verify-refine"]["steps"][0] == "verify"
 
 
 def test_api_task_artifacts_viewer(tmp_path: Path) -> None:

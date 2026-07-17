@@ -426,6 +426,11 @@ function setView(view) {
   else if (view === "repos") { renderRepos(); loadRepos(); }
   else if (view === "detail") renderDetailScreen();
   else if (view === "playlist-info") renderPlaylistInfo();
+  // Workflow editor screens (workflow-editor spec §5) live in
+  // workflow-editor.js, loaded after this file.
+  else if (view === "workflows") renderWorkflowsScreen();
+  else if (view === "workflow-editor") renderWorkflowEditor();
+  else if (view === "prompt-editor") renderPromptEditor();
 }
 
 // --------------------------------------------------------------------------
@@ -815,12 +820,19 @@ async function loadRepos() {
   if (state.view === "repos") renderRepos();
 }
 
-// The loaded workflow definitions, {name: [ordered step ids]}, for the create
-// pane's Workflow picker and the queue-row step badge (spec §9).
+// The loaded workflow definitions, {name: {steps, source, shadows_shipped}}
+// (workflow-editor spec §3), for the create pane's Workflow picker, the
+// queue-row step badge (workflows spec §9), and the editor's list view.
 async function loadWorkflows() {
   try {
     state.workflows = await getJSON("/api/workflows");
   } catch { /* workflows optional (older manager): keep the last known */ }
+}
+
+// The ordered step ids for one definition (tolerant of a missing name).
+function workflowSteps(name) {
+  const def = (state.workflows || {})[name];
+  return (def && def.steps) || [];
 }
 
 // Read-only workflow artifacts viewer (spec §9): an expando that lazily fetches
@@ -1514,7 +1526,7 @@ function queueItemRow(item) {
   if (item.workflow) {
     const badge = document.createElement("span");
     badge.className = "badge workflow";
-    const steps = (state.workflows || {})[item.workflow] || [];
+    const steps = workflowSteps(item.workflow);
     const visits = parseWorkflowVisits(item.workflow_visits);
     if (steps.length) {
       for (let i = 0; i < steps.length; i++) {
@@ -3619,13 +3631,26 @@ function enhanceSegment(draft, rerender, locked, creating) {
     planner.disabled = locked;
     planner.addEventListener("input", () => { draft.planner_model = planner.value.trim(); });
 
+    // Edit/new affordance beside the picker (workflow-editor spec §5): opens
+    // the visual editor on the chosen definition.
+    const editBtn = document.createElement("button");
+    editBtn.type = "button";
+    editBtn.className = "ghost-btn wf-edit-btn";
+    editBtn.textContent = "Edit…";
+    editBtn.title = "Open the workflow editor";
+    editBtn.addEventListener("click", () => {
+      if (typeof openWorkflowEditor === "function") {
+        openWorkflowEditor(draft.workflow || null);
+      }
+    });
+
     // Step-path hint for the chosen definition.
-    const steps = (state.workflows || {})[draft.workflow] || [];
+    const steps = workflowSteps(draft.workflow);
     const hint = document.createElement("span");
     hint.className = "wf-steps-hint";
     hint.textContent = steps.join(" → ");
 
-    group.append(picker, planner, hint);
+    group.append(picker, editBtn, planner, hint);
   }
   return group;
 }
@@ -6148,6 +6173,7 @@ function wire() {
       if (act === "settings") openSettings();
       else if (act === "workers") setView("workers");
       else if (act === "repos") setView("repos");
+      else if (act === "workflows") setView("workflows");
     });
   }
   document.addEventListener("click", closeSettingsMenu);
