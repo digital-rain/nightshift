@@ -187,7 +187,8 @@ CREATE TABLE nightshift.attempts (
     deadline_at    text,
     released_at    text,
     branch_ref     text,
-    head_sha       text
+    head_sha       text,
+    workflow       text
 );
 
 CREATE UNIQUE INDEX nightshift.attempts_live_task_uniq

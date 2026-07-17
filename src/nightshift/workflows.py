@@ -383,6 +383,52 @@ def resolve_role_model(
 # --------------------------------------------------------------------------- #
 
 
+def make_resolver(defs: dict[str, WorkflowDef], planner_model: str, default_model: str):
+    """A :class:`nightshift.manager.scheduler.WorkflowResolver` closure over the
+    loaded definitions + manager config. Given a brief's frontmatter and the
+    queue config, resolves ``(workflow, step_id, model)`` for the current step
+    (the brief's ``workflow_step`` or the definition's first step), or
+    ``(None, None, error)`` on any authoring error (unknown definition/step,
+    unresolvable role)."""
+
+    def resolve(
+        meta: dict, queue_config: dict
+    ) -> tuple[str, str, str] | tuple[None, None, str]:
+        name = str(meta.get("workflow") or "").strip()
+        wf = defs.get(name)
+        if wf is None:
+            return (None, None, f"unknown workflow '{name}'")
+        step_id = str(meta.get("workflow_step") or "").strip() or wf.first.id
+        if not wf.has_step(step_id):
+            return (None, None, f"workflow '{name}' has no step '{step_id}'")
+        step = wf.step(step_id)
+        model = resolve_role_model(
+            step.role,
+            brief_meta=meta,
+            queue_config=queue_config,
+            planner_model=planner_model,
+            default_model=default_model,
+        )
+        if model is None:
+            return (
+                None, None,
+                f"workflow '{name}' step '{step_id}': cannot resolve model for "
+                f"role '{step.role}'",
+            )
+        return (name, step_id, model)
+
+    return resolve
+
+
+def step_max_turns(step: WorkflowStep, inherited: int | None) -> int | None:
+    """Resolve a step's turn budget against the task/queue ``inherited`` value
+    per the absent/int/null rule (§3.1): absent → inherit; explicit null →
+    unbounded (None); int → override."""
+    if step.max_turns is _INHERIT:
+        return inherited
+    return step.max_turns  # type: ignore[return-value]  # int | None here
+
+
 def route(step: WorkflowStep, signal: str | None) -> str:
     """Destination step id or END. A declared signal wins; otherwise follow
     ``next``. Undeclared signals are ignored (route via next)."""
@@ -424,8 +470,10 @@ __all__ = [
     "WorkflowStep",
     "format_visits",
     "load_workflows",
+    "make_resolver",
     "parse_visits",
     "parse_workflow",
     "resolve_role_model",
     "route",
+    "step_max_turns",
 ]

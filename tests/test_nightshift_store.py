@@ -105,6 +105,26 @@ def test_create_attempt_records_required_mcps() -> None:
     assert attempt["required_mcps"] == ["slack", "github"]
 
 
+def test_create_attempt_workflow_column_roundtrips() -> None:
+    store = SqliteStore()
+    wf = {
+        "name": "plan-review-implement", "step": "plan", "kind": "doc",
+        "output": "plan", "signals": ["plan-trivial"],
+    }
+    _run(store.create_attempt(
+        "r1", task="t1", queue=None, worker_id="w1",
+        backend="claude-code", model="auto", base_ref=None, ttl_seconds=60,
+        workflow=wf,
+    ))
+    assert _run(store.get_attempt("r1"))["workflow"] == wf
+    # None for a non-workflow attempt.
+    _run(store.create_attempt(
+        "r2", task="t2", queue=None, worker_id="w1",
+        backend="claude-code", model="auto", base_ref=None, ttl_seconds=60,
+    ))
+    assert _run(store.get_attempt("r2"))["workflow"] is None
+
+
 def test_worker_status_and_stale_expiry() -> None:
     store = SqliteStore()
     _run(store.register_worker("w1", backend="claude-code", queues=None, priorities=None))

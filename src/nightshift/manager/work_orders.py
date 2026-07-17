@@ -16,7 +16,13 @@ from nightshift.manager.scheduler import parse_required_mcps, queue_label
 from nightshift.preflight import resolve_preflight_cmd
 from nightshift.queue_config import format_validate_cmd, resolve_validate_cmd
 from nightshift.spawn_daily import resolve_config, split_frontmatter
-from nightshift.task_files import resolve_title, split_notes, split_original
+from nightshift.task_files import (
+    read_artifacts,
+    resolve_title,
+    split_notes,
+    split_original,
+)
+from nightshift.workflows import StepKind, WorkflowDef, step_max_turns
 
 
 def task_meta(tasks_root: Path, task: str, queue: str | None) -> dict[str, Any]:
@@ -38,6 +44,7 @@ def build_work_order(
     run_id: str,
     base_ref: str | None,
     cfg: ManagerConfig,
+    workflow_defs: dict[str, WorkflowDef] | None = None,
 ) -> dict[str, Any]:
     """Assemble the JSON work order handed to a worker.
 
@@ -90,6 +97,36 @@ def build_work_order(
         # dedicated split output directory instead of implementing directly.
         "split": bool(meta.get("split", False)),
     }
+
+    # Workflow block (§6.2): a workflow task's work order embeds the current
+    # step's routing metadata + this step's declared input artifacts, and the
+    # step's model/max_turns override the blob's.
+    wf_name = str(meta.get("workflow") or "").strip()
+    if workflow_defs and wf_name and wf_name in workflow_defs:
+        wf = workflow_defs[wf_name]
+        step_id = str(meta.get("workflow_step") or "").strip() or wf.first.id
+        if wf.has_step(step_id):
+            step = wf.step(step_id)
+            artifacts = read_artifacts(
+                tasks_root, task, step.inputs, tasks_rel=tasks_rel,
+            )
+            wf_block: dict[str, Any] = {
+                "name": wf_name,
+                "step": step.id,
+                "kind": step.kind.value,
+                "artifacts": artifacts,
+                "signals": list(step.signals.keys()),
+            }
+            if step.kind is StepKind.DOC:
+                wf_block["prompt"] = step.prompt
+                wf_block["output"] = step.output
+            config_blob["workflow"] = wf_block
+            # A split step reuses the worker's decomposition path.
+            if step.kind is StepKind.SPLIT:
+                config_blob["split"] = True
+            # The step's max_turns overrides the inherited blob value.
+            config_blob["max_turns"] = step_max_turns(step, config_blob["max_turns"])
+
     return {
         "lease_id": lease_id,
         "run_id": run_id,

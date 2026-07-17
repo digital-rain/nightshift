@@ -41,8 +41,11 @@ from nightshift.pg import PgPoolLike
 # dropped. ``state`` is updatable here (the direct-write resolve path);
 # transitions carry it separately (Transition.state) and their ``fields``
 # must not.
+# ``document``/``signal`` are workflow doc-step transport fields consumed by the
+# submit handler (artifact custody + routing); they are never persisted on the
+# attempt row (no column), so they stay out of the updatable set.
 ATTEMPT_UPDATABLE_FIELDS = frozenset(
-    set(Outcome.model_fields) - {"landable", "status"}
+    set(Outcome.model_fields) - {"landable", "status", "document", "signal"}
 ) | {"state", "phase", "commit_sha", "loc", "remote", "pushed", "rating", "notes"}
 
 
@@ -233,6 +236,7 @@ class NightshiftStore(Protocol):
         validate_cmd: str | None = None,
         state: str = "running",
         enhanced: bool = False,
+        workflow: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None: ...
     async def get_attempt(self, attempt_id: str) -> dict[str, Any] | None: ...
     async def update_attempt(self, attempt_id: str, **fields: Any) -> None: ...
@@ -506,6 +510,7 @@ class SqlStoreBase:
         validate_cmd: str | None = None,
         state: str = "running",
         enhanced: bool = False,
+        workflow: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         # The ON CONFLICT predicate must match the partial unique index
         # (attempts_live_task_uniq) in migration 20260731000004 *verbatim*
@@ -518,10 +523,10 @@ class SqlStoreBase:
                 INSERT INTO nightshift.attempts
                     (id, task, queue, worker_id, backend, model, repo,
                      required_mcps, validate_cmd, state, title, body, notes,
-                     enhanced, base_ref, started_at, acquired_at, heartbeat_at,
-                     deadline_at)
+                     enhanced, base_ref, workflow, started_at, acquired_at,
+                     heartbeat_at, deadline_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11,
-                        $12, $13, $14, $15, now(), now(), now(),
+                        $12, $13, $14, $15, $17::jsonb, now(), now(), now(),
                         CASE WHEN $10 IN ({_ATTEMPT_LIVE_SQL})
                              THEN now() + ($16 || ' seconds')::interval END)
                 ON CONFLICT (queue, task) WHERE state IN ({_ATTEMPT_LIVE_SQL})
@@ -531,6 +536,7 @@ class SqlStoreBase:
                 attempt_id, task, _qkey(queue), worker_id, backend, model, repo,
                 json.dumps(required_mcps or []), validate_cmd, state, title, body,
                 notes, enhanced, base_ref, str(int(ttl_seconds)),
+                json.dumps(workflow) if workflow is not None else None,
             )
         return _attempt_row(row) if row else None
 
@@ -1032,6 +1038,8 @@ def _attempt_row(row: Any) -> dict[str, Any]:
         d["required_mcps"] = _jsonish(d.get("required_mcps")) or []
     if "usage" in d:
         d["usage"] = _jsonish(d.get("usage"))
+    if "workflow" in d:
+        d["workflow"] = _jsonish(d.get("workflow"))
     return d
 
 

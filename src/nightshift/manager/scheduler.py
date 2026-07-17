@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol
 
 from nightshift import playlists, repos
 from nightshift.spawn_daily import load_queue_config, split_frontmatter, task_priority
@@ -99,10 +100,27 @@ class TaskCandidate:
     # a *separate* check the manager performs in ``worker_poll``.
     repo: str | None = None
     repo_error: str | None = None
+    # Workflow awareness (§6.1): the definition name + current step id when the
+    # brief carries a ``workflow:`` field, and an authoring error (unresolved
+    # role / unknown definition / unknown step) surfaced exactly like
+    # ``repo_error`` (the manager marks the task blocked).
+    workflow: str | None = None
+    workflow_step: str | None = None
+    workflow_error: str | None = None
 
     @property
     def label(self) -> str:
         return queue_label(self.queue)
+
+
+class WorkflowResolver(Protocol):
+    """Resolves a workflow task's current step + model from its frontmatter and
+    the queue config. Returns ``(workflow, step_id, resolved_model)`` on success
+    or ``(None, None, error)`` on an authoring error."""
+
+    def __call__(
+        self, meta: dict, queue_config: dict
+    ) -> tuple[str, str, str] | tuple[None, None, str]: ...
 
 
 @dataclass(frozen=True)
@@ -213,6 +231,7 @@ def build_candidates(
     queue: str | None,
     *,
     default_model: str = "auto",
+    workflow_resolver: WorkflowResolver | None = None,
 ) -> list[TaskCandidate]:
     """Read a queue's runnable tasks (in execution order) into candidates.
 
@@ -226,7 +245,8 @@ def build_candidates(
     workspace on disk.
     """
     tasks_rel = playlists.tasks_rel(queue)
-    queue_repo = load_queue_config(tasks_root, tasks_rel).get("repo")
+    queue_config = load_queue_config(tasks_root, tasks_rel)
+    queue_repo = queue_config.get("repo")
     out: list[TaskCandidate] = []
     for stem in live_ordered_queue(tasks_root, tasks_rel):
         path = tasks_root / tasks_rel / f"{stem}.md"
@@ -240,16 +260,36 @@ def build_candidates(
             repo = repos.resolve_repo(meta.get("repo"), queue_repo)
         except repos.RepoConfigError as err:
             repo_error = str(err)
+
+        model = _normalize_model(meta, default_model)
+        workflow: str | None = None
+        workflow_step: str | None = None
+        workflow_error: str | None = None
+        # A workflow task's candidate model is its *current step's* resolved
+        # model (§6.1); the resolver reads the definitions + manager cfg + queue
+        # workflow_models. Non-workflow tasks (or no resolver) are unchanged.
+        if workflow_resolver is not None and str(meta.get("workflow") or "").strip():
+            wf, step, model_or_err = workflow_resolver(meta, queue_config)
+            if wf is None:
+                workflow_error = model_or_err
+            else:
+                workflow = wf
+                workflow_step = step
+                model = model_or_err
+
         out.append(
             TaskCandidate(
                 queue=queue,
                 task=stem,
                 priority=task_priority(meta),
-                model=_normalize_model(meta, default_model),
+                model=model,
                 required_mcps=parse_required_mcps(meta),
                 after=_after_deps(meta),
                 repo=repo,
                 repo_error=repo_error,
+                workflow=workflow,
+                workflow_step=workflow_step,
+                workflow_error=workflow_error,
             )
         )
     return out
@@ -381,6 +421,7 @@ __all__ = [
     "SchedulerState",
     "TaskCandidate",
     "WorkerFilter",
+    "WorkflowResolver",
     "arbitrate",
     "build_candidates",
     "is_agnostic_model",
