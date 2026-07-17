@@ -1,0 +1,41 @@
+{
+  "name": "plan-review-implement",
+  "steps": [
+    {
+      "id": "plan",
+      "kind": "doc",
+      "role": "planner",
+      "prompt": "workflow-plan.md",
+      "inputs": ["brief"],
+      "output": "plan",
+      "max_turns": 30,
+      "signals": { "plan-trivial": "implement" }
+    },
+    {
+      "id": "review",
+      "kind": "doc",
+      "role": "implementor",
+      "prompt": "workflow-review.md",
+      "inputs": ["brief", "plan"],
+      "output": "review",
+      "max_turns": 20,
+      "signals": { "review-clear": "implement" }
+    },
+    {
+      "id": "revise",
+      "kind": "doc",
+      "role": "planner",
+      "prompt": "workflow-revise.md",
+      "inputs": ["brief", "plan", "review"],
+      "output": "plan",
+      "max_turns": 30
+    },
+    {
+      "id": "implement",
+      "kind": "code",
+      "role": "implementor",
+      "inputs": ["brief", "plan"],
+      "max_turns": null
+    }
+  ]
+}

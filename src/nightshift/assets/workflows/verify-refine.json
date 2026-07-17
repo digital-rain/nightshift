@@ -1,0 +1,33 @@
+{
+  "name": "verify-refine",
+  "steps": [
+    {
+      "id": "verify",
+      "kind": "doc",
+      "role": "implementor",
+      "prompt": "workflow-verify.md",
+      "inputs": ["brief"],
+      "output": "gaps",
+      "max_turns": 30,
+      "signals": { "verify-clear": "$end" },
+      "next": "gap-plan"
+    },
+    {
+      "id": "gap-plan",
+      "kind": "doc",
+      "role": "planner",
+      "prompt": "workflow-gap-plan.md",
+      "inputs": ["brief", "gaps"],
+      "output": "plan",
+      "max_turns": 30,
+      "next": "implement"
+    },
+    {
+      "id": "implement",
+      "kind": "code",
+      "role": "implementor",
+      "inputs": ["brief", "plan"],
+      "max_turns": null
+    }
+  ]
+}
