@@ -23,6 +23,7 @@ from nightshift.workflows import (
     parse_visits,
     resolve_role_model,
     route,
+    step_max_turns,
 )
 
 
@@ -114,6 +115,44 @@ def test_max_turns_int_override():
 
 
 # --------------------------------------------------------------------------- #
+# step_max_turns() resolution (§3.1)
+# --------------------------------------------------------------------------- #
+
+
+def test_step_max_turns_inherit_passes_through():
+    d = _def(
+        [
+            {"id": "p", "kind": "doc", "role": "planner", "prompt": "x.md",
+             "inputs": ["brief"], "output": "plan"},
+            {"id": "i", "kind": "code", "role": "implementor", "inputs": ["brief", "plan"]},
+        ]
+    )
+    assert step_max_turns(d.step("p"), 42) == 42
+
+
+def test_step_max_turns_none_returns_none():
+    d = _def(
+        [
+            {"id": "p", "kind": "doc", "role": "planner", "prompt": "x.md",
+             "inputs": ["brief"], "output": "plan", "max_turns": None},
+            {"id": "i", "kind": "code", "role": "implementor", "inputs": ["brief", "plan"]},
+        ]
+    )
+    assert step_max_turns(d.step("p"), 42) is None
+
+
+def test_step_max_turns_int_overrides():
+    d = _def(
+        [
+            {"id": "p", "kind": "doc", "role": "planner", "prompt": "x.md",
+             "inputs": ["brief"], "output": "plan", "max_turns": 10},
+            {"id": "i", "kind": "code", "role": "implementor", "inputs": ["brief", "plan"]},
+        ]
+    )
+    assert step_max_turns(d.step("p"), 42) == 10
+
+
+# --------------------------------------------------------------------------- #
 # Validation rules
 # --------------------------------------------------------------------------- #
 
@@ -142,10 +181,48 @@ def test_code_step_must_not_set_prompt_or_output():
         ])
 
 
+def test_max_turns_rejects_bool():
+    with pytest.raises(WorkflowError):
+        _def([
+            {"id": "p", "kind": "doc", "role": "planner", "prompt": "x.md",
+             "inputs": ["brief"], "output": "plan", "max_turns": True},
+            {"id": "i", "kind": "code", "role": "implementor", "inputs": ["brief", "plan"]},
+        ])
+    with pytest.raises(WorkflowError):
+        _def([
+            {"id": "p", "kind": "doc", "role": "planner", "prompt": "x.md",
+             "inputs": ["brief"], "output": "plan", "max_turns": False},
+            {"id": "i", "kind": "code", "role": "implementor", "inputs": ["brief", "plan"]},
+        ])
+
+
+def test_max_visits_rejects_bool():
+    with pytest.raises(WorkflowError):
+        _def([
+            {"id": "p", "kind": "doc", "role": "planner", "prompt": "x.md",
+             "inputs": ["brief"], "output": "plan", "max_visits": True},
+            {"id": "i", "kind": "code", "role": "implementor", "inputs": ["brief", "plan"]},
+        ])
+    with pytest.raises(WorkflowError):
+        _def([
+            {"id": "p", "kind": "doc", "role": "planner", "prompt": "x.md",
+             "inputs": ["brief"], "output": "plan", "max_visits": False},
+            {"id": "i", "kind": "code", "role": "implementor", "inputs": ["brief", "plan"]},
+        ])
+
+
 def test_split_step_must_not_set_prompt_or_output():
     with pytest.raises(WorkflowError):
         _def([
             {"id": "s", "kind": "split", "role": "planner", "inputs": ["brief"], "output": "plan"},
+        ])
+
+
+def test_duplicate_step_ids_rejected():
+    with pytest.raises(WorkflowError):
+        _def([
+            {"id": "dup", "kind": "code", "role": "implementor", "inputs": ["brief"]},
+            {"id": "dup", "kind": "code", "role": "implementor", "inputs": ["brief"]},
         ])
 
 

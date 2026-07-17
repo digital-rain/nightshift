@@ -34,6 +34,7 @@ from nightshift.task_files import (
     artifacts_dir,
     read_artifacts,
     read_task,
+    split_output_dir,
 )
 
 
@@ -2698,6 +2699,90 @@ def test_workflow_evergreen_end_resets_cursor_and_artifacts(tmp_path: Path) -> N
         order = _poll(client, "10.feature")
         assert order["config"]["workflow"]["step"] == "implement"
         assert _step_of(root, "10.feature") == ("implement", "implement:1")
+
+
+def test_workflow_evergreen_split_retains_parent(tmp_path: Path) -> None:
+    """An evergreen plan-split workflow retains the parent brief after the
+    split step harvests children, resets the workflow cursor/visits/artifacts,
+    and the next dispatch restarts at the first step."""
+    root = _seed(tmp_path, {
+        "10.feature": "---\nworkflow: plan-split\nevergreen: true\npriority: 1\n---\nBuild it.",
+    })
+    tasks_root = root / _TASKS_ROOT_NAME
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+
+        # Walk the three doc steps (plan → review → revise) to reach split.
+        order = _poll(client, "10.feature")
+        assert order["config"]["workflow"]["step"] == "plan"
+        resp = _submit_doc(client, order, document="Plan.")
+        order = _next_order(client, resp, "10.feature")
+        resp = _submit_doc(client, order, document="Review.")
+        order = _next_order(client, resp, "10.feature")
+        resp = _submit_doc(client, order, document="Revised plan.")
+        order = _next_order(client, resp, "10.feature")
+        assert order["config"]["workflow"]["step"] == "split"
+        assert order["config"]["workflow"]["kind"] == "split"
+        assert order["config"].get("split") is True
+
+        # Simulate the worker writing a subtask brief into the split output dir.
+        sdir = split_output_dir(root, order["repo"], "10.feature", queue=None)
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / "subtask-a.md").write_text("---\npriority: 1\n---\nDo A.")
+
+        # Submit the split step (decomposition, not a code landing).
+        resp = client.post(
+            f"/api/worker/runs/{order['run_id']}/submit",
+            json={
+                "worker_id": "w1", "lease_id": order["lease_id"],
+                "task": "10.feature", "queue": "main", "title": "10.feature",
+                "status": "completed", "landable": False, "backend": "claude-code",
+            },
+        ).json()
+        assert resp["split"] is True
+        assert len(resp["subtasks"]) == 1
+        # Evergreen: parent brief survives, workflow resets.
+        assert (tasks_root / "main" / "10.feature.md").exists()
+        assert _step_of(root, "10.feature") == (None, None)
+        assert not artifacts_dir(tasks_root, "10.feature").exists()
+
+
+def test_workflow_split_zero_children_increments_no_progress(tmp_path: Path) -> None:
+    """A split step producing zero children retains the parent, keeps the cursor
+    on the split step (no visit burned), and registers as Progress.INCREMENT
+    so the no-change ladder can bound repeated empty splits."""
+    root = _wf_seed(tmp_path, "plan-split")
+    tasks_root = root / _TASKS_ROOT_NAME
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+
+        # Walk the three doc steps to reach the split step.
+        order = _poll(client, "10.feature")
+        resp = _submit_doc(client, order, document="Plan.")
+        order = _next_order(client, resp, "10.feature")
+        resp = _submit_doc(client, order, document="Review.")
+        order = _next_order(client, resp, "10.feature")
+        resp = _submit_doc(client, order, document="Revised plan.")
+        order = _next_order(client, resp, "10.feature")
+        assert order["config"]["workflow"]["step"] == "split"
+
+        # Do NOT create the split output dir — harvest finds no children.
+        resp = client.post(
+            f"/api/worker/runs/{order['run_id']}/submit",
+            json={
+                "worker_id": "w1", "lease_id": order["lease_id"],
+                "task": "10.feature", "queue": "main", "title": "10.feature",
+                "status": "completed", "landable": False, "backend": "claude-code",
+            },
+        ).json()
+        assert resp["split"] is True
+        assert resp["subtasks"] == []
+        # Parent brief survives; cursor stays on the split step.
+        assert (tasks_root / "main" / "10.feature.md").exists()
+        assert _step_of(root, "10.feature")[0] == "split"
+        # Visits accumulated through the doc walk are preserved (no reset).
+        visits = _step_of(root, "10.feature")[1]
+        assert visits is not None and "plan:1" in visits
 
 
 def test_workflow_chain_doc_to_doc_carries_next_order(tmp_path: Path) -> None:
