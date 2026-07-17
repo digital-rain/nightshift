@@ -51,6 +51,8 @@ from typing import Any, assert_never
 
 from pydantic import BaseModel
 
+from nightshift.workflows import StepKind
+
 
 class RunStatus(StrEnum):
     """The WIRE outcome vocabulary: what a worker's submit (``SubmitBody`` /
@@ -273,6 +275,11 @@ class Outcome(Telemetry):
     landable: bool = False
     model: str | None = None
     backend: str = ""
+    # Workflow doc steps (§5): the produced markdown artifact and any sentinel
+    # the run emitted. Both absent (None) on every non-doc-step outcome — the
+    # wire stays byte-compatible (absent in JSON ⇒ None).
+    document: str | None = None
+    signal: str | None = None
     # Cross-machine landing (transport B): the WIP ref the worker published its
     # validated branch to, and the branch tip SHA the manager re-verifies after
     # fetching. Both None when co-located (no rendezvous remote configured).
@@ -390,6 +397,23 @@ ENVIRONMENT_FAILURE_KINDS = frozenset(
 
 
 @dataclass(frozen=True)
+class WorkflowStepPolicy:
+    """Step context for ``on_submit`` — computed by the caller from the
+    attempt's work-order workflow block (never from frontmatter). Keeps
+    ``transitions.py`` pure and free of definition-loading: the api layer
+    resolves the graph; the transition core only acts on the verdict."""
+
+    workflow: str
+    step_id: str
+    kind: StepKind
+    output: str | None
+    route_to: str                  # precomputed: workflows.route(step, outcome.signal)
+    dest_kind: StepKind | None     # kind of route_to's step (None for $end)
+    dest_visits_exhausted: bool    # would entering route_to exceed its max_visits?
+    evergreen: bool
+
+
+@dataclass(frozen=True)
 class SubmitPolicy:
     """Everything the old ``worker_submit`` cascade read from config, the
     store, frontmatter, or ``app.state`` — computed by the caller, consumed by
@@ -409,6 +433,9 @@ class SubmitPolicy:
     evergreen: bool = False               # brief survives a land (never dropped)
     auto_resolve: bool = False            # cfg.auto_resolve
     pr_mode: bool = False                 # effective landing mode is PR
+    # Workflow step context (None on non-workflow submits). When set,
+    # ``on_submit`` delegates to ``on_workflow_step``.
+    workflow_step: WorkflowStepPolicy | None = None
 
 
 @dataclass(frozen=True)
@@ -468,6 +495,11 @@ class TaskEffects:
     pause_queue: str | None = None
     drop_brief: bool = False
     start_resolve: bool = False
+    # Workflow effects (§6.3–§6.5), applied post-commit through the tasks-repo
+    # executor lane that ``FrontmatterFlag`` uses today.
+    write_artifact: tuple[str, str] | None = None      # (name, text)
+    engine_meta: dict[str, object | None] | None = None  # workflow_step/visits
+    workflow_reset: bool = False                       # evergreen $end: clear + delete
 
 
 @dataclass(frozen=True)

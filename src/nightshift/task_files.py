@@ -6,6 +6,7 @@ Moved verbatim from ``engine.py`` in Phase 3 of the rebuild-in-place migration.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 from nightshift import playlists
@@ -277,16 +278,195 @@ def delete_task(tasks_root: Path, task: str, tasks_rel: str = "main") -> dict:
 
     Guards against path traversal: ``task`` must resolve to a direct child of
     the queue's tasks dir. Raises ``FileNotFoundError`` if there's no such task.
+    Also removes the task's ``<task>.artifacts/`` directory if present (spec §5:
+    workflow artifacts are deleted with the brief on operator delete — this
+    endpoint does not go through :func:`drop_completed_task`).
     """
     tasks_dir = (tasks_root / tasks_rel).resolve()
     dest = (tasks_dir / f"{task}.md").resolve()
     if dest.parent != tasks_dir or not dest.is_file():
         raise FileNotFoundError(task)
     dest.unlink()
+    _remove_artifacts_dir(tasks_root, task, tasks_rel)
     order = load_order(tasks_root, tasks_rel)
     if task in order:
         save_order(tasks_root, [name for name in order if name != task], tasks_rel)
     return {"task": task, "deleted": True}
+
+
+# --------------------------------------------------------------------------- #
+# Workflow artifacts (spec §5) — committed into the tasks repo by the manager.
+# --------------------------------------------------------------------------- #
+
+# Engine-owned frontmatter keys (spec §4). Written through :func:`set_engine_meta`
+# only — deliberately NOT added to :data:`_EDITABLE_META_KEYS` (operator UI
+# renders them read-only).
+ENGINE_META_KEYS = {"workflow_step", "workflow_visits"}
+
+
+def artifacts_dir(tasks_root: Path, task: str, tasks_rel: str = "main") -> Path:
+    """The directory holding a workflow task's committed artifacts:
+    ``<tasks_root>/<tasks_rel>/<task>.artifacts/``."""
+    return (tasks_root / tasks_rel).resolve() / f"{task}.artifacts"
+
+
+def write_artifact(
+    tasks_root: Path,
+    task: str,
+    name: str,
+    text: str,
+    tasks_rel: str = "main",
+) -> Path:
+    """Write ``<name>.md`` into the task's artifacts dir and commit it (one
+    commit per artifact write). Re-using a name overwrites in place — superseded
+    versions live in the tasks repo's git history (spec §5)."""
+    adir = artifacts_dir(tasks_root, task, tasks_rel)
+    adir.mkdir(parents=True, exist_ok=True)
+    dest = adir / f"{name}.md"
+    dest.write_text(text if text.endswith("\n") else f"{text}\n")
+    commit_tasks(
+        tasks_root,
+        f"nightshift: write artifact {task}/{name}",
+        pathspecs=(tasks_rel,),
+    )
+    return dest
+
+
+def read_artifacts(
+    tasks_root: Path,
+    task: str,
+    names: Sequence[str],
+    tasks_rel: str = "main",
+) -> dict[str, str]:
+    """Read the named artifacts (``<name>.md``) for a task. ``"brief"`` is
+    resolved from the task file's body, not the artifacts dir. Missing artifacts
+    are omitted from the result."""
+    adir = artifacts_dir(tasks_root, task, tasks_rel)
+    out: dict[str, str] = {}
+    for name in names:
+        if name == "brief":
+            try:
+                out["brief"] = read_task(tasks_root, task, tasks_rel).get("body", "")
+            except FileNotFoundError:
+                continue
+            continue
+        path = adir / f"{name}.md"
+        if path.is_file():
+            out[name] = path.read_text(errors="replace")
+    return out
+
+
+def delete_artifacts(
+    tasks_root: Path,
+    task: str,
+    tasks_rel: str = "main",
+    *,
+    commit: bool = True,
+) -> bool:
+    """Remove a task's ``<task>.artifacts/`` directory. Returns ``True`` when it
+    removed something. Commits the removal when ``commit`` is set (the default);
+    callers folding the removal into a larger commit pass ``commit=False``."""
+    adir = artifacts_dir(tasks_root, task, tasks_rel)
+    if not adir.exists():
+        return False
+    import shutil
+
+    shutil.rmtree(adir, ignore_errors=True)
+    if commit:
+        commit_tasks(
+            tasks_root,
+            f"nightshift: delete artifacts {task}",
+            pathspecs=(tasks_rel,),
+        )
+    return True
+
+
+def _remove_artifacts_dir(tasks_root: Path, task: str, tasks_rel: str) -> bool:
+    """Delete the artifacts dir without its own commit — for folding into a
+    caller's commit (:func:`delete_task`, :func:`drop_completed_task`)."""
+    return delete_artifacts(tasks_root, task, tasks_rel, commit=False)
+
+
+def set_engine_meta(
+    tasks_root: Path,
+    task: str,
+    changes: dict[str, object | None],
+    tasks_rel: str = "main",
+) -> dict:
+    """Engine-owned frontmatter lane (spec §4). Same rewrite mechanics as
+    :func:`set_task_meta` but keyed to :data:`ENGINE_META_KEYS`; a value of
+    ``None`` clears the key. These keys are NOT operator-editable."""
+    bad = set(changes) - ENGINE_META_KEYS
+    if bad:
+        raise ValueError(f"non-engine keys: {', '.join(sorted(bad))}")
+
+    tasks_dir = (tasks_root / tasks_rel).resolve()
+    dest = (tasks_dir / f"{task}.md").resolve()
+    if dest.parent != tasks_dir or not dest.is_file():
+        raise FileNotFoundError(task)
+
+    lines = dest.read_text(errors="replace").splitlines()
+    close: int | None = None
+    if lines and lines[0].strip() == "---":
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                close = i
+                break
+
+    if close is not None:
+        fence_lines = lines[1:close]
+        body_lines = lines[close + 1:]
+    else:
+        fence_lines = []
+        body_lines = lines
+
+    remaining = dict(changes)
+    new_fence: list[str] = []
+    for line in fence_lines:
+        stripped = line.strip()
+        key = (
+            line.split(":", 1)[0].strip()
+            if stripped and not stripped.startswith("#") and ":" in line
+            else None
+        )
+        if key is not None and key in remaining:
+            value = remaining.pop(key)
+            if value is not None:
+                new_fence.append(f"{key}: {_render_meta_value(value)}")
+        else:
+            new_fence.append(line)
+    for key, value in remaining.items():
+        if value is not None:
+            new_fence.append(f"{key}: {_render_meta_value(value)}")
+
+    body = _strip_leading_blanks(body_lines)
+    if new_fence:
+        out = ["---", *new_fence, "---", "", *body]
+    else:
+        out = body
+    dest.write_text("\n".join(out).rstrip("\n") + "\n")
+    return read_task(tasks_root, task, tasks_rel)
+
+
+def materialize_artifacts(
+    workspace: Path,
+    repo: str,
+    task: str,
+    artifacts: dict[str, str],
+    *,
+    queue: str | None = None,
+) -> dict[str, Path]:
+    """Write each artifact's text to a run-scratch sibling of the worktree dir
+    (``task-local-<queue>-<task>.artifact-<name>.md``) — read-only files outside
+    any worktree — and return ``{name: path}`` (spec §5)."""
+    base = workspace / ".worktrees" / repo
+    base.mkdir(parents=True, exist_ok=True)
+    out: dict[str, Path] = {}
+    for name, text in artifacts.items():
+        scratch = base / f"task-local-{queue_slug(queue)}-{task}.artifact-{name}.md"
+        scratch.write_text(text if text.endswith("\n") else f"{text}\n")
+        out[name] = scratch
+    return out
 
 
 def task_is_evergreen(meta: dict, task: str, config: dict) -> bool:
@@ -316,6 +496,8 @@ def drop_completed_task(
     task_file = (tasks_root / tasks_rel).resolve() / f"{task}.md"
     if not task_file.is_file():
         return False
+    # ``delete_task`` also folds ``<task>.artifacts/`` removal into this commit
+    # (spec §5: artifacts are deleted with the brief on terminal consumption).
     delete_task(tasks_root, task, tasks_rel)
     commit_tasks(
         tasks_root,
@@ -641,6 +823,7 @@ def harvest_split_output(
     *,
     queue: str | None = None,
     tasks_rel: str = "main",
+    retain_parent: bool = False,
 ) -> list[str]:
     """Collect subtask briefs from a decomposition run and enqueue them.
 
@@ -649,6 +832,10 @@ def harvest_split_output(
     collision-safe naming, commits via :func:`commit_tasks`, retires the
     parent brief via :func:`drop_completed_task`, and returns the list of
     created subtask stems (for the result line / event payload).
+
+    ``retain_parent`` (spec §6.3): when ``True``, skip :func:`drop_completed_task`
+    so an evergreen workflow parent survives its own decomposition (the reset is
+    driven separately by the transition).
 
     If the split dir is empty or missing, returns an empty list (the caller
     treats this as "no subtasks produced" — an honest-failure path).
@@ -684,7 +871,8 @@ def harvest_split_output(
             f"nightshift: decompose {task} into {len(created)} subtask(s)",
             pathspecs=(tasks_rel,),
         )
-        drop_completed_task(tasks_root, task, tasks_rel, queue=queue)
+        if not retain_parent:
+            drop_completed_task(tasks_root, task, tasks_rel, queue=queue)
 
     import shutil
     shutil.rmtree(sdir, ignore_errors=True)

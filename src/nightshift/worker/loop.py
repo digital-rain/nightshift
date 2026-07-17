@@ -29,6 +29,9 @@ _LOG_FLUSH_LINES = 20
 # on-disk record keys identical to the pre-Outcome finish dict.
 _LOCAL_HISTORY_EXCLUDE = frozenset({
     "landable", "branch_ref", "head_sha", "failure_reason", "validate_cmd",
+    # Workflow doc-step fields: the document can be large and neither is shown
+    # in the local Now/History UI — keep them off the on-disk record.
+    "document", "signal",
 })
 
 

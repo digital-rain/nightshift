@@ -72,6 +72,9 @@ PREVIOUS_SUBMIT_PAYLOAD_KEYS = frozenset({
     "turns", "input_tokens", "output_tokens",
     "cache_read_input_tokens", "cache_creation_input_tokens", "usage",
     "cost_usd", "validate_cmd", "worktree", "quarantine",
+    # Additive workflow fields (spec §5); a manager receiving a payload without
+    # them defaults both to None (wire-compat).
+    "document", "signal",
 })
 
 # The envelope the loop adds around the Outcome (lease/task identity + the
@@ -104,6 +107,19 @@ def test_outcome_model_dump_matches_previous_submit_payload_keys() -> None:
     dump = outcome.model_dump()
     assert set(dump) & ENVELOPE_KEYS == set(), "outcome/envelope keys must not overlap"
     assert set(dump) | ENVELOPE_KEYS == PREVIOUS_SUBMIT_PAYLOAD_KEYS
+
+
+def test_outcome_workflow_fields_default_none_and_accept() -> None:
+    """document/signal default to None and are accepted; a JSON body lacking
+    them (old workers) deserializes to None (wire-compat)."""
+    assert Outcome(status=RunStatus.COMPLETED).document is None
+    assert Outcome(status=RunStatus.COMPLETED).signal is None
+    out = Outcome(status=RunStatus.COMPLETED, document="# Plan", signal="review-clear")
+    assert out.document == "# Plan"
+    assert out.signal == "review-clear"
+    # Absent-in-JSON ⇒ None.
+    revived = Outcome.model_validate({"status": "completed", "result_line": "x"})
+    assert revived.document is None and revived.signal is None
 
 
 class _CapturingClient:

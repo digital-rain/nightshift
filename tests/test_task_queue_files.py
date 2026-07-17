@@ -43,20 +43,26 @@ from nightshift.spawn_daily import (
 )
 from nightshift.task_files import (
     ORIGINAL_BRIEF_MARKER,
+    artifacts_dir,
     build_task_list,
     create_task,
+    delete_artifacts,
     delete_task,
     drop_completed_task,
     harvest_split_output,
     join_original,
     list_queue,
     live_ordered_queue,
+    materialize_artifacts,
+    read_artifacts,
     read_task,
     resolve_title,
+    set_engine_meta,
     set_task_meta,
     split_original,
     split_output_dir,
     task_is_evergreen,
+    write_artifact,
 )
 
 
@@ -446,6 +452,108 @@ def test_split_output_dir_path_format(tmp_path: Path) -> None:
 
     sdir_q = split_output_dir(tmp_path, "myrepo", "04.task", queue="nightly")
     assert "nightly" in sdir_q.name
+
+
+def test_harvest_split_output_retain_parent(tmp_path: Path) -> None:
+    """retain_parent=True keeps the parent brief (evergreen workflow split)."""
+    workspace = build_workspace(
+        tmp_path,
+        tasks={"04.parent": "---\ntitle: Parent\n---\nBig task."},
+    )
+    tasks_root = workspace / DEFAULT_TASKS_REPO
+    sdir = split_output_dir(workspace, REPO, "04.parent", queue=None)
+    sdir.mkdir(parents=True, exist_ok=True)
+    (sdir / "04.1.setup.md").write_text("---\ntitle: Setup\n---\nDo setup.\n")
+
+    created = harvest_split_output(
+        workspace, tasks_root, REPO, "04.parent", {}, retain_parent=True,
+    )
+    assert len(created) == 1
+    assert (tasks_root / "main" / "04.parent.md").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Workflow artifacts (spec §5)
+# --------------------------------------------------------------------------- #
+
+
+def test_artifact_write_read_delete_roundtrip(tmp_path: Path) -> None:
+    tasks_root = _store_only(
+        tmp_path, tasks={"10.wf": "The brief body."}, commit=True,
+    )
+    path = write_artifact(tasks_root, "10.wf", "plan", "# Plan\nStep 1.")
+    assert path == artifacts_dir(tasks_root, "10.wf") / "plan.md"
+    assert path.is_file()
+
+    got = read_artifacts(tasks_root, "10.wf", ["brief", "plan"])
+    assert "The brief body." in got["brief"]
+    assert got["plan"].startswith("# Plan")
+
+    # Overwrite in place
+    write_artifact(tasks_root, "10.wf", "plan", "# Plan v2")
+    assert read_artifacts(tasks_root, "10.wf", ["plan"])["plan"].startswith("# Plan v2")
+
+    assert delete_artifacts(tasks_root, "10.wf") is True
+    assert not artifacts_dir(tasks_root, "10.wf").exists()
+    assert read_artifacts(tasks_root, "10.wf", ["plan"]) == {}
+
+
+def test_read_artifacts_omits_missing(tmp_path: Path) -> None:
+    tasks_root = _store_only(tmp_path, tasks={"10.wf": "brief."}, commit=True)
+    assert read_artifacts(tasks_root, "10.wf", ["ghost"]) == {}
+
+
+def test_set_engine_meta_writes_and_clears(tmp_path: Path) -> None:
+    tasks_root = _store_only(
+        tmp_path, tasks={"10.wf": "---\ntitle: WF\n---\nBody."}, commit=True,
+    )
+    set_engine_meta(tasks_root, "10.wf", {"workflow_step": "plan", "workflow_visits": "plan:1"})
+    meta = read_task(tasks_root, "10.wf")["frontmatter_raw"]
+    assert meta["workflow_step"] == "plan"
+    assert meta["workflow_visits"] == "plan:1"
+
+    set_engine_meta(tasks_root, "10.wf", {"workflow_step": None})
+    meta2 = read_task(tasks_root, "10.wf")["frontmatter_raw"]
+    assert "workflow_step" not in meta2
+    assert meta2["workflow_visits"] == "plan:1"
+
+
+def test_set_engine_meta_rejects_other_keys(tmp_path: Path) -> None:
+    tasks_root = _store_only(tmp_path, tasks={"10.wf": "body."}, commit=True)
+    with pytest.raises(ValueError):
+        set_engine_meta(tasks_root, "10.wf", {"model": "sonnet"})
+
+
+def test_set_task_meta_rejects_engine_keys(tmp_path: Path) -> None:
+    tasks_root = _store_only(tmp_path, tasks={"10.wf": "body."}, commit=True)
+    with pytest.raises(ValueError):
+        set_task_meta(tasks_root, "10.wf", {"workflow_step": "plan"})
+
+
+def test_drop_completed_task_removes_artifacts(tmp_path: Path) -> None:
+    tasks_root = _store_only(tmp_path, tasks={"10.wf": "body."}, commit=True)
+    write_artifact(tasks_root, "10.wf", "plan", "# Plan")
+    assert artifacts_dir(tasks_root, "10.wf").exists()
+    drop_completed_task(tasks_root, "10.wf")
+    assert not (tasks_root / "main" / "10.wf.md").exists()
+    assert not artifacts_dir(tasks_root, "10.wf").exists()
+
+
+def test_delete_task_removes_artifacts(tmp_path: Path) -> None:
+    tasks_root = _store_only(tmp_path, tasks={"10.wf": "body."}, commit=True)
+    write_artifact(tasks_root, "10.wf", "plan", "# Plan")
+    delete_task(tasks_root, "10.wf")
+    assert not artifacts_dir(tasks_root, "10.wf").exists()
+
+
+def test_materialize_artifacts_paths(tmp_path: Path) -> None:
+    paths = materialize_artifacts(
+        tmp_path, "myrepo", "10.wf", {"plan": "# Plan", "review": "questions"},
+    )
+    assert paths["plan"].name == "task-local-main-10.wf.artifact-plan.md"
+    assert paths["plan"].parent == tmp_path / ".worktrees" / "myrepo"
+    assert paths["plan"].read_text().startswith("# Plan")
+    assert paths["review"].is_file()
 
 
 # --------------------------------------------------------------------------- #
