@@ -68,24 +68,24 @@ class OperatorConfig:
     scheduled_models_allow: tuple[str, ...] = field(
         default=("claude-code/claude-sonnet-4-6", "claude-code/claude-opus-4-8"),
         metadata=meta(
-            category="Scheduling", label="Scheduled models allow",
+            category="Models", label="Scheduled models allow",
             desc="Filter: only auto-schedule tasks pinned to these provider/model ids.",
             type="string_list", validate="model_id_list"))
     default_model: str = field(default="auto", metadata=meta(
-        category="Scheduling", label="Default model",
+        category="Models", label="Default model",
         desc="Model a brief inherits when it sets no model:.",
         env="NIGHTSHIFT_DEFAULT_MODEL",
         validate="model_id_or_keyword"))
     enhance_brief_model: str = field(
         default="anthropic/claude-sonnet-4-6", metadata=meta(
-            category="Scheduling", label="Enhance brief model",
+            category="Models", label="Enhance brief model",
             desc=(
                 "Model for the enhance-on-create brief rewrite (a one-shot "
                 "manager-side completion; bare <vendor>/<model> id)."),
             env="NIGHTSHIFT_ENHANCE_MODEL",
             validate="model_id"))
     planner_model: str = field(default="", metadata=meta(
-        category="Scheduling", label="Planner model",
+        category="Models", label="Planner model",
         desc=(
             "Default model for a workflow's planner role (§3.2). Empty falls "
             "through to the default model."),
