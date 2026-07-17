@@ -650,3 +650,49 @@ def test_doc_step_toolless_backend_fails_before_worktree(tmp_path: Path, monkeyp
     assert outcome.failure_kind.value == "backend_unavailable"
     assert "tool-capable" in outcome.failure_reason
     assert _worktree_gone(workspace)
+
+
+# --------------------------------------------------------------------------- #
+# Session resume (spec §7.5)
+# --------------------------------------------------------------------------- #
+
+
+def test_stream_parser_captures_session_id() -> None:
+    from nightshift.backends import AgentStreamParser, WorkerResult
+
+    p = AgentStreamParser()
+    p.feed(json.dumps({"type": "system", "subtype": "init", "session_id": "sess-abc"}))
+    p.feed(json.dumps({"type": "result", "num_turns": 3, "session_id": "sess-abc"}))
+    result = p.apply(WorkerResult(returncode=0))
+    assert result.session_id == "sess-abc"
+
+
+def test_claude_argv_includes_resume() -> None:
+    from nightshift.prompts import build_claude_argv
+
+    argv = build_claude_argv("hi", "claude-sonnet-4-6", None, resume="sess-1")
+    assert "--resume" in argv and argv[argv.index("--resume") + 1] == "sess-1"
+    # Absent by default.
+    assert "--resume" not in build_claude_argv("hi", "m", None)
+
+
+def test_cursor_argv_includes_resume() -> None:
+    from nightshift.backends import build_cursor_argv
+
+    argv = build_cursor_argv("hi", "sonnet-4", {"resume_session_id": "sess-2"})
+    assert "--resume" in argv and argv[argv.index("--resume") + 1] == "sess-2"
+    assert "--resume" not in build_cursor_argv("hi", "sonnet-4", {})
+
+
+def test_local_store_session_memory_roundtrip_and_drop(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {})
+    local = LocalStore(root)
+    assert local.session_for("10.x", "planner") is None
+    local.remember_session("10.x", "planner", "sess-9")
+    local.remember_session("10.y", "planner", "sess-other")
+    assert local.session_for("10.x", "planner") == "sess-9"
+    # Never across tasks.
+    assert local.session_for("10.x", "reviewer") is None
+    local.drop_sessions("10.x")
+    assert local.session_for("10.x", "planner") is None
+    assert local.session_for("10.y", "planner") == "sess-other"

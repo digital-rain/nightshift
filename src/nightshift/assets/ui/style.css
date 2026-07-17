@@ -543,6 +543,12 @@ body {
 .badge.quarantined { color: #e6ac40; border-color: #e6ac40; }
 .badge.completed { color: var(--ok); border-color: var(--ok); }
 .badge.now { color: var(--accent); border-color: var(--accent); }
+/* Workflow step-path badge (spec §9): dim path, accent-highlighted cursor. */
+.badge.workflow { color: var(--text-dim); }
+.badge.workflow .wf-cursor { color: var(--accent); font-weight: 600; }
+/* Create-pane workflow controls. */
+.wf-picker, .wf-planner { margin-left: 8px; }
+.wf-steps-hint { margin-left: 8px; color: var(--text-dim); font-size: 12px; }
 /* Thumbs verdict on the task's latest run (read-only glyph on queue rows). */
 .badge.rating { border: none; padding: 1px 2px; font-size: 13px; }
 /* Priority chip (P0..P5): a monospace-ish pill whose tint runs from urgent

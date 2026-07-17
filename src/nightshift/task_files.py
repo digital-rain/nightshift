@@ -613,6 +613,10 @@ _EDITABLE_META_KEYS = {
     "disabled", "quarantined", "quarantine_reason", "failed", "failed_reason",
     "completed", "evergreen", "automerge", "draft", "model", "priority", "repo",
     "loop", "loop_max_iterations", "split", "enhanced",
+    # Workflow selection (operator-owned, §3.2): the definition name and the
+    # optional planner-role model. The engine-owned cursor keys
+    # (workflow_step/workflow_visits) are NOT here — they live in ENGINE_META_KEYS.
+    "workflow", "planner_model",
 }
 
 # The detail-view editor may also rewrite the spec prose (``body``), the
@@ -770,6 +774,10 @@ def list_queue(tasks_root: Path, tasks_rel: str = "main") -> list[dict]:
             "failed": is_failed(meta),
             "completed": is_completed(meta),
             "priority": priorities[p.stem],
+            # Workflow badge (spec §9): the definition + engine-owned cursor.
+            "workflow": str(meta.get("workflow") or "") or None,
+            "workflow_step": str(meta.get("workflow_step") or "") or None,
+            "workflow_visits": str(meta.get("workflow_visits") or "") or None,
         }
     ordered = order_stems(tasks_root, list(by_stem), tasks_rel, priorities=priorities)
     return [by_stem[s] for s in ordered]

@@ -2807,6 +2807,26 @@ def test_workflow_unknown_definition_blocks_task(tmp_path: Path) -> None:
         assert "no-such-workflow" in blocked["10.feature"]["blocked_reason"]
 
 
+def test_api_workflows_lists_step_ids(tmp_path: Path) -> None:
+    root = _seed(tmp_path, {})
+    with _client(root) as client:
+        defs = client.get("/api/workflows").json()
+        assert defs["plan-review-implement"] == ["plan", "review", "revise", "implement"]
+        assert defs["verify-refine"][0] == "verify"
+
+
+def test_api_task_artifacts_viewer(tmp_path: Path) -> None:
+    root = _wf_seed(tmp_path, "plan-review-implement")
+    with _client(root) as client:
+        client.post("/api/worker/checkin", json={"worker_id": "w1", "backend": "claude-code"})
+        # No artifacts before the first doc step completes.
+        assert client.get("/api/tasks/10.feature/artifacts").json()["artifacts"] == {}
+        order = _poll(client, "10.feature")
+        _submit_doc(client, order, document="# The Plan")
+        arts = client.get("/api/tasks/10.feature/artifacts").json()["artifacts"]
+        assert arts["plan"].startswith("# The Plan")
+
+
 def test_non_workflow_submit_untouched(tmp_path: Path) -> None:
     root = _seed(tmp_path, {"10.plain": "---\npriority: 1\n---\nDo a thing."})
     with _client(root) as client:

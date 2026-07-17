@@ -145,6 +145,7 @@ The manager sends them to each worker at checkin, so changing them here changes 
 |---|---|---|
 | `default_model` | `auto` | Model a brief inherits when it sets no `model:`. |
 | `enhance_brief_model` | `anthropic/claude-sonnet-4-6` | Model for the enhance-on-create brief rewrite (a one-shot manager-side completion). |
+| `planner_model` | `""` | Default model for a workflow's `planner` role (spec §3.2). Empty falls through to `default_model`. A brief's `planner_model:` and the queue's `workflow_models.planner` override it. |
 | `scheduled_models_allow` | (list) | Filter: only auto-schedule tasks pinned to these provider-qualified model ids (e.g. `claude-code/claude-sonnet-4-6`). The UI model dropdown is populated from live worker registrations, not this list. |
 | `max_per_day` | `200` | Dispatch cap (daily-queue path). |
 | `max_concurrent_queues` | `2` | Max queues served concurrently. |
@@ -183,6 +184,7 @@ The manager sends them to each worker at checkin, so changing them here changes 
 | `NIGHTSHIFT_RENDEZVOUS_REMOTE` | `rendezvous_remote` |
 | `NIGHTSHIFT_DEFAULT_MODEL` | `default_model` |
 | `NIGHTSHIFT_ENHANCE_MODEL` | `enhance_brief_model` |
+| `NIGHTSHIFT_PLANNER_MODEL` | `planner_model` |
 | `NIGHTSHIFT_TASKS_REPO` | `tasks_repo` |
 | `NIGHTSHIFT_WIP_REF_PREFIX` | `wip_ref_prefix` |
 | `NIGHTSHIFT_QUARANTINE_THRESHOLD` | `quarantine_threshold` |
@@ -277,11 +279,13 @@ Per-task overrides in a brief's YAML frontmatter (`<tasks_repo>/<queue>/<NN>.<na
 | `split` | bool | `false` | Decomposition run: write subtask briefs instead of implementing. |
 | `loop` | bool | `false` | Ralph-loop mode: iterative multi-pass prompt instead of the single-pass prompt. |
 | `loop_max_iterations` | int | `0` (unbounded) | Iteration cap for `loop` tasks. |
+| `workflow` | string | none | Run this task under a named workflow definition (spec §3). Mutually exclusive with `loop`. |
+| `planner_model` | string | config `planner_model` | Model for this task's workflow `planner` role, overriding the manager default. |
 | `autosplit` | bool | `false` | Accumulation task that periodically splits into subtasks. |
 | `evergreen` | bool | `false` | Reset from template on completion instead of being consumed. |
 | `disabled` | bool | `false` | Skip this task (never dispatched). |
 
-The system also writes state flags into frontmatter as a task progresses (`quarantined` / `quarantine_reason`, `failed` / `failed_reason`, `completed`, `enhanced`); these are managed from the UI, not hand-edited.
+The system also writes state flags into frontmatter as a task progresses (`quarantined` / `quarantine_reason`, `failed` / `failed_reason`, `completed`, `enhanced`); these are managed from the UI, not hand-edited. Workflow tasks additionally carry the engine-owned cursor (`workflow_step`, `workflow_visits`), which the engine writes and operators must not edit.
 
 ## Queue configuration
 
@@ -294,6 +298,7 @@ Per-queue `config.json` keys layer over `<tasks_root>/config.json` (a store-wide
 | `validate` | Validate command for this queue (overrides the manager-wide `validate`; empty string disables). |
 | `preflight` | Environment preflight command run in the worktree before the agent (default `uv sync --frozen`; empty string disables). |
 | `max_turns` | Default turn cap for the queue's tasks. |
+| `workflow_models` | Map of workflow *role* → model pin for this queue (e.g. `{"planner": "anthropic/claude-opus-4-8", "implementor": "claude-code/claude-sonnet-4-6"}`). Resolved per the §3.2 ladder: a brief's own `model`/`planner_model` wins, then this map, then the manager defaults. |
 
 Queue presentation settings, edited from the operator UI:
 

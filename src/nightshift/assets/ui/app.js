@@ -89,6 +89,7 @@ const state = {
   playlistInfoName: null, // playlist open in the full-area info pane (view "playlist-info")
   playlistInfoData: null, // loaded {name, repository, task_count} for the info pane
   blockedTasks: {},      // task id -> {reason, state} for tasks blocked or quarantined by manager
+  workflows: {},         // /api/workflows payload: {name: [ordered step ids]}
   selectedPlaylist: null,        // playlist-list cursor (name string, null = library)
   selectedPlaylists: new Set(),  // multi-selected playlist names (shift-click extends)
 };
@@ -814,6 +815,71 @@ async function loadRepos() {
   if (state.view === "repos") renderRepos();
 }
 
+// The loaded workflow definitions, {name: [ordered step ids]}, for the create
+// pane's Workflow picker and the queue-row step badge (spec §9).
+async function loadWorkflows() {
+  try {
+    state.workflows = await getJSON("/api/workflows");
+  } catch { /* workflows optional (older manager): keep the last known */ }
+}
+
+// Read-only workflow artifacts viewer (spec §9): an expando that lazily fetches
+// GET /api/tasks/<id>/artifacts on first open and renders each committed
+// document as its own markdown sub-panel.
+function artifactsPanel(task) {
+  const { panel, body } = expando("Artifacts", { open: false });
+  const head = panel.querySelector(".xpanel-head");
+  let loaded = false;
+  const load = async () => {
+    if (loaded) return;
+    loaded = true;
+    body.textContent = "Loading\u2026";
+    let data;
+    try {
+      data = await getJSON(`/api/tasks/${encodeURIComponent(task)}/artifacts${queueParam()}`);
+    } catch {
+      body.textContent = "Could not load artifacts.";
+      loaded = false; // allow a retry on the next open
+      return;
+    }
+    body.innerHTML = "";
+    const arts = (data && data.artifacts) || {};
+    const names = Object.keys(arts).sort();
+    if (!names.length) {
+      const empty = document.createElement("div");
+      empty.className = "muted";
+      empty.textContent = "No artifacts yet.";
+      body.append(empty);
+      return;
+    }
+    for (const name of names) {
+      const sub = expando(name, { open: false });
+      const doc = document.createElement("div");
+      doc.className = "detail-brief markdown-body";
+      doc.innerHTML = renderMarkdown(arts[name] || "");
+      sub.body.append(doc);
+      body.append(sub.panel);
+    }
+  };
+  if (head) head.addEventListener("click", () => {
+    if (panel.classList.contains("open")) load();
+  });
+  return panel;
+}
+
+// Parse the engine's "step:1,step2:2" visit map into {step: count}.
+function parseWorkflowVisits(raw) {
+  const out = {};
+  if (!raw) return out;
+  for (const chunk of String(raw).split(",")) {
+    const [k, v] = chunk.split(":");
+    const key = (k || "").trim();
+    const n = parseInt((v || "").trim(), 10);
+    if (key && !Number.isNaN(n)) out[key] = n;
+  }
+  return out;
+}
+
 // A <select> of known workspace repos for binding a queue/task to a target
 // repo. `current` is the bound value ("" / null = the empty option, named by
 // `emptyLabel`: "— none —" clears a queue default; "Inherit" for a per-task
@@ -1441,6 +1507,28 @@ function queueItemRow(item) {
     const badge = document.createElement("span");
     badge.className = "badge evergreen";
     badge.textContent = "evergreen";
+    li.append(badge);
+  }
+  // Workflow step badge (spec §9): the full step path with the current cursor
+  // highlighted (from workflow_step) and a visit count where the map has one.
+  if (item.workflow) {
+    const badge = document.createElement("span");
+    badge.className = "badge workflow";
+    const steps = (state.workflows || {})[item.workflow] || [];
+    const visits = parseWorkflowVisits(item.workflow_visits);
+    if (steps.length) {
+      for (let i = 0; i < steps.length; i++) {
+        if (i > 0) badge.append(document.createTextNode(" → "));
+        const s = document.createElement("span");
+        s.className = "wf-step" + (steps[i] === item.workflow_step ? " wf-cursor" : "");
+        const n = visits[steps[i]];
+        s.textContent = n ? `${steps[i]}·${n}` : steps[i];
+        badge.append(s);
+      }
+    } else {
+      badge.textContent = item.workflow;
+    }
+    badge.title = `Workflow: ${item.workflow}`;
     li.append(badge);
   }
   if (item.disabled) {
@@ -3350,10 +3438,13 @@ function settingsControls(brief, draft, rerender, locked, creating) {
   const statusSeg = labeledSegment("Status", "Task status", locked, rerender,
     statusOptions(draft));
 
-  // ATTRIBUTES — independent toggles: Evergreen, Loop, Split
+  // ATTRIBUTES — independent toggles: Evergreen, Loop, Split. Loop is disabled
+  // while a Workflow is selected (mutually exclusive, spec §4); Split and
+  // Evergreen compose with workflows.
   const attrSeg = labeledSegment("Attributes", "Task attributes", locked, rerender, [
     ["Evergreen", () => !!draft.evergreen, (on) => { draft.evergreen = on; }],
-    ["Loop", () => !!draft.loop, (on) => { draft.loop = on; }],
+    ["Loop", () => !!draft.loop, (on) => { if (!draft.workflow) draft.loop = on; },
+      () => !!draft.workflow],
     ["Split", () => !!draft.split, (on) => { draft.split = on; }],
   ]);
 
@@ -3371,12 +3462,10 @@ function settingsControls(brief, draft, rerender, locked, creating) {
     prioritySegment(draft, rerender, locked),
     repoOverride(draft, locked),
   );
-  // ENHANCE BRIEF — create flavour only: On runs the manager-side rewrite of
-  // the original brief before the task file is written; Off queues the
-  // original text verbatim.
-  if (creating) {
-    row.append(enhanceSegment(draft, rerender, locked));
-  }
+  // BRIEF MODE — Off | Enhance | Workflow. Enhance is create-only (it rewrites
+  // the brief before the file is written); the Workflow selection applies on
+  // both create and edit, so the segment is shown in both flavours.
+  row.append(enhanceSegment(draft, rerender, locked, creating));
   wrap.append(row);
 
   if (draft.loop) {
@@ -3430,7 +3519,7 @@ function labeledSegment(label, ariaLabel, locked, rerender, switches) {
   seg.className = "segmented";
   seg.setAttribute("role", "group");
   seg.setAttribute("aria-label", ariaLabel);
-  for (const [text, getOn, setOn] of switches) {
+  for (const [text, getOn, setOn, isDisabled] of switches) {
     const seg_btn = document.createElement("button");
     seg_btn.type = "button";
     seg_btn.className = "seg-opt";
@@ -3438,7 +3527,7 @@ function labeledSegment(label, ariaLabel, locked, rerender, switches) {
     const on = getOn();
     seg_btn.classList.toggle("on", on);
     seg_btn.setAttribute("aria-pressed", on ? "true" : "false");
-    seg_btn.disabled = locked;
+    seg_btn.disabled = locked || (typeof isDisabled === "function" && isDisabled());
     seg_btn.addEventListener("click", () => {
       setOn(!getOn());
       if (typeof rerender === "function") rerender();
@@ -3449,35 +3538,95 @@ function labeledSegment(label, ariaLabel, locked, rerender, switches) {
   return group;
 }
 
-// The create pane's ENHANCE BRIEF Off/On switch (mirrors the Turns-limit
-// pattern): Off by default; On runs the AI rewrite on create.
-function enhanceSegment(draft, rerender, locked) {
+// The create pane's brief-mode control: Off | Enhance | Workflow (spec §4).
+// Off queues the brief verbatim; Enhance runs the AI rewrite on create;
+// Workflow runs a declarative multi-step definition. Selecting Workflow reveals
+// a definition picker + optional planner-model input, and disables the Loop
+// toggle (mutually exclusive — enforced in the UI); an active Loop disables the
+// Workflow option in turn. Split and Evergreen compose freely.
+function enhanceSegment(draft, rerender, locked, creating) {
   const group = document.createElement("div");
   group.className = "seg-group";
   const lbl = document.createElement("span");
   lbl.className = "seg-group-label";
-  lbl.textContent = "Enhance brief";
+  lbl.textContent = "Brief mode";
   const seg = document.createElement("div");
   seg.className = "segmented";
   seg.setAttribute("role", "group");
-  seg.setAttribute("aria-label", "Enhance brief on create");
-  for (const [text, val] of [["Off", false], ["On", true]]) {
+  seg.setAttribute("aria-label", "Brief mode");
+
+  const mode = draft.workflow ? "workflow" : (draft.enhance ? "enhance" : "off");
+  const loopOn = !!draft.loop;
+  const options = [
+    ["Off", "off", false],
+    // Enhance-on-create only exists on the create pane.
+    ...(creating ? [["Enhance", "enhance", false]] : []),
+    // Loop and Workflow are mutually exclusive (spec §4): the Loop toggle
+    // disables the Workflow option here, and choosing Workflow clears Loop.
+    ["Workflow", "workflow", loopOn],
+  ];
+  for (const [text, val, disabledExtra] of options) {
     const b = document.createElement("button");
     b.type = "button";
     b.className = "seg-opt";
     b.textContent = text;
-    const on = val === !!draft.enhance;
+    const on = val === mode;
     b.classList.toggle("on", on);
     b.setAttribute("aria-pressed", on ? "true" : "false");
-    b.disabled = locked;
-    b.title = "Rewrite the original brief with AI for a higher worker success rate";
+    b.disabled = locked || disabledExtra;
+    if (val === "workflow" && loopOn) {
+      b.title = "Disabled while Loop is on (mutually exclusive)";
+    }
     b.addEventListener("click", () => {
-      draft.enhance = val;
+      if (val === "off") { draft.enhance = false; draft.workflow = ""; }
+      else if (val === "enhance") { draft.enhance = true; draft.workflow = ""; }
+      else if (val === "workflow") {
+        draft.enhance = false;
+        draft.loop = false;  // mutually exclusive
+        // Default to the first loaded definition if none chosen yet.
+        const names = Object.keys(state.workflows || {});
+        if (!draft.workflow) draft.workflow = names[0] || "";
+      }
       if (typeof rerender === "function") rerender();
     });
     seg.append(b);
   }
   group.append(lbl, seg);
+
+  // Workflow detail: definition picker + optional planner-model input.
+  if (mode === "workflow") {
+    const picker = document.createElement("select");
+    picker.className = "wf-picker";
+    picker.disabled = locked;
+    const names = Object.keys(state.workflows || {});
+    for (const name of names) {
+      const opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = name;
+      opt.selected = name === draft.workflow;
+      picker.append(opt);
+    }
+    picker.addEventListener("change", () => {
+      draft.workflow = picker.value;
+      if (typeof rerender === "function") rerender();
+    });
+
+    const planner = document.createElement("input");
+    planner.type = "text";
+    planner.className = "wf-planner";
+    planner.placeholder = "planner model (optional)";
+    planner.value = draft.planner_model || "";
+    planner.disabled = locked;
+    planner.addEventListener("input", () => { draft.planner_model = planner.value.trim(); });
+
+    // Step-path hint for the chosen definition.
+    const steps = (state.workflows || {})[draft.workflow] || [];
+    const hint = document.createElement("span");
+    hint.className = "wf-steps-hint";
+    hint.textContent = steps.join(" → ");
+
+    group.append(picker, planner, hint);
+  }
   return group;
 }
 
@@ -3643,6 +3792,10 @@ function draftFromBrief(brief) {
     original_brief: brief.original_brief || "",
     // Enhance-on-create: off by default for new tasks (ignored when editing).
     enhance: false,
+    // Workflow selection (§3.2): the definition name (empty = no workflow) and
+    // the optional planner-role model override.
+    workflow: raw.workflow || "",
+    planner_model: raw.planner_model || "",
     disabled: !!brief.disabled,
     quarantined: !!brief.quarantined,
     failed: !!brief.failed,
@@ -4182,6 +4335,13 @@ function taskDetailContent(brief, draft, opts = {}) {
     frag.append(lg.panel);
   }
 
+  // ARTIFACTS — read-only viewer of the workflow's committed documents (spec §9),
+  // shown only for a workflow task with a definition selected. Lazily fetched
+  // when the expando is opened; each artifact is a rendered-markdown sub-panel.
+  if (!creating && draft.workflow) {
+    frag.append(artifactsPanel(task));
+  }
+
   // BLOCKED — an expandable section, directly below LOG, shown only while the
   // task carries a blocked overlay. Expanding it reveals the blocked reason.
   // To clear blocked status, set STATUS to Ready and save.
@@ -4267,6 +4427,9 @@ async function saveDetail(brief, draft, errEl) {
     priority: typeof draft.priority === "number" ? draft.priority : 5,
     loop: !!draft.loop,
     loop_max_iterations: draft.loop ? (draft.loop_max_iterations || 0) : 0,
+    // Workflow selection (§4): "" clears it. Planner model rides along.
+    workflow: draft.workflow || "",
+    planner_model: draft.planner_model || "",
   };
   // The per-task repo override is only sent when the user actually changed it
   // (PATCH semantics — unsent fields are left untouched). A new value pins the
@@ -4336,6 +4499,12 @@ async function createDetail(draft, errEl) {
     loop: !!draft.loop,
     loop_max_iterations: draft.loop ? (draft.loop_max_iterations || 0) : 0,
   };
+  // Workflow selection (§4): sent only when chosen (create contract omits
+  // absent optional fields, matching repo below).
+  if (draft.workflow) {
+    payload.workflow = draft.workflow;
+    if (draft.planner_model) payload.planner_model = draft.planner_model;
+  }
   // Per-task repo override: included only when set (empty ⇒ inherit the queue
   // default). Omitted entirely otherwise, matching the create contract.
   if (draft.repo && draft.repo.trim()) payload.repo = draft.repo.trim();
@@ -6071,7 +6240,7 @@ async function init() {
     const active = await getJSON("/api/active");
     syncActivePlaylist(active && active.active_playlist);
   } catch { /* default to main */ }
-  await Promise.all([loadQueue(), loadRuns(), loadPlaylists(), loadRepos()]);
+  await Promise.all([loadQueue(), loadRuns(), loadPlaylists(), loadRepos(), loadWorkflows()]);
   // Seed the per-queue state map, then drive the focused queue's view from it
   // (the aggregate flat state follows whichever queue is running, which may not
   // be the focused one).

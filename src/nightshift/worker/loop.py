@@ -143,6 +143,17 @@ class WorkerLoop:
         queue_internal = playlists.queue_from_tasks_rel(queue)
         wt = str(worktree_dir(self.cfg.workspace, repo, task, queue_internal)) if repo else None
 
+        # Session resume (spec §7.5): a chained step whose (task, role) matches
+        # a session this worker just ran may reuse it — a worker-local hint
+        # injected into the order's config. A hint, never a dependency: the
+        # prompt still carries every declared input. Never across tasks.
+        wf = order.get("config", {}).get("workflow") or {}
+        role = wf.get("role")
+        if role:
+            prior = self.local.session_for(task, role)
+            if prior:
+                order["config"]["resume_session_id"] = prior
+
         order_model = str(order.get("config", {}).get("model", "auto"))
         self.local.begin(
             run_id=run_id,
@@ -188,10 +199,17 @@ class WorkerLoop:
         )
         hb.start()
 
+        def on_session(session_id: str) -> None:
+            # Remember the session for a (task, role) so a chained same-role
+            # step may resume it (spec §7.5). Worker-local, never on the wire.
+            if role:
+                self.local.remember_session(task, role, session_id)
+
         try:
             buffer.append({"type": "task_started", "task": task, "title": title})
             outcome = execute_work_order(
-                self.cfg, order, on_phase=on_phase, on_log=on_log
+                self.cfg, order, on_phase=on_phase, on_log=on_log,
+                on_session=on_session,
             )
             flush()
         finally:
@@ -252,6 +270,12 @@ class WorkerLoop:
                 "quarantined": bool(result.get("quarantined")),
             }
         )
+        # Drop remembered sessions when the task reaches a terminal outcome
+        # (spec §7.5 rule 3: within one task, dropped on task end). A landed
+        # change, a quarantine, or any non-advancing completion ends the run;
+        # an advancing chain keeps them (next_order present).
+        if result.get("next_order") is None:
+            self.local.drop_sessions(task)
         return result
 
 

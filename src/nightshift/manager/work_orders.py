@@ -114,6 +114,7 @@ def build_work_order(
                 "name": wf_name,
                 "step": step.id,
                 "kind": step.kind.value,
+                "role": step.role,
                 "artifacts": artifacts,
                 "signals": list(step.signals.keys()),
             }

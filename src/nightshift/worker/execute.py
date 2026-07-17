@@ -149,6 +149,7 @@ def _execute_doc_step(
     on_phase: PhaseCb,
     on_log: LogCb,
     fail: Callable[..., Outcome],
+    on_session: Callable[[str], None] | None = None,
 ) -> Outcome:
     """Run a workflow doc step (spec §7.1): a throwaway read-only worktree at
     ``base_ref``, torn down **unconditionally**. The agent explores and writes
@@ -230,6 +231,8 @@ def _execute_doc_step(
         )
         on_log(f"  running doc step [{provider}] ({bare_model})...\n")
         result = backend.run(spec, capture_log, lambda: None)
+        if on_session and result.session_id:
+            on_session(result.session_id)
 
         tele: dict[str, Any] = {
             "turns": result.turns,
@@ -311,8 +314,13 @@ def execute_work_order(
     *,
     on_phase: PhaseCb,
     on_log: LogCb,
+    on_session: Callable[[str], None] | None = None,
 ) -> Outcome:
-    """Run one work order to a landable (or failed) state. Never touches main."""
+    """Run one work order to a landable (or failed) state. Never touches main.
+
+    ``on_session`` (optional) receives the backend's session id when one is
+    parseable — the worker-local resume hint (spec §7.5). It never rides the
+    outcome (nothing crosses the wire)."""
     from nightshift.backends import LAUNCH_FAILED, WorkerSpec, require_backend
     from nightshift.git.worktrees import worktree_dir
 
@@ -396,6 +404,7 @@ def execute_work_order(
             model=model, provider=provider, backend=backend, bare_model=bare_model,
             wt_path=wt_path, config_blob=config_blob,
             on_phase=on_phase, on_log=on_log, fail=fail,
+            on_session=on_session,
         )
 
     on_phase("worker")
@@ -490,6 +499,8 @@ def execute_work_order(
         )
         on_log(f"  running worker [{provider}] ({bare_model})...\n")
         result = backend.run(spec, capture_log, lambda: None)
+        if on_session and result.session_id:
+            on_session(result.session_id)
 
         tele = {
             "turns": result.turns,

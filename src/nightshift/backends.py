@@ -103,6 +103,10 @@ class WorkerResult:
     returncode: int
     aborted: str | None = None
     error: str | None = None
+    # The backend's session id (Claude Code / cursor-agent stream-json), when
+    # cheaply parseable from the event stream — the worker-local resume hint
+    # (spec §7.5). ``None`` for backends that don't expose one.
+    session_id: str | None = None
     turns: int | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
@@ -168,8 +172,14 @@ class AgentStreamParser:
         self.cache_creation_input_tokens: int | None = None
         self.cost_usd: float | None = None
         self.usage_payload: dict[str, Any] | None = None
+        self.session_id: str | None = None
 
     def _capture(self, ev: dict[str, Any]) -> None:
+        # Session id (spec §7.5): both Claude Code and cursor-agent stamp a
+        # ``session_id`` on their events (init/result); last one wins.
+        sid = ev.get("session_id")
+        if isinstance(sid, str) and sid:
+            self.session_id = sid
         if "num_turns" in ev and ev["num_turns"] is not None:
             self.turns = int(ev["num_turns"])
         cost = ev.get("total_cost_usd", ev.get("cost_usd"))
@@ -211,6 +221,7 @@ class AgentStreamParser:
         return ""
 
     def apply(self, result: WorkerResult, model: str | None = None) -> WorkerResult:
+        result.session_id = self.session_id
         result.turns = self.turns
         result.input_tokens = self.input_tokens
         result.output_tokens = self.output_tokens
@@ -481,6 +492,10 @@ def build_cursor_argv(prompt: str, model: str, config: dict[str, Any]) -> list[s
     argv = ["cursor-agent", "-p", "--force", "--trust", "--output-format", "stream-json"]
     if model:
         argv += ["--model", model]
+    # Session resume (spec §7.5): a worker-local optimization hint.
+    resume = config.get("resume_session_id")
+    if resume:
+        argv += ["--resume", str(resume)]
     extra = config.get("cursor_extra_args")
     if extra:
         argv += list(extra)
@@ -505,7 +520,10 @@ class ClaudeCodeBackend:
         should_abort: ShouldAbort,
         on_worker_start: OnWorkerStart | None = None,
     ) -> WorkerResult:
-        argv = prompts.build_claude_argv(spec.prompt, spec.model, spec.max_turns)
+        argv = prompts.build_claude_argv(
+            spec.prompt, spec.model, spec.max_turns,
+            resume=spec.config.get("resume_session_id"),
+        )
         argv[0] = prompts.resolve_claude_bin(spec.config)
         return _stream_subprocess(
             argv, cwd=spec.cwd, env=spec.env, emit_log=emit_log,

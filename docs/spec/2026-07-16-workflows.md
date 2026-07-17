@@ -1,7 +1,7 @@
 # Nightshift — Workflows (`workflow:` multi-step task execution)
 
 **Subject:** A task frontmatter field that runs a brief through a named, declarative multi-step *workflow* — a small state machine of agent steps, each its own attempt with its own model, prompt, inputs, and budget — instead of the single-shot brief→run→land path. The first shipped workflow is `plan-review-implement`: a planning model writes an implementation plan, the implementing model reviews it, the planner reconciles the feedback, and a fresh instance of the implementing model implements the revised plan.
-**Status:** Proposed — for implementation. Where this doc and the code disagree once implemented, the code governs and this doc should be updated.
+**Status:** Implemented. Where this doc and the code disagree, the code governs and this doc should be updated.
 **Default:** No workflow. Existing paths — single-shot, `enhance`, `split`, retry/resolve — are untouched; a task without `workflow:` frontmatter behaves byte-identically to today.
 **Relationship:** `enhance` remains the light rewrite for small tasks (a workflow task skips create-time enhance — the plan step subsumes it). Standalone `split: true` keeps its meaning; workflows can also *end* in a decomposition (`kind: "split"` step, §3.1) so children are cut from a reviewed plan. `evergreen` composes: the brief survives completion and the workflow resets each cycle (§6.5) — the janitor shape. The goal-loop spec (`2026-07-04-loop-tasks.md`) is a *different* iteration axis (one goal, N runs, done-check); composition with workflows is deferred past v1.
 

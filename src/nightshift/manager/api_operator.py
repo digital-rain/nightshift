@@ -66,6 +66,7 @@ from nightshift.task_files import (
     frontmatter_held_tasks,
     import_task,
     list_queue,
+    read_artifacts,
     read_task,
     set_task_meta,
 )
@@ -122,6 +123,10 @@ class TaskCreate(BaseModel):
     repo: str | None = None
     loop: bool | None = None
     loop_max_iterations: int | None = None
+    # Workflow selection (§3.2): the definition name (empty/None = no workflow)
+    # and the optional planner-role model override.
+    workflow: str | None = None
+    planner_model: str | None = None
     # Enhance-on-create: run the manager-side brief rewrite before writing the
     # file. ``text`` is then the ORIGINAL brief; the enhanced rewrite becomes
     # the effective body and the original is preserved below the marker.
@@ -154,6 +159,9 @@ class TaskUpdate(BaseModel):
     loop: bool | None = None
     loop_max_iterations: int | None = None
     split: bool | None = None
+    # Workflow selection (§3.2): "" clears it (no workflow).
+    workflow: str | None = None
+    planner_model: str | None = None
     notes: str | None = None
     # The preserved pre-enhancement text ("" drops the marker section).
     original_brief: str | None = None
@@ -371,6 +379,37 @@ def register_operator_api(
         info["model_options"] = await _registry().models_for_queue(label)
         return JSONResponse(info)
 
+    @app.get("/api/tasks/{task}/artifacts")
+    async def get_task_artifacts(
+        task: str, queue: str | None = None
+    ) -> JSONResponse:
+        """Read-only artifact viewer (spec §9): the committed workflow
+        artifacts for a task, ``{name: text}``. Empty for a non-workflow task
+        or one that hasn't produced a doc yet."""
+        from nightshift.task_files import artifacts_dir
+
+        target = _resolve_queue(queue)
+        tasks_rel = playlists_mod.tasks_rel(target)
+        adir = artifacts_dir(tasks_root, task, tasks_rel)
+        names = (
+            sorted(p.stem for p in adir.glob("*.md")) if adir.is_dir() else []
+        )
+        return JSONResponse(
+            {"task": task, "artifacts": read_artifacts(tasks_root, task, names, tasks_rel)}
+        )
+
+    @app.get("/api/workflows")
+    async def get_workflows() -> JSONResponse:
+        """The loaded workflow definitions as ``{name: [ordered step ids]}`` —
+        the queue-row badge renders the full step path with the cursor
+        highlighted (spec §9)."""
+        return JSONResponse(
+            {
+                name: [s.id for s in wf.steps]
+                for name, wf in app.state.workflows.items()
+            }
+        )
+
     @app.get("/api/task-defaults")
     async def get_task_defaults(queue: str | None = None) -> JSONResponse:
         """Brief-shaped defaults for a new task: effective model/draft/automerge
@@ -479,6 +518,10 @@ def register_operator_api(
             meta_changes["loop"] = body.loop
         if body.loop_max_iterations is not None:
             meta_changes["loop_max_iterations"] = body.loop_max_iterations
+        if body.workflow:
+            meta_changes["workflow"] = body.workflow
+        if body.planner_model:
+            meta_changes["planner_model"] = body.planner_model
         if body.enhance:
             meta_changes["enhanced"] = True
         if meta_changes:
@@ -514,6 +557,9 @@ def register_operator_api(
                 elif key == "repo":
                     # "" / "default" clears the override → inherit the queue repo.
                     changes["repo"] = normalize_repo(value)
+                elif key in ("workflow", "planner_model"):
+                    # "" clears the workflow selection (a plain task again).
+                    changes[key] = value or None
                 else:
                     changes[key] = value
         except ValueError as exc:

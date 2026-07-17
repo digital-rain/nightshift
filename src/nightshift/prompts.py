@@ -111,6 +111,7 @@ def build_claude_argv(
     prompt: str,
     model: str,
     max_turns: int | None,
+    resume: str | None = None,
 ) -> list[str]:
     """Build the claude CLI argument vector.
 
@@ -131,6 +132,11 @@ def build_claude_argv(
     ]
     if max_turns is not None:
         argv.extend(["--max-turns", str(max_turns)])
+    # Session resume (spec §7.5): a worker-local hint to reuse the prior
+    # session's context (prompt-cache hits). A hint, never a dependency — the
+    # prompt still carries every declared input.
+    if resume:
+        argv.extend(["--resume", str(resume)])
     return argv
 
 

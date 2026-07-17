@@ -54,6 +54,28 @@ class LocalStore:
         self._path = self._dir / RUNS_FILE
         self._lock = threading.Lock()
         self._now: NowPlaying | None = None
+        # Session-resume hints (spec §7.5): ``(task, role) -> session_id`` for
+        # the last completed step. In memory only — dropped on task end or
+        # process restart (this dict is reborn empty each launch); nothing
+        # crosses the wire, the manager is unaware.
+        self._sessions: dict[tuple[str, str], str] = {}
+
+    # ---- session resume (worker-local, in memory) ------------------------- #
+
+    def remember_session(self, task: str, role: str, session_id: str) -> None:
+        with self._lock:
+            self._sessions[(task, role)] = session_id
+
+    def session_for(self, task: str, role: str) -> str | None:
+        with self._lock:
+            return self._sessions.get((task, role))
+
+    def drop_sessions(self, task: str) -> None:
+        """Forget every remembered session for a task (its workflow ended, or
+        the operator retired it) — the §7.5 within-one-task-only rule."""
+        with self._lock:
+            for key in [k for k in self._sessions if k[0] == task]:
+                del self._sessions[key]
 
     # ---- live "now" ------------------------------------------------------- #
 

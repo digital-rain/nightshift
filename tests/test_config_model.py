@@ -78,6 +78,10 @@ class TestDefaultsDriftGuard:
         from nightshift.config.manager import OperatorConfig
         assert OperatorConfig().default_model == "auto"
 
+    def test_operator_planner_model_defaults_empty(self):
+        from nightshift.config.manager import OperatorConfig
+        assert OperatorConfig().planner_model == ""
+
     def test_manager_host(self):
         from nightshift.config.manager import ManagerSettings
         assert ManagerSettings().host == "0.0.0.0"
@@ -208,6 +212,7 @@ class TestRoundTrip:
         assert loaded.cadences.refresh_ms == original.cadences.refresh_ms
         assert loaded.operator.max_per_day == original.operator.max_per_day
         assert loaded.operator.automerge == original.operator.automerge
+        assert loaded.operator.planner_model == original.operator.planner_model
 
     def test_worker_round_trip(self, workspace: Path, monkeypatch):
         monkeypatch.delenv("NIGHTSHIFT_WORKER_BACKEND", raising=False)
