@@ -65,12 +65,6 @@ class OperatorConfig:
         category="Scheduled Tasks", label="Max nights before parking",
         desc="Nights a failing task retries before being parked.",
         ))
-    scheduled_models_allow: tuple[str, ...] = field(
-        default=("claude-code/claude-sonnet-4-6", "claude-code/claude-opus-4-8"),
-        metadata=meta(
-            category="Models", label="Scheduled models allow",
-            desc="Filter: only auto-schedule tasks pinned to these provider/model ids.",
-            type="string_list", validate="model_id_list"))
     default_model: str = field(default="auto", metadata=meta(
         category="Models", label="Default model",
         desc="Model a brief inherits when it sets no model:.",
@@ -91,6 +85,12 @@ class OperatorConfig:
             "through to the default model."),
         apply="restart", env="NIGHTSHIFT_PLANNER_MODEL",
         validate="model_id_or_keyword"))
+    scheduled_models_allow: tuple[str, ...] = field(
+        default=("claude-code/claude-sonnet-4-6", "claude-code/claude-opus-4-8"),
+        metadata=meta(
+            category="Models", label="Scheduled models allow",
+            desc="Filter: only auto-schedule tasks pinned to these provider/model ids.",
+            type="string_list", validate="model_id_list"))
 
     landing_mode: LandingMode = field(default=LandingMode.NONE, metadata=meta(
         category="Landing & Git", label="Landing mode",
