@@ -83,6 +83,7 @@ const state = {
   createBrief: null,     // cached brief-shaped defaults (model options + flags) for create
   detailReturn: "now",   // view to return to when the detail pane's back is pressed
   detailDraft: null,     // buffered, unsaved edits for the open detail pane (discarded on back)
+  detailDocumentsSummary: null, // /api/tasks/<id>/documents payload for the current detail pane
   libraryTasks: null,    // cached main-queue tasks for the Add-from "library" source
   addToTargets: [],      // task ids the Add-to-playlist picker will copy into the chosen queue
   repos: null,           // /api/repos payload (workspace, known repos, per-queue bindings, warnings)
@@ -877,6 +878,535 @@ function artifactsPanel(task) {
     if (panel.classList.contains("open")) load();
   });
   return panel;
+}
+
+// --------------------------------------------------------------------------
+// Task documents (spec §6) — the create + detail pane's Documents section.
+// --------------------------------------------------------------------------
+//
+// The section is a sibling of Artifacts (`artifactsPanel` above) but edits
+// two operator-owned frontmatter lists — `docs:` (repo paths, pinned by blob
+// sha at first dispatch) and `attachments:` (task-local files under
+// `<task>.docs/`). Paths are the primary affordance; attaching is a heavier
+// secondary action captioned `Only for content that isn't in any repo.`
+//
+// The draft (see `draftFromBrief`) carries the paths list; attachments are
+// fetched lazily from `/api/tasks/<id>/documents` because their bytes live
+// server-side. The create flavour has no task yet, so any uploads are buffered
+// in `draft.pendingAttachments` and flushed after a successful create.
+
+// Autocomplete cache for `/api/repos/<repo>/paths?prefix=` — one entry per
+// (repo, base_ref) so re-opening the panel or typing keeps the debounced
+// path list warm without spamming git.
+const _docsPathsCache = new Map();
+
+async function loadRepoPaths(repo, prefix = "") {
+  if (!repo) return [];
+  const key = `${repo}\u0000${prefix}`;
+  if (_docsPathsCache.has(key)) return _docsPathsCache.get(key);
+  try {
+    const url = `/api/repos/${encodeURIComponent(repo)}/paths`
+      + (prefix ? `?prefix=${encodeURIComponent(prefix)}` : "");
+    const data = await getJSON(url);
+    const rows = (data && data.paths) || [];
+    _docsPathsCache.set(key, rows);
+    return rows;
+  } catch { return []; }
+}
+
+function _fmtShortSha(sha) {
+  return sha ? String(sha).slice(0, 7) : "";
+}
+
+// Guess a chip's media type from its extension without touching the network.
+// Only affects UI affordances (thumbnails, range field visibility); the
+// backend re-sniffs on dispatch.
+function _guessMediaFromPath(path) {
+  const ext = String(path || "").toLowerCase().split(".").pop();
+  return {
+    md: "text/markdown", markdown: "text/markdown",
+    txt: "text/plain", py: "text/x-python", js: "text/plain",
+    ts: "text/plain", rs: "text/plain", go: "text/plain",
+    json: "application/json", yaml: "application/yaml", yml: "application/yaml",
+    png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+    gif: "image/gif", webp: "image/webp", pdf: "application/pdf",
+  }[ext] || "text/plain";
+}
+
+function _mediaIsBinaryUi(media) {
+  if (!media) return false;
+  if (media.startsWith("text/")) return false;
+  if (media === "application/json" || media === "application/yaml") return false;
+  return true;
+}
+
+// The Documents section builder. `brief` gives us `frontmatter_raw` / task id;
+// `draft` is the editable state; `opts.creating` toggles the "buffer uploads"
+// flow. `opts.rerender` is the pane's re-render hook so a chip removal / new
+// upload repaints without a full server round-trip.
+function documentsPanel(brief, draft, opts = {}) {
+  const { creating = false, rerender = () => {}, locked = false } = opts;
+  const task = brief.task;
+  const repo = (draft.repo || (brief.frontmatter && brief.frontmatter.repo)
+    || (brief.effective_repo) || "");
+  // Resolve the queue's repo from `state.repos` so a "no per-task override"
+  // draft still lists the right autocomplete corpus.
+  const queueRepo = (() => {
+    const q = state.activePlaylist;
+    const qe = (state.repos && state.repos.queues) || [];
+    const row = qe.find((r) => r.queue === (q || "main"));
+    return (row && row.repo) || null;
+  })();
+  const effectiveRepo = repo || queueRepo || "";
+
+  const { panel, body } = expando("Documents", { open: true });
+  body.classList.add("documents-panel");
+
+  // --- Reference documents (paths) — primary section ---------------------
+
+  const pathsSection = document.createElement("div");
+  pathsSection.className = "docs-section docs-paths";
+  const pathsHeader = document.createElement("div");
+  pathsHeader.className = "docs-section-head";
+  pathsHeader.innerHTML =
+    "<h4>Reference documents</h4>"
+    + "<p class=\"docs-caption\">Repo paths, pinned by blob sha at first dispatch.</p>";
+  pathsSection.append(pathsHeader);
+
+  const chipList = document.createElement("div");
+  chipList.className = "docs-chips";
+  const drawChips = () => {
+    chipList.innerHTML = "";
+    if (!draft.docs.length) {
+      const empty = document.createElement("div");
+      empty.className = "muted docs-empty";
+      empty.textContent = "No reference documents yet.";
+      chipList.append(empty);
+      return;
+    }
+    draft.docs.forEach((doc, idx) => {
+      chipList.append(_docsChip(doc, idx, draft, effectiveRepo, {
+        locked,
+        drift: (opts.summary && (opts.summary.docs || []).find(
+          (d) => d.path === doc.path)),
+        onChange: () => { drawChips(); },
+        onRemove: () => { draft.docs.splice(idx, 1); drawChips(); },
+      }));
+    });
+  };
+  pathsSection.append(chipList);
+
+  if (!locked) {
+    pathsSection.append(_docsPathAdder(draft, effectiveRepo, () => drawChips()));
+  }
+  body.append(pathsSection);
+
+  // --- Attachments — secondary section ----------------------------------
+
+  const attSection = document.createElement("div");
+  attSection.className = "docs-section docs-attachments";
+  const attHeader = document.createElement("div");
+  attHeader.className = "docs-section-head";
+  attHeader.innerHTML =
+    "<h4>Attach a file</h4>"
+    + "<p class=\"docs-caption\">Only for content that isn't in any repo.</p>";
+  attSection.append(attHeader);
+
+  const attList = document.createElement("div");
+  attList.className = "docs-attachments-list";
+  const drawAttachments = () => {
+    attList.innerHTML = "";
+    // Server-side attachments (edit flavour) come from `opts.summary`.
+    const serverAtt = (opts.summary && opts.summary.attachments) || [];
+    for (const row of serverAtt) {
+      attList.append(_attachmentChip(row, task, {
+        locked,
+        onRemove: async () => {
+          if (locked) return;
+          if (!confirm(`Remove attachment "${row.name}"?`)) return;
+          await sendJSON(
+            `/api/tasks/${encodeURIComponent(task)}/attachments/${encodeURIComponent(row.name)}${queueParam()}`,
+            "DELETE",
+          );
+          rerender();
+        },
+      }));
+    }
+    // Client-side pending uploads (create flavour): chip preview.
+    for (const pending of (draft.pendingAttachments || [])) {
+      attList.append(_pendingAttachmentChip(pending, {
+        onRemove: () => {
+          draft.pendingAttachments = draft.pendingAttachments.filter(
+            (p) => p !== pending);
+          drawAttachments();
+        },
+      }));
+    }
+    if (!serverAtt.length && !(draft.pendingAttachments || []).length) {
+      const empty = document.createElement("div");
+      empty.className = "muted docs-empty";
+      empty.textContent = "No attachments.";
+      attList.append(empty);
+    }
+  };
+  attSection.append(attList);
+
+  if (!locked) {
+    attSection.append(_attachmentAdder(task, draft, creating, {
+      onAttached: () => { rerender(); },
+      onBuffered: () => { drawAttachments(); },
+    }));
+  }
+  body.append(attSection);
+
+  // --- Pin (read-only, collapsed) + budget meter -------------------------
+
+  if (opts.summary && opts.summary.docs_pin
+      && Object.keys(opts.summary.docs_pin).length) {
+    const pinExp = expando("Pin (docs_pin)", { open: false });
+    const pre = document.createElement("pre");
+    pre.className = "docs-pin-json";
+    pre.textContent = JSON.stringify(opts.summary.docs_pin, null, 2);
+    pinExp.body.append(pre);
+    body.append(pinExp.panel);
+  }
+
+  if (opts.summary && opts.summary.settings) {
+    const meter = _docsBudgetMeter(opts.summary, draft);
+    if (meter) body.append(meter);
+  }
+
+  drawChips();
+  drawAttachments();
+  return panel;
+}
+
+// One chip for a `docs:` path entry — path + short sha, drift badge, remove.
+// Images show a thumbnail (`/api/repos/<repo>/blob?sha=`) fetched inline.
+function _docsChip(doc, idx, draft, repo, opts = {}) {
+  const chip = document.createElement("div");
+  chip.className = "docs-chip docs-chip-path";
+  const media = (opts.drift && opts.drift.media) || _guessMediaFromPath(doc.path);
+  const sha = opts.drift && opts.drift.sha;
+  const drifted = opts.drift && opts.drift.drifted === true;
+
+  if (media.startsWith("image/") && sha && repo) {
+    const img = document.createElement("img");
+    img.className = "docs-chip-thumb";
+    img.alt = "";
+    img.src = `/api/repos/${encodeURIComponent(repo)}/blob?sha=${encodeURIComponent(sha)}`;
+    img.addEventListener("click", () => _openLightbox(img.src, doc.path));
+    chip.append(img);
+  } else {
+    const icon = document.createElement("span");
+    icon.className = "docs-chip-icon";
+    icon.textContent = _mediaIsBinaryUi(media) ? "📎" : "🔗";
+    chip.append(icon);
+  }
+
+  const label = document.createElement("div");
+  label.className = "docs-chip-label";
+  label.innerHTML = `<span class="docs-chip-path">${escapeHtml(doc.path)}</span>`
+    + (sha ? ` <span class="docs-chip-sha">@ ${_fmtShortSha(sha)}</span>` : "");
+  chip.append(label);
+
+  if (drifted) {
+    const badge = document.createElement("span");
+    badge.className = "docs-drift-badge";
+    badge.textContent = "source drifted — pinned to older version";
+    chip.append(badge);
+    const repinBtn = document.createElement("button");
+    repinBtn.type = "button";
+    repinBtn.className = "btn docs-repin-btn";
+    repinBtn.textContent = "Re-pin";
+    repinBtn.addEventListener("click", async () => {
+      const task = (state.detailScreenTask || null);
+      if (!task) return;
+      const { ok, data } = await sendJSON(
+        `/api/tasks/${encodeURIComponent(task)}/docs/repin${queueParam()}`,
+        "POST", { paths: [doc.path] },
+      );
+      if (!ok) { alert((data && data.detail) || "re-pin failed"); return; }
+      opts.onChange();
+      // Force a full re-render so the freshest drift state paints.
+      if (state.detailScreenTask) renderDetailScreen();
+    });
+    chip.append(repinBtn);
+  }
+
+  // Range editor for text chips only.
+  if (!_mediaIsBinaryUi(media) && !opts.locked) {
+    const rangeInput = document.createElement("input");
+    rangeInput.type = "text";
+    rangeInput.className = "docs-chip-range";
+    rangeInput.placeholder = "A-B";
+    rangeInput.value = doc.range || "";
+    rangeInput.addEventListener("input", () => {
+      doc.range = rangeInput.value.trim() || undefined;
+    });
+    chip.append(rangeInput);
+  }
+
+  if (!opts.locked) {
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.className = "docs-chip-remove";
+    rm.textContent = "×";
+    rm.title = "Remove reference";
+    rm.addEventListener("click", opts.onRemove);
+    chip.append(rm);
+  }
+  return chip;
+}
+
+function _docsPathAdder(draft, repo, redraw) {
+  const wrap = document.createElement("div");
+  wrap.className = "docs-path-adder";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "docs-path-input";
+  input.placeholder = repo
+    ? `path in ${repo} (e.g. docs/spec.md)`
+    : "repo path (bind the queue's repo first for autocomplete)";
+  input.setAttribute("list", "docs-path-suggestions");
+
+  const list = document.createElement("datalist");
+  list.id = "docs-path-suggestions";
+  wrap.append(list);
+
+  let timer = null;
+  const refresh = () => {
+    if (!repo) return;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const prefix = input.value;
+      const rows = await loadRepoPaths(repo, prefix);
+      list.innerHTML = "";
+      for (const row of rows.slice(0, 100)) {
+        const opt = document.createElement("option");
+        opt.value = row.path;
+        list.append(opt);
+      }
+    }, 150);
+  };
+  input.addEventListener("input", refresh);
+  input.addEventListener("focus", refresh);
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "btn";
+  btn.textContent = "Add";
+  const commit = () => {
+    const path = input.value.trim();
+    if (!path) return;
+    draft.docs.push({ path });
+    input.value = "";
+    redraw();
+  };
+  btn.addEventListener("click", commit);
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); commit(); }
+  });
+
+  wrap.append(input, btn);
+  return wrap;
+}
+
+function _attachmentChip(row, task, opts = {}) {
+  const chip = document.createElement("div");
+  chip.className = "docs-chip docs-chip-attach";
+  const media = row.media || _guessMediaFromPath(row.name);
+
+  if (media.startsWith("image/") && row.present) {
+    const img = document.createElement("img");
+    img.className = "docs-chip-thumb";
+    img.alt = "";
+    img.src = `/api/tasks/${encodeURIComponent(task)}/docs/${encodeURIComponent(row.name)}${queueParam()}`;
+    img.addEventListener("click", () => _openLightbox(img.src, row.name));
+    chip.append(img);
+  } else {
+    const icon = document.createElement("span");
+    icon.className = "docs-chip-icon";
+    icon.textContent = "📎";
+    chip.append(icon);
+  }
+  const label = document.createElement("div");
+  label.className = "docs-chip-label";
+  label.innerHTML = `<span class="docs-chip-path">${escapeHtml(row.name)}</span>`
+    + (row.bytes ? ` <span class="docs-chip-sha">${_fmtBytes(row.bytes)}</span>` : "");
+  chip.append(label);
+  if (row.orphan) {
+    const badge = document.createElement("span");
+    badge.className = "docs-drift-badge";
+    badge.textContent = "on disk, not in frontmatter";
+    chip.append(badge);
+  }
+  if (!opts.locked) {
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.className = "docs-chip-remove";
+    rm.textContent = "×";
+    rm.title = "Remove attachment";
+    rm.addEventListener("click", opts.onRemove);
+    chip.append(rm);
+  }
+  return chip;
+}
+
+function _pendingAttachmentChip(pending, opts = {}) {
+  const chip = document.createElement("div");
+  chip.className = "docs-chip docs-chip-attach docs-chip-pending";
+  const media = _guessMediaFromPath(pending.name);
+  if (media.startsWith("image/")) {
+    const img = document.createElement("img");
+    img.className = "docs-chip-thumb";
+    img.alt = "";
+    img.src = pending.previewUrl || "";
+    chip.append(img);
+  } else {
+    const icon = document.createElement("span");
+    icon.className = "docs-chip-icon";
+    icon.textContent = "📎";
+    chip.append(icon);
+  }
+  const label = document.createElement("div");
+  label.className = "docs-chip-label";
+  label.innerHTML = `<span class="docs-chip-path">${escapeHtml(pending.name)}</span>`
+    + ` <span class="docs-chip-sha">${_fmtBytes(pending.data.length)} · pending</span>`;
+  chip.append(label);
+  const rm = document.createElement("button");
+  rm.type = "button";
+  rm.className = "docs-chip-remove";
+  rm.textContent = "×";
+  rm.addEventListener("click", opts.onRemove);
+  chip.append(rm);
+  return chip;
+}
+
+function _attachmentAdder(task, draft, creating, opts = {}) {
+  const wrap = document.createElement("div");
+  wrap.className = "docs-attach-adder";
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "btn";
+  btn.textContent = "Choose file…";
+  const input = document.createElement("input");
+  input.type = "file";
+  input.hidden = true;
+
+  const handleFiles = async (fileList) => {
+    for (const file of fileList) {
+      const data = new Uint8Array(await file.arrayBuffer());
+      if (creating) {
+        // Buffer client-side; upload after task creation.
+        const previewUrl = file.type.startsWith("image/")
+          ? URL.createObjectURL(file) : null;
+        draft.pendingAttachments = draft.pendingAttachments || [];
+        draft.pendingAttachments.push({
+          name: file.name, data, previewUrl,
+        });
+        opts.onBuffered && opts.onBuffered();
+      } else {
+        const url = `/api/tasks/${encodeURIComponent(task)}/attachments`
+          + `?name=${encodeURIComponent(file.name)}`
+          + (state.activePlaylist ? `&queue=${encodeURIComponent(state.activePlaylist)}` : "");
+        const resp = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: data,
+        });
+        if (!resp.ok) {
+          const j = await resp.json().catch(() => ({}));
+          alert((j && j.detail) || `attach failed: ${resp.status}`);
+          return;
+        }
+        opts.onAttached && opts.onAttached();
+      }
+    }
+  };
+
+  btn.addEventListener("click", () => input.click());
+  input.addEventListener("change", () => {
+    if (input.files && input.files.length) handleFiles(Array.from(input.files));
+    input.value = "";
+  });
+
+  // Drag-and-drop.
+  wrap.addEventListener("dragover", (ev) => {
+    ev.preventDefault();
+    wrap.classList.add("docs-attach-drop");
+  });
+  wrap.addEventListener("dragleave", () => wrap.classList.remove("docs-attach-drop"));
+  wrap.addEventListener("drop", (ev) => {
+    ev.preventDefault();
+    wrap.classList.remove("docs-attach-drop");
+    const files = ev.dataTransfer && ev.dataTransfer.files;
+    if (files && files.length) handleFiles(Array.from(files));
+  });
+  // Paste from clipboard (screenshots).
+  wrap.addEventListener("paste", (ev) => {
+    const files = ev.clipboardData && ev.clipboardData.files;
+    if (files && files.length) handleFiles(Array.from(files));
+  });
+  wrap.tabIndex = 0;
+
+  const hint = document.createElement("div");
+  hint.className = "muted docs-attach-hint";
+  hint.textContent = "…or drag a file here, or paste a screenshot with ⌘V.";
+  wrap.append(btn, input, hint);
+  return wrap;
+}
+
+function _docsBudgetMeter(summary, draft) {
+  if (!summary || !summary.settings) return null;
+  const budget = summary.settings.document_budget_bytes;
+  if (!budget) return null;
+  let used = 0;
+  for (const d of (summary.docs || [])) used += d.bytes || 0;
+  for (const a of (summary.attachments || [])) used += a.bytes || 0;
+  for (const p of (draft.pendingAttachments || [])) used += p.data.length;
+  const pct = Math.min(100, Math.round((used / budget) * 100));
+  const meter = document.createElement("div");
+  meter.className = "docs-budget-meter";
+  meter.innerHTML =
+    `<div class="docs-budget-label">Documents: ${_fmtBytes(used)} of ${_fmtBytes(budget)}</div>`
+    + `<div class="docs-budget-bar"><div class="docs-budget-fill" style="width:${pct}%"></div></div>`;
+  return meter;
+}
+
+function _fmtBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+// Simple image lightbox using a native <dialog>. Falls back to a new tab
+// when the browser lacks <dialog> support.
+function _openLightbox(src, caption) {
+  const dlg = document.createElement("dialog");
+  dlg.className = "docs-lightbox";
+  const close = () => { try { dlg.close(); } catch { /* already closed */ }
+    dlg.remove(); };
+  dlg.addEventListener("click", (ev) => { if (ev.target === dlg) close(); });
+  const img = document.createElement("img");
+  img.src = src;
+  img.alt = caption || "";
+  dlg.append(img);
+  document.body.append(dlg);
+  if (typeof dlg.showModal === "function") dlg.showModal();
+  else window.open(src, "_blank", "noopener,noreferrer");
+}
+
+// Fetch the server-side documents summary (path pins, attachments, drift) for
+// a task and cache it on `state.detailDocumentsSummary` so re-renders don't
+// re-request.
+async function loadDocumentsSummary(task) {
+  if (!task) return null;
+  try {
+    return await getJSON(
+      `/api/tasks/${encodeURIComponent(task)}/documents${queueParam()}`,
+    );
+  } catch { return null; }
 }
 
 // Parse the engine's "step:1,step2:2" visit map into {step: count}.
@@ -3857,7 +4387,55 @@ function draftFromBrief(brief) {
     // Split (decomposition) mode: worker writes subtask briefs instead of
     // implementing the spec directly.
     split: !!(brief.frontmatter && brief.frontmatter.split),
+    // Task documents (spec §6): a normalised list of `{path, range?, as?, steps?}`
+    // objects derived from `docs:` frontmatter, so the UI edits chips and the
+    // draft round-trips through PATCH. Missing / string form parses in
+    // `docsFromRaw` below.
+    docs: docsFromRaw(raw.docs),
+    // Attachment names are surfaced from the server's Documents endpoint
+    // (loaded lazily by the Documents panel — see `loadDocumentsSummary`).
+    // A create pane buffers pending uploads here until the task exists.
+    pendingAttachments: [],
   };
+}
+
+// Parse a `docs:` frontmatter value (single string, comma-separated, JSON list,
+// or list of objects) into the UI's normalised chip list. Mirrors the Python
+// `parse_docs_field` shape (bare string → `{path}`); block-list `docs:\n  - x`
+// forms aren't visible in the raw frontmatter dict, so those come back as "".
+function docsFromRaw(raw) {
+  if (raw === null || raw === undefined) return [];
+  if (Array.isArray(raw)) {
+    return raw.map((v) => (typeof v === "string" ? { path: v } : { ...v }));
+  }
+  const text = String(raw).trim();
+  if (!text) return [];
+  if (text.startsWith("[") || text.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) {
+        return parsed.map((v) => (typeof v === "string" ? { path: v } : { ...v }));
+      }
+      if (parsed && typeof parsed === "object") return [{ ...parsed }];
+    } catch { /* fall through to comma-split */ }
+  }
+  return text.split(",").map((s) => s.trim()).filter(Boolean)
+    .map((path) => ({ path }));
+}
+
+// Serialise the draft's `docs` list into the compact JSON the API accepts.
+// Returns `null` for an empty list (clears the frontmatter key).
+function docsToPayload(docs) {
+  if (!docs || !docs.length) return [];
+  return docs.map((d) => {
+    const bare = d.path && !d.range && !d.as && (!d.steps || !d.steps.length);
+    return bare ? d.path : {
+      path: d.path,
+      ...(d.range ? { range: d.range } : {}),
+      ...(d.as ? { as: d.as } : {}),
+      ...(d.steps && d.steps.length ? { steps: d.steps } : {}),
+    };
+  });
 }
 
 // --------------------------------------------------------------------------
@@ -4375,6 +4953,24 @@ function taskDetailContent(brief, draft, opts = {}) {
     frag.append(artifactsPanel(task));
   }
 
+  // DOCUMENTS — operator-owned references (`docs:`) and attachments
+  // (`attachments:`), spec §6. The create flavour has no `summary` (nothing on
+  // disk yet); the edit flavour pulls one from the server on the first render
+  // (see `renderDetailScreen`) and caches it on `state.detailDocumentsSummary`.
+  frag.append(documentsPanel(brief, draft, {
+    creating,
+    locked,
+    summary: creating ? null : state.detailDocumentsSummary,
+    rerender: async () => {
+      // A mutation from within the panel (delete attachment, re-pin) needs a
+      // fresh summary from the server before repainting.
+      if (!creating) {
+        state.detailDocumentsSummary = await loadDocumentsSummary(task);
+      }
+      rerender();
+    },
+  }));
+
   // BLOCKED — an expandable section, directly below LOG, shown only while the
   // task carries a blocked overlay. Expanding it reveals the blocked reason.
   // To clear blocked status, set STATUS to Ready and save.
@@ -4476,6 +5072,9 @@ async function saveDetail(brief, draft, errEl) {
   const origNow = draft.original_brief || "";
   const origWas = brief.original_brief || "";
   if (origNow !== origWas) payload.original_brief = origNow;
+  // Reference documents (`docs:`) are always sent so a chip removal actually
+  // clears the frontmatter list; the server treats `[]` as "drop the key".
+  payload.docs = docsToPayload(draft.docs || []);
   if (!payload.title) {
     if (errEl) { errEl.textContent = "title is required"; errEl.hidden = false; }
     return;
@@ -4541,10 +5140,31 @@ async function createDetail(draft, errEl) {
   // Per-task repo override: included only when set (empty ⇒ inherit the queue
   // default). Omitted entirely otherwise, matching the create contract.
   if (draft.repo && draft.repo.trim()) payload.repo = draft.repo.trim();
+  // Reference documents (`docs:`) travel on create so the first dispatch's pin
+  // resolution has something to walk (spec §6).
+  if (draft.docs && draft.docs.length) payload.docs = docsToPayload(draft.docs);
   const { ok, data } = await sendJSON(`/api/tasks${queueParam()}`, "POST", payload);
   if (!ok) {
     if (errEl) { errEl.textContent = (data && data.error) || "could not create task"; errEl.hidden = false; }
     return false;
+  }
+  // Flush buffered attachment uploads to the freshly-created task; each is a
+  // raw-bytes POST with the filename as a query param (matches api_documents).
+  const newTask = (data && data.task) || null;
+  const pending = draft.pendingAttachments || [];
+  if (newTask && pending.length) {
+    for (const p of pending) {
+      const url = `/api/tasks/${encodeURIComponent(newTask)}/attachments`
+        + `?name=${encodeURIComponent(p.name)}`
+        + (state.activePlaylist ? `&queue=${encodeURIComponent(state.activePlaylist)}` : "");
+      try {
+        await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: p.data,
+        });
+      } catch { /* the operator can retry from the detail pane */ }
+    }
   }
   await loadQueue();
   closeDetailScreen();
@@ -4615,6 +5235,7 @@ function clearDetailState() {
   state.detailCreate = false;
   state.createBrief = null;
   state.detailDraft = null;
+  state.detailDocumentsSummary = null;
   clearTaskHash();
 }
 
@@ -4646,6 +5267,16 @@ function renderDetailScreen() {
       // so a live re-render (status flip, new log line) never clobbers in-flight
       // typing.
       if (!state.detailDraft) state.detailDraft = draftFromBrief(brief);
+      // Fire-and-forget the Documents summary (path pins, attachments, drift)
+      // for the panel; a follow-up render paints it in when the promise lands.
+      if (state.detailDocumentsSummary === null
+          || state.detailDocumentsSummary.task !== task) {
+        loadDocumentsSummary(task).then((summary) => {
+          if (state.detailScreenTask !== task) return;
+          state.detailDocumentsSummary = summary;
+          renderDetailScreenLocal(brief);
+        });
+      }
       body.append(taskDetailContent(brief, state.detailDraft, {
         rerender: () => renderDetailScreenLocal(brief),
         isActive: () => state.detailScreenTask === task && state.view === "detail",

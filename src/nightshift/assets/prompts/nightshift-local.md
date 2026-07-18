@@ -44,6 +44,15 @@ files, function-level changes, and per-item tests; read the manifest's files
 first rather than re-deriving the layout. When no PLAN file is named, this
 paragraph does not apply and the task file is your only spec.
 
+## Reference documents
+
+When the header above lists reference documents, read them first; treat them as
+authoritative context before exploring the repo. A document annotated with an
+`image/*` or `application/pdf` media type is binary — open it with a tool that
+can read that type; if you cannot, note that in your output and proceed with
+the remaining context. Never modify, move, or commit these files: they are
+read-only scratch copies that live outside this repo.
+
 ## Split tasks (decomposition runs)
 
 When `$SPLIT` is `true`, **do not implement the spec.**

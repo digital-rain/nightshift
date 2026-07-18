@@ -1084,6 +1084,14 @@ def harvest_split_output(
     parent_num = task.split(".", 1)[0] if "." in task else task
     sub_id = next_sub_id(tasks_dir, parent_num) - 1
 
+    # Parent's operator-owned doc frontmatter (spec §7 decomposition): copy
+    # ``docs:``/``attachments:`` into each child so children remain
+    # self-contained. ``docs_pin`` is deliberately NOT copied — children
+    # re-pin at their own first dispatch.
+    parent_docs_raw = meta.get("docs")
+    parent_attachments_raw = meta.get("attachments")
+    parent_attachments_dir = attachments_dir(tasks_root, task, tasks_rel)
+
     created: list[str] = []
     for brief_path in briefs:
         sub_id += 1
@@ -1095,6 +1103,25 @@ def harvest_split_output(
         created.append(name)
 
     if created:
+        # Attachment bytes are copied *before* the frontmatter rewrite so a
+        # single commit captures both; child ``attachments:`` frontmatter
+        # points at bytes that already live under the child's own ``.docs/``.
+        import shutil as _shutil
+
+        for child_name in created:
+            if parent_attachments_dir.exists() and any(parent_attachments_dir.iterdir()):
+                child_docs_dir = attachments_dir(tasks_root, child_name, tasks_rel)
+                child_docs_dir.mkdir(parents=True, exist_ok=True)
+                for entry in parent_attachments_dir.iterdir():
+                    if entry.is_file():
+                        _shutil.copy2(entry, child_docs_dir / entry.name)
+            child_changes: dict[str, object | None] = {}
+            if parent_docs_raw not in (None, ""):
+                child_changes["docs"] = parent_docs_raw
+            if parent_attachments_raw not in (None, ""):
+                child_changes["attachments"] = parent_attachments_raw
+            if child_changes:
+                set_task_meta(tasks_root, child_name, child_changes, tasks_rel)
         commit_tasks(
             tasks_root,
             f"nightshift: decompose {task} into {len(created)} subtask(s)",

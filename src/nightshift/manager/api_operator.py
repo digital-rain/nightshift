@@ -32,6 +32,7 @@ from nightshift.git.executor import ExecutorPool
 from nightshift.git.store import commit_tasks
 from nightshift.lifecycle import AttemptRef, AttemptState, TaskHoldKind
 from nightshift.manager import failure_policy
+from nightshift.manager.api_documents import register_documents_api
 from nightshift.manager.api_playlists import register_playlist_api
 from nightshift.manager.api_repo_tasks import register_repo_tasks_api
 from nightshift.manager.registry import Registry
@@ -131,6 +132,12 @@ class TaskCreate(BaseModel):
     # file. ``text`` is then the ORIGINAL brief; the enhanced rewrite becomes
     # the effective body and the original is preserved below the marker.
     enhance: bool = False
+    # Task documents (spec §1): operator-declared reference paths + task-local
+    # attachments. Accepted as a list of strings or list of objects with
+    # ``{path, range?, as?, steps?}``; serialised into frontmatter via
+    # :func:`set_task_meta` (compact JSON — Phase 1 encoding).
+    docs: list[str | dict[str, Any]] | None = None
+    attachments: list[str | dict[str, Any]] | None = None
 
 
 class TaskUpdate(BaseModel):
@@ -165,6 +172,12 @@ class TaskUpdate(BaseModel):
     notes: str | None = None
     # The preserved pre-enhancement text ("" drops the marker section).
     original_brief: str | None = None
+    # Task documents (spec §1): edited through the same PATCH lane as other
+    # editable frontmatter. ``None`` leaves the key untouched (PATCH semantics);
+    # an empty list clears it. Values may be paths (strings) or objects with
+    # ``{path, range?, as?, steps?}``.
+    docs: list[str | dict[str, Any]] | None = None
+    attachments: list[str | dict[str, Any]] | None = None
 
 
 class RunRating(BaseModel):
@@ -515,6 +528,12 @@ def register_operator_api(
             meta_changes["planner_model"] = body.planner_model
         if body.enhance:
             meta_changes["enhanced"] = True
+        if body.docs is not None:
+            meta_changes["docs"] = list(body.docs) if body.docs else None
+        if body.attachments is not None:
+            meta_changes["attachments"] = (
+                list(body.attachments) if body.attachments else None
+            )
         if meta_changes:
             with contextlib.suppress(FileNotFoundError, ValueError):
                 set_task_meta(
@@ -551,6 +570,11 @@ def register_operator_api(
                 elif key in ("workflow", "planner_model"):
                     # "" clears the workflow selection (a plain task again).
                     changes[key] = value or None
+                elif key in ("docs", "attachments"):
+                    # An empty list clears the key so the task returns to
+                    # "no docs" (byte-identical to pre-feature); a populated
+                    # list is written as compact JSON via _render_meta_value.
+                    changes[key] = list(value) if value else None
                 else:
                     changes[key] = value
         except ValueError as exc:
@@ -939,6 +963,17 @@ def register_operator_api(
         _queue_repo=_queue_repo,
         _commit=_commit,
         _emit=_emit,
+        _executors=_executors,
+    )
+
+    register_documents_api(
+        app,
+        workspace=workspace,
+        tasks_root=tasks_root,
+        tasks_repo=tasks_repo,
+        _resolve_queue=_resolve_queue,
+        _queue_repo=_queue_repo,
+        _commit=_commit,
         _executors=_executors,
     )
 

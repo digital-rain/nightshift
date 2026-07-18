@@ -164,6 +164,16 @@ The manager sends them to each worker at checkin, so changing them here changes 
 | `quarantine_threshold` | `2` | Consecutive no-progress runs of one task before it is quarantined: held in the queue but skipped by every worker until an operator releases it. `0` disables. |
 | `retry_backoff_seconds` | `60.0` | Base of the exponential retry backoff: the n-th consecutive no-progress attempt delays the task's next dispatch by `base * 2**(n-1)` seconds (capped at an hour). |
 
+### Task documents
+
+Governs the by-reference delivery of `docs:` / `attachments:` (see [Task documents](#task-documents-by-reference-delivery)). All three are ceiling-clamped hard limits — Nightshift never delivers more than the operator explicitly permits.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `document_cap_bytes` | `262_144` (256 KiB) | Per-document byte cap. Applies to each `docs:` blob and each `attachments:` file individually; over-cap attach requests are rejected with `400 document_too_large`. The `NIGHTSHIFT_DOCUMENT_CAP_BYTES` environment variable overrides this at load time; both are clamped to a hard ceiling of `5 MiB` — a larger configured value is silently reduced. |
+| `document_budget_bytes` | `4_194_304` (4 MiB) | Total document footprint per task (paths + attachments). Attach requests that would push the sum over the budget are rejected with `400 document_budget_exceeded`. |
+| `allowed_doc_media_types` | `["text/*", "application/json", "application/yaml", "image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"]` | Allow-list of media types (glob patterns supported). Anything outside is rejected with `400 unsupported_document_type` at attach time and never resolved into `docs_pin`. |
+
 ### Conflict resolution
 
 | Key | Default | Meaning |
@@ -188,6 +198,7 @@ The manager sends them to each worker at checkin, so changing them here changes 
 | `NIGHTSHIFT_TASKS_REPO` | `tasks_repo` |
 | `NIGHTSHIFT_WIP_REF_PREFIX` | `wip_ref_prefix` |
 | `NIGHTSHIFT_QUARANTINE_THRESHOLD` | `quarantine_threshold` |
+| `NIGHTSHIFT_DOCUMENT_CAP_BYTES` | `document_cap_bytes` (clamped to the 5 MiB ceiling) |
 | `NIGHTSHIFT_SHARED_SECRET` | Shared secret (stored in `.env`, never in `manager.json`) |
 | `NIGHTSHIFT_PG_DSN` | Database DSN (stored in `.env`, never in `manager.json`) |
 
@@ -284,8 +295,15 @@ Per-task overrides in a brief's YAML frontmatter (`<tasks_repo>/<queue>/<NN>.<na
 | `autosplit` | bool | `false` | Accumulation task that periodically splits into subtasks. |
 | `evergreen` | bool | `false` | Reset from template on completion instead of being consumed. |
 | `disabled` | bool | `false` | Skip this task (never dispatched). |
+| `docs` | list | none | Repo paths (or `{path, range?, as?, steps?}` objects) delivered to the worker by reference. Pinned to their blob sha on first dispatch (see `docs_pin`). |
+| `attachments` | list | none | Task-local filenames under `<task>.docs/` in the tasks repo (bytes committed alongside the brief); delivered by reference to the worker. |
+| `docs_pin` | JSON object | (engine-owned) | Written by the engine on first dispatch — a `{key: {sha, media, bytes}}` map that locks each `docs:` path and `attach:<name>` to a specific blob so later runs materialize identical bytes even if the source drifts. Never hand-edited; the operator uses the detail pane's **Re-pin** button. |
 
 The system also writes state flags into frontmatter as a task progresses (`quarantined` / `quarantine_reason`, `failed` / `failed_reason`, `completed`, `enhanced`); these are managed from the UI, not hand-edited. Workflow tasks additionally carry the engine-owned cursor (`workflow_step`, `workflow_visits`), which the engine writes and operators must not edit.
+
+### Task documents (by-reference delivery)
+
+Task documents attach real content to a brief — repo paths (`docs:`) and task-local attachments (`attachments:`) — without embedding bytes in the work order. On first dispatch the engine resolves every entry to a Git blob sha and writes the `docs_pin` map into the brief's frontmatter; every later run materializes the exact same bytes from the target-repo (`docs:`) or tasks-repo (`attachments:`) object store, so a source edit at the base_ref never silently changes what a running task sees. The manager UI surfaces drift ("source drifted — pinned to older version") with a **Re-pin** action that refreshes the pin against the current base_ref.
 
 ## Queue configuration
 

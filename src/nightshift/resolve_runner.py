@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from nightshift import backends, playlists
+from nightshift.docs_resolve import DocumentUnavailable
 from nightshift.events import (
     TASK_LOG,
     TASK_RESULT,
@@ -50,6 +51,7 @@ from nightshift.spawn_daily import (
 from nightshift.task_files import (
     drop_completed_task,
     materialize_brief,
+    materialize_docs,
     task_is_evergreen,
 )
 
@@ -255,6 +257,27 @@ def _agent_resolve(
     # Deliver the brief via a run-scratch file outside the worktree (the brief
     # never enters the target repo).
     scratch = materialize_brief(workspace, repo, task, body, queue=queue)
+    # Reference docs (spec §3.2 / §8): materialize the same pinned blobs the
+    # original attempt saw so the resolver has identical context. Best-effort
+    # — a resolve run without recoverable docs proceeds without them (rather
+    # than compounding an existing failure with a doc materialize error).
+    from nightshift.docs_resolve import entries_from_pin
+
+    doc_entries = entries_from_pin(
+        meta, task,
+        workflow_step_id=(str(meta.get("workflow_step") or "") or None),
+        task_file_text=(task_file.read_text() if task_file.exists() else None),
+    )
+    if doc_entries:
+        try:
+            materialize_docs(
+                workspace, repo, task, doc_entries,
+                queue=queue,
+                tasks_root=tasks_root,
+                target_repo_root=repo_root,
+            )
+        except DocumentUnavailable as exc:
+            _emit_log(f"  reference docs unavailable for resolve: {exc}\n")
     resolved = resolve_frontmatter(meta, config)
     backend, model = select_run_backend(
         config.get("resolve_model") or resolved["model"],

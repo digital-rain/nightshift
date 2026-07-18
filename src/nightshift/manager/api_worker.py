@@ -96,7 +96,13 @@ from nightshift.manager.wire import (
     SubmitBody,
     jsonable,
 )
-from nightshift.manager.work_orders import build_work_order, task_meta
+from nightshift.manager.work_orders import (
+    _DOCS_PIN_DIRTY_KEY,
+    _DOCS_PIN_KEY,
+    DocsBlocked,
+    build_work_order,
+    task_meta,
+)
 from nightshift.model_id import provider_of
 from nightshift.spawn_daily import (
     is_failed,
@@ -292,11 +298,22 @@ def register_worker_api(
 
     def _workflow_reset_job(queue: str | None, task: str) -> None:
         """Evergreen ``$end`` reset (§6.5): clear the engine meta lane and drop
-        the workflow's artifacts, leaving the (evergreen) brief in place."""
+        the workflow's artifacts, leaving the (evergreen) brief in place.
+
+        The docs feature (spec §4 / §7): also clear ``docs_pin`` so the next
+        cycle re-pins to the then-current ``base_ref``. Attachments and the
+        operator-owned ``docs:``/``attachments:`` frontmatter are retained —
+        operator inputs are cycle-independent.
+        """
         tasks_rel = playlists_mod.tasks_rel(queue)
         set_engine_meta(
             tasks_root, task,
-            {"workflow_step": None, "workflow_visits": None}, tasks_rel,
+            {
+                "workflow_step": None,
+                "workflow_visits": None,
+                "docs_pin": None,
+            },
+            tasks_rel,
         )
         delete_artifacts(tasks_root, task, tasks_rel)
         commit_tasks(tasks_root, f"nightshift: workflow reset {task}")
@@ -375,11 +392,34 @@ def register_worker_api(
                             "workflow_visits": format_visits({first_step: 1}),
                         },
                     ))
-        order = build_work_order(
-            workspace, tasks_root, task, queue, repo,
-            run_id, run_id, base_ref, cfg,
-            workflow_defs=app.state.workflows,
-        )
+        try:
+            order = build_work_order(
+                workspace, tasks_root, task, queue, repo,
+                run_id, run_id, base_ref, cfg,
+                workflow_defs=app.state.workflows,
+            )
+        except DocsBlocked as exc:
+            # Authoring/environment error resolving ``docs:``/``attachments:``
+            # (spec §7): hold the task with the operator-facing reason and
+            # hand out no lease. The reconciler / operator surface the reason
+            # through the existing task-state overlay.
+            with contextlib.suppress(Exception):
+                await store.set_task_state(
+                    queue, task, TaskHoldKind.BLOCKED,
+                    blocked_reason=exc.reason,
+                )
+            return None
+        # Persist a fresh ``docs_pin`` when resolution rewrote it. The pin
+        # rides the same tasks-repo executor lane as the workflow cursor,
+        # then is stripped from the order so the wire stays clean.
+        if order.get(_DOCS_PIN_DIRTY_KEY):
+            rendered = order.get(_DOCS_PIN_KEY)
+            with contextlib.suppress(Exception):
+                await _run_tasks_repo_job(_executors, tasks_repo, partial(
+                    _set_engine_meta_job, queue, task, {"docs_pin": rendered},
+                ))
+        order.pop(_DOCS_PIN_KEY, None)
+        order.pop(_DOCS_PIN_DIRTY_KEY, None)
         planned_validate = order["config"].get("validate_cmd") or None
         # The attempt row persists the work order's workflow block MINUS
         # ``artifacts`` (context lives in the tasks repo; the row stores routing

@@ -22,6 +22,7 @@ from collections.abc import Callable
 from typing import Any
 
 from nightshift import playlists, repos
+from nightshift.docs_resolve import DocumentUnavailable
 from nightshift.git import GitError
 from nightshift.git.transport import prepare_worktree_base, publish_task_branch
 from nightshift.git.worktrees import has_commits as worktree_has_commits
@@ -45,6 +46,7 @@ from nightshift.queue_config import DEFAULT_VALIDATE_CMD, validate_cmd_from_blob
 from nightshift.task_files import (
     materialize_artifacts,
     materialize_brief,
+    materialize_docs,
     split_output_dir,
 )
 from nightshift.worker.config import WorkerConfig
@@ -54,6 +56,51 @@ from nightshift.worker.config import WorkerConfig
 PhaseCb = Callable[[str], None]
 # Log callback: (line) -> None, streamed to the manager + local tail.
 LogCb = Callable[[str], None]
+
+
+def _materialize_order_docs(
+    cfg: WorkerConfig,
+    order: dict[str, Any],
+    repo: str,
+    task: str,
+    queue: str | None,
+) -> list[dict]:
+    """Materialize the work order's ``config.docs`` pin-only entries.
+
+    Returns the ``doc_files`` list the prompt header builder consumes: one
+    dict per entry with ``label``/``path``/``media``/``range``. An empty
+    ``config.docs`` (or no docs key) yields an empty list.
+
+    Raises :class:`~nightshift.docs_resolve.DocumentUnavailable` when the
+    caller must surface :class:`FailureKind.DOCUMENT_UNAVAILABLE`.
+    """
+    entries = list(order.get("config", {}).get("docs") or [])
+    if not entries:
+        return []
+    # ``task_path`` is ``<tasks_repo>/<queue>/<task>.md`` — derive the tasks
+    # repo checkout so path docs read via ``git cat-file`` from the target
+    # repo object store, attachments from the tasks repo.
+    tasks_repo = (order.get("task_path") or "").split("/", 1)[0]
+    tasks_root = cfg.workspace / tasks_repo if tasks_repo else None
+    materialised = materialize_docs(
+        cfg.workspace, repo, task, entries,
+        queue=queue,
+        tasks_root=tasks_root,
+        target_repo_root=cfg.workspace / repo,
+    )
+    doc_files: list[dict] = []
+    for entry in entries:
+        name = entry.get("name") or ""
+        path = materialised.get(name)
+        if path is None:
+            continue
+        doc_files.append({
+            "label": entry.get("label") or name,
+            "path": str(path),
+            "media": entry.get("media") or "application/octet-stream",
+            "range": entry.get("range"),
+        })
+    return doc_files
 
 
 def _finish_landable(
@@ -203,6 +250,16 @@ def _execute_doc_step(
             FailureKind.WORKTREE_FAILED, str(exc), line="worktree setup failed",
         )
 
+    # Reference docs (spec §3.2) materialize from the target repo's object
+    # store (path docs; ``prepare_worktree_base`` has fetched them) and the
+    # tasks repo checkout (attachments). Sha-verify failure surfaces as a
+    # DOCUMENT_UNAVAILABLE (environment) failure.
+    try:
+        doc_files = _materialize_order_docs(cfg, order, repo, task, queue)
+    except DocumentUnavailable as exc:
+        teardown_worktree(workspace, repo, task, queue=queue)
+        return fail(FailureKind.DOCUMENT_UNAVAILABLE, str(exc))
+
     captured: list[str] = []
 
     def capture_log(line: str) -> None:
@@ -217,6 +274,7 @@ def _execute_doc_step(
             artifact_files=artifact_files,
             output_file=str(output_path),
             prompt_text=workflow.get("prompt_text"),
+            doc_files=doc_files or None,
         )
         env = worker_env(wt_dir)
         max_turns = config_blob.get("max_turns")
@@ -442,6 +500,14 @@ def execute_work_order(
             str(exc),
             line="worktree setup failed",
         )
+    # Reference docs (spec §3.2). Materialise *after* the worktree is cut so
+    # the target repo's object store is populated by ``prepare_worktree_base``
+    # (fetch on remote workers; a no-op on co-located).
+    try:
+        doc_files = _materialize_order_docs(cfg, order, repo, task, queue)
+    except DocumentUnavailable as exc:
+        teardown_worktree(workspace, repo, task, queue=queue)
+        return fail(FailureKind.DOCUMENT_UNAVAILABLE, str(exc))
     preserve = False
     captured: list[str] = []
 
@@ -459,6 +525,7 @@ def execute_work_order(
             split=is_split,
             split_dir=sdir,
             artifact_files=artifact_files or None,
+            doc_files=doc_files or None,
         )
         env = worker_env(wt_dir)
 

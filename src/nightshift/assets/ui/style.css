@@ -1968,3 +1968,125 @@ button.btn.primary.wink {
   .settings-sidebar { flex: 0 0 180px; }
   .settings-main { padding: 14px 12px 80px; }
 }
+
+/* ---- Documents panel (spec §6) ------------------------------------------ */
+.documents-panel .docs-section { margin: 8px 0 14px 0; }
+.documents-panel .docs-section-head h4 {
+  margin: 0 0 2px 0;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text);
+}
+.documents-panel .docs-caption {
+  margin: 0 0 8px 0;
+  font-size: 0.85rem;
+  color: var(--text-dim);
+}
+.docs-chips, .docs-attachments-list {
+  display: flex; flex-direction: column; gap: 6px;
+}
+.docs-chip {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-sunken);
+  min-height: 32px;
+}
+.docs-chip-thumb {
+  width: 32px; height: 32px; object-fit: cover;
+  border-radius: 4px; cursor: zoom-in;
+  background: #0002;
+}
+.docs-chip-icon {
+  width: 20px; text-align: center; opacity: 0.7;
+}
+.docs-chip-label { flex: 1; min-width: 0; }
+.docs-chip-path {
+  font-family: var(--font-mono, monospace);
+  font-size: 0.85rem;
+  word-break: break-all;
+}
+.docs-chip-sha {
+  color: var(--text-dim);
+  font-family: var(--font-mono, monospace);
+  font-size: 0.75rem;
+  margin-left: 4px;
+}
+.docs-chip-range {
+  width: 80px; font-size: 0.8rem; padding: 2px 4px;
+  border: 1px solid var(--border); border-radius: 4px;
+  background: var(--bg); color: var(--text);
+}
+.docs-chip-remove {
+  background: transparent; border: none; color: var(--text-dim);
+  font-size: 1.1rem; line-height: 1; cursor: pointer; padding: 2px 6px;
+}
+.docs-chip-remove:hover { color: var(--danger, #c33); }
+.docs-drift-badge {
+  background: #f0ad4e22;
+  color: #b8770e;
+  border: 1px solid #f0ad4e55;
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 0.75rem;
+}
+.docs-repin-btn {
+  font-size: 0.75rem; padding: 2px 8px;
+}
+.docs-chip-pending {
+  opacity: 0.85;
+  border-style: dashed;
+}
+.docs-empty {
+  font-size: 0.85rem; padding: 4px 0;
+}
+.docs-path-adder, .docs-attach-adder {
+  display: flex; align-items: center; gap: 6px;
+  margin-top: 8px; flex-wrap: wrap;
+}
+.docs-path-input {
+  flex: 1; min-width: 200px;
+  padding: 4px 8px;
+  border: 1px solid var(--border); border-radius: 4px;
+  background: var(--bg); color: var(--text);
+}
+.docs-attach-adder {
+  padding: 8px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+}
+.docs-attach-adder.docs-attach-drop {
+  background: var(--accent-bg, #4a90e211);
+  border-color: var(--accent);
+}
+.docs-attach-hint {
+  font-size: 0.8rem; color: var(--text-dim); flex: 1;
+}
+.docs-pin-json {
+  font-size: 0.75rem;
+  background: var(--bg-sunken);
+  padding: 6px 8px;
+  border-radius: 4px;
+  max-height: 200px; overflow: auto;
+}
+.docs-budget-meter {
+  margin-top: 10px; font-size: 0.8rem;
+}
+.docs-budget-label { margin-bottom: 4px; color: var(--text-dim); }
+.docs-budget-bar {
+  height: 4px; background: var(--bg-sunken); border-radius: 2px; overflow: hidden;
+}
+.docs-budget-fill {
+  height: 100%; background: var(--accent, #4a90e2); transition: width 0.2s ease;
+}
+.docs-lightbox {
+  border: none; background: #0009;
+  padding: 20px; max-width: 90vw; max-height: 90vh;
+}
+.docs-lightbox::backdrop { background: #0008; }
+.docs-lightbox img {
+  max-width: 100%; max-height: 80vh; display: block; margin: 0 auto;
+  border-radius: 4px;
+}

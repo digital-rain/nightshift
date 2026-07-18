@@ -27,6 +27,51 @@ def _artifact_header(artifact_files: dict[str, str] | None) -> str:
     return "".join(lines)
 
 
+def _label_titled(label: str) -> str:
+    """Capitalise the leading ``the`` in an operator-supplied doc label."""
+    if not label:
+        return label
+    stripped = label.strip()
+    if stripped.lower().startswith("the "):
+        return "The " + stripped[4:]
+    return stripped[0].upper() + stripped[1:]
+
+
+def _binary_annotation(media: str) -> str:
+    """Annotation suffix for a binary doc (spec §3.2)."""
+    if media == "application/pdf":
+        return f"  [{media} — open with a PDF-capable tool]"
+    return f"  [{media} — open with an image-capable tool]"
+
+
+def _docs_header(doc_files: list[dict] | None) -> str:
+    """Header block naming each materialized reference document (spec §3.2).
+
+    ``doc_files`` is a list of dicts each with ``label``, ``path`` (scratch),
+    ``media``, and optional ``range``. Empty/None yields an empty string so
+    a task with no docs stays byte-identical to today's header.
+    """
+    if not doc_files:
+        return ""
+    lines = ["Reference documents (read-only, read these before exploring):\n"]
+    for entry in doc_files:
+        label = _label_titled(str(entry.get("label") or "the document"))
+        path = entry["path"]
+        media = str(entry.get("media") or "")
+        rng = entry.get("range")
+        line = f"  - {label}"
+        if rng and media.startswith("text/"):
+            rng_display = str(rng).replace("-", "\u2013")  # en dash
+            line += f" (lines {rng_display})"
+        line += f" is: {path}"
+        if media and not media.startswith("text/") and media not in (
+            "application/json", "application/yaml",
+        ):
+            line += _binary_annotation(media)
+        lines.append(line + "\n")
+    return "".join(lines)
+
+
 def build_prompt(
     task: str,
     *,
@@ -37,6 +82,7 @@ def build_prompt(
     split: bool = False,
     split_dir: str | None = None,
     artifact_files: dict[str, str] | None = None,
+    doc_files: list[dict] | None = None,
 ) -> str:
     """Build the worker prompt matching CI injection format.
 
@@ -76,6 +122,7 @@ def build_prompt(
         f"The VALIDATE command is: {validate_cmd}\n"
     )
     header += _artifact_header(artifact_files)
+    header += _docs_header(doc_files)
     if split:
         header += (
             f"The SPLIT variable is: true\n"
@@ -92,6 +139,7 @@ def build_doc_prompt(
     artifact_files: dict[str, str],
     output_file: str,
     prompt_text: str | None = None,
+    doc_files: list[dict] | None = None,
 ) -> str:
     """Build a workflow doc-step prompt: a task-varying header (task file,
     artifact paths, ``$OUTPUT_FILE``) followed by the byte-stable charter body.
@@ -112,6 +160,7 @@ def build_doc_prompt(
         f"The TASK_FILE variable is: {task_file}\n"
     )
     header += _artifact_header(artifact_files)
+    header += _docs_header(doc_files)
     header += f"The OUTPUT_FILE variable is: {output_file}\n"
     return f"{header}\n{prompt_body}"
 

@@ -12,6 +12,11 @@ from typing import Any
 
 from nightshift import playlists as playlists_mod
 from nightshift.config.manager import ManagerConfig
+from nightshift.docs_resolve import (
+    DocsBlocked,
+    render_docs_pin,
+    resolve_task_docs,
+)
 from nightshift.manager.scheduler import parse_required_mcps, queue_label
 from nightshift.preflight import resolve_preflight_cmd
 from nightshift.queue_config import format_validate_cmd, resolve_validate_cmd
@@ -28,6 +33,23 @@ from nightshift.workflows import (
     resolve_prompt_text,
     step_max_turns,
 )
+
+
+# Internal keys stashed on a work order for ``_lease_and_build`` to consume
+# and strip before returning the order to the worker. Keeps pin persistence
+# out of the pure work-order builder while satisfying the "one call site
+# resolves docs" invariant.
+_DOCS_PIN_KEY = "_docs_pin"
+_DOCS_PIN_DIRTY_KEY = "_docs_pin_dirty"
+
+
+__all__ = [
+    "DocsBlocked",
+    "_DOCS_PIN_DIRTY_KEY",
+    "_DOCS_PIN_KEY",
+    "build_work_order",
+    "task_meta",
+]
 
 
 def task_meta(tasks_root: Path, task: str, queue: str | None) -> dict[str, Any]:
@@ -142,7 +164,35 @@ def build_work_order(
             # The step's max_turns overrides the inherited blob value.
             config_blob["max_turns"] = step_max_turns(step, config_blob["max_turns"])
 
-    return {
+    # Docs resolution pass (spec §3.1 / plan phase 2). A task with neither
+    # ``docs:`` nor ``attachments:`` in frontmatter must produce a work order
+    # byte-identical to today — ``resolve_task_docs`` returns an empty result
+    # for that case and we skip touching ``config_blob``. On authoring or
+    # environment errors ``DocsBlocked`` is raised so ``_lease_and_build`` can
+    # hold the task and never issue a lease. On success, pin-only entries land
+    # in ``config_blob["docs"]`` and pin-update state is stashed on the order
+    # for the caller to persist through the tasks-repo executor.
+    workflow_step_id: str | None = None
+    if isinstance(config_blob.get("workflow"), dict):
+        workflow_step_id = config_blob["workflow"].get("step") or None
+    docs_result = resolve_task_docs(
+        workspace=workspace,
+        tasks_root=tasks_root,
+        task=task,
+        queue=queue,
+        repo=repo,
+        base_ref=base_ref,
+        meta=meta,
+        merged_config=merged,
+        workflow_step_id=workflow_step_id,
+        task_file_text=text,
+    )
+    if docs_result.blocked_reason is not None:
+        raise DocsBlocked(docs_result.blocked_reason)
+    if docs_result.entries:
+        config_blob["docs"] = list(docs_result.entries)
+
+    order = {
         "lease_id": lease_id,
         "run_id": run_id,
         "task": task,
@@ -159,3 +209,12 @@ def build_work_order(
         "base_ref": base_ref,
         "config": config_blob,
     }
+    # Stash pin state for the caller to persist and strip. Only present when a
+    # rewrite is required (or a full clear is needed — e.g. the operator
+    # removed the last docs entry so the map should be empty).
+    if docs_result.pin_dirty or (
+        docs_result.pin and "docs_pin" not in meta
+    ):
+        order[_DOCS_PIN_KEY] = render_docs_pin(docs_result.pin) if docs_result.pin else None
+        order[_DOCS_PIN_DIRTY_KEY] = True
+    return order

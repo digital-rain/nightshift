@@ -15,6 +15,12 @@ The header above names the task file and any input artifacts (paths on disk).
 Read the brief first. It is the authority for *what* to build; your plan is the
 authority for *how*.
 
+When the header also lists reference documents, read them first; treat them as
+authoritative context before exploring the repo. A document annotated with an
+`image/*` or `application/pdf` media type is binary — open it with a tool that
+can read that type; if you cannot, note that in your output and proceed with
+the remaining context.
+
 ## What a plan must contain
 
 Write an **implementable plan**, not a design essay. It must give a later
