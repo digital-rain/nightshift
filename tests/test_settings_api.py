@@ -59,17 +59,14 @@ class TestRegistryProjection:
         missing = expected_fields - registry_fields
         assert not missing, f"fields missing from registry: {missing}"
 
-    def test_declaration_order_preserved(self):
-        from nightshift.config.registry import build_registry
+    def test_categories_sorted_alphabetically(self, workspace: Path, monkeypatch):
+        _clear_env(monkeypatch)
+        from nightshift.config.validate import build_get_response
 
-        specs = build_registry()
-        manager_specs = [s for s in specs if s.surface == "manager"]
-        categories = []
-        for s in manager_specs:
-            if not categories or categories[-1] != s.category:
-                categories.append(s.category)
-        assert categories[0] == "Identity & connection"
-        assert "Cadences" in categories
+        resp = build_get_response(workspace, ["manager"])
+        tier = resp["tiers"][0]
+        cat_names = [c["name"] for c in tier["categories"]]
+        assert cat_names == sorted(cat_names)
 
     def test_store_correct_for_non_secret(self):
         from nightshift.config.registry import build_registry

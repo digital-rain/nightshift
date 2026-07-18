@@ -400,6 +400,7 @@ def build_get_response(
                 categories.append({"name": cat_name, "fields": cat_fields})
             seen_cats[cat_name].append(field_payload)
 
+        categories.sort(key=lambda c: c["name"])
         tiers.append({"surface": surface, "categories": categories})
 
     return {
