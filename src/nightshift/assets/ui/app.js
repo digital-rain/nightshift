@@ -4765,24 +4765,27 @@ function renderHistoryDetail() {
   // NOTES — editable free-form text area for operator notes on this run.
   // Positioned as the last section before LOG.
   {
-    const notesArea = document.createElement("textarea");
-    notesArea.rows = 4;
-    notesArea.value = rec.notes || "";
-    notesArea.placeholder = "Add notes…";
-    notesArea.className = "detail-brief-edit";
-    wireEditKeydown(notesArea);
-    const nt = expando("Notes", { open: !!(rec.notes) });
-    nt.body.append(notesArea);
-    body.append(nt.panel);
+    let savedNotes = rec.notes || "";
 
-    const notesSaveRow = document.createElement("div");
-    notesSaveRow.className = "detail-actions";
+    const notesSave = document.createElement("button");
+    notesSave.className = "btn";
+    notesSave.textContent = "Save notes";
+
     const notesErr = document.createElement("p");
     notesErr.className = "error detail-save-error";
     notesErr.hidden = true;
-    const notesSave = document.createElement("button");
-    notesSave.className = "btn primary";
-    notesSave.textContent = "Save notes";
+
+    const notesArea = document.createElement("textarea");
+    notesArea.rows = 4;
+    notesArea.value = savedNotes;
+    notesArea.placeholder = "Add notes…";
+    notesArea.className = "detail-brief-edit";
+    wireEditKeydown(notesArea);
+
+    notesArea.addEventListener("input", () => {
+      notesSave.classList.toggle("primary", notesArea.value !== savedNotes);
+    });
+
     notesSave.addEventListener("click", async () => {
       notesSave.disabled = true;
       const { ok, data } = await sendJSON(
@@ -4795,10 +4798,14 @@ function renderHistoryDetail() {
         return;
       }
       notesErr.hidden = true;
+      savedNotes = notesArea.value;
       rec.notes = notesArea.value || null;
+      notesSave.classList.remove("primary");
     });
-    notesSaveRow.append(notesErr, notesSave);
-    body.append(notesSaveRow);
+
+    const nt = expando("Notes", { open: !!(rec.notes), accessory: notesSave });
+    nt.body.append(notesArea, notesErr);
+    body.append(nt.panel);
   }
 
   // LOG — the run's captured output (history-only).
