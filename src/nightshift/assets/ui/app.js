@@ -880,24 +880,11 @@ function artifactsPanel(task) {
   return panel;
 }
 
-// --------------------------------------------------------------------------
-// Task documents (spec §6) — the create + detail pane's Documents section.
-// --------------------------------------------------------------------------
-//
-// The section is a sibling of Artifacts (`artifactsPanel` above) but edits
-// two operator-owned frontmatter lists — `docs:` (repo paths, pinned by blob
-// sha at first dispatch) and `attachments:` (task-local files under
-// `<task>.docs/`). Paths are the primary affordance; attaching is a heavier
-// secondary action captioned `Only for content that isn't in any repo.`
-//
-// The draft (see `draftFromBrief`) carries the paths list; attachments are
-// fetched lazily from `/api/tasks/<id>/documents` because their bytes live
-// server-side. The create flavour has no task yet, so any uploads are buffered
-// in `draft.pendingAttachments` and flushed after a successful create.
+// Task documents — create/detail Documents panel.
+// Paths (`docs:`) are primary; file attach (`attachments:`) is secondary.
+// Draft carries paths; attachments load from `/api/tasks/<id>/documents`.
+// Create buffers uploads in `draft.pendingAttachments` until after create.
 
-// Autocomplete cache for `/api/repos/<repo>/paths?prefix=` — one entry per
-// (repo, base_ref) so re-opening the panel or typing keeps the debounced
-// path list warm without spamming git.
 const _docsPathsCache = new Map();
 
 async function loadRepoPaths(repo, prefix = "") {
@@ -962,28 +949,10 @@ function documentsPanel(brief, draft, opts = {}) {
   const { panel, body } = expando("Documents", { open: true });
   body.classList.add("documents-panel");
 
-  // --- Reference documents (paths) — primary section ---------------------
-
-  const pathsSection = document.createElement("div");
-  pathsSection.className = "docs-section docs-paths";
-  const pathsHeader = document.createElement("div");
-  pathsHeader.className = "docs-section-head";
-  pathsHeader.innerHTML =
-    "<h4>Reference documents</h4>"
-    + "<p class=\"docs-caption\">Repo paths, pinned by blob sha at first dispatch.</p>";
-  pathsSection.append(pathsHeader);
-
   const chipList = document.createElement("div");
   chipList.className = "docs-chips";
   const drawChips = () => {
     chipList.innerHTML = "";
-    if (!draft.docs.length) {
-      const empty = document.createElement("div");
-      empty.className = "muted docs-empty";
-      empty.textContent = "No reference documents yet.";
-      chipList.append(empty);
-      return;
-    }
     draft.docs.forEach((doc, idx) => {
       chipList.append(_docsChip(doc, idx, draft, effectiveRepo, {
         locked,
@@ -994,29 +963,15 @@ function documentsPanel(brief, draft, opts = {}) {
       }));
     });
   };
-  pathsSection.append(chipList);
-
+  body.append(chipList);
   if (!locked) {
-    pathsSection.append(_docsPathAdder(draft, effectiveRepo, () => drawChips()));
+    body.append(_docsPathAdder(draft, effectiveRepo, () => drawChips()));
   }
-  body.append(pathsSection);
-
-  // --- Attachments — secondary section ----------------------------------
-
-  const attSection = document.createElement("div");
-  attSection.className = "docs-section docs-attachments";
-  const attHeader = document.createElement("div");
-  attHeader.className = "docs-section-head";
-  attHeader.innerHTML =
-    "<h4>Attach a file</h4>"
-    + "<p class=\"docs-caption\">Only for content that isn't in any repo.</p>";
-  attSection.append(attHeader);
 
   const attList = document.createElement("div");
   attList.className = "docs-attachments-list";
   const drawAttachments = () => {
     attList.innerHTML = "";
-    // Server-side attachments (edit flavour) come from `opts.summary`.
     const serverAtt = (opts.summary && opts.summary.attachments) || [];
     for (const row of serverAtt) {
       attList.append(_attachmentChip(row, task, {
@@ -1032,7 +987,6 @@ function documentsPanel(brief, draft, opts = {}) {
         },
       }));
     }
-    // Client-side pending uploads (create flavour): chip preview.
     for (const pending of (draft.pendingAttachments || [])) {
       attList.append(_pendingAttachmentChip(pending, {
         onRemove: () => {
@@ -1042,38 +996,13 @@ function documentsPanel(brief, draft, opts = {}) {
         },
       }));
     }
-    if (!serverAtt.length && !(draft.pendingAttachments || []).length) {
-      const empty = document.createElement("div");
-      empty.className = "muted docs-empty";
-      empty.textContent = "No attachments.";
-      attList.append(empty);
-    }
   };
-  attSection.append(attList);
-
+  body.append(attList);
   if (!locked) {
-    attSection.append(_attachmentAdder(task, draft, creating, {
+    body.append(_attachmentAdder(task, draft, creating, {
       onAttached: () => { rerender(); },
       onBuffered: () => { drawAttachments(); },
     }));
-  }
-  body.append(attSection);
-
-  // --- Pin (read-only, collapsed) + budget meter -------------------------
-
-  if (opts.summary && opts.summary.docs_pin
-      && Object.keys(opts.summary.docs_pin).length) {
-    const pinExp = expando("Pin (docs_pin)", { open: false });
-    const pre = document.createElement("pre");
-    pre.className = "docs-pin-json";
-    pre.textContent = JSON.stringify(opts.summary.docs_pin, null, 2);
-    pinExp.body.append(pre);
-    body.append(pinExp.panel);
-  }
-
-  if (opts.summary && opts.summary.settings) {
-    const meter = _docsBudgetMeter(opts.summary, draft);
-    if (meter) body.append(meter);
   }
 
   drawChips();
@@ -1113,7 +1042,7 @@ function _docsChip(doc, idx, draft, repo, opts = {}) {
   if (drifted) {
     const badge = document.createElement("span");
     badge.className = "docs-drift-badge";
-    badge.textContent = "source drifted — pinned to older version";
+    badge.textContent = "drifted";
     chip.append(badge);
     const repinBtn = document.createElement("button");
     repinBtn.type = "button";
@@ -1165,9 +1094,7 @@ function _docsPathAdder(draft, repo, redraw) {
   const input = document.createElement("input");
   input.type = "text";
   input.className = "docs-path-input";
-  input.placeholder = repo
-    ? `path in ${repo} (e.g. docs/spec.md)`
-    : "repo path (bind the queue's repo first for autocomplete)";
+  input.placeholder = "repo relative path (e.g. docs/spec.md)";
   input.setAttribute("list", "docs-path-suggestions");
 
   const list = document.createElement("datalist");
@@ -1238,7 +1165,7 @@ function _attachmentChip(row, task, opts = {}) {
   if (row.orphan) {
     const badge = document.createElement("span");
     badge.className = "docs-drift-badge";
-    badge.textContent = "on disk, not in frontmatter";
+    badge.textContent = "orphan";
     chip.append(badge);
   }
   if (!opts.locked) {
@@ -1331,7 +1258,7 @@ function _attachmentAdder(task, draft, creating, opts = {}) {
     input.value = "";
   });
 
-  // Drag-and-drop.
+  // Drag-and-drop + paste still work on the control (no hint text).
   wrap.addEventListener("dragover", (ev) => {
     ev.preventDefault();
     wrap.classList.add("docs-attach-drop");
@@ -1343,35 +1270,14 @@ function _attachmentAdder(task, draft, creating, opts = {}) {
     const files = ev.dataTransfer && ev.dataTransfer.files;
     if (files && files.length) handleFiles(Array.from(files));
   });
-  // Paste from clipboard (screenshots).
   wrap.addEventListener("paste", (ev) => {
     const files = ev.clipboardData && ev.clipboardData.files;
     if (files && files.length) handleFiles(Array.from(files));
   });
   wrap.tabIndex = 0;
 
-  const hint = document.createElement("div");
-  hint.className = "muted docs-attach-hint";
-  hint.textContent = "…or drag a file here, or paste a screenshot with ⌘V.";
-  wrap.append(btn, input, hint);
+  wrap.append(btn, input);
   return wrap;
-}
-
-function _docsBudgetMeter(summary, draft) {
-  if (!summary || !summary.settings) return null;
-  const budget = summary.settings.document_budget_bytes;
-  if (!budget) return null;
-  let used = 0;
-  for (const d of (summary.docs || [])) used += d.bytes || 0;
-  for (const a of (summary.attachments || [])) used += a.bytes || 0;
-  for (const p of (draft.pendingAttachments || [])) used += p.data.length;
-  const pct = Math.min(100, Math.round((used / budget) * 100));
-  const meter = document.createElement("div");
-  meter.className = "docs-budget-meter";
-  meter.innerHTML =
-    `<div class="docs-budget-label">Documents: ${_fmtBytes(used)} of ${_fmtBytes(budget)}</div>`
-    + `<div class="docs-budget-bar"><div class="docs-budget-fill" style="width:${pct}%"></div></div>`;
-  return meter;
 }
 
 function _fmtBytes(n) {
