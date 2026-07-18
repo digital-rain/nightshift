@@ -151,6 +151,10 @@ WORKER_COOLDOWN_SECONDS = 300.0
 # so a runaway agent can't wedge the tasks repo with a multi-megabyte commit.
 _DOCUMENT_MAX_BYTES = 256 * 1024
 
+# Absolute ceiling for any operator-configured document cap (under GitHub's
+# non-LFS blob limit).  Imported by docs_resolve for the effective-cap helper.
+DOCUMENT_CAP_CEILING_BYTES = 5 * 1024 * 1024
+
 
 def _build_workflow_step_policy(
     workflows: dict[str, Any],

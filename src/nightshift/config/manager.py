@@ -177,6 +177,28 @@ class OperatorConfig:
             "base * 2**(n-1) seconds (capped at an hour)."),
         ))
 
+    document_cap_bytes: int = field(default=256 * 1024, metadata=meta(
+        category="Worker execution policy", label="Document cap bytes",
+        desc=(
+            "Per-document byte cap for task reference documents and "
+            "attachments.  Clamped to the code-constant ceiling "
+            "(5 MB)."),
+        env="NIGHTSHIFT_DOCUMENT_CAP_BYTES"))
+    allowed_doc_media_types: tuple[str, ...] = field(
+        default=(
+            "text/*", "application/json", "application/yaml",
+            "image/png", "image/jpeg", "image/gif", "image/webp",
+            "application/pdf",
+        ),
+        metadata=meta(
+            category="Worker execution policy",
+            label="Allowed doc media types",
+            desc="Media-type allow-list for task documents (glob patterns like text/*).",
+            type="string_list"))
+    document_budget_bytes: int = field(default=4 * 1024 * 1024, metadata=meta(
+        category="Worker execution policy", label="Document budget bytes",
+        desc="Aggregate byte budget across all docs for a single task dispatch."))
+
     auto_resolve: bool = field(default=True, metadata=meta(
         category="Conflict resolution", label="Auto resolve",
         desc="Hand out resolve work-orders on conflict/validation failure.",

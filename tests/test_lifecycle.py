@@ -896,6 +896,7 @@ def test_retry_policy_classifies_every_failure_kind() -> None:
         FailureKind.WORKTREE_FAILED: RetryAction.RETRY_ELSEWHERE,
         FailureKind.WORKER_LAUNCH: RetryAction.RETRY_ELSEWHERE,
         FailureKind.PUBLISH_FAILED: RetryAction.RETRY_ELSEWHERE,
+        FailureKind.DOCUMENT_UNAVAILABLE: RetryAction.RETRY_ELSEWHERE,
         # task: retried under the counter threshold.
         FailureKind.WORKER_ERROR: RetryAction.RETRY,
         # recoverable/holdable: an operator or resolve owns the next step.

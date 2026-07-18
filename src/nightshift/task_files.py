@@ -100,7 +100,9 @@ def join_original(body: str, original: str) -> str:
     return f"{body}\n\n{ORIGINAL_BRIEF_MARKER}\n{original}"
 
 
-def build_task_list(tasks_root: Path, task_arg: str, tasks_rel: str = "main") -> list[str]:
+def build_task_list(
+    tasks_root: Path, task_arg: str, tasks_rel: str = "main"
+) -> list[str]:
     """Build the ordered list of tasks to run for a queue.
 
     Autosplit dispatch (spawning subtasks, committing the daily queue to the
@@ -113,7 +115,9 @@ def build_task_list(tasks_root: Path, task_arg: str, tasks_rel: str = "main") ->
         if is_main:
             autosplit_sources = set(find_autosplit_sources(tasks_root, tasks_rel))
             if task_arg in autosplit_sources:
-                result = spawn_source(tasks_root, task_arg, write=True, tasks_rel=tasks_rel)
+                result = spawn_source(
+                    tasks_root, task_arg, write=True, tasks_rel=tasks_rel
+                )
                 if result and result.spawned:
                     commit_dispatch(tasks_root, tasks_rel)
                     return [t.name for t in result.spawned]
@@ -128,7 +132,9 @@ def build_task_list(tasks_root: Path, task_arg: str, tasks_rel: str = "main") ->
 
     queue_names = live_ordered_queue(tasks_root, tasks_rel)
     spawned_names = [t.name for r in results for t in r.spawned]
-    ordered = order_stems(tasks_root, list(set(queue_names) | set(spawned_names)), tasks_rel)
+    ordered = order_stems(
+        tasks_root, list(set(queue_names) | set(spawned_names)), tasks_rel
+    )
     # Re-apply the play-priority filter so freshly-spawned autosplit subtasks
     # (folded in via the union above) also respect the active filter.
     return apply_play_filter(tasks_root, ordered, tasks_rel)
@@ -163,7 +169,8 @@ def live_ordered_queue(tasks_root: Path, tasks_rel: str = "main") -> list[str]:
 
 
 def frontmatter_held_tasks(
-    tasks_root: Path, tasks_rel: str = "main",
+    tasks_root: Path,
+    tasks_rel: str = "main",
 ) -> list[dict[str, str]]:
     """Return quarantined and failed tasks from frontmatter for a queue.
 
@@ -174,6 +181,7 @@ def frontmatter_held_tasks(
     if not tasks_dir.exists():
         return []
     from nightshift import playlists
+
     queue = playlists.queue_from_tasks_rel(tasks_rel)
     queue_key = queue or ""
     out: list[dict[str, str]] = []
@@ -181,15 +189,23 @@ def frontmatter_held_tasks(
         text = p.read_text(errors="replace")
         meta = split_frontmatter(text)[0] if text.startswith("---") else {}
         if is_quarantined(meta):
-            out.append({
-                "queue": queue_key, "task": p.stem, "state": "quarantined",
-                "blocked_reason": meta.get("quarantine_reason", ""),
-            })
+            out.append(
+                {
+                    "queue": queue_key,
+                    "task": p.stem,
+                    "state": "quarantined",
+                    "blocked_reason": meta.get("quarantine_reason", ""),
+                }
+            )
         elif is_failed(meta):
-            out.append({
-                "queue": queue_key, "task": p.stem, "state": "failed",
-                "blocked_reason": meta.get("failed_reason", ""),
-            })
+            out.append(
+                {
+                    "queue": queue_key,
+                    "task": p.stem,
+                    "state": "failed",
+                    "blocked_reason": meta.get("failed_reason", ""),
+                }
+            )
     return out
 
 
@@ -204,6 +220,7 @@ def failed_tasks(tasks_root: Path, tasks_rel: str = "main") -> list[dict[str, st
     if not tasks_dir.exists():
         return []
     from nightshift import playlists
+
     queue = playlists.queue_from_tasks_rel(tasks_rel)
     queue_key = queue or ""
     out: list[dict[str, str]] = []
@@ -288,6 +305,7 @@ def delete_task(tasks_root: Path, task: str, tasks_rel: str = "main") -> dict:
         raise FileNotFoundError(task)
     dest.unlink()
     _remove_artifacts_dir(tasks_root, task, tasks_rel)
+    _remove_attachments_dir(tasks_root, task, tasks_rel)
     order = load_order(tasks_root, tasks_rel)
     if task in order:
         save_order(tasks_root, [name for name in order if name != task], tasks_rel)
@@ -301,7 +319,7 @@ def delete_task(tasks_root: Path, task: str, tasks_rel: str = "main") -> dict:
 # Engine-owned frontmatter keys (spec §4). Written through :func:`set_engine_meta`
 # only — deliberately NOT added to :data:`_EDITABLE_META_KEYS` (operator UI
 # renders them read-only).
-ENGINE_META_KEYS = {"workflow_step", "workflow_visits"}
+ENGINE_META_KEYS = {"workflow_step", "workflow_visits", "docs_pin"}
 
 
 def artifacts_dir(tasks_root: Path, task: str, tasks_rel: str = "main") -> Path:
@@ -415,7 +433,7 @@ def set_engine_meta(
 
     if close is not None:
         fence_lines = lines[1:close]
-        body_lines = lines[close + 1:]
+        body_lines = lines[close + 1 :]
     else:
         fence_lines = []
         body_lines = lines
@@ -467,6 +485,188 @@ def materialize_artifacts(
         scratch.write_text(text if text.endswith("\n") else f"{text}\n")
         out[name] = scratch
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Task document attachments — byte-native sibling of workflow artifacts.
+# --------------------------------------------------------------------------- #
+
+
+def attachments_dir(tasks_root: Path, task: str, tasks_rel: str = "main") -> Path:
+    """``<tasks_root>/<tasks_rel>/<task>.docs/``."""
+    return (tasks_root / tasks_rel).resolve() / f"{task}.docs"
+
+
+def write_attachment(
+    tasks_root: Path,
+    task: str,
+    name: str,
+    data: bytes,
+    tasks_rel: str = "main",
+) -> Path:
+    """Write opaque bytes into the task's attachments dir and commit."""
+    adir = attachments_dir(tasks_root, task, tasks_rel)
+    adir.mkdir(parents=True, exist_ok=True)
+    dest = adir / name
+    dest.write_bytes(data)
+    commit_tasks(
+        tasks_root,
+        f"nightshift: write attachment {task}/{name}",
+        pathspecs=(tasks_rel,),
+    )
+    return dest
+
+
+def read_attachment(
+    tasks_root: Path, task: str, name: str, tasks_rel: str = "main"
+) -> bytes:
+    """Read an attachment's raw bytes."""
+    path = attachments_dir(tasks_root, task, tasks_rel) / name
+    return path.read_bytes()
+
+
+def delete_attachment(
+    tasks_root: Path,
+    task: str,
+    name: str,
+    tasks_rel: str = "main",
+    *,
+    commit: bool = True,
+) -> bool:
+    """Remove a single attachment file. Returns True when it removed something."""
+    path = attachments_dir(tasks_root, task, tasks_rel) / name
+    if not path.is_file():
+        return False
+    path.unlink()
+    adir = attachments_dir(tasks_root, task, tasks_rel)
+    if adir.exists() and not any(adir.iterdir()):
+        adir.rmdir()
+    if commit:
+        commit_tasks(
+            tasks_root,
+            f"nightshift: delete attachment {task}/{name}",
+            pathspecs=(tasks_rel,),
+        )
+    return True
+
+
+def list_attachments(tasks_root: Path, task: str, tasks_rel: str = "main") -> list[str]:
+    """List attachment filenames for a task."""
+    adir = attachments_dir(tasks_root, task, tasks_rel)
+    if not adir.is_dir():
+        return []
+    return sorted(p.name for p in adir.iterdir() if p.is_file())
+
+
+def delete_attachments(
+    tasks_root: Path,
+    task: str,
+    tasks_rel: str = "main",
+    *,
+    commit: bool = True,
+) -> bool:
+    """Remove a task's ``<task>.docs/`` directory."""
+    adir = attachments_dir(tasks_root, task, tasks_rel)
+    if not adir.exists():
+        return False
+    import shutil
+
+    shutil.rmtree(adir, ignore_errors=True)
+    if commit:
+        commit_tasks(
+            tasks_root,
+            f"nightshift: delete attachments {task}",
+            pathspecs=(tasks_rel,),
+        )
+    return True
+
+
+def _remove_attachments_dir(tasks_root: Path, task: str, tasks_rel: str) -> bool:
+    """Delete the attachments dir without its own commit."""
+    return delete_attachments(tasks_root, task, tasks_rel, commit=False)
+
+
+def materialize_docs(
+    workspace: Path,
+    repo: str,
+    task: str,
+    docs: Sequence[dict],
+    *,
+    queue: str | None = None,
+    tasks_root: Path | None = None,
+    target_repo_root: Path | None = None,
+) -> dict[str, Path]:
+    """Byte-native sibling of :func:`materialize_artifacts`.
+
+    Reads each doc entry's bytes via ``git cat-file blob <sha>`` from the
+    appropriate object store (target repo for path docs, tasks repo for
+    attachments), verifies the git blob sha matches, applies text range if
+    present, writes a read-only scratch file with the real extension, and
+    returns ``{entry_name: scratch_path}``.
+
+    The sha in each entry is a **git blob object id** — ``hashlib.sha1(b"blob
+    {len}\\0" + data).hexdigest()``.  Mismatch raises
+    :class:`~nightshift.docs_resolve.DocumentUnavailable`.
+    """
+    import hashlib
+    import os
+    import stat
+
+    from nightshift.docs_resolve import (
+        DocumentUnavailable,
+        extension_for_media,
+        media_is_binary,
+    )
+    from nightshift.git.runner import GitRunner
+
+    base = workspace / ".worktrees" / repo
+    base.mkdir(parents=True, exist_ok=True)
+    result: dict[str, Path] = {}
+
+    for entry in docs:
+        sha = entry["sha"]
+        media = entry.get("media", "application/octet-stream")
+        name = entry.get("name", "doc")
+        rng = entry.get("range")
+        kind = entry.get("kind", "path")
+        stem = name.rsplit(".", 1)[0] if "." in name else name
+        ext = extension_for_media(media, name)
+
+        if kind == "attach" and tasks_root is not None:
+            git_dir = tasks_root
+        elif target_repo_root is not None:
+            git_dir = target_repo_root
+        else:
+            git_dir = workspace / repo
+
+        git = GitRunner(git_dir)
+        rc, data = git.run_bytes("cat-file", "blob", sha)
+
+        if rc != 0:
+            raise DocumentUnavailable(
+                f"blob {sha} for '{name}' not found in object store"
+            )
+
+        blob_header = f"blob {len(data)}\0".encode()
+        computed_sha = hashlib.sha1(blob_header + data).hexdigest()  # noqa: S324
+        if computed_sha != sha:
+            raise DocumentUnavailable(
+                f"sha mismatch for '{name}': expected {sha}, got {computed_sha}"
+            )
+
+        if rng and not media_is_binary(media):
+            lines = data.decode(errors="replace").splitlines(keepends=True)
+            parts = rng.split("-", 1)
+            start = int(parts[0]) - 1
+            end = int(parts[1]) if len(parts) > 1 else start + 1
+            data = "".join(lines[start:end]).encode()
+
+        scratch = base / f"task-local-{queue_slug(queue)}-{task}.doc-{stem}{ext}"
+        scratch.write_bytes(data)
+        os.chmod(scratch, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+        result[name] = scratch
+
+    return result
 
 
 def task_is_evergreen(meta: dict, task: str, config: dict) -> bool:
@@ -610,13 +810,29 @@ def read_task(tasks_root: Path, task: str, tasks_rel: str = "main") -> dict:
 # the per-task target-repo override (a bare workspace-child name); clearing it
 # (``repo: None``) falls the task back to the queue's default ``repo``.
 _EDITABLE_META_KEYS = {
-    "disabled", "quarantined", "quarantine_reason", "failed", "failed_reason",
-    "completed", "evergreen", "automerge", "draft", "model", "priority", "repo",
-    "loop", "loop_max_iterations", "split", "enhanced",
+    "disabled",
+    "quarantined",
+    "quarantine_reason",
+    "failed",
+    "failed_reason",
+    "completed",
+    "evergreen",
+    "automerge",
+    "draft",
+    "model",
+    "priority",
+    "repo",
+    "loop",
+    "loop_max_iterations",
+    "split",
+    "enhanced",
     # Workflow selection (operator-owned, §3.2): the definition name and the
     # optional planner-role model. The engine-owned cursor keys
     # (workflow_step/workflow_visits) are NOT here — they live in ENGINE_META_KEYS.
-    "workflow", "planner_model",
+    "workflow",
+    "planner_model",
+    "docs",
+    "attachments",
 }
 
 # The detail-view editor may also rewrite the spec prose (``body``), the
@@ -629,6 +845,10 @@ _EDITABLE_CONTENT_KEYS = {"title", "body", "notes", "original_brief"}
 def _render_meta_value(value: object) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        import json
+
+        return json.dumps(value, separators=(",", ":"), sort_keys=True)
     return str(value)
 
 
@@ -691,7 +911,7 @@ def set_task_meta(
 
     if close is not None:
         fence_lines = lines[1:close]
-        body_lines = lines[close + 1:]
+        body_lines = lines[close + 1 :]
     else:
         fence_lines = []
         body_lines = lines
@@ -797,7 +1017,9 @@ def materialize_brief(
     brief markdown (as carried in the work order).
     """
     scratch = (
-        workspace / ".worktrees" / repo
+        workspace
+        / ".worktrees"
+        / repo
         / f"task-local-{queue_slug(queue)}-{task}.taskfile.md"
     )
     scratch.parent.mkdir(parents=True, exist_ok=True)
@@ -817,8 +1039,7 @@ def split_output_dir(
     finishes, :func:`harvest_split_output` scans it for ``*.md`` files.
     """
     return (
-        workspace / ".worktrees" / repo
-        / f"task-local-{queue_slug(queue)}-{task}.split"
+        workspace / ".worktrees" / repo / f"task-local-{queue_slug(queue)}-{task}.split"
     )
 
 
@@ -883,6 +1104,7 @@ def harvest_split_output(
             drop_completed_task(tasks_root, task, tasks_rel, queue=queue)
 
     import shutil
+
     shutil.rmtree(sdir, ignore_errors=True)
 
     return created

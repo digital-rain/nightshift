@@ -94,6 +94,20 @@ class GitRunner:
             )
         return result
 
+    def run_bytes(self, *args: str) -> tuple[int, bytes]:
+        """Run git and return ``(returncode, raw stdout bytes)``.
+
+        Used by callers that need binary output (e.g. ``git cat-file blob``
+        for opaque document content).  Never raises on non-zero exit.
+        """
+        argv = ("git", *args)
+        proc = subprocess.run(  # noqa: S603
+            argv,
+            cwd=self.repo_root,
+            capture_output=True,
+        )
+        return proc.returncode, proc.stdout
+
     def out(self, *args: str) -> str | None:
         """Query policy: stripped stdout on success, ``None`` on failure."""
         result = self.run(*args)

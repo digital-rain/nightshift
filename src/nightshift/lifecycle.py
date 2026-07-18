@@ -144,6 +144,7 @@ class FailureKind(StrEnum):
     WORKTREE_FAILED = "worktree_failed"
     WORKER_LAUNCH = "worker_launch"
     PUBLISH_FAILED = "publish_failed"
+    DOCUMENT_UNAVAILABLE = "document_unavailable"
     # task — the work itself failed (or honestly declared a hold).
     WORKER_ERROR = "worker_error"
     VALIDATION_ERROR = "validation_error"
@@ -366,6 +367,7 @@ class RetryPolicy:
                 | FailureKind.WORKTREE_FAILED
                 | FailureKind.WORKER_LAUNCH
                 | FailureKind.PUBLISH_FAILED
+                | FailureKind.DOCUMENT_UNAVAILABLE
             ):
                 # Environment: the box is at fault, not the task — never
                 # counted, never held; the transition cools the worker down.
