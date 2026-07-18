@@ -1276,7 +1276,10 @@ function _attachmentAdder(task, draft, creating, opts = {}) {
   });
   wrap.tabIndex = 0;
 
-  wrap.append(btn, input);
+  const hint = document.createElement("div");
+  hint.className = "muted docs-attach-hint";
+  hint.textContent = "…or drag a file here, or paste a screenshot with ⌘V.";
+  wrap.append(btn, input, hint);
   return wrap;
 }
 
