@@ -695,17 +695,16 @@ body {
   font-size: 12px; color: var(--text-dim); background: var(--bg-sunken);
   border: 1px dashed var(--border); border-radius: 8px; padding: 7px 10px;
 }
-.wf-prompt-split { display: flex; gap: 12px; flex: 1; min-height: 0; }
-@media (max-width: 900px) { .wf-prompt-split { flex-direction: column; } }
+.wf-prompt-pane { display: flex; flex-direction: column; flex: 1; min-height: 0; gap: 8px; }
 .wf-prompt-source {
-  flex: 1 1 50%; min-height: 320px; resize: vertical; padding: 10px;
+  width: 100%; min-height: 320px; resize: vertical; padding: 10px;
   background: var(--bg-sunken); color: var(--text); border: 1px solid var(--border);
   border-radius: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px; line-height: 1.55;
+  font-size: 12px; line-height: 1.55; flex: 1;
 }
 .wf-prompt-preview {
-  flex: 1 1 50%; min-width: 0; overflow-y: auto; max-height: 70vh;
-  background: var(--bg-elev); border: 1px solid var(--border); border-radius: 10px;
+  min-width: 0; overflow-y: auto; max-height: 70vh;
+  background: var(--bg-sunken); border: 1px solid var(--border); border-radius: 10px;
   padding: 12px 14px; font-size: 13px;
 }
 .wf-prompt-status { color: var(--text-dim); font-size: 12px; flex: 1; }

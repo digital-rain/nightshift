@@ -1400,8 +1400,6 @@ function renderPromptEditor() {
     body.append(note);
   }
 
-  const split = document.createElement("div");
-  split.className = "wf-prompt-split";
   const ta = document.createElement("textarea");
   ta.className = "wf-prompt-source";
   ta.spellcheck = false;
@@ -1410,19 +1408,44 @@ function renderPromptEditor() {
   ta.value = pm.text;
   const preview = document.createElement("div");
   preview.className = "wf-prompt-preview markdown-body";
-  preview.innerHTML = renderMarkdown(pm.text || "");
-  let previewTimer = null;
+
+  const seg = document.createElement("div");
+  seg.className = "segmented brief-view-seg";
+  seg.setAttribute("role", "group");
+  seg.setAttribute("aria-label", "Prompt view");
+  const setView = (view) => {
+    const previewing = view === "preview";
+    pm.promptView = view;
+    ta.hidden = previewing;
+    preview.hidden = !previewing;
+    if (previewing) preview.innerHTML = renderMarkdown(pm.text || "");
+    for (const b of seg.children) {
+      const on = b.dataset.view === view;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-pressed", on ? "true" : "false");
+    }
+  };
+  for (const [label, view] of [["Markdown", "markdown"], ["Preview", "preview"]]) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "seg-opt";
+    b.textContent = label;
+    b.dataset.view = view;
+    b.addEventListener("click", () => setView(view));
+    seg.append(b);
+  }
+
   ta.addEventListener("input", () => {
     pm.text = ta.value;
     pm.dirty = true;
     wfPromptRefreshBar();
-    if (previewTimer) clearTimeout(previewTimer);
-    previewTimer = setTimeout(() => {
-      preview.innerHTML = renderMarkdown(pm.text || "");
-    }, 200);
   });
-  split.append(ta, preview);
-  body.append(split);
+
+  const promptPane = document.createElement("div");
+  promptPane.className = "wf-prompt-pane";
+  promptPane.append(seg, ta, preview);
+  setView(pm.promptView === "preview" ? "preview" : "markdown");
+  body.append(promptPane);
 
   const bar = document.createElement("div");
   bar.className = "wf-ed-savebar";
