@@ -52,6 +52,12 @@ async function loadInfo() {
     if (typeof info.refresh_ms === "number" && info.refresh_ms > 0) {
       refreshMs = info.refresh_ms;
     }
+    // Reflect a server-side deferred (draining) restart so the button keeps its
+    // attention style across a browser reload while the current task finishes.
+    if (info.restart_pending) {
+      wSettings.restartPending = true;
+      updateNavRestart();
+    }
   } catch (_e) {
     /* manager/worker not ready yet */
   }
@@ -1066,9 +1072,77 @@ function hasDirtyRestartField() {
 function updateNavRestart() {
   const btn = document.getElementById("nav-restart");
   if (!btn) return;
-  const show = wSettings.restartPending || hasDirtyRestartField();
-  btn.hidden = !show;
-  btn.classList.toggle("pending", wSettings.restartPending);
+  // The button is always visible now; it only gains the "attention" pulse when
+  // a saved settings change requires a restart (or one is otherwise pending).
+  const attention = wSettings.restartPending || hasDirtyRestartField();
+  btn.classList.toggle("attention", attention);
+}
+
+// Operator-requested in-app restart with drain semantics. If a task is running
+// the server stays up until the run drains, so we keep polling a status
+// endpoint and only reload once the server has actually gone down and come
+// back up (the down->up transition).
+async function restartWorker() {
+  const btn = document.getElementById("nav-restart");
+  if (!btn || btn.disabled) return;
+  if (!window.confirm(
+    "Restart this worker?\n\n" +
+    "If a task is running, the restart waits until it finishes. The UI " +
+    "reconnects automatically once the worker is back."
+  )) return;
+
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Restarting…";
+  let resp;
+  try {
+    resp = await fetch("/api/restart", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+  } catch (_e) {
+    resp = null;
+  }
+  if (!resp || !resp.ok) {
+    btn.disabled = false;
+    btn.textContent = label;
+    return;
+  }
+  const data = await resp.json().catch(() => ({}));
+  if (data.pending) {
+    btn.textContent = "Restarting after current task…";
+  } else {
+    btn.textContent = "Restarting…";
+  }
+
+  // Poll until the server actually goes down, then comes back up, then reload.
+  // In the drain case the server can stay up for a while first, so we require
+  // the down->up transition before reloading (a bare "up" is not enough).
+  let sawDown = false;
+  const startedAt = Date.now();
+  const poll = async () => {
+    let up = false;
+    try {
+      const r = await fetch("/api/info", { cache: "no-store" });
+      up = r.ok;
+    } catch (_e) {
+      up = false;
+    }
+    if (!up) {
+      sawDown = true;
+    } else if (sawDown) {
+      location.reload();
+      return;
+    }
+    // Safety valve: never wait forever if we somehow never observe the dip.
+    if (sawDown && Date.now() - startedAt > 120000) {
+      location.reload();
+      return;
+    }
+    setTimeout(poll, 1000);
+  };
+  setTimeout(poll, 1000);
 }
 
 function updateWorkerSaveBar() {
@@ -1147,6 +1221,8 @@ document.addEventListener("DOMContentLoaded", async () => {
     renderWorkerSettings();
   });
   document.getElementById("w-settings-save").addEventListener("click", saveWorkerSettings);
+  const restartBtn = document.getElementById("nav-restart");
+  if (restartBtn) restartBtn.addEventListener("click", restartWorker);
   const searchEl = document.getElementById("w-settings-search");
   if (searchEl) {
     searchEl.addEventListener("input", () => {

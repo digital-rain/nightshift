@@ -9,15 +9,20 @@ in-memory store.
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import uvicorn
 
 from nightshift.config.manager import load_manager_config
 from nightshift.manager.app import create_app
+from nightshift.restart import re_exec
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Capture the original CLI args so an operator-requested restart can re-exec
+    # this same process with identical flags (host/port/workspace all survive).
+    original_args = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", type=Path, default=Path.cwd())
     parser.add_argument("--host", default=None)
@@ -43,12 +48,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     server = uvicorn.Server(config)
     app.state.uvicorn_server = server
+    app.state.restart_requested = False
     try:
         server.run()
     except KeyboardInterrupt:
         # Ctrl-C: uvicorn re-raises after shutting down. Swallow it so the exit
         # is quiet rather than dumping a traceback.
         print("\nNightshift manager stopped.")
+        return 0
+    # A clean return from server.run() with the restart flag set means the
+    # operator pressed "Restart manager" in the UI (the endpoint set
+    # should_exit). Re-exec so fresh code + settings are picked up; the Ctrl-C
+    # path above returns first and never reaches here.
+    if getattr(app.state, "restart_requested", False):
+        print("[nightshift-manager] restarting (operator requested)…")
+        re_exec("nightshift.manager", original_args)
     return 0
 
 

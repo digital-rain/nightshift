@@ -6112,6 +6112,53 @@ function initSettingsSearch() {
 }
 
 // --------------------------------------------------------------------------
+// Restart the manager (operator-requested in-app restart)
+// --------------------------------------------------------------------------
+async function restartManager() {
+  if (!window.confirm(
+    "Restart the manager?\n\n" +
+    "The manager will re-exec to pick up settings and new code. The UI " +
+    "will reconnect automatically once it is back."
+  )) return;
+
+  // Lightweight full-screen "Restarting…" overlay reusing the modal styling.
+  const overlay = document.createElement("div");
+  overlay.className = "modal";
+  overlay.innerHTML =
+    '<div class="modal-card"><h3>Restarting manager…</h3>' +
+    '<p class="raw-json" id="restart-status">Sending restart request…</p></div>';
+  document.body.appendChild(overlay);
+  const status = overlay.querySelector("#restart-status");
+
+  const { ok } = await sendJSON("/api/control/restart", "POST", {});
+  if (!ok) {
+    status.textContent = "Restart request failed. The manager was not restarted.";
+    setTimeout(() => overlay.remove(), 3000);
+    return;
+  }
+  status.textContent = "Waiting for the manager to come back…";
+
+  // Poll a cheap existing GET until the server answers again, then reload.
+  // The server drops the socket mid-restart, so failures here are expected;
+  // we only reload once /api/info responds from the fresh process.
+  const startedAt = Date.now();
+  const poll = async () => {
+    try {
+      const r = await fetch("/api/info", { cache: "no-store" });
+      if (r.ok) { location.reload(); return; }
+    } catch (_e) { /* still down — keep polling */ }
+    if (Date.now() - startedAt > 60000) {
+      status.textContent =
+        "The manager is taking longer than expected. Reloading anyway…";
+      setTimeout(() => location.reload(), 2000);
+      return;
+    }
+    setTimeout(poll, 1000);
+  };
+  setTimeout(poll, 1500);
+}
+
+// --------------------------------------------------------------------------
 // Wiring
 // --------------------------------------------------------------------------
 function wire() {
@@ -6189,6 +6236,7 @@ function wire() {
       else if (act === "workers") setView("workers");
       else if (act === "repos") setView("repos");
       else if (act === "workflows") setView("workflows");
+      else if (act === "restart") restartManager();
     });
   }
   document.addEventListener("click", closeSettingsMenu);

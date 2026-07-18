@@ -1101,6 +1101,28 @@ def register_operator_api(
             **response,
         })
 
+    # ----- control (restart) ---------------------------------------------- #
+
+    @app.post("/api/control/restart")
+    async def control_restart(request: Request) -> JSONResponse:
+        """Operator-requested in-app restart. Respond first, then trigger a
+        graceful shutdown so ``__main__`` re-execs this process (fresh code +
+        settings). The SSE stream already watches ``should_exit`` and closes."""
+        app_state = request.app.state
+        app_state.restart_requested = True
+        server = getattr(app_state, "uvicorn_server", None)
+
+        def _shutdown() -> None:
+            if server is not None:
+                server.should_exit = True
+
+        # Defer slightly so this 200 flushes before uvicorn tears the socket
+        # down; None under the test client (no running loop handle) is fine —
+        # the flag is set and the test asserts on the scheduled callback.
+        with contextlib.suppress(RuntimeError):
+            asyncio.get_running_loop().call_later(0.2, _shutdown)
+        return JSONResponse({"ok": True, "restarting": True})
+
     # ----- SSE ------------------------------------------------------------- #
 
     async def _snapshot() -> dict[str, Any]:

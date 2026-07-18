@@ -33,6 +33,34 @@
   border-color: var(--accent, #3b82f6);
 }
 
+/* Restart! — always-visible control pushed to the right of the nav. Carries
+   an "attention" style when a saved settings change needs a restart, and a
+   disabled "waiting" state while a drain-restart is pending. */
+.worker-nav .nav-restart {
+  margin-left: auto;
+  background: transparent;
+  border: 1px solid var(--err, #f0786f);
+  color: var(--err, #f0786f);
+  border-radius: 6px;
+  padding: 0.35rem 0.9rem;
+  cursor: pointer;
+}
+.worker-nav .nav-restart:hover {
+  background: rgba(240, 120, 111, 0.12);
+}
+.worker-nav .nav-restart.attention {
+  animation: nav-restart-pulse 1.4s ease-in-out infinite;
+}
+.worker-nav .nav-restart[disabled] {
+  opacity: 0.6;
+  cursor: default;
+  animation: none;
+}
+@keyframes nav-restart-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(240, 120, 111, 0.5); }
+  50% { box-shadow: 0 0 0 4px rgba(240, 120, 111, 0); }
+}
+
 /* Make main fill remaining viewport and each view fill main */
 main {
   flex: 1;
