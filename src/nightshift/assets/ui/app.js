@@ -1094,19 +1094,22 @@ function _docsPathAdder(draft, repo, redraw) {
   const input = document.createElement("input");
   input.type = "text";
   input.className = "docs-path-input";
-  input.placeholder = "repo relative path (e.g. docs/spec.md)";
+  input.placeholder = "repo path — @docs/a.md, @docs/b.md";
   input.setAttribute("list", "docs-path-suggestions");
 
   const list = document.createElement("datalist");
   list.id = "docs-path-suggestions";
   wrap.append(list);
 
+  const stripAt = (s) => s.replace(/^@/, "");
+
   let timer = null;
   const refresh = () => {
     if (!repo) return;
     if (timer) clearTimeout(timer);
     timer = setTimeout(async () => {
-      const prefix = input.value;
+      const last = input.value.split(",").pop().trim();
+      const prefix = stripAt(last);
       const rows = await loadRepoPaths(repo, prefix);
       list.innerHTML = "";
       for (const row of rows.slice(0, 100)) {
@@ -1124,9 +1127,10 @@ function _docsPathAdder(draft, repo, redraw) {
   btn.className = "btn";
   btn.textContent = "Add";
   const commit = () => {
-    const path = input.value.trim();
-    if (!path) return;
-    draft.docs.push({ path });
+    const raw = input.value;
+    const paths = raw.split(",").map((s) => stripAt(s.trim())).filter(Boolean);
+    if (!paths.length) return;
+    for (const path of paths) draft.docs.push({ path });
     input.value = "";
     redraw();
   };
