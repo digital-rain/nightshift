@@ -3785,6 +3785,16 @@ function buildPlaylistInfoContent(info) {
     "playlist-info-validate", "e.g. just validate");
   body.append(nameField, repoField, validateField);
 
+  // Description + notes are playlist prose (persisted in the queue config); the
+  // library (main queue) has no config path for them, so they show only for a
+  // named playlist. Description is a one-line summary; Notes is free-form
+  // markdown with a MARKDOWN | PREVIEW segmented control, like the task BRIEF.
+  if (!isLibrary) {
+    const descField = playlistInfoField("Description", info.description || "",
+      "playlist-info-description", "one-sentence summary");
+    body.append(descField, playlistNotesField(info.notes || ""));
+  }
+
   const actions = document.createElement("div");
   actions.className = "detail-actions";
   const err = document.createElement("p");
@@ -3810,6 +3820,61 @@ function playlistInfoField(label, value, id, placeholder) {
   input.value = value || "";
   if (placeholder) input.placeholder = placeholder;
   field.append(span, input);
+  return field;
+}
+
+// The playlist's free-form Notes field: an editable textarea with a
+// MARKDOWN | PREVIEW segmented control pinned to the label row, mirroring the
+// task-detail BRIEF editor. MARKDOWN shows the textarea (id `playlist-info-notes`,
+// read by savePlaylistInfo); PREVIEW renders the buffered markdown read-only.
+function playlistNotesField(value) {
+  const field = document.createElement("div");
+  field.className = "detail-field";
+
+  const head = document.createElement("div");
+  head.className = "detail-field-label-row";
+  const span = document.createElement("span");
+  span.className = "detail-field-label";
+  span.textContent = "Notes";
+
+  const area = document.createElement("textarea");
+  area.id = "playlist-info-notes";
+  area.rows = 6;
+  area.value = value || "";
+  area.placeholder = "free-form notes (markdown)";
+  area.className = "detail-brief-edit";
+
+  const preview = document.createElement("div");
+  preview.className = "detail-brief markdown-body";
+
+  const seg = document.createElement("div");
+  seg.className = "segmented brief-view-seg";
+  seg.setAttribute("role", "group");
+  seg.setAttribute("aria-label", "Notes view");
+  const setView = (view) => {
+    const previewing = view === "preview";
+    area.hidden = previewing;
+    preview.hidden = !previewing;
+    if (previewing) preview.innerHTML = renderMarkdown(area.value);
+    for (const b of seg.children) {
+      const on = b.dataset.view === view;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-pressed", on ? "true" : "false");
+    }
+  };
+  for (const [label, view] of [["Markdown", "markdown"], ["Preview", "preview"]]) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "seg-opt";
+    b.textContent = label;
+    b.dataset.view = view;
+    b.addEventListener("click", () => setView(view));
+    seg.append(b);
+  }
+
+  head.append(span, seg);
+  field.append(head, area, preview);
+  setView("markdown");
   return field;
 }
 
@@ -3842,10 +3907,16 @@ async function savePlaylistInfo(info, errEl) {
 
   // Send only the fields that changed: a rename is a separate, heavier op than
   // a repo edit, so leaving name untouched avoids a needless directory move.
+  const descEl = $("playlist-info-description");
+  const notesEl = $("playlist-info-notes");
+  const newDesc = descEl ? descEl.value.trim() : "";
+  const newNotes = notesEl ? notesEl.value : "";
   const payload = {};
   if (newName !== info.name) payload.name = newName;
   if (newRepo !== (info.repository || "")) payload.repository = newRepo;
   if (newValidate !== (info.validate || "")) payload.validate = newValidate;
+  if (newDesc !== (info.description || "")) payload.description = newDesc;
+  if (newNotes !== (info.notes || "")) payload.notes = newNotes;
   if (!Object.keys(payload).length) { closePlaylistInfo(); return; }
   const { ok, data } = await sendJSON(
     `/api/playlists/${encodeURIComponent(info.name)}`, "PUT", payload);

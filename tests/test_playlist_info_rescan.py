@@ -211,6 +211,55 @@ def test_manager_playlist_validate_command_persists(tmp_path: Path) -> None:
         assert client.get("/api/playlists/longitude").json()["validate"] == ""
 
 
+def test_manager_playlist_description_notes_persist(tmp_path: Path) -> None:
+    # The info page's "Description" (one-sentence) and "Notes" (free-form
+    # markdown) fields must round-trip through the manager's PUT + GET and land
+    # in the queue's config.json alongside its other keys.
+    build_workspace(
+        tmp_path, repos=("longitude",),
+        queues={"longitude": {"config": {"repo": "longitude", "order": []}}},
+    )
+    with _mgr(tmp_path) as client:
+        # Absent by default.
+        info = client.get("/api/playlists/longitude").json()
+        assert info["description"] is None
+        assert info["notes"] is None
+
+        # Save both; notes preserves its internal newlines.
+        r = client.put(
+            "/api/playlists/longitude",
+            json={"description": "Nightly UI polish.", "notes": "- a\n- b\n"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["description"] == "Nightly UI polish."
+        assert body["notes"] == "- a\n- b\n"
+
+        # Persisted on disk (siblings preserved) and re-read on a fresh GET.
+        cfg = json.loads(
+            (tmp_path / "nightshift-tasks" / "longitude" / "config.json").read_text()
+        )
+        assert cfg["description"] == "Nightly UI polish."
+        assert cfg["notes"] == "- a\n- b\n"
+        assert cfg["repo"] == "longitude"
+        again = client.get("/api/playlists/longitude").json()
+        assert again["description"] == "Nightly UI polish."
+        assert again["notes"] == "- a\n- b\n"
+
+        # A blank value clears the key; an unset field is left untouched.
+        r = client.put(
+            "/api/playlists/longitude", json={"description": "   "}
+        )
+        assert r.status_code == 200
+        assert r.json()["description"] is None
+        assert r.json()["notes"] == "- a\n- b\n"
+        cfg = json.loads(
+            (tmp_path / "nightshift-tasks" / "longitude" / "config.json").read_text()
+        )
+        assert "description" not in cfg
+        assert cfg["notes"] == "- a\n- b\n"
+
+
 def test_manager_rename_migrates_store_and_blocks_running(tmp_path: Path) -> None:
     build_workspace(
         tmp_path, repos=("longitude",),

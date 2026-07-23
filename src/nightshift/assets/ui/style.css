@@ -1005,6 +1005,13 @@ body {
 /* ---- task detail pane: editable fields (title + brief) ---- */
 .detail-field { display: block; }
 .detail-field-label { display: block; color: var(--text-dim); font-size: 13px; }
+/* Label + accessory (e.g. the notes MARKDOWN|PREVIEW control) on one baseline. */
+.detail-field-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
 .detail-field input, .detail-field textarea {
   width: 100%;
   margin-top: 4px;

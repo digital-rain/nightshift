@@ -53,6 +53,11 @@ class PlaylistUpdate(BaseModel):
     # scheduler's candidate set; ``False`` re-enables it. ``None`` leaves it
     # untouched.
     disabled: bool | None = None
+    # A one-sentence summary and free-form (markdown) notes for the playlist.
+    # A blank/whitespace-only value clears the stored key; ``None`` (field unset)
+    # leaves it untouched.
+    description: str | None = None
+    notes: str | None = None
 
 
 def register_playlist_api(
@@ -101,6 +106,8 @@ def register_playlist_api(
             "repository": cfg.get("repo"),
             "validate": cfg.get("validate"),
             "disabled": playlists_mod.is_disabled(tasks_root, name),
+            "description": cfg.get("description"),
+            "notes": cfg.get("notes"),
         }
 
     @app.get("/api/main/info")
@@ -196,6 +203,21 @@ def register_playlist_api(
             await _emit(
                 "queue_changed", queue=current, payload={"disabled": req.disabled}
             )
+        # ``description`` (one-sentence summary) and ``notes`` (free-form markdown)
+        # are plain queue-config prose. A blank/whitespace-only value clears the
+        # key so the config stays clean; any other value is stored verbatim (notes
+        # keep their internal whitespace/newlines). An unset field is untouched.
+        sent = req.model_dump(exclude_unset=True)
+        for key in ("description", "notes"):
+            if key not in sent:
+                continue
+            raw = getattr(req, key)
+            value = raw if (raw and raw.strip()) else None
+            save_queue_config_value(
+                tasks_root, key, value, playlists_mod.tasks_rel(current)
+            )
+            await _commit(f"nightshift: set {key} {queue_label(current)}")
+            await _emit("queue_changed", queue=current, payload={key: value})
         return JSONResponse(_playlist_info(current))
 
     @app.delete("/api/playlists/{name}")
