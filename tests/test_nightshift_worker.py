@@ -20,6 +20,7 @@ from nightshift.worker.config import WorkerConfig, load_worker_config
 from nightshift.worker.execute import execute_work_order
 from nightshift.worker.local_store import LocalStore
 from nightshift.worker.loop import WorkerLoop
+from nightshift.worker.ui_app import create_worker_app
 
 
 def _seed(tmp_path: Path, tasks: dict[str, str]) -> Path:
@@ -30,6 +31,25 @@ def _seed(tmp_path: Path, tasks: dict[str, str]) -> Path:
     is bound to the ``main`` queue, so a dispatched task lands there.
     """
     return build_workspace(tmp_path, tasks=tasks)
+
+
+# --------------------------------------------------------------------------- #
+# worker UI: /api/backends powers the settings vendor dropdown
+# --------------------------------------------------------------------------- #
+
+
+def test_worker_api_backends_lists_vendors(tmp_path: Path) -> None:
+    """The settings vendor dropdown is filled from GET /api/backends, so the
+    worker UI must serve every registered backend's name (e.g. cursor)."""
+    build_workspace(tmp_path, tasks={})
+    cfg = WorkerConfig(workspace=tmp_path, worker_id="w1", manager_url="http://x")
+    app = create_worker_app(cfg, LocalStore(tmp_path))
+    with TestClient(app) as client:
+        resp = client.get("/api/backends")
+        assert resp.status_code == 200
+        names = [b["name"] for b in resp.json()["backends"]]
+        assert names == backends_mod.backend_names()
+        assert "cursor" in names
 
 
 # --------------------------------------------------------------------------- #

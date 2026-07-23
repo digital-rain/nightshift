@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 
 from nightshift._paths import UI_DIR as SHARED_UI_DIR
 from nightshift._paths import WORKER_UI_DIR as UI_DIR
+from nightshift.backends import list_backends
 from nightshift.config.validate import build_get_response, validate_delta, write_delta
 from nightshift.repos import known_repos
 from nightshift.worker.config import WorkerConfig
@@ -147,6 +148,11 @@ def create_worker_app(cfg: WorkerConfig, local: LocalStore) -> FastAPI:
     def scan_queues() -> JSONResponse:
         repos = known_repos(cfg.workspace)
         return JSONResponse({"queues": repos})
+
+    @app.get("/api/backends")
+    def backends() -> JSONResponse:
+        # Supported vendors for the model-id vendor dropdown in settings.
+        return JSONResponse({"backends": list_backends()})
 
     _WORKER_SURFACES = ["worker"]
 
