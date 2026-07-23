@@ -125,9 +125,11 @@ def resolve_task(
       immediately — the cheap recovery path.
     * If ``main`` is still dirty (``recoverable``) it reports that: an agent can't
       touch the operator's unrelated local edits.
-    * Otherwise it's a content conflict: an agent rebases the branch onto ``main``,
-      resolves the conflicts, re-validates, and squashes — bounded by
-      ``max_resolve_attempts``.
+    * Otherwise try a deterministic rebase onto ``main``, re-validate, and squash
+      (no agent) — the common recovery when ``main`` was fixed out-of-band after a
+      post-run validation failure.
+    * When that hits rebase conflicts, an agent rebases, resolves them,
+      re-validates, and squashes — bounded by ``max_resolve_attempts``.
 
     The brief is read from ``tasks_root`` (the content store); rebase/squash run
     in ``repo_root``. Emits ``TASK_STARTED``/``TASK_STATUS``/``TASK_RESULT`` so the
@@ -170,19 +172,10 @@ def resolve_task(
         workspace, repo, task, title, queue=queue
     )
     if sha is not None:
-        loc = compute_code_loc(repo_root, sha)
-        teardown_worktree(workspace, repo, task, queue=queue)
-        # Backstop queue removal for a landed regular task (see drop_completed_task).
-        if not task_is_evergreen(meta, task, config):
-            drop_completed_task(tasks_root, task, tasks_rel, queue=queue)
-        result_line = f"resolved: landed ({sha})"
-        emit(Event(TASK_RESULT, {
-            "task": task, "status": "completed", "repo": repo,
-            "result_line": result_line, "commit_sha": sha, "loc": loc,
-        }))
-        return TaskResult(
-            task=task, title=title, success=True, commit_sha=sha, loc=loc,
-            result_line=result_line,
+        return _land_resolved(
+            workspace, repo, tasks_root, task, title,
+            sha=sha, meta=meta, config=config, tasks_rel=tasks_rel,
+            emit=emit, queue=queue,
         )
 
     if recoverable:
@@ -197,12 +190,167 @@ def resolve_task(
             failure_kind="merge_rejected",
         )
 
-    # 2. Content conflict (or generic merge failure): hand it to the agent.
+    # 2. Deterministic path: rebase onto main, re-validate, squash (no agent).
+    det = _deterministic_resolve(
+        workspace, repo, tasks_root, task, title, meta=meta, config=config,
+        tasks_rel=tasks_rel, emit=emit, queue=queue,
+    )
+    if det is not None:
+        return det
+
+    # 3. Rebase conflicts: hand it to the agent.
     return _agent_resolve(
         workspace, repo, tasks_root, task, title,
         conflict_detail=detail, emit=emit, config=config,
         backend_name=backend_name, abort_reason=abort_reason, queue=queue,
     )
+
+
+def _land_resolved(
+    workspace: Path,
+    repo: str,
+    tasks_root: Path,
+    task: str,
+    title: str,
+    *,
+    sha: str,
+    meta: dict,
+    config: dict,
+    tasks_rel: str,
+    emit: Listener,
+    queue: str | None,
+) -> TaskResult:
+    """Record a successful resolve land and tear down the preserved worktree."""
+    repo_root = workspace / repo
+    loc = compute_code_loc(repo_root, sha)
+    teardown_worktree(workspace, repo, task, queue=queue)
+    if not task_is_evergreen(meta, task, config):
+        drop_completed_task(tasks_root, task, tasks_rel, queue=queue)
+    result_line = f"resolved: landed ({sha})"
+    emit(Event(TASK_RESULT, {
+        "task": task, "status": "completed", "repo": repo,
+        "result_line": result_line, "commit_sha": sha, "loc": loc,
+    }))
+    return TaskResult(
+        task=task, title=title, success=True, commit_sha=sha, loc=loc,
+        result_line=result_line,
+    )
+
+
+def _deterministic_resolve(
+    workspace: Path,
+    repo: str,
+    tasks_root: Path,
+    task: str,
+    title: str,
+    *,
+    meta: dict,
+    config: dict,
+    tasks_rel: str,
+    emit: Listener,
+    queue: str | None = None,
+) -> TaskResult | None:
+    """Rebase the preserved branch onto ``main``, re-run validation, and squash.
+
+    Returns a :class:`TaskResult` on success or on a terminal failure (rebase
+    error, validate still failing after auto-repair, recoverable squash
+    blocker). Returns ``None`` when the rebase paused on conflicts so the
+    caller can escalate to :func:`_agent_resolve`.
+    """
+    repo_root = workspace / repo
+
+    def _emit_log(line: str) -> None:
+        emit(Event(TASK_LOG, {"task": task, "line": line}))
+
+    worktree_dir = ensure_worktree_for_branch(workspace, repo, task, queue=queue)
+    if worktree_dir is None:
+        error = "could not prepare the task worktree for resolution"
+        emit(Event(TASK_RESULT, {
+            "task": task, "status": "error", "error": error, "repo": repo,
+            "result_line": "resolve setup failed", "failure_kind": "merge_conflict",
+        }))
+        return TaskResult(
+            task=task, title=title, success=False, error=error,
+            failure_kind="merge_conflict",
+        )
+
+    validate_cmd = resolve_validate_cmd(config)
+    env = worker_env(worktree_dir)
+
+    emit(Event(TASK_STATUS, {"task": task, "status": "running", "phase": "resolve"}))
+    _emit_log("  rebasing onto main (deterministic resolve)...\n")
+    outcome, rebase_detail = rebase_onto_main(worktree_dir)
+    if outcome == "error":
+        abort_rebase(worktree_dir)
+        error = f"rebase onto main failed:\n{rebase_detail}"
+        emit(Event(TASK_RESULT, {
+            "task": task, "status": "error", "error": error, "repo": repo,
+            "result_line": "rebase failed during resolve",
+            "failure_kind": "merge_rejected",
+        }))
+        return TaskResult(
+            task=task, title=title, success=False, error=error,
+            failure_kind="merge_rejected",
+        )
+    if outcome == "conflict":
+        abort_rebase(worktree_dir)
+        return None
+
+    if validate_cmd is None:
+        _emit_log("  validation disabled for this queue — skipping.\n")
+    else:
+        emit(Event(TASK_STATUS, {"task": task, "status": "running", "phase": "validate"}))
+        _emit_log(f"  running {' '.join(validate_cmd)}...\n")
+        validate_result = subprocess.run(
+            validate_cmd, cwd=worktree_dir, capture_output=True, text=True, env=env,
+        )
+        if validate_result.returncode != 0:
+            _emit_log("  validate failed — attempting auto-repair...\n")
+            validate_result = attempt_repair(
+                worktree_dir, validate_result, validate_cmd=validate_cmd, env=env,
+            )
+        if validate_result.returncode != 0:
+            _emit_log(f"\n── validate failed (exit {validate_result.returncode}) ──\n")
+            if validate_result.stdout:
+                _emit_log(validate_result.stdout[-3000:])
+            if validate_result.stderr:
+                _emit_log(validate_result.stderr[-1500:])
+            _emit_log("\n── end validate output ──\n")
+            error = (
+                "validate failed after rebase:\n"
+                f"{validate_result.stdout[-1500:]}\n{validate_result.stderr[-1500:]}"
+            )
+            emit(Event(TASK_RESULT, {
+                "task": task, "status": "error", "error": error, "repo": repo,
+                "result_line": "validate still failing after rebase",
+                "failure_kind": "validation_error",
+            }))
+            return TaskResult(
+                task=task, title=title, success=False, error=error,
+                failure_kind="validation_error",
+            )
+
+    emit(Event(TASK_STATUS, {"task": task, "status": "running", "phase": "commit"}))
+    sha, squash_detail, recoverable = squash_to_main(
+        workspace, repo, task, title, queue=queue,
+    )
+    if sha is not None:
+        return _land_resolved(
+            workspace, repo, tasks_root, task, title,
+            sha=sha, meta=meta, config=config, tasks_rel=tasks_rel,
+            emit=emit, queue=queue,
+        )
+    if recoverable:
+        emit(Event(TASK_RESULT, {
+            "task": task, "status": "error", "error": squash_detail, "repo": repo,
+            "result_line": "blocked — clear main, then resolve",
+            "recoverable": True, "failure_kind": "merge_rejected",
+        }))
+        return TaskResult(
+            task=task, title=title, success=False, error=squash_detail,
+            failure_kind="merge_rejected",
+        )
+    return None
 
 
 def _agent_resolve(
@@ -376,19 +524,10 @@ def _agent_resolve(
             workspace, repo, task, title, queue=queue,
         )
         if sha is not None:
-            loc = compute_code_loc(repo_root, sha)
-            teardown_worktree(workspace, repo, task, queue=queue)
-            # Backstop queue removal for a landed regular task (see drop_completed_task).
-            if not task_is_evergreen(meta, task, config):
-                drop_completed_task(tasks_root, task, tasks_rel, queue=queue)
-            result_line = f"resolved: landed ({sha})"
-            emit(Event(TASK_RESULT, {
-                "task": task, "status": "completed", "repo": repo,
-                "result_line": result_line, "commit_sha": sha, "loc": loc,
-            }))
-            return TaskResult(
-                task=task, title=title, success=True, commit_sha=sha, loc=loc,
-                result_line=result_line,
+            return _land_resolved(
+                workspace, repo, tasks_root, task, title,
+                sha=sha, meta=meta, config=config, tasks_rel=tasks_rel,
+                emit=emit, queue=queue,
             )
         last_error = squash_detail or "squash-merge still failed after resolution"
 

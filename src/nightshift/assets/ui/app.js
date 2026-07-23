@@ -244,15 +244,37 @@ function failureBadge(kind) {
   return span;
 }
 
-// A task's validated work is preserved on a branch (so Resolve can land it)
-// only when the squash-merge itself failed.
+// A task's preserved work can be finished via resolve when the squash-merge
+// failed or when post-run validation failed (branch still holds the agent's work).
 function isResolvable(task) {
   return (
     task.status === "error" &&
     (task.recoverable ||
       task.failure_kind === "merge_conflict" ||
-      task.failure_kind === "merge_rejected")
+      task.failure_kind === "merge_rejected" ||
+      task.failure_kind === "validation_error")
   );
+}
+
+function resolveButtonLabel(rec) {
+  return rec.failure_kind === "validation_error" ? "Revalidate & land" : "Resolve";
+}
+
+function appendResolveButton(actions, runId, task, rec) {
+  const resolve = document.createElement("button");
+  resolve.className = "btn primary btn-resolve";
+  if (rec.failure_kind === "validation_error") {
+    resolve.textContent = resolveButtonLabel(rec);
+    resolve.title = (
+      "Rebase the preserved branch onto main, re-run validate, and squash-land "
+      + "the agent's work (no full re-run)."
+    );
+  } else {
+    resolve.innerHTML = resolveButtonInner();
+    resolve.title = "Resolve merge conflicts and land the preserved work.";
+  }
+  resolve.addEventListener("click", () => resolveTask(runId, task, resolve));
+  actions.append(resolve);
 }
 
 // --------------------------------------------------------------------------
@@ -3211,14 +3233,25 @@ async function clearCompleted() {
 }
 
 async function resolveTask(runId, task, btn) {
-  if (btn) { btn.disabled = true; btn.textContent = "Resolving\u2026"; }
+  const busy = btn && btn.textContent === resolveButtonLabel({ failure_kind: "validation_error" })
+    ? "Revalidating\u2026"
+    : "Resolving\u2026";
+  if (btn) { btn.disabled = true; btn.textContent = busy; }
   const { ok, data } = await sendJSON(
     `/api/runs/${encodeURIComponent(runId)}/${encodeURIComponent(task)}/resolve`,
     "POST",
   );
   if (!ok) {
     alert((data && data.error) || "could not resolve task");
-    if (btn) { btn.disabled = false; btn.innerHTML = resolveButtonInner(); }
+    if (btn) {
+      btn.disabled = false;
+      const rec = latestRecordFor(task);
+      if (rec && rec.rec.failure_kind === "validation_error") {
+        btn.textContent = resolveButtonLabel(rec.rec);
+      } else {
+        btn.innerHTML = resolveButtonInner();
+      }
+    }
     return;
   }
   // The resolve runs as a tracked job — jump to Now to watch it land.
@@ -4493,6 +4526,16 @@ function blockedSection(overlay) {
   reason.className = "blocked-reason";
   reason.textContent = (overlay && overlay.reason) || "This task is blocked.";
   bl.body.append(reason);
+  const reasonText = (overlay && overlay.reason) || "";
+  if (reasonText.includes("validation failed")) {
+    const hint = document.createElement("p");
+    hint.className = "blocked-hint muted";
+    hint.textContent = (
+      "If main is fixed, use Revalidate & land (below) to rebase onto main, "
+      + "re-run validate, and squash the preserved work — no full re-run needed."
+    );
+    bl.body.append(hint);
+  }
   return bl.panel;
 }
 
@@ -5019,6 +5062,9 @@ function taskDetailContent(brief, draft, opts = {}) {
     });
     actions.append(delBtn);
   }
+  if (!creating && rec && run && isResolvable(rec)) {
+    appendResolveButton(actions, run.id, task, rec);
+  }
   actions.append(err, saveBtn);
   frag.append(actions);
   return frag;
@@ -5486,17 +5532,14 @@ function historyFrontmatter(rec) {
   return panel;
 }
 
-// The history run actions: Resolve (when the task validated but didn't land),
-// Run now (when it's back in the active queue), and Delete run.
+// The history run actions: Resolve / Revalidate & land (when preserved work can
+// finish without a full re-run), Run now (when it's back in the active queue),
+// and Delete run.
 function historyActions(run, rec) {
   const actions = document.createElement("div");
   actions.className = "detail-actions";
   if (isResolvable(rec)) {
-    const resolve = document.createElement("button");
-    resolve.className = "btn primary btn-resolve";
-    resolve.innerHTML = resolveButtonInner();
-    resolve.addEventListener("click", () => resolveTask(run.id, rec.task, resolve));
-    actions.append(resolve);
+    appendResolveButton(actions, run.id, rec.task, rec);
   }
   const queueItem = state.queue.find((i) => i.task === rec.task);
   if (queueItem) {

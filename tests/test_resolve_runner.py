@@ -223,3 +223,59 @@ def test_resolve_task_bounded_attempts_preserves_branch(tmp_path: Path) -> None:
     assert result.failure_kind == "merge_conflict"
     assert stub.calls == 1  # bounded by max_resolve_attempts
     assert "task-local/main/10.hello" in git(repo_root, "branch")
+
+
+def test_resolve_deterministic_rebase_after_main_fixed(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """When main was broken then fixed out-of-band, deterministic resolve rebases
+    the preserved branch, re-validates, and lands without an agent."""
+    from nightshift.git import squash as squash_mod
+    import nightshift.resolve_runner as resolve_mod
+
+    validate = "true"
+    workspace, tasks_root, repo_root = _full(
+        tmp_path,
+        tasks={"10.hello": "Do something."},
+        config={"validate": validate},
+    )
+    (repo_root / "main_ok").write_text("ok\n")
+    git_commit_all(repo_root, "healthy main")
+
+    worktree = setup_worktree(workspace, REPO, "10.hello")
+    (worktree / "branch_ok").write_text("ok\n")
+    git(worktree, "add", "branch_ok")
+    git(worktree, "commit", "-m", "agent work")
+
+    # Main breaks after the branch was cut (pre-existing validate failure).
+    (repo_root / "main_ok").unlink()
+    git(repo_root, "add", "main_ok")
+    git(repo_root, "commit", "-m", "main broke")
+
+    # Operator fixes main; the branch still holds the agent's work.
+    (repo_root / "main_ok").write_text("ok\n")
+    git(repo_root, "add", "main_ok")
+    git(repo_root, "commit", "-m", "main fixed")
+
+    real_squash = squash_mod.squash_to_main
+    squash_calls: list[int] = []
+
+    def _squash_once_then_real(*args, **kwargs):
+        squash_calls.append(1)
+        if len(squash_calls) == 1:
+            return None, "simulated stale-base squash failure", False
+        return real_squash(*args, **kwargs)
+
+    monkeypatch.setattr(resolve_mod, "squash_to_main", _squash_once_then_real)
+
+    events: list = []
+    result = resolve_task(
+        workspace, REPO, tasks_root, "10.hello", "hello world", emit=events.append
+    )
+    assert result.success, result.error
+    assert len(squash_calls) == 2  # cheap path failed, deterministic path landed
+    assert (repo_root / "branch_ok").exists()
+    assert (repo_root / "main_ok").exists()
+    assert "task-local/main/10.hello" not in git(repo_root, "branch")
+    phases = [e.payload.get("phase") for e in events if e.type == TASK_STATUS]
+    assert "validate" in phases

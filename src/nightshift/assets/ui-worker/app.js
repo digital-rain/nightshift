@@ -649,7 +649,7 @@ function buildModelIdComposite(value, onChange, onBlur) {
   select.className = "w-sf-model-vendor";
   const providerSet = new Set(wSettings.providers);
   if (curProvider) providerSet.add(curProvider);
-  for (const p of providerSet) {
+  for (const p of [...providerSet].sort()) {
     const o = document.createElement("option");
     o.value = p; o.textContent = p;
     if (p === curProvider) o.selected = true;
