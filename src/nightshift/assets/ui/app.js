@@ -971,7 +971,7 @@ function documentsPanel(brief, draft, opts = {}) {
   })();
   const effectiveRepo = repo || queueRepo || "";
 
-  const { panel, body } = expando("Documents", { open: true });
+  const { panel, body } = expando("Documents", { open: false });
   body.classList.add("documents-panel");
 
   const chipList = document.createElement("div");
@@ -4953,8 +4953,26 @@ function taskDetailContent(brief, draft, opts = {}) {
     if (tb) frag.append(tb);
   }
 
+  // DOCUMENTS — operator-owned references (`docs:`) and attachments
+  // (`attachments:`), spec §6. The create flavour has no `summary` (nothing on
+  // disk yet); the edit flavour pulls one from the server on the first render
+  // (see `renderDetailScreen`) and caches it on `state.detailDocumentsSummary`.
+  // Positioned directly above NOTES; collapsed by default.
+  frag.append(documentsPanel(brief, draft, {
+    creating,
+    locked,
+    summary: creating ? null : state.detailDocumentsSummary,
+    rerender: async () => {
+      // A mutation from within the panel (delete attachment, re-pin) needs a
+      // fresh summary from the server before repainting.
+      if (!creating) {
+        state.detailDocumentsSummary = await loadDocumentsSummary(task);
+      }
+      rerender();
+    },
+  }));
+
   // NOTES — free-form, multi-line editable text area for operator notes.
-  // Positioned as the last section before LOG.
   {
     const notesArea = document.createElement("textarea");
     notesArea.rows = 4;
@@ -4982,24 +5000,6 @@ function taskDetailContent(brief, draft, opts = {}) {
   if (!creating && draft.workflow) {
     frag.append(artifactsPanel(task));
   }
-
-  // DOCUMENTS — operator-owned references (`docs:`) and attachments
-  // (`attachments:`), spec §6. The create flavour has no `summary` (nothing on
-  // disk yet); the edit flavour pulls one from the server on the first render
-  // (see `renderDetailScreen`) and caches it on `state.detailDocumentsSummary`.
-  frag.append(documentsPanel(brief, draft, {
-    creating,
-    locked,
-    summary: creating ? null : state.detailDocumentsSummary,
-    rerender: async () => {
-      // A mutation from within the panel (delete attachment, re-pin) needs a
-      // fresh summary from the server before repainting.
-      if (!creating) {
-        state.detailDocumentsSummary = await loadDocumentsSummary(task);
-      }
-      rerender();
-    },
-  }));
 
   // BLOCKED — an expandable section, directly below LOG, shown only while the
   // task carries a blocked overlay. Expanding it reveals the blocked reason.
