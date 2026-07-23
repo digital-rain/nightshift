@@ -88,6 +88,7 @@ def test_setup_worktree_creates_dir_and_symlinks(tmp_path: Path) -> None:
     (repo_root / ".venv").mkdir()
     (repo_root / ".venv/bin").mkdir(parents=True)
     (repo_root / "services/dashboard_ui/node_modules").mkdir(parents=True)
+    (repo_root / ".env").write_text("LONG_PG_DSN=postgresql://x\n")
 
     worktree = setup_worktree(workspace, REPO, "10.hello")
     assert worktree.exists()
@@ -95,6 +96,10 @@ def test_setup_worktree_creates_dir_and_symlinks(tmp_path: Path) -> None:
     assert str(worktree).startswith(str(workspace / ".worktrees" / REPO))
     assert (worktree / ".venv").is_symlink()
     assert (worktree / "services/dashboard_ui/node_modules").is_symlink()
+    # The repo's own (gitignored) secrets file rides along so repo tooling
+    # that dotenv-loads from the repo root works inside the worktree.
+    assert (worktree / ".env").is_symlink()
+    assert (worktree / ".env").read_text() == "LONG_PG_DSN=postgresql://x\n"
 
 
 def test_squash_to_main_produces_single_commit(tmp_path: Path) -> None:

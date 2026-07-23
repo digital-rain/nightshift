@@ -26,6 +26,10 @@ Environment variables always win.
 > Each entry point additionally loads `<workspace>/.env` at startup with setdefault semantics (a real environment variable always wins).
 > When the workspace is the repo dir — the default — they are the same file.
 
+> **Target-repo `.env` inside task worktrees.** Each *target repo's own* (gitignored) `.env` is symlinked into every task worktree cut from it, alongside `.venv`/`node_modules` — so repo tooling that dotenv-loads from the repo root (`just`, dotenv libraries) works unmodified during a run, and the agent can use those values.
+> Write briefs to reference such values **by name** (e.g. "connect using `$LONG_PG_DSN`"), never by value: the bytes stay on the worker box and out of the tasks repo, the prompt, and the run logs.
+> Note this is per-repo and distinct from `<workspace>/.env` (Nightshift's own secrets), which is **not** placed in worktrees — though as part of the worker's process environment its variables do reach the agent's environment.
+
 ## The workspace
 
 The **workspace** is the directory passed as `--workspace` to the manager and each worker.

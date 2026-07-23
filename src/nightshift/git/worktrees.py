@@ -18,6 +18,12 @@ SYMLINK_TARGETS = [
     ".venv",
     "services/dashboard_ui/node_modules",
     "node_modules",
+    # The target repo's own (gitignored) secrets file, so repo tooling that
+    # loads `.env` from the repo root (`just` dotenv-load, dotenv libraries)
+    # works unmodified inside a task worktree. Briefs reference values by
+    # name (e.g. "connect using $LONG_PG_DSN"); the values stay on the
+    # worker box and never enter the tasks repo, the prompt, or the logs.
+    ".env",
 ]
 
 
