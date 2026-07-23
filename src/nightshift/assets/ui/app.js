@@ -1626,6 +1626,10 @@ function renderNowInner() {
   const active = state.player.state === "playing" || state.player.state === "paused";
   wrap.append(active ? executionCard() : idleHero());
   wrap.append(spacer());
+  // Concurrent runs on *other* queues get an "up next"-sized slice each, so the
+  // hero stays dedicated to the selected queue while it's still clear that work
+  // is running elsewhere. Clicking a slice focuses that queue's Now page.
+  for (const slice of otherRunningQueueSlices()) wrap.append(slice);
   wrap.append(upNextCard());
   renderPauseBanner("now-pause-banner");
 
@@ -1776,6 +1780,43 @@ function idleHero() {
   sub.textContent = next ? `Press play to start \u201c${next.title || next.task}\u201d` : "Add a task to get started";
   hero.append(btn, big, sub);
   return hero;
+}
+
+// Slices for the *other* running queues (every playing queue that isn't the one
+// in focus). Each renders as an "up next"-sized card so a concurrent run stays
+// visible on the Now page without stealing the hero. Only "playing" queues
+// count — a paused queue isn't actively running a task.
+function otherRunningQueueSlices() {
+  const current = focusedQueueKey();
+  return runningQueueKeys()
+    .filter((key) => key !== current && (state.players[key] || {}).state === "playing")
+    .map((key) => runningQueueSlice(key, state.players[key]));
+}
+
+function queueLabel(key) {
+  return key === "main" ? "Main queue" : key;
+}
+
+function runningQueueSlice(key, st) {
+  const card = document.createElement("button");
+  card.className = "upnext running-slice";
+  card.type = "button";
+  card.addEventListener("click", () => activatePlaylist(key === "main" ? null : key, "now"));
+  const left = document.createElement("div");
+  left.className = "upnext-left";
+  const label = document.createElement("div");
+  label.className = "upnext-label";
+  label.textContent = `Running · ${queueLabel(key)}`;
+  const next = document.createElement("div");
+  next.className = "upnext-next";
+  const task = st && st.now_playing;
+  next.textContent = task || "Starting…";
+  left.append(label, next);
+  const chev = document.createElement("span");
+  chev.className = "upnext-chev";
+  chev.innerHTML = "&#8250;";
+  card.append(left, chev);
+  return card;
 }
 
 function upNextCard() {

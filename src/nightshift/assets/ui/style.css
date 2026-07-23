@@ -478,6 +478,11 @@ body {
 .upnext-next { font-weight: 600; margin-top: 2px; }
 .upnext-chev { font-size: 22px; color: var(--text-dim); }
 
+/* A running-queue slice reuses the "up next" card shape but marks itself as a
+   live run on another queue with an accent edge + eyebrow. */
+.running-slice { border-left: 3px solid var(--accent); }
+.running-slice .upnext-label { color: var(--accent); }
+
 /* ---- queue ---- */
 .queue { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
 .q-item {
