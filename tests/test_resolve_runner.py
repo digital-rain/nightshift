@@ -230,8 +230,8 @@ def test_resolve_deterministic_rebase_after_main_fixed(
 ) -> None:
     """When main was broken then fixed out-of-band, deterministic resolve rebases
     the preserved branch, re-validates, and lands without an agent."""
-    from nightshift.git import squash as squash_mod
     import nightshift.resolve_runner as resolve_mod
+    from nightshift.git import squash as squash_mod
 
     validate = "true"
     workspace, tasks_root, repo_root = _full(
