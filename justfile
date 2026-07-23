@@ -40,17 +40,29 @@ manager port="":
     {{py}} -m nightshift.manager "${args[@]}"
 
 # Launch a worker: polls the manager, runs/validates/submits (worker UI :8810).
+# Identity comes from NIGHTSHIFT_WORKER_ID in .env (required; see .env.example).
 worker port="":
     #!/usr/bin/env bash
     set -euo pipefail
+    if [ -z "${NIGHTSHIFT_WORKER_ID:-}" ]; then
+        echo "NIGHTSHIFT_WORKER_ID is not set (add it to .env)" >&2
+        exit 1
+    fi
     args=(--workspace "{{workspace}}")
     if [ -n "{{port}}" ]; then args+=(--ui-port "{{port}}"); fi
-    echo "launching worker on {{workspace}}:{{port}}"
+    echo "launching worker ${NIGHTSHIFT_WORKER_ID} on {{workspace}}:{{port}}"
     {{py}} -m nightshift.worker "${args[@]}"
 
 # Launch a worker with no UI (poll loop only).
+# Identity comes from NIGHTSHIFT_WORKER_ID in .env (required; see .env.example).
 worker-headless:
-    echo "launching worker-headless on {{workspace}}"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z "${NIGHTSHIFT_WORKER_ID:-}" ]; then
+        echo "NIGHTSHIFT_WORKER_ID is not set (add it to .env)" >&2
+        exit 1
+    fi
+    echo "launching worker-headless ${NIGHTSHIFT_WORKER_ID} on {{workspace}}"
     {{py}} -m nightshift.worker --workspace "{{workspace}}" --no-ui
 
 # Launch the Slack Socket Mode capture daemon (needs the `slack` extra + tokens).

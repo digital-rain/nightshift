@@ -628,6 +628,10 @@ def register_operator_api(
         states (validation-failed, unroutable, bad-repo-reference). It does
         NOT touch frontmatter-backed quarantined/failed flags — those are
         toggled via the normal PATCH/detail-pane save.
+
+        When the brief is already gone (orphan hold), the row is deleted
+        outright (``reset_progress=True``) so dismiss-from-Workers does not
+        leave a counter-only ghost behind.
         """
         target = _resolve_queue(queue)
         store = _store()
@@ -638,7 +642,12 @@ def register_operator_api(
             return JSONResponse(
                 {"error": "task is not currently blocked"}, status_code=404,
             )
-        await store.clear_task_state(target, task)
+        brief = (
+            tasks_root / playlists_mod.tasks_rel(target) / f"{task}.md"
+        )
+        await store.clear_task_state(
+            target, task, reset_progress=not brief.exists(),
+        )
         await _emit(
             "task_released", queue=target, task=task,
             payload={"prior_state": prior.get("state")},
@@ -650,6 +659,9 @@ def register_operator_api(
     async def remove_task(task: str, queue: str | None = None) -> JSONResponse:
         target = _resolve_queue(queue)
         result = delete_task(tasks_root, task, playlists_mod.tasks_rel(target))
+        # Drop any DB overlay so a deleted brief cannot leave an orphan
+        # blocked/quarantined row visible only on the Workers page.
+        await _store().clear_task_state(target, task, reset_progress=True)
         await _commit(f"nightshift: delete task {task}")
         await _emit("queue_changed", queue=target, task=task)
         return JSONResponse(result)

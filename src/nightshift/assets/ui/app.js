@@ -713,6 +713,9 @@ async function loadBlocked() {
     state.blockedTasks = {};
   }
 }
+// Workers page dismiss calls this after clearing a hold so queue-row badges
+// drop without a full reload.
+window.loadBlocked = loadBlocked;
 
 // Toggle the active queue between manual (drag) order and priority sort,
 // persist it, and reload so the display and the engine's play order agree.

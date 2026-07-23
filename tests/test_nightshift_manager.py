@@ -2085,6 +2085,45 @@ def test_reset_clears_blocked_task(tmp_path: Path) -> None:
         assert "10.a" not in blocked2
 
 
+def test_reset_purges_orphan_blocked_hold(tmp_path: Path) -> None:
+    """Reset on a blocked hold whose brief is gone deletes the overlay row."""
+    root = _seed(tmp_path, {"10.a": "A."})
+    store = SqliteStore()
+    with _client(root, store) as client:
+        asyncio.run(
+            store.set_task_state(
+                None, "ghost-task", "blocked",
+                blocked_reason="no target repo set",
+            )
+        )
+        assert any(
+            b["task"] == "ghost-task" for b in client.get("/api/blocked").json()
+        )
+        r = client.post("/api/tasks/ghost-task/reset?queue=")
+        assert r.status_code == 200
+        assert r.json()["released"] is True
+        assert client.get("/api/blocked").json() == []
+        # Orphan dismiss must not leave a counter-only ghost.
+        assert asyncio.run(store.get_task_state(None, "ghost-task")) is None
+
+
+def test_delete_task_clears_db_hold(tmp_path: Path) -> None:
+    """DELETE /api/tasks/{task} also drops any DB overlay for that task."""
+    root = _seed(tmp_path, {"10.a": "A."})
+    store = SqliteStore()
+    with _client(root, store) as client:
+        asyncio.run(
+            store.set_task_state(
+                None, "10.a", "blocked",
+                blocked_reason="validation failed: boom",
+            )
+        )
+        r = client.delete("/api/tasks/10.a")
+        assert r.status_code == 200
+        assert client.get("/api/blocked").json() == []
+        assert asyncio.run(store.get_task_state(None, "10.a")) is None
+
+
 def test_reset_not_blocked_returns_404(tmp_path: Path) -> None:
     """POST /api/tasks/{task}/reset on a non-blocked task returns 404."""
     root = _seed(tmp_path, {"10.a": "Do a thing."})

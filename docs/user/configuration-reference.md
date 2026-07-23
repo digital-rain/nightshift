@@ -29,6 +29,7 @@ Environment variables always win.
 > **Target-repo `.env` inside task worktrees.** Each *target repo's own* (gitignored) `.env` is symlinked into every task worktree cut from it, alongside `.venv`/`node_modules` — so repo tooling that dotenv-loads from the repo root (`just`, dotenv libraries) works unmodified during a run, and the agent can use those values.
 > Write briefs to reference such values **by name** (e.g. "connect using `$LONG_PG_DSN`"), never by value: the bytes stay on the worker box and out of the tasks repo, the prompt, and the run logs.
 > Note this is per-repo and distinct from `<workspace>/.env` (Nightshift's own secrets), which is **not** placed in worktrees — though as part of the worker's process environment its variables do reach the agent's environment.
+> See [Using `.env` values in tasks](#using-env-values-in-tasks) for the brief-writing convention.
 
 ## The workspace
 
@@ -84,6 +85,22 @@ NIGHTSHIFT_MANAGER_URL=http://localhost:8800
 NIGHTSHIFT_PG_DSN=postgresql://nightshift:nightshift@127.0.0.1:5432/nightshift
 ANTHROPIC_API_KEY=sk-ant-api03-...
 ```
+
+### Using `.env` values in tasks
+
+A task's agent can consume secrets (a database DSN, an API key) through two channels — neither of which ever puts the value itself in a brief:
+
+1. **The worker's process environment.** Everything in the worker process's environment — including `<workspace>/.env`, loaded at startup — is inherited by the agent, so `$SOME_VAR` resolves in any command the agent runs. Use this for values shared across repos on that box.
+2. **The target repo's own `.env`.** Each target repo's (gitignored) `.env` is symlinked into every task worktree cut from it, so repo tooling that dotenv-loads from the repo root (`just` recipes, dotenv libraries) picks it up unmodified, and the agent can `source .env` for raw commands. Use this for repo-scoped values; each repo's tasks see that repo's file.
+
+**Write briefs to reference values by name, never by value:**
+
+```markdown
+Review yesterday's transactions. The database DSN is `LONG_PG_DSN` in this
+repo's `.env` — source it or use the `just` recipes.
+```
+
+A literal value in a brief would be committed to the tasks repo forever, echoed into the prompt, and streamed into the run logs; a name keeps the bytes on the worker box. Because `.env` availability is per-worker, pair secret-dependent tasks with routing that targets workers that have them (queue dedication or a pinned model only that worker serves). Prefer least-privilege credentials (e.g. a read-only database role): nothing sandboxes what an agent does with a value once it has it, and validation guards `main`, not external systems.
 
 ## Manager configuration
 

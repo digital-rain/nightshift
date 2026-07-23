@@ -165,6 +165,44 @@
     }
   }
 
+  // Queue query for /api/tasks/.../reset. Empty string must be sent explicitly
+  // (`?queue=`) so the manager targets the main/empty storage key rather than
+  // falling back to the focused playlist.
+  function blockedQueueParam(queue) {
+    if (queue == null || queue === "") return "?queue=";
+    return `?queue=${encodeURIComponent(queue)}`;
+  }
+
+  // DB holds (blocked / repo_unavailable) clear via Reset. Frontmatter
+  // quarantined/failed rows still have a brief and belong in the queue view —
+  // no dismiss control here (Reset 404s on them).
+  function isResettableHold(b) {
+    const s = (b && b.state) || "blocked";
+    return s === "blocked" || s === "repo_unavailable";
+  }
+
+  async function dismissBlocked(b, btn) {
+    if (!b || !b.task) return;
+    btn.disabled = true;
+    try {
+      const r = await fetch(
+        `/api/tasks/${encodeURIComponent(b.task)}/reset${blockedQueueParam(b.queue)}`,
+        { method: "POST", headers: { Accept: "application/json" } },
+      );
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error((data && data.error) || `reset -> ${r.status}`);
+      await refreshWorkers();
+      // Keep the shared queue-row overlay in sync when the operator is looking
+      // at Workers (app.js owns loadBlocked; call it if present).
+      if (typeof window.loadBlocked === "function") {
+        try { await window.loadBlocked(); } catch (_) { /* ignore */ }
+      }
+    } catch (e) {
+      btn.disabled = false;
+      alert((e && e.message) || "could not clear blocked hold");
+    }
+  }
+
   function renderBlocked(blocked) {
     const wrap = $("workers-blocked");
     const list = $("blocked-list");
@@ -183,6 +221,22 @@
       reason.className = "reason";
       reason.textContent = b.blocked_reason ? ` — ${b.blocked_reason}` : "";
       li.append(task, reason);
+      if (isResettableHold(b)) {
+        const rm = document.createElement("button");
+        rm.type = "button";
+        rm.className = "blocked-dismiss";
+        rm.textContent = "×";
+        rm.title = "Clear blocked hold";
+        rm.setAttribute(
+          "aria-label",
+          `Clear blocked hold for ${(b.queue ? `${b.queue}/` : "") + b.task}`,
+        );
+        rm.addEventListener("click", (ev) => {
+          ev.preventDefault();
+          dismissBlocked(b, rm);
+        });
+        li.append(rm);
+      }
       list.appendChild(li);
     }
   }
