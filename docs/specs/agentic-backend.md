@@ -13,7 +13,7 @@ Where this doc and the code disagree once implemented, the code governs and this
 
 Nightshift already routes work by **provider-qualified model id** (`<provider>/<model>`, where the provider token is exactly a backend name): `claude-code/claude-opus-4-8`, `cursor/gpt-5`, `ollama-cloud/qwen3-coder:480b`.
 One worker can serve many providers at once; the provider half selects the backend that executes the task.
-Today the agentic providers (`claude-code`, `cursor`, `gemini`) all **shell out to a vendor CLI we do not control**, and the API providers (`anthropic`, `ollama`, `ollama-cloud`) stream a single completion and edit nothing.
+Today the agentic providers (`claude-code`, `cursor`, `antigravity`) all **shell out to a vendor CLI we do not control**, and the API providers (`anthropic`, `ollama`, `ollama-cloud`) stream a single completion and edit nothing.
 
 This spec adds one more provider — working name **`nightshift`** — that is an **in-process agentic harness we own end to end.**
 It talks to the model APIs nightshift already reaches over `httpx`, runs its own tool loop, and applies edits deterministically in Python.

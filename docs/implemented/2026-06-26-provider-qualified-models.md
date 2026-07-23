@@ -12,7 +12,7 @@
 
 ## Design decisions (read before starting)
 
-- **Provider == backend name.** The provider token is exactly an existing backend name: `claude-code`, `cursor`, `gemini`, `anthropic`, `ollama`, `ollama-cloud`. There is no separate vendor concept.
+- **Provider == backend name.** The provider token is exactly an existing backend name: `claude-code`, `cursor`, `antigravity`, `anthropic`, `ollama`, `ollama-cloud`. There is no separate vendor concept.
 - **Slug format:** `provider/model`, split on the **first** `/` only. The model half may itself contain `/` (e.g. `ollama/hf.co/user/repo`) and `:` (e.g. `ollama-cloud/gpt-oss:120b`). Matching is case-insensitive, consistent with the existing scheduler.
 - **Agnostic keywords keep working:** `auto`, `max`, `default`, `""` are *not* qualified and never carry a provider. The worker resolves them to a concrete qualified id at execution.
 - **One worker, many providers:** a worker’s providers are derived from the set of qualified models it advertises. The hard single-`backend` field is removed.

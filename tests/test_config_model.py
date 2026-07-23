@@ -236,16 +236,16 @@ class TestRoundTrip:
         original = WorkerConfig(
             workspace=workspace,
             worker_id="test-1",
-            models=["gemini/gemini-2.5-pro"],
-            auto_model="gemini/gemini-2.5-flash",
-            max_model="gemini/gemini-2.5-pro",
+            models=["antigravity/gemini-3.1-pro-high"],
+            auto_model="antigravity/gemini-3.5-flash-low",
+            max_model="antigravity/gemini-3.1-pro-high",
         )
         save_worker_config(workspace, original)
         loaded = load_worker_config(workspace)
 
         assert loaded.worker_id == "test-1"
-        assert loaded.models == ["gemini/gemini-2.5-pro"]
-        assert loaded.auto_model == "gemini/gemini-2.5-flash"
+        assert loaded.models == ["antigravity/gemini-3.1-pro-high"]
+        assert loaded.auto_model == "antigravity/gemini-3.5-flash-low"
         assert loaded.ui_port == 8810
 
     def test_player_round_trip(self, workspace: Path):

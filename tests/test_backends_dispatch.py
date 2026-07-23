@@ -78,13 +78,13 @@ def test_stream_subprocess_kills_on_timeout(tmp_path: Path) -> None:
 def test_backend_registry_and_selection() -> None:
     names = backends_mod.backend_names()
     assert names == [
-        "claude-code", "cursor", "gemini", "anthropic", "ollama", "ollama-cloud",
+        "claude-code", "cursor", "antigravity", "anthropic", "ollama", "ollama-cloud",
         "nightshift",
     ]
 
     # Known name resolves; unknown/empty falls back to the default (claude-code).
     assert backends_mod.get_backend("cursor").name == "cursor"
-    assert backends_mod.get_backend("gemini").name == "gemini"
+    assert backends_mod.get_backend("antigravity").name == "antigravity"
     assert backends_mod.get_backend(None).name == "claude-code"
     assert backends_mod.get_backend("nope").name == "claude-code"
     assert backends_mod.get_backend("nightshift").name == "nightshift"
@@ -92,7 +92,7 @@ def test_backend_registry_and_selection() -> None:
 
     described = {b["name"]: b for b in backends_mod.list_backends({})}
     assert described["claude-code"]["agentic"] is True
-    assert described["gemini"]["agentic"] is True  # Gemini CLI edits files
+    assert described["antigravity"]["agentic"] is True  # agy edits files
     assert described["anthropic"]["agentic"] is False
     assert described["ollama"]["agentic"] is False
     assert described["ollama-cloud"]["agentic"] is False
@@ -101,6 +101,8 @@ def test_backend_registry_and_selection() -> None:
 
 def test_backend_availability_gating(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(backends_mod.shutil, "which", lambda name: None)
+    # Antigravity also probes EXTRA_BIN_DIRS on disk (agy lives in ~/.local/bin).
+    monkeypatch.setattr(backends_mod.prompts, "EXTRA_BIN_DIRS", ())
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     assert backends_mod.ClaudeCodeBackend().available({}) is False
     assert backends_mod.ClaudeCodeBackend().available({"claude_bin": "/x/claude"}) is True
@@ -110,51 +112,29 @@ def test_backend_availability_gating(monkeypatch: pytest.MonkeyPatch) -> None:
     assert backends_mod.AnthropicBackend().available({}) is True
     # Ollama is usable when a host is configured even without the CLI on PATH.
     assert backends_mod.OllamaBackend().available({"ollama_host": "http://h"}) is True
-    # Gemini needs the CLI (or an explicit bin) on the worker.
-    assert backends_mod.GeminiCLIBackend().available({}) is False
-    assert backends_mod.GeminiCLIBackend().available({"gemini_bin": "/x/gemini"}) is True
+    # Antigravity needs the agy CLI (or an explicit bin) on the worker.
+    assert backends_mod.AntigravityBackend().available({}) is False
+    assert backends_mod.AntigravityBackend().available({"antigravity_bin": "/x/agy"}) is True
 
 
-def test_gemini_argv_and_stats_parse() -> None:
-    argv = backends_mod.build_gemini_argv("do it", "gemini-2.5-pro", {})
-    assert argv[0] == "gemini"
+def test_antigravity_argv() -> None:
+    argv = backends_mod.build_antigravity_argv("do it", "gemini-3.1-pro-high", {})
+    assert argv[0] == "agy"
     assert argv[argv.index("-p") + 1] == "do it"  # prompt is the -p value
-    assert "--yolo" in argv  # headless auto-approve of edit/shell tools
-    assert argv[argv.index("--output-format") + 1] == "json"
-    assert argv[argv.index("--model") + 1] == "gemini-2.5-pro"
+    assert "--dangerously-skip-permissions" in argv  # headless auto-approve
+    assert argv[argv.index("--model") + 1] == "gemini-3.1-pro-high"
     # auto/max are worker keywords, not real model ids → no --model flag.
-    assert "--model" not in backends_mod.build_gemini_argv("x", "auto", {})
-    # cursor_model-style override.
-    custom = backends_mod.build_gemini_argv("x", "auto", {"gemini_model": "gemini-2.5-flash"})
-    assert custom[custom.index("--model") + 1] == "gemini-2.5-flash"
-
-    # Telemetry mined from the end-of-run JSON blob's stats.models[*].
-    stats = backends_mod.parse_gemini_stats({
-        "response": "done",
-        "stats": {"models": {"gemini-2.5-pro": {
-            "api": {"totalRequests": 4},
-            "tokens": {"prompt": 1000, "cached": 200, "candidates": 300},
-        }}},
-    })
-    assert stats["turns"] == 4
-    assert stats["input_tokens"] == 1200   # prompt + cached
-    assert stats["output_tokens"] == 300   # candidates
-    assert stats["cost_usd"] is None       # Gemini CLI reports no dollar cost
-    # Gemini's "cached" figure is a cache *read* only — no write concept.
-    assert stats["cache_read_input_tokens"] == 200
-    assert stats["cache_creation_input_tokens"] is None
-    # The raw stats.models subtree rides along (keeps thoughts/tool detail).
-    assert stats["usage"] == {"gemini-2.5-pro": {
-        "api": {"totalRequests": 4},
-        "tokens": {"prompt": 1000, "cached": 200, "candidates": 300},
-    }}
-
-
-def test_gemini_stats_parse_with_no_models_reports_no_cache_activity() -> None:
-    stats = backends_mod.parse_gemini_stats({"response": "done"})
-    assert stats["turns"] is None
-    assert stats["cache_read_input_tokens"] is None
-    assert stats["usage"] is None
+    assert "--model" not in backends_mod.build_antigravity_argv("x", "auto", {})
+    # antigravity_model-style override.
+    custom = backends_mod.build_antigravity_argv(
+        "x", "auto", {"antigravity_model": "gemini-3.5-flash-low"},
+    )
+    assert custom[custom.index("--model") + 1] == "gemini-3.5-flash-low"
+    # Session resume maps to --conversation.
+    resumed = backends_mod.build_antigravity_argv(
+        "x", "gemini-3.5-flash-low", {"resume_session_id": "abc-123"},
+    )
+    assert resumed[resumed.index("--conversation") + 1] == "abc-123"
 
 
 def test_usage_cache_tokens_distinguishes_unreported_from_zero() -> None:

@@ -399,7 +399,7 @@ NIGHTSHIFT_MANAGER_URL=http://localhost:8800
 # NIGHTSHIFT_PG_DSN=postgresql://nightshift@localhost:5432/nightshift
 # Backend credentials (whichever backend you run):
 # ANTHROPIC_API_KEY=
-# GEMINI_API_KEY=
+# antigravity: authenticate with `agy` (Google OAuth); no API key env var.
 ```
 
 > The samples are illustrative; the *authoritative* defaults are the dataclass defaults (§7). The regex lists here are abbreviated — keep them short and point at the reference for the full set. JSON has no comments, so per-key guidance lives in the docs (§11) and the registry (Part 2).

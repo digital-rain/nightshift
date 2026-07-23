@@ -1,7 +1,7 @@
 # AGENTS.md
 
 Guidance for AI coding agents in this repo.
-Read by Cursor, Claude Code (`CLAUDE.md` → this file), and Gemini CLI (`GEMINI.md` → this file).
+Read by Cursor, Claude Code (`CLAUDE.md` → this file), and Antigravity CLI (`agy` reads `AGENTS.md` / `GEMINI.md`).
 Keep this file small; it is loaded on every run.
 Push detail into the linked docs below.
 

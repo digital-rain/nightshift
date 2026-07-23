@@ -8,7 +8,7 @@ token usage can report a cost.
 
 Honesty over coverage: an unknown model returns ``None`` (not a guessed
 zero), so a missing price is visibly missing rather than silently understated.
-Ollama/Gemini stay ``None`` because there is no meaningful public per-token
+Ollama/Antigravity stay ``None`` because there is no meaningful public per-token
 price to apply.
 
 Rates are **USD per million tokens**. Cache economics follow Anthropic's

@@ -4,7 +4,7 @@ A pull-based overnight agent task runner.
 
 You write task briefs — markdown files with a little frontmatter.
 A **manager** owns the queues, the canonical briefs, the centralized config, Postgres-backed state, and the git landing authority.
-One or more **workers** poll the manager, execute each task with a coding agent (Claude Code, Cursor, Gemini CLI, or a raw API model), validate the result, and squash-submit it back for the manager to land on `main`.
+One or more **workers** poll the manager, execute each task with a coding agent (Claude Code, Cursor, Antigravity, or a raw API model), validate the result, and squash-submit it back for the manager to land on `main`.
 You wake up to validated, landed commits — or to a precise record of what blocked.
 
 ```mermaid
@@ -19,7 +19,7 @@ flowchart LR
 
 - **Pull-based routing** — a worker advertises its capabilities (queues, priorities, models, MCP connectors) on every poll, and the manager hands back the first runnable task that fits.
 - **Manager-owned git authority** — workers only ever produce commits on isolated task branches in git worktrees; the manager is the sole writer to `main`, with conflict detection, a landing lock, and an optional push/PR remote policy.
-- **Multiple backends** — Claude Code, Cursor, and Gemini CLI as agentic backends; the Anthropic API and Ollama (local or cloud) as single-shot backends; plus an in-house agentic harness.
+- **Multiple backends** — Claude Code, Cursor, and Antigravity CLI as agentic backends; the Anthropic API and Ollama (local or cloud) as single-shot backends; plus an in-house agentic harness.
 - **Validation as the trust boundary** — every run must pass your validate command (default `just validate`, per-queue override) before it can land.
 - **Operator UI** — live queue / run / worker views over SSE, per-model / backend / queue analytics, and in-browser settings editing.
 - **Cross-machine workers** — a remote worker pushes its validated branch to a rendezvous remote; the manager fetches, verifies the SHA fail-closed, and lands.
@@ -100,7 +100,7 @@ Install only the tooling for the providers you advertise:
 
 - `claude-code` — the `claude` CLI on `PATH` (agentic).
 - `cursor` — the `cursor-agent` CLI on `PATH` (agentic).
-- `gemini` — the `gemini` CLI on `PATH`, with an authenticated account or `GEMINI_API_KEY` (agentic).
+- `antigravity` — the `agy` CLI on `PATH`, with an authenticated Google account (agentic; successor to Gemini CLI).
 - `anthropic` — `ANTHROPIC_API_KEY` set (single-shot API, no CLI).
 - `ollama` — the `ollama` CLI on `PATH` or a reachable Ollama daemon (single-shot API).
 - `ollama-cloud` — `OLLAMA_API_KEY` for cloud-hosted models on `ollama.com` (single-shot API).

@@ -71,11 +71,10 @@ Only `NIGHTSHIFT_WORKSPACE` is strictly required for a local setup (and only whe
 | `NIGHTSHIFT_PG_DSN` | Recommended | (in-memory) | Postgres DSN for durable state. Omit for the ephemeral in-memory store. |
 | `NIGHTSHIFT_SHARED_SECRET` | If remote | — | Shared secret protecting the manager's worker API. Must match on both sides. |
 | `ANTHROPIC_API_KEY` | `anthropic` backend, harness, or enhance-on-create | — | Anthropic API key. |
-| `GEMINI_API_KEY` | `gemini` backend (unless the CLI account is authenticated) | — | Gemini API key. |
 | `OLLAMA_API_KEY` | `ollama-cloud` backend | — | Ollama Cloud API key (create at `https://ollama.com/settings/keys`). Sent as a Bearer token to `https://ollama.com`. |
 | `OLLAMA_HOST` | No | `http://localhost:11434` | Local Ollama daemon address (harness `ollama` vendor). |
 
-Backend CLIs (`claude`, `cursor-agent`, `gemini`, `ollama`) are resolved from `PATH`, with a fallback scan of the common install dirs a non-login shell misses (`~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`).
+Backend CLIs (`claude`, `cursor-agent`, `agy`, `ollama`) are resolved from `PATH`, with a fallback scan of the common install dirs a non-login shell misses (`~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`). The `antigravity` backend authenticates via the Antigravity CLI's Google OAuth (`agy` login) — there is no API-key env var.
 
 **Minimal working `.env`** (single box, `claude-code` backend, Postgres):
 
@@ -271,7 +270,7 @@ At execution the worker resolves the work order's model:
 
 The provider portion of the resolved model id determines which backend executes the task. A single worker can serve multiple providers simultaneously (e.g. `claude-code` and `ollama-cloud`) by advertising models from each.
 
-There is no vendor-mismatch failure: capability routing only ever hands a worker a model it advertised. Use `model_aliases` to absorb upgrades, sunsets, and cross-vendor naming (e.g. `{"gemini-3-pro": "gemini/gemini-3-pro-002"}`).
+There is no vendor-mismatch failure: capability routing only ever hands a worker a model it advertised. Use `model_aliases` to absorb upgrades, sunsets, and cross-vendor naming (e.g. `{"gemini-3-pro": "antigravity/gemini-3.1-pro-high"}`).
 
 Model keywords `auto`, `max`, and `default` are **agnostic** — any worker may serve them; each worker resolves them to its own configured `auto_model` / `max_model`.
 
@@ -283,7 +282,7 @@ A worker can serve multiple providers concurrently. The provider is chosen per t
 |---|---|---|---|
 | `claude-code` | Agentic CLI | `claude` on `PATH` | turns + tokens + cost from `stream-json` |
 | `cursor` | Agentic CLI | `cursor-agent` on `PATH` | turns + tokens from `stream-json` |
-| `gemini` | Agentic CLI | `gemini` on `PATH` + authenticated account / `GEMINI_API_KEY` | turns + tokens from end-of-run JSON (no live stream, no cost) |
+| `antigravity` | Agentic CLI | `agy` on `PATH` + authenticated Google account | live text stream (no turn/token/cost telemetry) |
 | `anthropic` | Single-shot API | `ANTHROPIC_API_KEY` | token counts with `turns=1` |
 | `ollama` | Single-shot API | `ollama` on `PATH` / a local daemon | token counts with `turns=1`, no dollar cost |
 | `ollama-cloud` | Single-shot API | `OLLAMA_API_KEY` (cloud-hosted on `ollama.com`) | token counts with `turns=1`, no dollar cost |

@@ -7,7 +7,7 @@
 #                   `nightshift` role + database for durable manager state.
 #                   Opens UFW port 5432 to the local subnet.
 #   --with-claude   Install Node + the Claude Code CLI (the default worker
-#                   backend). Other backends (cursor/gemini/ollama) are BYO.
+#                   backend). Other backends (cursor/antigravity/ollama) are BYO.
 #
 # Usage:
 #   ./provision.sh [--with-db] [--with-claude] [--repo=PATH] [--pg-version=NN]

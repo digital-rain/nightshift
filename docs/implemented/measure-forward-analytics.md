@@ -43,7 +43,7 @@ cost_of(model: str | None, usage: dict | None) -> float | None
 - Rates are **USD per million tokens**, keyed on a normalized model name.
 - `normalize_model` peels `provider/` prefixes — including the harness's double segment (`nightshift/anthropic/claude-…`) — lowercases, and drops a trailing 8-digit `-YYYYMMDD` date stamp.
 - Cache economics follow Anthropic's published multipliers: a cache **write** (creation) bills at **1.25×** the base input rate, a cache **read** at **0.1×**. `usage.input_tokens` is the *uncached* input (Anthropic reports the cache splits separately), so the three input components are additive and priced distinctly.
-- **Unknown model → `None`, not a guessed zero.** A missing price is visibly missing. Ollama/Gemini have no meaningful public per-token price, so they stay `None`, and the analytics UI is built to handle missing cost.
+- **Unknown model → `None`, not a guessed zero.** A missing price is visibly missing. Ollama/Antigravity have no meaningful public per-token price, so they stay `None`, and the analytics UI is built to handle missing cost.
 
 ```
 input_cost  = uncached·rate_in
@@ -128,7 +128,7 @@ All views are filterable by **time window** (24h / 7d / 30d / all) and by **dime
 
 ### 3.4 Missing-data honesty
 
-Because Ollama/Gemini report no cost, every cost figure guards on presence: a group with no priced runs shows `—`, not `$0.00`. Token throughput uses `input_tokens` directly (which already folds cache tokens in), so cache splits are never double-counted.
+Because Ollama/Antigravity report no cost, every cost figure guards on presence: a group with no priced runs shows `—`, not `$0.00`. Token throughput uses `input_tokens` directly (which already folds cache tokens in), so cache splits are never double-counted.
 
 ---
 
@@ -182,7 +182,7 @@ There is intentionally **little to configure** — the analytics UI is derived f
 ### 7.1 What's automatic
 
 - **Both Statistics pages** work with no setup. The manager reads the fleet's `attempts`; the worker reads its local `runs.jsonl`. No flags, no migration beyond the token-usage-granularity migration that already added the cache/`usage` columns.
-- **Cost appears automatically** for priced models. Anthropic models (harness or single-shot) and Claude Code runs report `cost_usd`. Ollama/Gemini runs correctly show no cost.
+- **Cost appears automatically** for priced models. Anthropic models (harness or single-shot) and Claude Code runs report `cost_usd`. Ollama/Antigravity runs correctly show no cost.
 - **Theme** follows the host UI's light/dark toggle — `analytics.css` uses the shared theme variables from `style.css`.
 
 ### 7.2 The one thing you maintain: the price table

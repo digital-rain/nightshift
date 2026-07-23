@@ -159,7 +159,7 @@ The manager serves the operator UI as static files from `src/nightshift/assets/u
 | `repo_tasks.py` | Repo task import: drain a target repo's `.tasks/` publishing inbox into its queue (scan the `main` tree in both legacy layouts, copy to the content store, remove from repo `main` via the landing pipeline) |
 | `preflight.py`, `prompts.py` | Run preconditions, env sync, prompt building |
 | `resolve_runner.py` | Conflict-resolve driver run by the manager's out-of-process resolve job |
-| `backends.py` | Pluggable backend shims: `claude-code`, `cursor`, `gemini`, `anthropic`, `ollama`, `ollama-cloud`, `nightshift` |
+| `backends.py` | Pluggable backend shims: `claude-code`, `cursor`, `antigravity`, `anthropic`, `ollama`, `ollama-cloud`, `nightshift` |
 | `agent/` | The in-house `nightshift` agentic harness: tool loop, tools, API transport |
 | `model_id.py` | Provider-qualified model id parsing (`provider/model`) |
 | `price.py` | Owned price table — per-run `cost_usd` for harness/Anthropic runs |

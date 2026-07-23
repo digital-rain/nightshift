@@ -272,7 +272,7 @@ def build_doc_prompt(task: str, *, prompt_asset: str, task_file: str,
 #   materialized artifacts in the header ("The PLAN file is: <path>")
 
 # backends.py — each backend class gains a class attr:
-    tool_capable: bool   # True: claude-code, cursor, gemini, nightshift; False: anthropic, ollama, ollama-cloud
+    tool_capable: bool   # True: claude-code, cursor, antigravity, nightshift; False: anthropic, ollama, ollama-cloud
 ```
 
 **Worker branch in `execute_work_order`** (after backend resolution, before the existing worktree setup): when `order["config"]["workflow"]["kind"] == "doc"`:

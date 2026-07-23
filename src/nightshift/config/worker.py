@@ -26,7 +26,7 @@ DEFAULT_MAX_MODEL = "claude-code/claude-opus-4-8"
 # Agentic-CLI providers whose runs the harness re-routes when the toggle is on
 # (Phase 8). Non-agentic API providers (anthropic/ollama/ollama-cloud single-shot)
 # and an already-nightshift id are never rewritten.
-_AGENTIC_CLI_PROVIDERS = frozenset({"claude-code", "cursor", "gemini"})
+_AGENTIC_CLI_PROVIDERS = frozenset({"claude-code", "cursor", "antigravity"})
 
 
 @dataclass
@@ -201,7 +201,7 @@ class WorkerConfig:
         """Re-route an agentic-CLI model to the harness when the toggle is on.
 
         The single Phase 8 routing seam. When ``nightshift.enabled`` is true and
-        ``qualified`` names an agentic-CLI provider (claude-code/cursor/gemini),
+        ``qualified`` names an agentic-CLI provider (claude-code/cursor/antigravity),
         rewrite it to ``nightshift/<vendor>/<model>``. Off (the default) it is a
         byte-identical no-op; non-agentic-CLI and already-``nightshift/`` ids pass
         through untouched. If the harness vendor backend is unavailable, the

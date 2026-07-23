@@ -9,7 +9,8 @@ These are registered:
 
 - ``claude-code``   — Claude Code CLI (default; fully **agentic**: edits files, runs bash).
 - ``cursor``        — Cursor's headless agent (``cursor-agent``; **agentic**).
-- ``gemini``        — Google's Gemini CLI (``gemini``; **agentic**).
+- ``antigravity``   — Google Antigravity CLI (``agy``; **agentic**). Successor to
+  the deprecated Gemini CLI.
 - ``anthropic``     — the Anthropic Messages API directly (**single-shot completion**,
   NOT agentic — it streams a model response but does not edit files).
 - ``ollama``        — a local Ollama model (**single-shot completion**, NOT agentic).
@@ -96,8 +97,8 @@ class WorkerResult:
     (Anthropic-shaped; ``None`` when the backend doesn't report cache activity
     at all — Ollama, or an Anthropic call with no cache breakpoints). ``usage``
     is the raw vendor-shaped usage payload (per-turn detail for the harness,
-    per-model splits for Claude Code, thinking/tool tokens for Gemini, …),
-    kept for detail beyond what the normalized columns hold.
+    per-model splits for Claude Code, …), kept for detail beyond what the
+    normalized columns hold.
     """
 
     returncode: int
@@ -340,138 +341,25 @@ def _stream_subprocess(
     return parser.apply(result, model) if parser is not None else result
 
 
-def _run_buffered(
-    argv: list[str],
-    *,
-    cwd: Path,
-    env: dict[str, str],
-    should_abort: ShouldAbort,
-    on_start: OnWorkerStart | None = None,
-    timeout: float | None = None,
-) -> tuple[int, str, str | None, str | None]:
-    """Run ``argv`` to completion, **buffering** combined stdout/stderr instead of
-    streaming it. Returns ``(returncode, output, aborted_reason, launch_error)``.
+def build_antigravity_argv(prompt: str, model: str, config: dict[str, Any]) -> list[str]:
+    """Argv for the Antigravity CLI (``agy``) headless run.
 
-    Used by backends whose telemetry only arrives as a single end-of-run JSON
-    blob (Gemini CLI ``--output-format json``), where line streaming would split
-    the JSON. Abort polling + process-group kill match :func:`_stream_subprocess`.
+    ``-p`` / ``--print`` / ``--prompt`` take the prompt as the flag's value
+    (non-interactive print mode). ``--dangerously-skip-permissions`` auto-approves
+    tool calls so a headless run doesn't hang on approval (Gemini CLI's ``--yolo``
+    successor). There is no structured ``--output-format``; stdout is plain text
+    streamed live. ``antigravity_model`` overrides the model;
+    ``antigravity_extra_args`` appends extra flags. ``resume_session_id`` maps to
+    ``--conversation``.
     """
-    try:
-        proc = subprocess.Popen(
-            argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True,
-        )
-    except (FileNotFoundError, OSError) as exc:
-        return LAUNCH_FAILED, "", None, f"could not launch worker ({argv[0]!r}): {exc}"
-    if on_start is not None:
-        on_start(proc.pid)
-    assert proc.stdout is not None
-    chunks: list[str] = []
-    aborted: dict[str, str | None] = {"reason": None}
-    done = threading.Event()
-    deadline = (time.monotonic() + timeout) if timeout and timeout > 0 else None
-
-    def _watch_abort() -> None:
-        while not done.wait(0.25):
-            reason = should_abort()
-            if reason is None and deadline is not None and time.monotonic() > deadline:
-                reason = "timeout"
-            if reason is not None:
-                aborted["reason"] = reason
-                preflight.kill_process_group(proc)
-                return
-
-    watcher = threading.Thread(target=_watch_abort, daemon=True)
-    watcher.start()
-    try:
-        for line in proc.stdout:
-            chunks.append(line)
-            reason = should_abort()
-            if reason is None and deadline is not None and time.monotonic() > deadline:
-                reason = "timeout"
-            if reason is not None:
-                aborted["reason"] = reason
-                preflight.kill_process_group(proc)
-                break
-        returncode = proc.wait()
-    finally:
-        done.set()
-        watcher.join(timeout=1)
-    return returncode, "".join(chunks), aborted["reason"], None
-
-
-def _extract_json_object(text: str) -> dict[str, Any] | None:
-    """Best-effort parse of a JSON object from ``text`` that may carry leading
-    warnings/log noise before the blob. Returns ``None`` if nothing parses."""
-    text = text.strip()
-    if not text:
-        return None
-    try:
-        obj = json.loads(text)
-        return obj if isinstance(obj, dict) else None
-    except json.JSONDecodeError:
-        pass
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end <= start:
-        return None
-    try:
-        obj = json.loads(text[start : end + 1])
-        return obj if isinstance(obj, dict) else None
-    except json.JSONDecodeError:
-        return None
-
-
-def parse_gemini_stats(data: dict[str, Any]) -> dict[str, Any]:
-    """Pull turns/token telemetry from a Gemini CLI ``--output-format json`` blob.
-
-    The ``stats.models[*]`` map carries per-model ``api`` (request counts) and
-    ``tokens`` (prompt/candidates/cached/…). Turns ≈ total model API requests;
-    input folds prompt + cached, output uses candidate (response) tokens.
-    Gemini's ``cached`` figure is a cache *read* count (there's no cache-write
-    concept in its API, so ``cache_creation_input_tokens`` stays ``None``).
-    Gemini reports no dollar cost, so ``cost_usd`` stays ``None``. The raw
-    ``stats.models`` subtree rides along in ``usage`` — it also carries
-    ``thoughts``/``tool`` token counts the normalized fields don't hold.
-    """
-    models = (data.get("stats") or {}).get("models") or {}
-    turns = 0
-    inp = 0
-    out = 0
-    cache_read = 0
-    for m in models.values():
-        if not isinstance(m, dict):
-            continue
-        turns += int((m.get("api") or {}).get("totalRequests", 0) or 0)
-        tok = m.get("tokens") or {}
-        cached = int(tok.get("cached", 0) or 0)
-        inp += int(tok.get("prompt", 0) or 0) + cached
-        out += int(tok.get("candidates", tok.get("response", 0)) or 0)
-        cache_read += cached
-    return {
-        "turns": turns or None,
-        "input_tokens": inp or None,
-        "output_tokens": out or None,
-        "cache_read_input_tokens": cache_read if models else None,
-        "cache_creation_input_tokens": None,
-        "usage": models or None,
-        "cost_usd": None,
-    }
-
-
-def build_gemini_argv(prompt: str, model: str, config: dict[str, Any]) -> list[str]:
-    """Argv for the Gemini CLI (``gemini``) headless run.
-
-    ``-p`` is headless/non-interactive (prompt is the flag's value); ``--yolo``
-    auto-approves the agent's edit/shell tools so a headless run doesn't hang on
-    approval; ``--output-format json`` makes the CLI print a final JSON blob with
-    a ``stats`` block we mine for telemetry. ``gemini_model`` overrides the model;
-    ``gemini_extra_args`` appends extra flags.
-    """
-    model = config.get("gemini_model") or model
-    argv = ["gemini", "-p", prompt, "--yolo", "--output-format", "json"]
+    model = config.get("antigravity_model") or model
+    argv = ["agy", "-p", prompt, "--dangerously-skip-permissions"]
     if model and model not in ("auto", "max"):
         argv += ["--model", model]
-    extra = config.get("gemini_extra_args")
+    resume = config.get("resume_session_id")
+    if resume:
+        argv += ["--conversation", str(resume)]
+    extra = config.get("antigravity_extra_args")
     if extra:
         argv += list(extra)
     return argv
@@ -561,18 +449,28 @@ class CursorAgentBackend:
         )
 
 
-class GeminiCLIBackend:
-    name = "gemini"
+class AntigravityBackend:
+    name = "antigravity"
     agentic = True
     tool_capable = True
     description = (
-        "Google Gemini CLI (gemini) — agentic (edits files, runs tools via "
-        "--yolo). Direct vendor path for comparing against Gemini-via-Cursor. "
-        "Requires the Gemini CLI + an authenticated account / GEMINI_API_KEY."
+        "Google Antigravity CLI (agy) — agentic (edits files, runs tools via "
+        "--dangerously-skip-permissions). Successor to the deprecated Gemini CLI. "
+        "Requires the agy binary + an authenticated Google account (`agy` login)."
     )
 
     def available(self, config: dict[str, Any] | None = None) -> bool:
-        return bool(shutil.which("gemini") or (config or {}).get("gemini_bin"))
+        cfg = config or {}
+        if cfg.get("antigravity_bin"):
+            return True
+        if shutil.which("agy") or shutil.which("antigravity"):
+            return True
+        # Install script drops `agy` in ~/.local/bin, which non-login shells
+        # (and therefore shutil.which alone) often miss.
+        for d in prompts.EXTRA_BIN_DIRS:
+            if (Path(d) / "agy").exists() or (Path(d) / "antigravity").exists():
+                return True
+        return False
 
     def run(
         self,
@@ -581,43 +479,25 @@ class GeminiCLIBackend:
         should_abort: ShouldAbort,
         on_worker_start: OnWorkerStart | None = None,
     ) -> WorkerResult:
-        argv = build_gemini_argv(spec.prompt, spec.model, spec.config)
-        argv[0] = resolve_bin("gemini", spec.config.get("gemini_bin"))
-        # Gemini's JSON telemetry only arrives as one end-of-run blob, so unlike
-        # the stream-json backends the readable output is shown on completion.
-        emit_log(
-            f"  [gemini] {spec.model}: buffered JSON run "
-            "(telemetry-rich; response shown on completion)\n"
-        )
-        rc, output, aborted, launch_err = _run_buffered(
-            argv, cwd=spec.cwd, env=spec.env,
+        argv = build_antigravity_argv(spec.prompt, spec.model, spec.config)
+        override = spec.config.get("antigravity_bin")
+        # Prefer the installed `agy` binary; fall back to an `antigravity` alias
+        # if an operator has one on PATH (or an explicit override).
+        if override:
+            argv[0] = resolve_bin("agy", override)
+        elif shutil.which("agy"):
+            argv[0] = resolve_bin("agy", None)
+        else:
+            argv[0] = resolve_bin("antigravity", None)
+        # Plain-text print mode — stream live; no turn/token/cost telemetry from
+        # the CLI (cost_usd stays None, same as the old Gemini path).
+        return _stream_subprocess(
+            argv, cwd=spec.cwd, env=spec.env, emit_log=emit_log,
             should_abort=should_abort, on_start=on_worker_start,
+            parser=None,
             timeout=spec.timeout,
+            model=spec.model,
         )
-        if launch_err is not None:
-            return WorkerResult(returncode=LAUNCH_FAILED, error=launch_err)
-        if aborted is not None:
-            return WorkerResult(returncode=0, aborted=aborted)
-
-        data = _extract_json_object(output)
-        if data is not None:
-            response = data.get("response")
-            if response:
-                emit_log(str(response) + "\n")
-            tele = parse_gemini_stats(data)
-            error = data.get("error") if isinstance(data.get("error"), dict) else None
-            if rc != 0 and error:
-                return WorkerResult(
-                    returncode=rc or 1,
-                    error=f"gemini {error.get('type', 'error')}: {error.get('message', '')}".strip(),
-                    **tele,
-                )
-            return WorkerResult(returncode=rc, **tele)
-
-        # No parseable JSON (e.g. an older CLI without --output-format) — surface
-        # the raw output so the operator still sees what happened.
-        emit_log(output)
-        return WorkerResult(returncode=rc)
 
 
 class AnthropicBackend:
@@ -980,7 +860,7 @@ class NightshiftAgentBackend:
 _BACKENDS: tuple[Any, ...] = (
     ClaudeCodeBackend(),
     CursorAgentBackend(),
-    GeminiCLIBackend(),
+    AntigravityBackend(),
     AnthropicBackend(),
     OllamaBackend(),
     OllamaCloudBackend(),

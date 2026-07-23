@@ -8,7 +8,7 @@
 
 ## 0. The one idea
 
-Nightshift already has a pluggable backend seam: a worker runs exactly one backend (`claude-code` / `cursor` / `gemini` / `anthropic` / `ollama`), and the engine picks it by name.
+Nightshift already has a pluggable backend seam: a worker runs exactly one backend (`claude-code` / `cursor` / `antigravity` / `anthropic` / `ollama`), and the engine picks it by name.
 Two of those — `anthropic` and `ollama` — talk to a model API directly but are **single-shot and non-agentic**: they stream one completion and never edit files.
 Their own module docstring says they exist "to give a foundation for a future tool loop."
 

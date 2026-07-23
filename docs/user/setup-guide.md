@@ -27,7 +27,7 @@ flowchart LR
 - At least one backend's tooling is available on the worker machine (you only need the ones whose models you advertise):
   - `claude-code` — the `claude` CLI on `PATH`.
   - `cursor` — the `cursor-agent` CLI on `PATH`.
-  - `gemini` — the `gemini` CLI on `PATH`, with an authenticated account or `GEMINI_API_KEY`.
+  - `antigravity` — the `agy` CLI on `PATH`, with an authenticated Google account (`agy` login).
   - `anthropic` — `ANTHROPIC_API_KEY` set (single-shot API backend, no CLI).
   - `ollama` — the `ollama` CLI on `PATH` (a local daemon at `http://localhost:11434`).
   - `ollama-cloud` — `OLLAMA_API_KEY` set (cloud-hosted models on `ollama.com`).
@@ -191,7 +191,7 @@ Both workers now poll the same manager. Because the first advertises `claude-cod
 ```bash
 NIGHTSHIFT_MANAGER_URL=http://manager-host:8800
 NIGHTSHIFT_WORKER_ID=box-2
-NIGHTSHIFT_WORKER_MODELS=gemini/gemini-3-pro,gemini/gemini-2.5-flash
+NIGHTSHIFT_WORKER_MODELS=antigravity/gemini-3.1-pro-high,antigravity/gemini-3.5-flash-low
 # Must match the manager's secret if one is set:
 NIGHTSHIFT_SHARED_SECRET=...
 # Cross-machine landing: the git remote (resolved in each repo) this worker

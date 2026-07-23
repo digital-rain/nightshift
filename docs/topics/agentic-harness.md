@@ -10,7 +10,7 @@ Related: `docs/spec/agentic-backend.md` (design), `docs/spec/measure-forward-ana
 
 ## 1. What it is, in one idea
 
-Nightshift routes work by **provider-qualified model id** — `<provider>/<model>`, where the provider token is a backend name. The agentic CLI backends (`claude-code`, `cursor`, `gemini`) shell out to a vendor CLI we don't control; the plain API backends (`anthropic`, `ollama`, `ollama-cloud`) stream a single completion and edit nothing.
+Nightshift routes work by **provider-qualified model id** — `<provider>/<model>`, where the provider token is a backend name. The agentic CLI backends (`claude-code`, `cursor`, `antigravity`) shell out to a vendor CLI we don't control; the plain API backends (`anthropic`, `ollama`, `ollama-cloud`) stream a single completion and edit nothing.
 
 The **`nightshift` provider** is a third thing: an **in-process agentic harness we own end to end**. It talks to the model APIs Nightshift already reaches (`anthropic`, `ollama-cloud`, `ollama`) over `httpx`, runs its **own tool loop**, and applies edits **deterministically in Python** (no apply-model round-trip). Its model id carries a *second* vendor segment:
 
