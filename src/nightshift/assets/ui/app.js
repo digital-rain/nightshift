@@ -3480,6 +3480,17 @@ function playlistMenuButton(pl) {
   return btn;
 }
 
+// Drive a single playlist queue's runner from its "…" menu. These controls act
+// on only that queue (never the focused/main queue): the server's transport
+// endpoint takes an explicit `queue`, so we target the row's own name and leave
+// the current focus and view untouched — the per-queue running badges on this
+// screen update from the returned/streamed state.
+async function playlistTransport(action, name) {
+  const { data } = await sendJSON("/api/transport", "POST",
+    { action, mode: getMode(), queue: name });
+  if (data && data.state) ingestState(data);
+}
+
 // Open the floating menu for a playlist row, reusing the shared rowMenuEl so
 // outside-click/Escape/scroll dismiss works identically.
 function openPlaylistMenu(anchor, pl) {
@@ -3498,6 +3509,12 @@ function openPlaylistMenu(anchor, pl) {
   menu.setAttribute("role", "menu");
 
   const items = [
+    // Basic player controls scoped to this one queue.
+    { label: "Play", act: () => playlistTransport("play", pl.name) },
+    { label: "Pause", act: () => playlistTransport("pause", pl.name) },
+    { label: "Stop", act: () => playlistTransport("stop", pl.name) },
+    { label: "Skip", act: () => playlistTransport("skip", pl.name) },
+    { divider: true },
     { label: "Get info", act: () => openPlaylistInfo(pl.name), disabled: many },
     { divider: true },
     {
