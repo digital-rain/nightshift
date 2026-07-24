@@ -1550,6 +1550,21 @@ body[data-view="detail"] #screen-detail { display: flex; flex: 1; }
   }
 }
 
+/* The model tag in a history row: a teal-tinted monospace chip, distinct from
+   the accent playlist tag, the neutral repo tag, and the purple workflow tag. */
+.hrow-model {
+  background: #1f3a3a;
+  color: #7fd1c4;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 600;
+}
+@media (prefers-color-scheme: light) {
+  .hrow-model {
+    background: #dcf2ee;
+    color: #1f6f63;
+  }
+}
+
 /* History playlist tag */
 .hrow-tag {
   display: inline-block;

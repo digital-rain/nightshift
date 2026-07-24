@@ -3110,6 +3110,15 @@ function modelRingsChart(byModel) {
   return wrap;
 }
 
+// Compact a recorded model id for a history tag: keep the last "/"-delimited
+// segment so a long "nightshift/anthropic/claude-sonnet-4-6" shows as
+// "claude-sonnet-4-6". Keywords ("auto", "max") have no slash and pass through
+// unchanged. The full id rides along in the tag's title attribute.
+function shortModel(model) {
+  const s = String(model).trim();
+  return s.slice(s.lastIndexOf("/") + 1) || s;
+}
+
 function historyRow(run, task) {
   const row = document.createElement("button");
   row.className = "hrow";
@@ -3147,6 +3156,16 @@ function historyRow(run, task) {
     rtag.textContent = repo;
     rtag.title = `Target repo: ${repo}`;
     title.append(rtag);
+  }
+  // The model that executed the run, as a neutral tag beside the title so the
+  // History list shows *which* model produced each result without opening the
+  // detail pane. Absent on runs that predate the recorded-model column.
+  if (task.model) {
+    const mtag = document.createElement("span");
+    mtag.className = "hrow-tag hrow-model";
+    mtag.textContent = shortModel(task.model);
+    mtag.title = `Model: ${task.model}`;
+    title.append(mtag);
   }
   const meta = document.createElement("div");
   meta.className = "hrow-meta";
