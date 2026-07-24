@@ -657,13 +657,23 @@ def _ollama_generate(
             returncode=1, error=f"{label} request failed: {exc}{error_hint}"
         )
     emit_log("\n")
-    # Token counts but no dollar cost; single-shot → one turn. Ollama reports
-    # no cache split at all (not even a KV-cached-prefix concept in the API),
-    # so cache_read/cache_creation stay None rather than a misleading 0.
+    # Single-shot → one turn. Ollama reports no cache split at all (not even a
+    # KV-cached-prefix concept in the API), so cache_read/cache_creation stay
+    # None rather than a misleading 0. Cost comes from the owned price table
+    # when the model is priced (Ollama Cloud vendor proxies); local/unpriced
+    # models stay an honest None. Map Ollama's prompt_eval/eval counts into
+    # the Anthropic-shaped keys ``cost_of`` expects.
+    priced_usage: dict[str, Any] | None = None
+    if input_tokens is not None or output_tokens is not None:
+        priced_usage = {
+            "input_tokens": int(input_tokens or 0),
+            "output_tokens": int(output_tokens or 0),
+        }
     return WorkerResult(
         returncode=0, turns=1,
         input_tokens=input_tokens, output_tokens=output_tokens,
         usage=usage or None,
+        cost_usd=price.cost_of(model, priced_usage),
     )
 
 
@@ -846,7 +856,7 @@ class NightshiftAgentBackend:
             cache_creation_input_tokens=cache_creation,
             usage=usage_payload or None,
             # Vendor half of the model id (e.g. anthropic/claude-…) prices the
-            # Anthropic path; unknown/Ollama vendors return None (honest).
+            # run; unknown / local-Ollama vendors return None (honest).
             cost_usd=price.cost_of(upstream, loop.usage),
         )
         if loop.error is not None:
