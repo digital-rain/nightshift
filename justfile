@@ -16,13 +16,16 @@ default:
 # ----- setup -----
 
 # Install dependencies into .venv via uv (creates .venv if absent).
+# Include the `dev` extra — `just validate` needs pytest + the lockfile-pinned
+# ruff. Plain `uv sync` would drop them and leave agents free to `pip install
+# ruff` an unpinned newer major that fails the project's lint gate.
 install:
-    uv sync
+    uv sync --extra dev
 
 # Recreate the virtualenv from scratch.
 venv:
     uv venv
-    uv sync
+    uv sync --extra dev
 
 # Scaffold workspace config from shipped templates (idempotent, never clobbers).
 init:

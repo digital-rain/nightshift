@@ -800,7 +800,7 @@ async function loadRuns() {
     // renderHistory, latestRecordFor, and currentTaskRecord all work.
     state.runs = Array.isArray(raw) ? raw.map((r) => ({
       id: r.id,
-      playlist: (r.queue && r.queue !== "main") ? r.queue : null,
+      playlist: r.queue || "main",
       repo: r.repo,
       launched_by: r.launched_by || null,
       started_at: r.started_at,

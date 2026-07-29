@@ -26,7 +26,10 @@ slack = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "ruff>=0.14",
+    # Cap below 0.16: that release broadens the default rule set far past this
+    # project's extend-select posture and fails `just validate` with ~80
+    # pre-existing findings. Bump deliberately once the codebase is cleaned up.
+    "ruff>=0.14,<0.16",
 ]
 
 [project.scripts]
