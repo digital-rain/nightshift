@@ -67,7 +67,11 @@ uncommitted working-tree files are not published yet. Within that tree:
 `POST /api/queue/repo-tasks/import?queue=X`, all manager-side, one import at
 a time (imports are rare, operator-initiated actions):
 
-1. **Scan** (read-only, rules above).
+1. **Scan** (read-only, rules above), then **narrow to the operator's
+   selection** (`select_repo_tasks`) — the briefs they ticked in the modal, or
+   the whole scanned set when the request carries no selection. Everything
+   below operates on the picked subset only: unpicked briefs are neither
+   copied nor removed, so the next preview offers them again.
 2. **Copy into the content store:** write each non-duplicate brief to
    `nightshift-tasks/X/`, append to `order`, commit the content store
    (`nightshift: import N task(s) from R/.tasks`). *After this commit the
@@ -84,7 +88,8 @@ a time (imports are rare, operator-initiated actions):
    - **push `main` to `origin` best-effort.** A failed push keeps the local
      commit and surfaces a warning in the response — never unwound; dedupe
      covers any replay.
-4. Emit `queue_changed`; respond `{imported, deduped, removed, warning}`.
+4. Emit `queue_changed`; respond
+   `{imported, deduped, removed, warning, missing}`.
 
 A removal where none of the paths exist on `main` collapses to the base
 commit (no empty commit) — the idempotent replay path.
@@ -95,9 +100,15 @@ commit (no empty commit) — the idempotent replay path.
   `{queue, repo, available, count, tasks: [{task, title, source, priority,
   disabled, duplicate}]}`. Inert (`available: false`, empty `tasks`) when the
   queue has no bound repo, the repo is unavailable, or there is no `.tasks`.
-- `POST /api/queue/repo-tasks/import?queue=X` — drains the full scanned set
-  (no partial selection). 404 unknown queue; 409 when the queue has no
-  available repo.
+- `POST /api/queue/repo-tasks/import?queue=X` — drains the briefs the operator
+  selected. Optional body `{sources: [".tasks/….md", …]}`: absent (or an absent
+  `sources`) drains the full scanned set, `[]` drains nothing. Selection keys on
+  the repo-relative `source` path rather than the task name, because the name is
+  ambiguous — the same stem can be published both flat and under the queue's
+  subdir, and those are two distinct briefs. Picked sources the re-scan no
+  longer offers come back as `missing` rather than failing the batch: a stale
+  preview imports what is still published and reports the rest. 404 unknown
+  queue; 409 when the queue has no available repo.
 
 Registered by `manager/api_repo_tasks.py` (the `api_playlists.py` split
 pattern — `api_operator.py` is near the 1k-line budget).
@@ -105,13 +116,21 @@ pattern — `api_operator.py` is near the 1k-line budget).
 ## UI
 
 The queue page's **"+ Add" menu** gains **"Import from repository…"**. It
-opens a modal in the established `addfrom` pattern: fetches the preview,
-lists each brief (title, source path, an "in queue" tag on duplicates), one
-**Import** button. Rows are static previews (no per-task selection); the
-button is the only action and reports progress ("Importing…") while the
-move runs — the removal syncs and pushes the repo's main, which takes a few
-seconds. Empty state: "No importable tasks in `R/.tasks`." Success refreshes
-the queue and reports the count plus the push warning, if any.
+opens a modal in the established `addfrom` pattern: fetches the preview and
+lists each brief (title, source path, an "in queue" tag on duplicates).
+
+Each row carries a tick box and the whole row is its toggle, with a
+**Select all** box above the list (tri-state) — the operator controls exactly
+what is imported rather than choosing between "all" and "cancel". Everything
+starts ticked, since draining the whole inbox is the common case and
+de-selecting the exceptions is the shorter path. The **Import** button counts
+the selection (`Import 3 tasks`) and goes inert at zero. It reports progress
+("Importing…") while the move runs — the removal syncs and pushes the repo's
+main, which takes a few seconds. Empty state: "No importable tasks in
+`R/.tasks`." Success refreshes the queue, reports the count (plus any `missing`
+and the push warning), and **re-scans the inbox** so the briefs left unticked
+are still on offer for a second pass — the modal empties out only once the
+inbox is actually drained.
 
 ## Testing
 
@@ -119,6 +138,11 @@ Against `tests/_workspace.py` fixtures (`tests/test_repo_tasks.py`):
 
 - scan-rule units: both layouts, `_`/`.` and autosplit skipping, ordering,
   dedupe flagging, uncommitted files ignored;
+- selection units: picked subset in scan order (not request order), `None` vs
+  `[]`, same stem in two layouts kept distinct, stale picks reported;
+- partial import end to end: only the picked briefs land and are removed, the
+  rest stay published and import on a second pass; an empty selection touches
+  neither side (no removal commit);
 - main-tree authority: with the checkout parked on a feature branch the
   preview still serves main's briefs, and drained briefs leave the preview
   even while the branch carries the files on disk;
@@ -134,8 +158,6 @@ Against `tests/_workspace.py` fixtures (`tests/test_repo_tasks.py`):
 - **Auto-import on origin sync.** The scan module supports draining in the
   background (e.g. after `sync_main_locked` detects new briefs) behind a
   per-queue config key, if tooling volume grows. Not built now.
-- **Partial selection.** The modal drains the whole scanned set; per-task
-  pick can be added to the POST body (`tasks: [...]`) later.
 - The pre-existing `/api/queue/import` (add-from-playlist) endpoint referenced
   by the UI was dropped in the rebuild-in-place migration and is unrelated to
   this feature (`/api/queue/repo-tasks*` is a distinct namespace).

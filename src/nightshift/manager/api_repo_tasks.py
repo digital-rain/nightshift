@@ -18,6 +18,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from nightshift import playlists as playlists_mod
 from nightshift import repos
@@ -29,7 +30,17 @@ from nightshift.repo_tasks import (
     copy_repo_tasks,
     remove_repo_tasks_locked,
     scan_repo_tasks,
+    select_repo_tasks,
 )
+
+
+class RepoTaskImport(BaseModel):
+    # The briefs to drain, as repo-relative source paths (null = the whole
+    # scanned set; ``[]`` = nothing). Selection keys on ``source`` rather than
+    # the task stem because the stem is ambiguous — the same name can be
+    # published both flat (``.tasks/x.md``) and under the queue's subdir
+    # (``.tasks/<queue>/x.md``), and those are two distinct briefs.
+    sources: list[str] | None = None
 
 
 def register_repo_tasks_api(
@@ -88,7 +99,13 @@ def register_repo_tasks_api(
         })
 
     @app.post("/api/queue/repo-tasks/import")
-    async def post_repo_tasks_import(queue: str | None = None) -> JSONResponse:
+    async def post_repo_tasks_import(
+        req: RepoTaskImport | None = None, queue: str | None = None
+    ) -> JSONResponse:
+        """Drain the selected briefs (``sources``; absent = the whole scanned
+        set) into the queue and remove them from the repo's ``main``. Briefs the
+        operator left out stay published in the inbox and are offered again by
+        the next preview."""
         target = _resolve_queue(queue)
         if not _queue_exists(target):
             return JSONResponse({"error": "queue not found"}, status_code=404)
@@ -100,11 +117,17 @@ def register_repo_tasks_api(
             )
         label = queue_label(target)
         async with import_lock:
-            entries = _scan(target, repo)
+            entries, missing = select_repo_tasks(
+                _scan(target, repo), req.sources if req else None
+            )
             if not entries:
-                return JSONResponse(
-                    {"imported": [], "deduped": [], "removed": False, "warning": None}
-                )
+                return JSONResponse({
+                    "imported": [],
+                    "deduped": [],
+                    "removed": False,
+                    "warning": None,
+                    "missing": missing,
+                })
             # 1. Copy into the content store and commit — the briefs are
             #    durable from here; the removal below is cleanup.
             imported = copy_repo_tasks(
@@ -134,4 +157,5 @@ def register_repo_tasks_api(
             "deduped": [e.name for e in entries if e.duplicate],
             "removed": removal["removed"],
             "warning": removal["warning"],
+            "missing": missing,
         })

@@ -443,6 +443,12 @@
         </div>
         <p id="repoimport-desc" class="field-desc"></p>
         <p id="repoimport-status" class="field-desc addfrom-status" hidden></p>
+        <!-- Per-task selection: the operator ticks exactly which briefs to
+             drain; unticked ones stay published in the repo. -->
+        <label id="repoimport-all" class="repoimport-all" hidden>
+          <input id="repoimport-all-check" type="checkbox" checked>
+          <span>Select all</span>
+        </label>
         <ul id="repoimport-list" class="addfrom-list"></ul>
         <p id="repoimport-empty" class="empty" hidden></p>
         <div class="modal-actions">

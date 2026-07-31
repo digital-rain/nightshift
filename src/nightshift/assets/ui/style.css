@@ -361,10 +361,19 @@ body {
 .addfrom-task:hover { background: var(--border); }
 .addfrom-task .addfrom-add { width: 22px; height: 22px; font-size: 14px; }
 .addfrom-task-title { flex: 1; font-size: 13px; }
-/* Preview-only rows (repo import modal): not click targets, so no
-   pointer/hover invitation. */
-.addfrom-task.static { cursor: default; }
-.addfrom-task.static:hover { background: none; }
+/* Repo-import picker: per-task tick boxes plus the select-all header. */
+.repoimport-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--text-dim);
+  cursor: pointer;
+  user-select: none;
+}
+.repoimport-check { flex: none; margin: 0; cursor: pointer; accent-color: var(--accent); }
+.repoimport-all input { margin: 0; cursor: pointer; accent-color: var(--accent); }
 
 /* ---- Now screen ---- */
 .now-layout { display: flex; flex-direction: column; width: 100%; gap: 16px; }

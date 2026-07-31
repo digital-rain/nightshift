@@ -15,8 +15,12 @@ is never lost. The scan reads the inbox from the same authority the removal
 writes to — the ``main`` *tree*, never the operator checkout, which may be
 parked on any branch. See ``docs/spec/2026-07-04-repo-task-import.md``.
 
-This module is shared-core: read-only scan/copy plus the lock-held removal
-orchestration; the HTTP surface lives in
+An import drains the briefs the operator picked (the whole scanned set when
+they pick nothing in particular); anything left out stays published in the
+inbox and is offered again next time.
+
+This module is shared-core: read-only scan/select/copy plus the lock-held
+removal orchestration; the HTTP surface lives in
 :mod:`nightshift.manager.api_repo_tasks`.
 """
 
@@ -165,6 +169,29 @@ def scan_repo_tasks(
                 text=text,
             ))
     return out
+
+
+def select_repo_tasks(
+    entries: list[RepoTask], sources: list[str] | None
+) -> tuple[list[RepoTask], list[str]]:
+    """Narrow a scan to the operator's picked ``sources`` (repo-relative paths;
+    ``None`` = the whole set, ``[]`` = nothing), keeping scan order.
+
+    Selection keys on ``source`` rather than the task name because the name is
+    ambiguous — the same stem can be published both flat and under the queue's
+    subdir, and those are two distinct briefs.
+
+    Returns ``(picked, missing)``, where ``missing`` are picked sources the scan
+    no longer offers. A selection made against a stale preview (a concurrent
+    import drained a brief, or tooling rewrote it) is not a batch failure: what
+    is still published imports, and the caller reports the rest rather than
+    claiming they moved.
+    """
+    if sources is None:
+        return entries, []
+    wanted = set(sources)
+    picked = [e for e in entries if e.source in wanted]
+    return picked, sorted(wanted - {e.source for e in picked})
 
 
 def copy_repo_tasks(

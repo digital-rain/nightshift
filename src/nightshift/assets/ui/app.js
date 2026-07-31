@@ -5957,12 +5957,19 @@ async function openRepoImport() {
   $("repoimport-desc").textContent = "Scanning the repository\u2026";
   $("repoimport-empty").hidden = true;
   $("repoimport-list").innerHTML = "";
+  $("repoimport-all").hidden = true;
   $("repoimport-go").hidden = true;
   $("repoimport-modal").hidden = false;
+  await refreshRepoImport();
+}
+
+// (Re)scan the inbox and render the picker. Called on open and again after an
+// import, since a partial import leaves the unselected briefs published — the
+// modal stays usable for a second pass.
+async function refreshRepoImport() {
   let data;
   try { data = await getJSON(`/api/queue/repo-tasks${queueParam()}`); }
   catch { data = null; }
-  $("repoimport-desc").textContent = "";
   renderRepoImport(data);
 }
 
@@ -5972,6 +5979,10 @@ function renderRepoImport(data) {
   const go = $("repoimport-go");
   const ul = $("repoimport-list");
   ul.innerHTML = "";
+  desc.textContent = "";
+  empty.hidden = true;
+  go.hidden = true;
+  $("repoimport-all").hidden = true;
   if (!data || data.error) {
     empty.textContent = (data && data.error) || "could not scan the repository";
     empty.hidden = false;
@@ -5991,24 +6002,32 @@ function renderRepoImport(data) {
   }
   desc.textContent =
     `${data.count} task${data.count === 1 ? "" : "s"} published in ` +
-    `${data.repo}/.tasks. Importing moves them into this queue and removes ` +
-    "them from the repository.";
+    `${data.repo}/.tasks. Ticked tasks move into this queue and are removed ` +
+    "from the repository; unticked ones stay published there.";
   for (const t of data.tasks) ul.append(repoImportRow(t));
-  go.textContent = `Import ${data.count} task${data.count === 1 ? "" : "s"}`;
+  $("repoimport-all").hidden = false;
   go.hidden = false;
-  go.disabled = false;
+  syncRepoImportSelection();   // seeds the button count + the select-all box
 }
 
 function repoImportRow(t) {
   const li = document.createElement("li");
-  // "static": preview rows, not click targets — the whole batch imports via
-  // the Import button (no per-task selection).
-  li.className = "addfrom-task static";
+  li.className = "addfrom-task";
+  const check = document.createElement("input");
+  check.type = "checkbox";
+  check.className = "repoimport-check";
+  // Ticked by default: draining the whole inbox is the common case, so the
+  // operator de-selects the exceptions rather than picking one by one.
+  check.checked = true;
+  // `source` (the repo-relative path), not the task stem, is a brief's identity
+  // in the inbox: the same stem can be published both flat and under the
+  // queue's subdir, and those are two distinct briefs.
+  check.dataset.source = t.source;
   const title = document.createElement("span");
   title.className = "addfrom-task-title";
   title.textContent = t.title || t.task;
   title.title = t.source;
-  li.append(title);
+  li.append(check, title);
   if (t.duplicate) {
     const tag = document.createElement("span");
     tag.className = "addfrom-tag";
@@ -6021,7 +6040,36 @@ function repoImportRow(t) {
     tag.textContent = "disabled";
     li.append(tag);
   }
+  // The whole row is the toggle, not just the box. A click *on* the box already
+  // flipped it — don't undo that.
+  li.addEventListener("click", (e) => {
+    if (e.target !== check) check.checked = !check.checked;
+    syncRepoImportSelection();
+  });
   return li;
+}
+
+function repoImportChecks() {
+  return Array.from($("repoimport-list").querySelectorAll(".repoimport-check"));
+}
+
+// Keep the Import button's count and the select-all box in step with the row
+// ticks — with nothing ticked there is nothing to do, so the button goes inert.
+function syncRepoImportSelection() {
+  const boxes = repoImportChecks();
+  const n = boxes.filter((b) => b.checked).length;
+  const all = $("repoimport-all-check");
+  all.checked = boxes.length > 0 && n === boxes.length;
+  all.indeterminate = n > 0 && n < boxes.length;
+  const go = $("repoimport-go");
+  go.textContent = `Import ${n} task${n === 1 ? "" : "s"}`;
+  go.disabled = n === 0;
+}
+
+function toggleAllRepoImport() {
+  const on = $("repoimport-all-check").checked;
+  for (const b of repoImportChecks()) b.checked = on;
+  syncRepoImportSelection();
 }
 
 async function runRepoImport() {
@@ -6029,15 +6077,20 @@ async function runRepoImport() {
   if (go.disabled) return;
   const label = go.textContent;
   const status = $("repoimport-status");
+  const sources = repoImportChecks().filter((b) => b.checked).map((b) => b.dataset.source);
+  if (!sources.length) return;
   // Immediate feedback: the removal side syncs and pushes the repo's main,
   // which can take a few seconds — without this the click looks inert.
   go.disabled = true;
   go.textContent = "Importing\u2026";
-  status.textContent = "Importing\u2026 moving tasks into the queue and removing them from the repository.";
+  status.textContent =
+    `Importing\u2026 moving ${sources.length} task${sources.length === 1 ? "" : "s"} ` +
+    "into the queue and removing them from the repository.";
   status.hidden = false;
   let result;
   try {
-    result = await sendJSON(`/api/queue/repo-tasks/import${queueParam()}`, "POST", {});
+    result = await sendJSON(
+      `/api/queue/repo-tasks/import${queueParam()}`, "POST", { sources });
   } catch {
     result = { ok: false, data: null };
   }
@@ -6049,16 +6102,20 @@ async function runRepoImport() {
     return;
   }
   await loadQueue();
-  $("repoimport-list").innerHTML = "";
-  go.hidden = true;
   const n = (data.imported || []).length;
   const d = (data.deduped || []).length;
+  const m = (data.missing || []).length;
   let msg = `Imported ${n} task${n === 1 ? "" : "s"}` +
     (d ? ` (${d} already in queue)` : "") +
     (data.removed ? " and removed them from the repository." : ".");
+  // Honest reporting: a selection made against a stale preview imports what is
+  // still published and says so rather than claiming the rest moved.
+  if (m) msg += ` ${m} selected task${m === 1 ? " was" : "s were"} no longer published.`;
   if (data.warning) msg += ` Warning: ${data.warning}`;
   status.textContent = msg;
-  $("repoimport-desc").textContent = "";
+  // Re-scan: whatever the operator left unticked is still in the inbox, so the
+  // modal stays usable for a second pass (and empties out once drained).
+  await refreshRepoImport();
 }
 
 // ----- Add to another playlist -------------------------------------------
@@ -6961,6 +7018,7 @@ function wire() {
     if (e.target === $("repoimport-modal")) $("repoimport-modal").hidden = true;
   });
   $("repoimport-go").addEventListener("click", runRepoImport);
+  $("repoimport-all-check").addEventListener("change", toggleAllRepoImport);
   // Gear → popup menu (Settings / Workers / Repos), mirroring the Add dropdown.
   $("btn-settings").addEventListener("click", (e) => {
     e.stopPropagation();

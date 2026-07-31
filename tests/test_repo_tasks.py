@@ -23,7 +23,12 @@ from _workspace import (
 )
 from nightshift.manager.app import create_app
 from nightshift.manager.store_sqlite import SqliteStore
-from nightshift.repo_tasks import RepoTask, copy_repo_tasks, scan_repo_tasks
+from nightshift.repo_tasks import (
+    RepoTask,
+    copy_repo_tasks,
+    scan_repo_tasks,
+    select_repo_tasks,
+)
 
 
 def _publish(repo_root: Path, files: dict[str, str], *, message: str = "publish tasks") -> None:
@@ -118,6 +123,47 @@ def test_copy_suffixes_collisions_and_appends_order(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Selection
+# --------------------------------------------------------------------------- #
+
+
+def _entry(name: str, source: str) -> RepoTask:
+    return RepoTask(
+        name=name, title=name, source=source, priority=5,
+        disabled=False, duplicate=False, text=f"{name}\n",
+    )
+
+
+def test_select_narrows_to_the_picked_sources_in_scan_order() -> None:
+    entries = [_entry("a", ".tasks/a.md"), _entry("b", ".tasks/b.md"),
+               _entry("c", ".tasks/c.md")]
+    # Request order is irrelevant: the scan's published order is what runs.
+    picked, missing = select_repo_tasks(entries, [".tasks/c.md", ".tasks/a.md"])
+    assert [e.name for e in picked] == ["a", "c"]
+    assert missing == []
+    # No selection = the whole set; an empty selection = nothing.
+    assert select_repo_tasks(entries, None) == (entries, [])
+    assert select_repo_tasks(entries, []) == ([], [])
+
+
+def test_select_keys_on_source_not_task_name() -> None:
+    """The same stem published both flat and under the queue's subdir is two
+    distinct briefs — picking one must not drag the other along."""
+    entries = [_entry("dup", ".tasks/dup.md"), _entry("dup", ".tasks/main/dup.md")]
+    picked, missing = select_repo_tasks(entries, [".tasks/main/dup.md"])
+    assert [e.source for e in picked] == [".tasks/main/dup.md"]
+    assert missing == []
+
+
+def test_select_reports_sources_the_scan_no_longer_offers() -> None:
+    picked, missing = select_repo_tasks(
+        [_entry("a", ".tasks/a.md")], [".tasks/a.md", ".tasks/gone.md"]
+    )
+    assert [e.name for e in picked] == ["a"]
+    assert missing == [".tasks/gone.md"]
+
+
+# --------------------------------------------------------------------------- #
 # Operator endpoints, end to end
 # --------------------------------------------------------------------------- #
 
@@ -165,6 +211,95 @@ def test_import_moves_briefs_into_queue_and_off_main(tmp_path: Path) -> None:
         # The queue serves the imported briefs; the inbox is drained.
         assert {t["task"] for t in client.get("/api/queue").json()} >= {"alpha", "beta"}
         assert client.get("/api/queue/repo-tasks").json()["count"] == 0
+
+
+def test_import_drains_only_the_selected_briefs(tmp_path: Path) -> None:
+    """Per-task selection: the operator picks which briefs move. Unpicked ones
+    are neither copied into the queue nor removed from the repo, so the next
+    preview offers them again."""
+    ws = build_workspace(tmp_path)
+    repo_root = ws / "longitude"
+    tasks_root = ws / "nightshift-tasks"
+    _publish(repo_root, {
+        ".tasks/alpha.md": "Do alpha.\n",
+        ".tasks/beta.md": "Do beta.\n",
+        ".tasks/main/gamma.md": "Do gamma.\n",
+    })
+    with _client(ws) as client:
+        data = client.post(
+            "/api/queue/repo-tasks/import",
+            json={"sources": [".tasks/beta.md", ".tasks/main/gamma.md"]},
+        ).json()
+        assert [t["task"] for t in data["imported"]] == ["beta", "gamma"]
+        assert data["missing"] == []
+        assert data["removed"] is True
+
+        # The unpicked brief is still published — and still on offer.
+        preview = client.get("/api/queue/repo-tasks").json()
+        assert [t["task"] for t in preview["tasks"]] == ["alpha"]
+
+        # ...and importable on a second pass, appended after the first batch.
+        second = client.post(
+            "/api/queue/repo-tasks/import", json={"sources": [".tasks/alpha.md"]}
+        ).json()
+        assert [t["task"] for t in second["imported"]] == ["alpha"]
+        assert client.get("/api/queue/repo-tasks").json()["count"] == 0
+
+    assert (tasks_root / "main" / "alpha.md").exists()
+    order = json.loads((tasks_root / "main" / "config.json").read_text())["order"]
+    assert order[-3:] == ["beta", "gamma", "alpha"]
+    tree = git(repo_root, "ls-tree", "-r", "--name-only", "main")
+    assert ".tasks/beta.md" not in tree
+    assert ".tasks/main/gamma.md" not in tree
+    assert ".tasks/alpha.md" not in tree
+
+
+def test_import_of_nothing_selected_is_a_no_op(tmp_path: Path) -> None:
+    ws = build_workspace(tmp_path)
+    repo_root = ws / "longitude"
+    _publish(repo_root, {".tasks/alpha.md": "Do alpha.\n"})
+    head = git(repo_root, "rev-parse", "main")
+    with _client(ws) as client:
+        data = client.post(
+            "/api/queue/repo-tasks/import", json={"sources": []}
+        ).json()
+        assert data == {
+            "imported": [], "deduped": [], "removed": False,
+            "warning": None, "missing": [],
+        }
+        assert client.get("/api/queue/repo-tasks").json()["count"] == 1
+    # Nothing picked, nothing touched: no removal commit on the repo's main.
+    assert git(repo_root, "rev-parse", "main") == head
+    assert not (ws / "nightshift-tasks" / "main" / "alpha.md").exists()
+
+
+def test_import_of_a_stale_selection_imports_the_rest(tmp_path: Path) -> None:
+    """A brief the operator picked from a preview that has since gone stale is
+    reported as ``missing`` instead of failing the whole batch."""
+    ws = build_workspace(tmp_path)
+    _publish(ws / "longitude", {".tasks/alpha.md": "Do alpha.\n"})
+    with _client(ws) as client:
+        data = client.post(
+            "/api/queue/repo-tasks/import",
+            json={"sources": [".tasks/alpha.md", ".tasks/vanished.md"]},
+        ).json()
+        assert [t["task"] for t in data["imported"]] == ["alpha"]
+        assert data["missing"] == [".tasks/vanished.md"]
+        assert data["removed"] is True
+
+
+def test_import_without_a_body_drains_everything(tmp_path: Path) -> None:
+    """No selection = the whole scanned set (the pre-selection API contract)."""
+    ws = build_workspace(tmp_path)
+    _publish(ws / "longitude", {
+        ".tasks/alpha.md": "Do alpha.\n",
+        ".tasks/beta.md": "Do beta.\n",
+    })
+    with _client(ws) as client:
+        data = client.post("/api/queue/repo-tasks/import").json()
+        assert [t["task"] for t in data["imported"]] == ["alpha", "beta"]
+        data = client.post("/api/queue/repo-tasks/import", json={}).json()
+        assert data["imported"] == []
 
 
 def test_import_reads_and_drains_main_not_the_checkout(tmp_path: Path) -> None:
