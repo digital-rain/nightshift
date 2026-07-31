@@ -1,6 +1,7 @@
-"""Repo task import — draining a target repo's ``.tasks/`` publishing inbox.
+"""Repo task import — draining a target repo's publishing inboxes.
 
-Scan-rule units on :mod:`nightshift.repo_tasks` plus the operator endpoints
+Scan-rule units on :mod:`nightshift.repo_tasks` (both inbox roots, ``.tasks/``
+and ``docs/tasks/``) plus the operator endpoints
 (``/api/queue/repo-tasks*``) end to end: briefs move into the content store,
 the sources are removed from the repo's ``main`` through the landing pipeline,
 and the never-lose paths (push failure, identical re-publish) converge instead
@@ -82,6 +83,46 @@ def test_scan_rules_and_order(tmp_path: Path) -> None:
     assert beta.duplicate is False
     assert beta.source == ".tasks/beta.md"
     assert entries[2].source == ".tasks/main/gamma.md"
+
+
+def test_scan_reads_the_docs_tasks_inbox(tmp_path: Path) -> None:
+    """``docs/tasks/`` is the second inbox root: markdown briefs with their
+    metadata in frontmatter and no json control file, so they publish in
+    filename order (a stray ``config.json`` there orders nothing)."""
+    ws = build_workspace(tmp_path)
+    _publish(ws / "longitude", {
+        "docs/tasks/zeta.md": "---\ntitle: Zeta task\npriority: 1\n---\n\nDo zeta.\n",
+        "docs/tasks/alpha.md": "Do alpha.\n",
+        # Same skip rules as the legacy inbox.
+        "docs/tasks/_todo.md": "---\nautosplit: true\n---\nitems\n",
+        "docs/tasks/recurring.md": "---\nautosplit: true\n---\nitems\n",
+        "docs/tasks/notes.txt": "not a brief\n",
+        "docs/tasks/config.json": json.dumps({"order": ["zeta", "alpha"]}) + "\n",
+        # Queue-dir layout under the new root too: only the queue's own subdir.
+        "docs/tasks/main/gamma.md": "Do gamma.\n",
+        "docs/tasks/other/delta.md": "Belongs to another queue.\n",
+        # Neighbouring docs are not an inbox.
+        "docs/specs/some-spec.md": "A spec, not a brief.\n",
+    })
+    entries = scan_repo_tasks(ws, "longitude", "main", ws / "nightshift-tasks", "main")
+    assert [e.name for e in entries] == ["alpha", "zeta", "gamma"]
+    assert [e.source for e in entries] == [
+        "docs/tasks/alpha.md", "docs/tasks/zeta.md", "docs/tasks/main/gamma.md",
+    ]
+    zeta = entries[1]
+    assert zeta.title == "Zeta task"
+    assert zeta.priority == 1
+
+
+def test_scan_reads_both_inbox_roots(tmp_path: Path) -> None:
+    """A repo publishing into both roots offers both, the legacy inbox first."""
+    ws = build_workspace(tmp_path)
+    _publish(ws / "longitude", {
+        ".tasks/legacy.md": "Do legacy.\n",
+        "docs/tasks/fresh.md": "Do fresh.\n",
+    })
+    entries = scan_repo_tasks(ws, "longitude", "main", ws / "nightshift-tasks", "main")
+    assert [e.source for e in entries] == [".tasks/legacy.md", "docs/tasks/fresh.md"]
 
 
 def test_scan_flags_duplicates(tmp_path: Path) -> None:
@@ -211,6 +252,38 @@ def test_import_moves_briefs_into_queue_and_off_main(tmp_path: Path) -> None:
         # The queue serves the imported briefs; the inbox is drained.
         assert {t["task"] for t in client.get("/api/queue").json()} >= {"alpha", "beta"}
         assert client.get("/api/queue/repo-tasks").json()["count"] == 0
+
+
+def test_import_moves_docs_tasks_briefs(tmp_path: Path) -> None:
+    """The same move for the ``docs/tasks/`` root: briefs land in the content
+    store and are removed from the repo's ``main``, so they never run twice."""
+    ws = build_workspace(tmp_path)
+    repo_root = ws / "longitude"
+    tasks_root = ws / "nightshift-tasks"
+    _publish(repo_root, {
+        "docs/tasks/alpha.md": "---\ntitle: Alpha task\n---\n\nDo alpha.\n",
+        "docs/tasks/main/beta.md": "Do beta.\n",
+        "docs/specs/some-spec.md": "A spec, not a brief.\n",
+    })
+    with _client(ws) as client:
+        preview = client.get("/api/queue/repo-tasks").json()
+        assert [t["source"] for t in preview["tasks"]] == [
+            "docs/tasks/alpha.md", "docs/tasks/main/beta.md",
+        ]
+        data = client.post("/api/queue/repo-tasks/import").json()
+        assert [t["task"] for t in data["imported"]] == ["alpha", "beta"]
+        assert data["removed"] is True
+        assert data["warning"] is None
+        assert client.get("/api/queue/repo-tasks").json()["count"] == 0
+
+    assert (tasks_root / "main" / "alpha.md").read_text().endswith("Do alpha.\n")
+    order = json.loads((tasks_root / "main" / "config.json").read_text())["order"]
+    assert order[-2:] == ["alpha", "beta"]
+    tree = git(repo_root, "ls-tree", "-r", "--name-only", "main")
+    assert "docs/tasks/alpha.md" not in tree
+    assert "docs/tasks/main/beta.md" not in tree
+    # Neighbouring docs are untouched by the removal commit.
+    assert "docs/specs/some-spec.md" in tree
 
 
 def test_import_drains_only_the_selected_briefs(tmp_path: Path) -> None:

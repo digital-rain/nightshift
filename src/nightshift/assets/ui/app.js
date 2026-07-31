@@ -5948,10 +5948,11 @@ async function importFrom(source, tasks) {
   }
 }
 
-// ----- Import from repository (.tasks publishing inbox) -------------------
-// Drains briefs external tooling published into the bound repo's `.tasks/`
-// into this queue, removing them from the repo's main so they never run
-// twice (docs/spec/2026-07-04-repo-task-import.md).
+// ----- Import from repository (task publishing inboxes) -------------------
+// Drains briefs external tooling published into the bound repo's inbox roots
+// (`.tasks/` and `docs/tasks/`) into this queue, removing them from the repo's
+// main so they never run twice (docs/spec/2026-07-04-repo-task-import.md).
+const REPO_INBOXES = ".tasks/ or docs/tasks/";
 async function openRepoImport() {
   $("repoimport-status").hidden = true;
   $("repoimport-desc").textContent = "Scanning the repository\u2026";
@@ -5996,14 +5997,14 @@ function renderRepoImport(data) {
     return;
   }
   if (!data.count) {
-    empty.textContent = `No importable tasks in ${data.repo}/.tasks.`;
+    empty.textContent = `No importable tasks in ${data.repo} (${REPO_INBOXES}).`;
     empty.hidden = false;
     return;
   }
   desc.textContent =
     `${data.count} task${data.count === 1 ? "" : "s"} published in ` +
-    `${data.repo}/.tasks. Ticked tasks move into this queue and are removed ` +
-    "from the repository; unticked ones stay published there.";
+    `${data.repo} (${REPO_INBOXES}). Ticked tasks move into this queue and are ` +
+    "removed from the repository; unticked ones stay published there.";
   for (const t of data.tasks) ul.append(repoImportRow(t));
   $("repoimport-all").hidden = false;
   go.hidden = false;

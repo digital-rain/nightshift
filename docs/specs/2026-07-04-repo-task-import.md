@@ -1,14 +1,19 @@
-# Repo task import — draining a target repo's `.tasks/` publishing inbox
+# Repo task import — draining a target repo's publishing inboxes
 
 ## Problem
 
-Repositories in the wild still carry a `.tasks/` directory in one of two
-legacy layouts (sometimes both at once):
+Repositories in the wild publish briefs into one of two **inbox roots**:
 
-1. **Flat** — `.tasks/*.md` briefs directly in the root, optionally with a
-   root `config.json` holding an `order`.
-2. **Queue dirs** — `.tasks/<queue>/` subdirectories, each with a
-   `config.json` (order) and `*.md` briefs.
+- **`.tasks/`** — the legacy root, still carried by repos in the wild;
+- **`docs/tasks/`** — plain markdown briefs kept with the repo's docs, with
+  **no json control file** (all metadata is frontmatter).
+
+Each root appears in one of two layouts (sometimes both at once):
+
+1. **Flat** — `<root>/*.md` briefs directly in the root; under `.tasks/`
+   optionally with a root `config.json` holding an `order`.
+2. **Queue dirs** — `<root>/<queue>/` subdirectories with `*.md` briefs (and
+   under `.tasks/` a `config.json` order).
 
 Frontmatter in either layout may carry `title`, `priority`, `draft`,
 `automerge`, `disabled` — any field Nightshift understands today. External
@@ -16,7 +21,7 @@ tooling **publishes tasks this way** and will keep doing so; those briefs must
 flow into Nightshift's queues without being lost and without running twice.
 
 This is a first-class, repo-scoped task *source*, not a bolt-on: a target
-repo's `.tasks/` is a **publishing inbox** that the queue bound to that repo
+repo's inbox roots are **publishing inboxes** that the queue bound to that repo
 drains.
 
 ## Semantics
@@ -34,26 +39,30 @@ idempotent (see *Dedupe*).
 
 ## Scan rules (`nightshift/repo_tasks.py`)
 
-For queue X bound to repo R, the importable set is read from the `.tasks`
-tree of R's **canonical `main`** (`main_sha`) — the same authority the
+For queue X bound to repo R, the importable set is read from the inbox trees
+of R's **canonical `main`** (`main_sha`) — the same authority the
 removal commits to, never the operator checkout. A checkout parked on a
 feature branch neither hides main's briefs nor re-offers drained ones, and
-uncommitted working-tree files are not published yet. Within that tree:
+uncommitted working-tree files are not published yet. Within that tree, for
+each root (`.tasks`, then `docs/tasks` — an absent root contributes nothing):
 
-- **Flat layout:** `.tasks/*.md` directly in the root.
-- **Queue-dir layout:** `.tasks/X/*.md` — only the subdir matching the
+- **Flat layout:** `<root>/*.md` directly in the root.
+- **Queue-dir layout:** `<root>/X/*.md` — only the subdir matching the
   queue's label (`main` for the default queue). Other subdirs belong to other
-  queues and stay untouched.
+  queues and stay untouched. Nothing else under `docs/` is an inbox.
 - **Skipped everywhere:** stems starting with `_` or `.` (templates and
   evergreen/autosplit inboxes like `_todo.md` stay in the repo), files whose
   frontmatter sets `autosplit: true` (recurring sources, same reason),
   `config.json`, `runs/`, non-`.md` files.
 - **Imported as-is:** brief text (frontmatter + body) is carried verbatim.
   A `disabled: true` brief arrives disabled; nothing is silently rewritten.
-- **Ordering:** root files first, then the queue subdir's files; each group
-  ordered by its local `config.json` `order` with a filename fallback. The
-  batch appends to the destination queue's execution order. Source
-  `config.json` *settings* (`sort`, `validate`, …) are not imported.
+- **Ordering:** per root, flat files first, then the queue subdir's files, with
+  `.tasks` ahead of `docs/tasks`. Each `.tasks` group is ordered by its local
+  `config.json` `order` with a filename fallback; `docs/tasks` has no json
+  control file, so it is always filename-ordered (a `config.json` sitting there
+  orders nothing). The batch appends to the destination queue's execution
+  order. Source `config.json` *settings* (`sort`, `validate`, …) are not
+  imported.
 - **Dedupe:** a source file whose exact text already matches a brief in the
   destination queue is flagged `duplicate` — import removes it from the repo
   without creating a second copy. This is also crash recovery: if a previous
@@ -99,13 +108,14 @@ commit (no empty commit) — the idempotent replay path.
 - `GET /api/queue/repo-tasks?queue=X` — preview:
   `{queue, repo, available, count, tasks: [{task, title, source, priority,
   disabled, duplicate}]}`. Inert (`available: false`, empty `tasks`) when the
-  queue has no bound repo, the repo is unavailable, or there is no `.tasks`.
+  queue has no bound repo, the repo is unavailable, or it has no inbox at all.
 - `POST /api/queue/repo-tasks/import?queue=X` — drains the briefs the operator
-  selected. Optional body `{sources: [".tasks/….md", …]}`: absent (or an absent
+  selected. Optional body `{sources: [".tasks/….md", "docs/tasks/….md", …]}`:
+  absent (or an absent
   `sources`) drains the full scanned set, `[]` drains nothing. Selection keys on
   the repo-relative `source` path rather than the task name, because the name is
-  ambiguous — the same stem can be published both flat and under the queue's
-  subdir, and those are two distinct briefs. Picked sources the re-scan no
+  ambiguous — the same stem can be published under either root, and both flat
+  and under the queue's subdir; those are distinct briefs. Picked sources the re-scan no
   longer offers come back as `missing` rather than failing the batch: a stale
   preview imports what is still published and reports the rest. 404 unknown
   queue; 409 when the queue has no available repo.
@@ -126,8 +136,8 @@ starts ticked, since draining the whole inbox is the common case and
 de-selecting the exceptions is the shorter path. The **Import** button counts
 the selection (`Import 3 tasks`) and goes inert at zero. It reports progress
 ("Importing…") while the move runs — the removal syncs and pushes the repo's
-main, which takes a few seconds. Empty state: "No importable tasks in
-`R/.tasks`." Success refreshes the queue, reports the count (plus any `missing`
+main, which takes a few seconds. Empty state: "No importable tasks in `R`
+(`.tasks/` or `docs/tasks/`)." Success refreshes the queue, reports the count (plus any `missing`
 and the push warning), and **re-scans the inbox** so the briefs left unticked
 are still on offer for a second pass — the modal empties out only once the
 inbox is actually drained.
@@ -136,8 +146,10 @@ inbox is actually drained.
 
 Against `tests/_workspace.py` fixtures (`tests/test_repo_tasks.py`):
 
-- scan-rule units: both layouts, `_`/`.` and autosplit skipping, ordering,
-  dedupe flagging, uncommitted files ignored;
+- scan-rule units: both roots and both layouts, `_`/`.` and autosplit skipping,
+  ordering (including `docs/tasks` staying filename-ordered next to a stray
+  `config.json`, and `.tasks` ahead of `docs/tasks`), dedupe flagging,
+  uncommitted files ignored, neighbouring `docs/` dirs not scanned;
 - selection units: picked subset in scan order (not request order), `None` vs
   `[]`, same stem in two layouts kept distinct, stale picks reported;
 - partial import end to end: only the picked briefs land and are removed, the
@@ -148,10 +160,10 @@ Against `tests/_workspace.py` fixtures (`tests/test_repo_tasks.py`):
   even while the branch carries the files on disk;
 - end-to-end API: briefs land in the content store (committed), source files
   removed from repo `main` (commit present, clean checkout advanced), order
-  appended;
+  appended — for `docs/tasks` sources too, leaving neighbouring docs untouched;
 - never-lose: removal push failure → import still succeeds with a warning;
   second import after re-publish dedupes instead of duplicating;
-- inert paths: queue without a repo, absent repo, no `.tasks`.
+- inert paths: queue without a repo, absent repo, no inbox at all.
 
 ## Known non-goals / future work
 

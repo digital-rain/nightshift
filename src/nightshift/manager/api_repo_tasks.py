@@ -1,7 +1,7 @@
 """Operator repo-task import endpoints — ``/api/queue/repo-tasks*``.
 
-The queue-page affordance that drains a target repo's ``.tasks/`` publishing
-inbox into the queue bound to that repo (see
+The queue-page affordance that drains a target repo's publishing inboxes
+(``.tasks/`` and ``docs/tasks/``) into the queue bound to that repo (see
 ``docs/spec/2026-07-04-repo-task-import.md``). Endpoints are registered onto
 the shared FastAPI app by :func:`register_repo_tasks_api`; the shared wiring
 (queue resolution, repo binding, content-store committer, event emitter, git
@@ -38,8 +38,8 @@ class RepoTaskImport(BaseModel):
     # The briefs to drain, as repo-relative source paths (null = the whole
     # scanned set; ``[]`` = nothing). Selection keys on ``source`` rather than
     # the task stem because the stem is ambiguous — the same name can be
-    # published both flat (``.tasks/x.md``) and under the queue's subdir
-    # (``.tasks/<queue>/x.md``), and those are two distinct briefs.
+    # published under either inbox root (``.tasks/x.md``, ``docs/tasks/x.md``)
+    # and both flat and under the queue's subdir — those are distinct briefs.
     sources: list[str] | None = None
 
 
@@ -135,8 +135,7 @@ def register_repo_tasks_api(
             )
             if imported:
                 await _commit(
-                    f"nightshift: import {len(imported)} task(s) "
-                    f"from {repo}/.tasks"
+                    f"nightshift: import {len(imported)} task(s) from {repo}"
                 )
             # 2. Remove the drained sources from the repo's main as a
             #    repo-executor job (serialized with lands/syncs on that repo).

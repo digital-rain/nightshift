@@ -1,17 +1,19 @@
-"""Repo task import — draining a target repo's ``.tasks/`` publishing inbox.
+"""Repo task import — draining a target repo's publishing inboxes.
 
-A target repo may carry a ``.tasks/`` directory that external tooling
-publishes task briefs into, in one of two legacy layouts (or both at once):
-
-* **flat** — ``.tasks/*.md`` briefs directly in the root;
-* **queue dirs** — ``.tasks/<queue>/`` subdirectories, each with a local
-  ``config.json`` (order) and ``*.md`` briefs.
+A target repo may carry two inbox roots that external tooling publishes task
+briefs into — ``.tasks/`` and ``docs/tasks/`` — each in a flat layout
+(``*.md`` briefs directly in the root) or a queue-dir layout
+(``<queue>/*.md`` subdirectories), or both at once. ``.tasks/`` is the legacy
+root, where a local ``config.json`` may also carry the publication ``order``;
+``docs/tasks/`` briefs are plain markdown with no json control file, so they
+publish in filename order and carry all their Nightshift metadata in
+frontmatter.
 
 Import is a *move* with git authority on both sides: the brief becomes
 canonical in the content store (``nightshift-tasks/<queue>/``) and the source
 file is removed from the repo's ``main`` by the manager (the sole writer to
 ``main``), so a brief exists in exactly one place, can never run twice, and
-is never lost. The scan reads the inbox from the same authority the removal
+is never lost. The scan reads the inboxes from the same authority the removal
 writes to — the ``main`` *tree*, never the operator checkout, which may be
 parked on any branch. See ``docs/spec/2026-07-04-repo-task-import.md``.
 
@@ -45,9 +47,21 @@ from nightshift.spawn_daily import is_disabled, split_frontmatter, task_priority
 from nightshift.task_files import resolve_title
 
 
-# The inbox directory external tooling publishes briefs into, at a target
-# repo's root.
+# The inbox directories external tooling publishes briefs into, relative to a
+# target repo's root. Only ``.tasks`` carries a ``config.json`` order — see
+# :func:`_inboxes`.
 REPO_TASKS_DIR = ".tasks"
+DOCS_TASKS_DIR = "docs/tasks"
+
+
+@dataclass(frozen=True)
+class _Inbox:
+    """One inbox tree to scan: its repo-relative path plus whether a local
+    ``config.json`` may order it (``.tasks`` only — ``docs/tasks`` briefs are
+    plain markdown with no json control file)."""
+
+    path: str
+    ordered: bool
 
 
 @dataclass(frozen=True)
@@ -68,6 +82,19 @@ class RepoTask:
     text: str
 
 
+def _inboxes(queue_name: str) -> list[_Inbox]:
+    """The inbox trees a queue drains, in the order they publish: each root's
+    flat briefs, then the subdir matching ``queue_name`` (the queue's label;
+    other subdirs belong to other queues and stay untouched). ``.tasks`` comes
+    before ``docs/tasks`` so a repo publishing into both keeps the legacy
+    inbox's precedence in the destination queue's execution order."""
+    return [
+        _Inbox(path, ordered=root == REPO_TASKS_DIR)
+        for root in (REPO_TASKS_DIR, DOCS_TASKS_DIR)
+        for path in (root, f"{root}/{queue_name}")
+    ]
+
+
 def _local_order(git: GitRunner, treeish: str) -> list[str]:
     """The inbox-local ``config.json`` ``order`` list read from the inbox tree
     (best-effort: ``[]`` on a missing/malformed file — callers fall back to
@@ -83,10 +110,15 @@ def _local_order(git: GitRunner, treeish: str) -> list[str]:
     return [str(name) for name in order] if isinstance(order, list) else []
 
 
-def _scan_tree(git: GitRunner, treeish: str) -> list[str]:
-    """The ``*.md`` blob names of one inbox tree (``<sha>:.tasks[/…]``) in its
+def _scan_tree(git: GitRunner, treeish: str, *, ordered: bool = True) -> list[str]:
+    """The ``*.md`` blob names of one inbox tree (``<sha>:<inbox>``) in its
     published order: stems listed in the tree's ``config.json`` ``order``
-    first, the rest by filename. ``[]`` when the tree does not exist."""
+    first, the rest by filename. ``[]`` when the tree does not exist.
+
+    ``ordered=False`` skips the ``config.json`` read entirely — a json-free
+    inbox publishes in filename order, so an unrelated ``config.json`` sitting
+    in it never reorders the briefs.
+    """
     listing = git.run("ls-tree", "-z", treeish)
     if not listing.ok:
         return []
@@ -95,7 +127,8 @@ def _scan_tree(git: GitRunner, treeish: str) -> list[str]:
         meta, _, name = entry.partition("\t")
         if meta.split()[1:2] == ["blob"] and name.endswith(".md"):
             by_stem[name[: -len(".md")]] = name
-    rank = {name: i for i, name in enumerate(_local_order(git, treeish))}
+    local = _local_order(git, treeish) if ordered else []
+    rank = {name: i for i, name in enumerate(local)}
     listed = sorted((s for s in by_stem if s in rank), key=lambda s: rank[s])
     unlisted = sorted(s for s in by_stem if s not in rank)
     return [by_stem[s] for s in (*listed, *unlisted)]
@@ -125,17 +158,17 @@ def scan_repo_tasks(
     tasks_root: Path,
     dest_rel: str,
 ) -> list[RepoTask]:
-    """Scan the repo's canonical ``main`` for ``.tasks`` briefs importable
-    into a queue.
+    """Scan the repo's canonical ``main`` for inbox briefs importable into a
+    queue.
 
     The scan reads the ``main`` *tree* — the same authority the removal
     commits to — never the operator checkout, which may be parked on any
     branch (a drained brief must disappear from the preview even while some
-    feature branch still carries the file). Flat root files come first, then
-    the subdir matching ``queue_name`` (the queue's label; other subdirs
-    belong to other queues and stay untouched), each group in its published
-    order (:func:`_scan_tree`). Read-only — the import itself is
-    :func:`copy_repo_tasks` + :func:`remove_repo_tasks_locked`.
+    feature branch still carries the file). Every inbox tree of every root
+    (:func:`_inboxes`) is scanned in turn, each group in its published order
+    (:func:`_scan_tree`); a root that does not exist simply contributes
+    nothing. Read-only — the import itself is :func:`copy_repo_tasks` +
+    :func:`remove_repo_tasks_locked`.
     """
     repo_root = workspace / repo
     git = GitRunner(repo_root)
@@ -151,9 +184,9 @@ def scan_repo_tasks(
     )
 
     out: list[RepoTask] = []
-    for inbox in (REPO_TASKS_DIR, f"{REPO_TASKS_DIR}/{queue_name}"):
-        treeish = f"{base}:{inbox}"
-        for name in _scan_tree(git, treeish):
+    for inbox in _inboxes(queue_name):
+        treeish = f"{base}:{inbox.path}"
+        for name in _scan_tree(git, treeish, ordered=inbox.ordered):
             parsed = _parse_brief(git, treeish, name)
             if parsed is None:
                 continue
@@ -162,7 +195,7 @@ def scan_repo_tasks(
             out.append(RepoTask(
                 name=stem,
                 title=resolve_title(stem, meta),
-                source=f"{inbox}/{name}",
+                source=f"{inbox.path}/{name}",
                 priority=task_priority(meta),
                 disabled=is_disabled(meta),
                 duplicate=text in existing,
@@ -178,8 +211,8 @@ def select_repo_tasks(
     ``None`` = the whole set, ``[]`` = nothing), keeping scan order.
 
     Selection keys on ``source`` rather than the task name because the name is
-    ambiguous — the same stem can be published both flat and under the queue's
-    subdir, and those are two distinct briefs.
+    ambiguous — the same stem can be published under either inbox root, and
+    both flat and under the queue's subdir; those are all distinct briefs.
 
     Returns ``(picked, missing)``, where ``missing`` are picked sources the scan
     no longer offers. A selection made against a stale preview (a concurrent
