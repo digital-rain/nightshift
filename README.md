@@ -5,7 +5,7 @@ A pull-based overnight agent task runner.
 You write task briefs — markdown files with a little frontmatter.
 A **manager** owns the queues, the canonical briefs, the centralized config, Postgres-backed state, and the git landing authority.
 One or more **workers** poll the manager, execute each task with a coding agent (Claude Code, Cursor, Antigravity, or a raw API model), validate the result, and squash-submit it back for the manager to land on `main`.
-You wake up to validated, landed commits — or to a precise record of what blocked.
+You wake up to validated, landed commits, PRs — or to a precise record of what blocked.
 
 ```mermaid
 flowchart LR
