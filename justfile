@@ -9,6 +9,11 @@ root    := justfile_directory()
 workspace := env_var_or_default("NIGHTSHIFT_WORKSPACE", justfile_directory())
 mig_dir := justfile_directory() / "src/nightshift/assets/migrations"
 
+# Drop ambient PYTHONPATH so {{py}} resolves packages from this project's
+# .venv. A sibling repo's .localrc (e.g. longitude) may still be exporting
+# its own site-packages into the shell after `cd` + `activate`.
+export PYTHONPATH := ""
+
 # List available recipes.
 default:
     @just --list
