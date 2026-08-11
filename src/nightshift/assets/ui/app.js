@@ -802,7 +802,6 @@ async function loadRuns() {
       id: r.id,
       playlist: r.queue || "main",
       repo: r.repo,
-      launched_by: r.launched_by || null,
       started_at: r.started_at,
       finished_at: r.finished_at,
       tasks: [r],
@@ -4658,7 +4657,8 @@ function applyLocalRating(runId, rating) {
 }
 
 // The RUN DETAILS metaGrid pairs for a run + its task record: per-task window,
-// per-phase timings (when instrumented), commit landing, and who launched it.
+// per-phase timings (when instrumented), commit landing, and the worker that
+// ran it.
 function runDetailPairs(run, rec) {
   const pairs = [
     ["Started", rec.started_at || run.started_at ? new Date(rec.started_at || run.started_at).toLocaleString() : "—"],
@@ -4695,7 +4695,10 @@ function runDetailPairs(run, rec) {
   } else if (rec.remote === "none" || (rec.commit_sha && rec.pushed == null && rec.remote == null)) {
     pairs.push(["Remote", "local only"]);
   }
-  pairs.push(["Launched by", run.launched_by || "—"]);
+  // The worker that ran the attempt — essential for diagnosing failures on a
+  // multi-worker fleet. (Replaces the dead "Launched by" row: that key came
+  // from the retired local run.json shape and /api/runs never serves it.)
+  pairs.push(["Worker", rec.worker_id || "—"]);
   // Token usage and cost — only shown when the run carries this data.
   if (rec.model) pairs.push(["Model", rec.model]);
   if (typeof rec.turns === "number") pairs.push(["Turns", String(rec.turns)]);
