@@ -20,7 +20,11 @@
  *   { task, queue, model, backend, worker_id, status, landed (bool),
  *     turns, input_tokens, output_tokens, cache_read_input_tokens,
  *     cache_creation_input_tokens, cost_usd, usage, failure_kind,
- *     started_at, finished_at }
+ *     started_at, finished_at, timings }
+ * `timings` is the per-phase wall-clock split in seconds recorded by the
+ * worker loop ({worker, preflight, validate, total} — only phases the run
+ * entered); null/absent on runs that predate the instrumentation, so every
+ * time stat below skips absent phases rather than counting them as zero.
  * Optional (manager records only): enhanced (bool — the brief went through
  * the enhance-on-create rewrite) and rating ('up' | 'down' | null — the
  * operator's thumbs verdict), which drive the "Brief enhancement" panel.
@@ -73,6 +77,14 @@
     return typeof v === "number" && isFinite(v);
   }
 
+  // Wall-clock duration from seconds: "42s", "12m 34s", "3h 12m".
+  function fmtDur(s) {
+    if (!hasNum(s)) return "—";
+    if (s < 60) return Math.round(s) + "s";
+    if (s < 3600) return Math.floor(s / 60) + "m " + Math.round(s % 60) + "s";
+    return Math.floor(s / 3600) + "h " + Math.round((s % 3600) / 60) + "m";
+  }
+
   // ---- DOM helpers ------------------------------------------------------- //
 
   function el(tag, cls, text) {
@@ -101,6 +113,24 @@
     return num(r.input_tokens);
   }
 
+  // Overall wall-clock for a run in seconds: started_at → finished_at (the
+  // manager's authoritative window, present on all history), falling back to
+  // the worker-measured timings.total. null when neither is usable.
+  function runSeconds(r) {
+    const t0 = Date.parse(r.started_at);
+    const t1 = Date.parse(r.finished_at);
+    if (!isNaN(t0) && !isNaN(t1) && t1 >= t0) return (t1 - t0) / 1000;
+    if (r.timings && hasNum(r.timings.total)) return r.timings.total;
+    return null;
+  }
+
+  // Per-phase seconds from the worker-measured split; null (not 0) when the
+  // run predates the instrumentation or never entered the phase.
+  function phaseSeconds(r, phase) {
+    if (r.timings && hasNum(r.timings[phase])) return r.timings[phase];
+    return null;
+  }
+
   function aggregate(runs) {
     const terminal = runs.filter(isTerminal);
     const landed = terminal.filter((r) => r.landed);
@@ -112,6 +142,15 @@
     let turnsSum = 0;
     let turnsCount = 0;
     let landedCost = 0;
+    // Time accounting: overall from the run window (all history), the
+    // implementation (worker phase) / validation split from Outcome.timings —
+    // each averaged only over the runs that carry the figure.
+    let durSum = 0;
+    let durCount = 0;
+    let implSum = 0;
+    let implCount = 0;
+    let valSum = 0;
+    let valCount = 0;
     const nonLanded = [];
     const valFail = [];
     for (const r of terminal) {
@@ -124,6 +163,21 @@
       if (hasNum(r.turns)) {
         turnsSum += r.turns;
         turnsCount++;
+      }
+      const dur = runSeconds(r);
+      if (dur !== null) {
+        durSum += dur;
+        durCount++;
+      }
+      const impl = phaseSeconds(r, "worker");
+      if (impl !== null) {
+        implSum += impl;
+        implCount++;
+      }
+      const val = phaseSeconds(r, "validate");
+      if (val !== null) {
+        valSum += val;
+        valCount++;
       }
       if (r.landed) landedCost += c;
       else nonLanded.push(r);
@@ -150,6 +204,15 @@
       nonLandedCost,
       valFailCount: valFail.length,
       valFailCost,
+      avgDuration: durCount ? durSum / durCount : null,
+      durTotal: durSum,
+      durRuns: durCount,
+      avgImpl: implCount ? implSum / implCount : null,
+      implTotal: implSum,
+      implRuns: implCount,
+      avgValidate: valCount ? valSum / valCount : null,
+      valTotal: valSum,
+      valRuns: valCount,
     };
   }
 
@@ -311,6 +374,37 @@
         deltaBadge(cur.valFailCost, prior.valFailCost, { lowerIsBetter: true })
       )
     );
+    // Time cards: overall from the run window, implementation / validation
+    // from the worker-measured per-phase split (subtext totals only count
+    // runs that carry the figure).
+    row.append(
+      kpiCard(
+        "Time / task",
+        fmtDur(cur.avgDuration),
+        fmtDur(cur.durTotal) + " total · " + cur.durRuns + " runs",
+        deltaBadge(cur.avgDuration, prior.avgDuration, { lowerIsBetter: true })
+      )
+    );
+    row.append(
+      kpiCard(
+        "Implementation / task",
+        fmtDur(cur.avgImpl),
+        cur.implRuns
+          ? fmtDur(cur.implTotal) + " total · " + cur.implRuns + " runs"
+          : "no per-phase timings yet",
+        deltaBadge(cur.avgImpl, prior.avgImpl, { lowerIsBetter: true })
+      )
+    );
+    row.append(
+      kpiCard(
+        "Validation / task",
+        fmtDur(cur.avgValidate),
+        cur.valRuns
+          ? fmtDur(cur.valTotal) + " total · " + cur.valRuns + " runs"
+          : "no per-phase timings yet",
+        deltaBadge(cur.avgValidate, prior.avgValidate, { lowerIsBetter: true })
+      )
+    );
     container.append(row);
   }
 
@@ -348,6 +442,16 @@
     grid.append(trendCell("Spend on landed", costSeries, days, fmtMoney));
     grid.append(trendCell("Avg tokens/task", tokenSeries, days, fmtTokens));
     grid.append(trendCell("Land rate", landSeries.map((v) => v * 100), days, (v) => v.toFixed(0) + "%"));
+    // Time trends: overall always (the run window covers all history); the
+    // implementation/validation splits only once instrumented runs exist.
+    const aggByDay = days.map((d) => aggregate(byDay.get(d)));
+    grid.append(trendCell("Avg time/task", aggByDay.map((a) => a.avgDuration || 0), days, fmtDur));
+    if (aggByDay.some((a) => a.implRuns > 0)) {
+      grid.append(trendCell("Implementation/task", aggByDay.map((a) => a.avgImpl || 0), days, fmtDur));
+    }
+    if (aggByDay.some((a) => a.valRuns > 0)) {
+      grid.append(trendCell("Validation/task", aggByDay.map((a) => a.avgValidate || 0), days, fmtDur));
+    }
     panel.append(grid);
     container.append(panel);
   }
@@ -400,6 +504,44 @@
       tr.append(el("td", null, agg.avgTurns !== null ? fmtNum(agg.avgTurns) : "—"));
       tr.append(el("td", null, agg.cacheHitRate !== null ? fmtPct(agg.cacheHitRate) : "—"));
       tr.append(el("td", null, agg.hasCost ? fmtMoney(agg.cost) : "—"));
+      tbody.append(tr);
+    }
+    table.append(tbody);
+    panel.append(table);
+    container.append(panel);
+  }
+
+  // Time-per-task breakdown: the same grouping as renderBreakdown but with
+  // duration columns (overall window, implementation/validation phase split).
+  // Sorted by total wall-clock so the dimension eating the most time leads.
+  function renderTimeBreakdown(container, title, runs, keyFn) {
+    const groups = groupBy(runs, keyFn);
+    if (!groups.size) return;
+    const rows = Array.from(groups.entries())
+      .map(([key, list]) => ({ key, agg: aggregate(list) }))
+      .filter((r) => r.agg.durRuns > 0 || r.agg.implRuns > 0 || r.agg.valRuns > 0);
+    if (!rows.length) return;
+    rows.sort((a, b) => b.agg.durTotal - a.agg.durTotal);
+
+    const panel = el("div", "an-panel");
+    panel.append(el("h3", "an-panel-title", title));
+    const table = el("table", "an-table");
+    const thead = el("thead");
+    const htr = el("tr");
+    ["", "Runs", "Time/task", "Impl/task", "Validate/task", "Total time"].forEach((h) => {
+      htr.append(el("th", null, h));
+    });
+    thead.append(htr);
+    table.append(thead);
+    const tbody = el("tbody");
+    for (const { key, agg } of rows) {
+      const tr = el("tr");
+      tr.append(el("td", "an-td-key", key));
+      tr.append(el("td", null, String(agg.runs)));
+      tr.append(el("td", null, fmtDur(agg.avgDuration)));
+      tr.append(el("td", null, fmtDur(agg.avgImpl)));
+      tr.append(el("td", null, fmtDur(agg.avgValidate)));
+      tr.append(el("td", null, agg.durRuns ? fmtDur(agg.durTotal) : "—"));
       tbody.append(tr);
     }
     table.append(tbody);
@@ -1070,6 +1212,9 @@
       if (distinct(current, (r) => r.worker_id).length > 1) {
         renderBreakdown(body, "By worker", current, (r) => r.worker_id);
       }
+      renderTimeBreakdown(body, "Time by model", current, (r) => r.model);
+      renderTimeBreakdown(body, "Time by backend", current, (r) => r.backend);
+      renderTimeBreakdown(body, "Time by queue", current, (r) => r.queue);
       renderEnhancement(body, current);
       renderWaste(body, current);
       renderRunShape(body, current);

@@ -65,8 +65,9 @@ def _attempt_set_sql(
     fill ``$start..``), with the one-shot ``finished_at``/``released_at``
     stamps when ``new_state`` is terminal (invariant 4).
 
-    A dict-valued field (currently just ``usage``, the raw vendor telemetry
-    payload) is JSON-encoded with an explicit ``::jsonb`` cast — the SQLite
+    A dict-valued field (``usage``, the raw vendor telemetry payload, and
+    ``timings``, the per-phase split) is JSON-encoded with an explicit
+    ``::jsonb`` cast — the SQLite
     dialect seam strips casts, so this runs verbatim on both stores, same as
     ``required_mcps`` in ``create_attempt``.
     """
@@ -1038,6 +1039,8 @@ def _attempt_row(row: Any) -> dict[str, Any]:
         d["required_mcps"] = _jsonish(d.get("required_mcps")) or []
     if "usage" in d:
         d["usage"] = _jsonish(d.get("usage"))
+    if "timings" in d:
+        d["timings"] = _jsonish(d.get("timings"))
     if "workflow" in d:
         d["workflow"] = _jsonish(d.get("workflow"))
     return d

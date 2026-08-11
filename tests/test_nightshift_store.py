@@ -46,6 +46,9 @@ USAGE_DETAIL_MIGRATION = (
 ENHANCE_TRACKING_MIGRATION = (
     MIGRATIONS_DIR / "20260801000001_nightshift_enhance_tracking.sql"
 )
+TIMINGS_MIGRATION = (
+    MIGRATIONS_DIR / "20260811000001_nightshift_attempt_timings.sql"
+)
 
 
 def _run(coro):
@@ -392,6 +395,18 @@ def test_usage_payload_round_trips_through_update_and_get_attempt() -> None:
     assert attempt["usage"] == payload
     assert attempt["cache_read_input_tokens"] == 600
     assert attempt["cache_creation_input_tokens"] is None  # not reported
+
+
+def test_timings_round_trip_through_update_and_get_attempt() -> None:
+    """The per-phase ``timings`` jsonb column round-trips as a dict (same
+    encode/decode treatment as ``usage``); a fresh attempt leaves it NULL —
+    "not measured", distinct from a zero-second phase."""
+    store = SqliteStore()
+    _run(_attempt(store, "r1"))
+    assert _run(store.get_attempt("r1"))["timings"] is None
+    split = {"worker": 512.3, "preflight": 4.1, "validate": 88.0, "total": 604.4}
+    _run(store.update_attempt("r1", state=AttemptState.LANDED, timings=split))
+    assert _run(store.get_attempt("r1"))["timings"] == split
 
 
 def test_new_usage_columns_default_null_not_zero_on_a_fresh_attempt() -> None:
@@ -1002,6 +1017,17 @@ def test_usage_detail_migration_shape() -> None:
     assert "DROP COLUMN IF EXISTS cache_read_input_tokens" in down
     assert "DROP COLUMN IF EXISTS cache_creation_input_tokens" in down
     assert "DROP COLUMN IF EXISTS usage" in down
+
+
+def test_attempt_timings_migration_shape() -> None:
+    """The per-phase timings column: a nullable jsonb (no backfill — history
+    predating the instrumentation stays NULL, "not measured"), reversible."""
+    sql = TIMINGS_MIGRATION.read_text()
+    assert "-- migrate:up" in sql and "-- migrate:down" in sql
+    up = sql[sql.index("-- migrate:up"):sql.index("-- migrate:down")]
+    down = sql[sql.index("-- migrate:down"):]
+    assert "ADD COLUMN IF NOT EXISTS timings jsonb" in up
+    assert "DROP COLUMN IF EXISTS timings" in down
 
 
 def test_capability_migration_adds_columns_and_queue_routing() -> None:

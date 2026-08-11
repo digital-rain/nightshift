@@ -34,6 +34,9 @@ RUN_VIEW_KEYS = (
     # Workflow routing metadata (name/step/kind): added post-Phase-8 so the
     # history view can badge workflow stages.
     "workflow",
+    # Per-phase wall-clock split in seconds (Outcome.timings) — feeds the run
+    # detail's Worker/Validate time rows and the analytics time KPIs.
+    "timings",
 )
 
 # The exact pre-Phase-8 lease-row key set and order (the retired store's acquire_lease
@@ -69,7 +72,7 @@ ANALYTICS_RUN_KEYS = (
     "input_tokens", "output_tokens",
     "cache_read_input_tokens", "cache_creation_input_tokens",
     "cost_usd", "usage", "failure_kind", "started_at", "finished_at",
-    "enhanced", "rating",
+    "enhanced", "rating", "timings",
 )
 
 

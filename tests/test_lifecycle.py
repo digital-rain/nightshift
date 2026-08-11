@@ -75,6 +75,9 @@ PREVIOUS_SUBMIT_PAYLOAD_KEYS = frozenset({
     # Additive workflow fields (spec §5); a manager receiving a payload without
     # them defaults both to None (wire-compat).
     "document", "signal",
+    # Additive telemetry: the per-phase wall-clock split the worker loop
+    # measures (None on payloads from older workers — wire-compat).
+    "timings",
 })
 
 # The envelope the loop adds around the Outcome (lease/task identity + the
@@ -98,6 +101,9 @@ PREVIOUS_LOCAL_FINISH_KEYS = frozenset({
     "cache_read_input_tokens", "cache_creation_input_tokens", "usage",
     "cost_usd", "worktree",
     "started_at", "finished_at",
+    # Additive telemetry: the per-phase wall-clock split (rides along like
+    # the token fields — not in _LOCAL_HISTORY_EXCLUDE).
+    "timings",
 })
 
 
@@ -213,6 +219,7 @@ def test_local_finish_record_carries_analytics_fields(tmp_path: Path) -> None:
         "turns", "input_tokens", "output_tokens",
         "cache_read_input_tokens", "cache_creation_input_tokens",
         "cost_usd", "usage", "failure_kind", "started_at", "finished_at",
+        "timings",
     }
     client = _CapturingClient()
     cfg = WorkerConfig(workspace=tmp_path, worker_id="w1", manager_url="http://x")
@@ -255,11 +262,12 @@ def test_telemetry_slice_matches_the_old_worker_submit_repack() -> None:
         "cache_read_input_tokens": 200, "cache_creation_input_tokens": 100,
         "usage": {"input_tokens": 1500},
         "cost_usd": 0.09, "validate_cmd": "just validate", "worktree": "/w/t",
+        "timings": None,
     }
     assert set(Telemetry.model_fields) == {
         "turns", "input_tokens", "output_tokens",
         "cache_read_input_tokens", "cache_creation_input_tokens", "usage",
-        "cost_usd", "validate_cmd", "worktree",
+        "cost_usd", "validate_cmd", "worktree", "timings",
     }
 
 

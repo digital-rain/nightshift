@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from typing import Any
 
 from nightshift import playlists
@@ -174,7 +175,25 @@ class WorkerLoop:
                 self.client.post_events(run_id, list(buffer))
                 buffer.clear()
 
+        # Per-phase wall-clock (Outcome.timings): every phase change funnels
+        # through on_phase, so timing the transitions here covers every
+        # execute path (code, doc, split) without touching their returns.
+        phase_seconds: dict[str, float] = {}
+        current_phase: str | None = None
+        phase_started = 0.0
+
+        def close_phase(now: float) -> None:
+            nonlocal current_phase
+            if current_phase is not None:
+                phase_seconds[current_phase] = (
+                    phase_seconds.get(current_phase, 0.0) + (now - phase_started)
+                )
+                current_phase = None
+
         def on_phase(phase: str) -> None:
+            nonlocal current_phase, phase_started
+            close_phase(time.monotonic())
+            current_phase, phase_started = phase, time.monotonic()
             self.local.set_phase(phase)
             buffer.append(
                 {
@@ -207,6 +226,7 @@ class WorkerLoop:
 
         try:
             buffer.append({"type": "task_started", "task": task, "title": title})
+            execute_started = time.monotonic()
             outcome = execute_work_order(
                 self.cfg, order, on_phase=on_phase, on_log=on_log,
                 on_session=on_session,
@@ -215,6 +235,16 @@ class WorkerLoop:
         finally:
             hb_stop.set()
             hb.join(timeout=1)
+
+        # Stamp the phase split onto the outcome. A run that never entered a
+        # phase (an environment failure before the worker phase) carries no
+        # timings — None distinguishes "not measured" from a zero-second run.
+        ended = time.monotonic()
+        close_phase(ended)
+        if phase_seconds:
+            timings = {k: round(v, 3) for k, v in phase_seconds.items()}
+            timings["total"] = round(ended - execute_started, 3)
+            outcome = outcome.model_copy(update={"timings": timings})
 
         return self._submit(order, outcome)
 

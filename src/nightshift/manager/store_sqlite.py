@@ -122,7 +122,7 @@ def _adapt_row(row: sqlite3.Row) -> dict[str, Any]:
 
 
 # DDL mirroring the CURRENT post-migration Postgres schema (through
-# 20260801000001_nightshift_enhance_tracking.sql) in SQLite types: jsonb → text
+# 20260811000001_nightshift_attempt_timings.sql) in SQLite types: jsonb → text
 # holding JSON, timestamptz → text holding UTC ISO-8601, boolean → integer,
 # numeric → real. The ``nightshift`` schema arrives via ATTACH so the shared
 # SQL's qualified names run verbatim. Keep the attempts_live_task_uniq
@@ -167,6 +167,7 @@ CREATE TABLE nightshift.attempts (
     cache_read_input_tokens     integer,
     cache_creation_input_tokens integer,
     usage          text,
+    timings        text,
     cost_usd       real,
     failure_kind   text,
     failure_reason text,

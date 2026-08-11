@@ -364,8 +364,17 @@ def test_worker_lands_a_task_via_manager(tmp_path: Path, monkeypatch) -> None:
         # The run carries the target repo it landed against.
         assert runs[0]["repo"] == "longitude"
 
-        # Local worker history reflects the landed run.
+        # The per-phase timings (Outcome.timings) rode the submit onto the
+        # attempt row: the worker + validate phases were measured (the seeded
+        # config's validate is `true`), with total covering the whole execute.
+        timings = runs[0]["timings"]
+        assert set(timings) >= {"worker", "validate", "total"}
+        assert timings["total"] >= timings["worker"] >= 0
+        assert timings["validate"] >= 0
+
+        # Local worker history reflects the landed run, same timings split.
         assert local.history()[0]["status"] == "completed"
+        assert local.history()[0]["timings"] == timings
 
         # A second poll finds nothing left to do.
         assert loop.run_once() is False

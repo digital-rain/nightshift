@@ -553,6 +553,9 @@ def execute_work_order(
                     pre.detail or f"{preflight_display} failed",
                     line="preflight failed (environment not provisioned)",
                 )
+            # Back to the worker phase: without this the agent run below would
+            # be shown (and timed — Outcome.timings) as "preflight".
+            on_phase("worker")
 
         max_turns = config_blob.get("max_turns")
         spec = WorkerSpec(

@@ -240,6 +240,13 @@ class Telemetry(BaseModel):
     that don't report cache activity leave them ``None``. ``usage`` is the raw
     vendor-shaped usage payload (per-turn detail, per-model splits, thinking/
     tool tokens, …) kept for post-processing beyond the normalized columns.
+
+    ``timings`` is the per-phase wall-clock split in seconds, measured by the
+    worker loop from its ``on_phase`` transitions (``{"worker": …,
+    "preflight": …, "validate": …, "total": …}`` — only phases the run
+    actually entered, plus ``total`` for the whole execute). ``None`` when the
+    run failed before entering any phase (environment failures) or predates
+    the instrumentation.
     """
 
     turns: int | None = None
@@ -251,6 +258,7 @@ class Telemetry(BaseModel):
     cost_usd: float | None = None
     validate_cmd: str | None = None
     worktree: str | None = None
+    timings: dict[str, float] | None = None
 
 
 class Failure(BaseModel):
