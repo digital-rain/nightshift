@@ -543,6 +543,9 @@ body {
   animation: spin-ring 0.7s linear infinite;
 }
 @keyframes spin-ring { to { transform: rotate(360deg); } }
+/* A paused queue keeps its ring — it still holds its place in the run — but the
+   ring stops turning and goes amber, so "held" never reads as "progressing". */
+.q-spinner.spinning.paused { border-color: var(--warn); animation: none; }
 .q-main { flex: 1; min-width: 0; }
 .q-title { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .q-file { color: var(--text-dim); font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -1283,6 +1286,22 @@ body[data-view="detail"] #screen-detail { display: flex; flex: 1; }
 }
 #screen-detail .detail-body,
 #screen-playlist-info .detail-body { max-width: 760px; width: 100%; margin: 0 auto; }
+
+/* Paused marker on a playlist row, immediately left of the add-task "+". Unlike
+   the row's other buttons this is queue state, so it never hides on hover-out —
+   it is only in the DOM while that queue is paused. Amber to match the
+   failure-pause badge and banner. */
+.pl-paused {
+  background: none;
+  border: none;
+  color: var(--warn);
+  cursor: pointer;
+  line-height: 0;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+.pl-paused svg { width: 15px; height: 15px; display: block; }
+.pl-paused:hover { color: var(--accent); background: var(--bg-sunken); }
 
 /* Add-task shortcut on a playlist row: same reveal-on-hover treatment, sitting
    just to the left of the info button. */

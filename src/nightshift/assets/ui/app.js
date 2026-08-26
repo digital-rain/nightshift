@@ -825,6 +825,11 @@ async function loadPlaylists() {
       state.libraryCount = Array.isArray(m) ? m.length : 0;
     } catch { /* keep the last known count on a transient error */ }
   }
+  // The row spinners and pause icons read the per-queue runner map, which is
+  // otherwise only refreshed by this browser's own transport responses. Re-seed
+  // it while this screen is up so a queue paused elsewhere — another browser,
+  // or the failure policy quarantining a run — shows its pause icon here.
+  if (state.view === "playlists") await refreshQueues();
   renderPlaylists();
 }
 
@@ -1556,6 +1561,17 @@ function isQueueRunning(name) {
   // first per-queue frame lands.
   const live = state.player.state === "playing" || state.player.state === "paused";
   return live && (state.player.running_playlist ?? null) === (name ?? null);
+}
+
+// True when `name` (null = main) has a paused runner — an operator pause or a
+// failure-policy pause, both of which the server reports as state "paused".
+// Reads the per-queue map so a queue paused while another one is focused still
+// reports paused on the Playlists screen.
+function isQueuePaused(name) {
+  const p = state.players[name || "main"];
+  if (p) return p.state === "paused";
+  return state.player.state === "paused"
+    && (state.player.active_playlist ?? null) === (name ?? null);
 }
 
 function currentTaskRecord() {
@@ -3359,13 +3375,35 @@ async function deleteRun(runId) {
 // now-playing spinner exactly (same .q-spinner style, same leading slot): every
 // row reserves the space so names never shift, and the slot only animates when
 // that queue has a live run — so you can see which playlists are playing from
-// the Playlists screen.
-function playlistSpinner(running) {
+// the Playlists screen. A paused queue counts as running (it holds its place in
+// the run) but its ring freezes and goes amber, so a held queue never reads as
+// one that's making progress.
+function playlistSpinner(running, paused) {
   const spinner = document.createElement("span");
   spinner.className = running ? "q-spinner spinning" : "q-spinner";
+  if (running && paused) spinner.className += " paused";
   spinner.setAttribute("aria-hidden", "true");
-  if (running) spinner.title = "Running";
+  if (running) spinner.title = paused ? "Paused" : "Running";
   return spinner;
+}
+
+// The paused indicator for a playlist row: shown only while that queue's runner
+// is paused, and unlike the row's other buttons it stays visible without hover
+// — it is queue *state* first, control second. Clicking it resumes the queue
+// (the same "play" the row menu sends), which clears the pause and so removes
+// this icon on the next render.
+function playlistPauseButton(name) {
+  const btn = document.createElement("button");
+  btn.className = "pl-paused";
+  const reason = (state.players[name || "main"] || {}).pause_reason;
+  btn.title = PAUSE_REASON_COPY[reason] || "Queue paused — click to resume";
+  btn.setAttribute("aria-label", "Queue paused — resume");
+  btn.innerHTML = PAUSE_SVG;
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    playlistTransport("play", name);
+  });
+  return btn;
 }
 
 function renderPlaylists() {
@@ -3599,7 +3637,7 @@ function libraryRow() {
   li.addEventListener("click", () => activatePlaylist(null, "playlists"));
   li.addEventListener("dblclick", () => activatePlaylist(null, "queue"));
 
-  li.append(playlistSpinner(isQueueRunning(null)));
+  li.append(playlistSpinner(isQueueRunning(null), isQueuePaused(null)));
 
   const main = document.createElement("div");
   main.className = "pl-main";
@@ -3655,7 +3693,7 @@ function playlistRow(pl) {
   });
   li.addEventListener("dblclick", () => activatePlaylist(pl.name, "queue"));
 
-  li.append(playlistSpinner(isQueueRunning(pl.name)));
+  li.append(playlistSpinner(isQueueRunning(pl.name), isQueuePaused(pl.name)));
 
   const main = document.createElement("div");
   main.className = "pl-main";
@@ -3674,6 +3712,11 @@ function playlistRow(pl) {
     main.append(badge);
   }
   li.append(main);
+
+  // Paused queues carry a persistent pause icon just left of the "+", so the
+  // Playlists screen shows at a glance which queues are held. Clicking it (or
+  // "Play" in the row menu) resumes and the icon goes away.
+  if (isQueuePaused(pl.name)) li.append(playlistPauseButton(pl.name));
 
   // Add task: shortcut to create a new task directly in this queue.
   const addTask = document.createElement("button");
