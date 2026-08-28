@@ -234,7 +234,7 @@ body {
 .count { color: var(--text-dim); font-weight: 400; }
 .empty { color: var(--text-dim); font-style: italic; }
 
-/* ---- Queue chrome (active queue name + Add menu) ---- */
+/* ---- Queue chrome (active queue name + play/pause + Add menu) ---- */
 .queue-chrome {
   display: flex;
   align-items: center;
@@ -244,6 +244,17 @@ body {
   border-bottom: 1px solid var(--border);
 }
 .queue-playlist { margin: 0; }
+/* Right-hand cluster of the queue chrome: the play/pause control then "+ Add".
+   Grouping them keeps the chrome's space-between split at name | actions. */
+.queue-chrome-actions { display: flex; align-items: center; gap: 8px; }
+.queue-play { display: inline-flex; align-items: center; gap: 6px; }
+.queue-play .queue-play-glyph { display: block; line-height: 0; }
+.queue-play svg { width: 11px; height: 11px; display: block; }
+/* A paused queue's control reads "Resume" and goes amber — the same colour the
+   pause banner and the Playlists row icon use — so a held queue announces
+   itself from its own chrome, not only from the Playlists screen. */
+.queue-play.paused { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
+.queue-play.paused:hover { color: var(--accent); border-color: var(--accent); }
 .queue-upnext { margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
 /* Sort toggle in line with the UP NEXT title: a borderless icon button that
    lights up (accent) when priority sort is active. */

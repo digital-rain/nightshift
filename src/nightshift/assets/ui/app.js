@@ -473,7 +473,7 @@ function setMode(mode) {
   }
 }
 
-async function transport(action, extra = {}) {
+async function transport(action, extra = {}, { follow = true } = {}) {
   // Drive the *focused* queue's runner by default (null → server falls back to
   // the focused queue); callers may target another queue via `extra.queue`.
   const body = { action, mode: getMode(), queue: state.activePlaylist, ...extra };
@@ -483,12 +483,23 @@ async function transport(action, extra = {}) {
   // from (bottom-bar, idle hero, a queue-row double-click). A selected task has
   // already moved the server cursor, so the run starts from there; this just
   // brings the focus to what's now playing. Pause/select/stop/skip stay put.
-  if (action === "play" && data && data.state === "playing") setView("now");
+  // `follow: false` opts out, for controls whose whole point is to toggle in
+  // place (the queue chrome's play/pause).
+  if (follow && action === "play" && data && data.state === "playing") setView("now");
 }
 
 // The single play/pause control: pause while playing, otherwise play/resume.
 function togglePlayPause() {
   transport(state.player.state === "playing" ? "pause" : "play");
+}
+
+// The same toggle, from the queue chrome's control. It drives the queue whose
+// UP NEXT list is on screen (the focused queue, which is what `transport`
+// targets by default) and deliberately does not follow the run to Now: the
+// point of a control in this chrome is that Pause flips to Resume under your
+// cursor while you keep watching the list.
+function toggleQueuePlayPause() {
+  transport(state.player.state === "playing" ? "pause" : "play", {}, { follow: false });
 }
 
 // The map key for a queue: "main" for the main `.tasks` queue, else its name.
@@ -1895,6 +1906,31 @@ function renderPauseBanner(containerId) {
 
 // Queue screen
 // --------------------------------------------------------------------------
+
+// The queue chrome's play/pause control, sat immediately left of "+ Add". It
+// speaks the same one-button vocabulary as the bottom transport, for the queue
+// in focus: Pause while that queue is playing, Resume once it is paused, Play
+// when it is idle. Pressing it therefore turns Pause into Resume in place —
+// no separate button, and no ambiguity about which queue is being held, since
+// the queue's name sits at the other end of the same row.
+function syncQueuePlayButton() {
+  const btn = $("queue-play");
+  if (!btn) return;
+  const playing = state.player.state === "playing";
+  const paused = state.player.state === "paused";
+  const label = playing ? "Pause" : paused ? "Resume" : "Play";
+  const glyph = btn.querySelector(".queue-play-glyph");
+  if (glyph) glyph.innerHTML = playing ? PAUSE_SVG : PLAY_SVG;
+  const text = btn.querySelector(".queue-play-label");
+  if (text) text.textContent = label;
+  const title = `${label} this queue`;
+  btn.title = title;
+  btn.setAttribute("aria-label", title);
+  // Amber while held, so the chrome carries the paused state and not just the
+  // action available on it.
+  btn.classList.toggle("paused", paused);
+}
+
 function renderQueue() {
   renderList("queue", renderQueueNow);
 }
@@ -1922,6 +1958,7 @@ function renderQueueNow() {
       ? "Sorted by priority — click for manual (drag) order"
       : "Manual order — click to sort by priority";
   }
+  syncQueuePlayButton();
   $("queue-empty").hidden = state.queue.length > 0;
   for (const item of state.queue) ul.append(queueItemRow(item));
   renderPauseBanner("queue-pause-banner");
@@ -7016,6 +7053,9 @@ function wire() {
   }
   document.addEventListener("keydown", onGlobalKeydown);
   $("btn-add").addEventListener("click", openAdd);
+  // Queue chrome play/pause: holds and releases the focused queue in place.
+  const queuePlayBtn = $("queue-play");
+  if (queuePlayBtn) queuePlayBtn.addEventListener("click", toggleQueuePlayPause);
   // UP NEXT sort toggle: manual (drag) order <-> priority sort.
   const sortBtn = $("queue-sort");
   if (sortBtn) sortBtn.addEventListener("click", toggleSortMode);

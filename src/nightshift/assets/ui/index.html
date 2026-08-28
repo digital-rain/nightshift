@@ -111,17 +111,26 @@
       </section>
 
       <section id="screen-queue" class="screen screen-queue" aria-label="Queue">
-        <!-- Chrome: the active queue's name + the Add menu, hairline-separated
-             from the UP NEXT list below. -->
+        <!-- Chrome: the active queue's name + the play/pause control and the
+             Add menu, hairline-separated from the UP NEXT list below. The
+             transport control sits left of "+ Add" so the queue you are
+             looking at can be held and released without leaving the list. -->
         <div class="queue-chrome">
           <h2 id="queue-playlist" class="queue-playlist">Main queue</h2>
-          <div class="add-menu-wrap">
-            <button id="btn-add-menu" class="ghost-btn" title="Add"
-                    aria-haspopup="true" aria-expanded="false">+ Add</button>
-            <div id="add-menu" class="add-menu" hidden role="menu">
-              <button class="add-menu-item" data-act="new" role="menuitem">New task…</button>
-              <button class="add-menu-item" data-act="from" role="menuitem">Add from playlist…</button>
-              <button class="add-menu-item" data-act="import-repo" role="menuitem">Import from repository…</button>
+          <div class="queue-chrome-actions">
+            <button id="queue-play" type="button" class="ghost-btn queue-play"
+                    title="Play this queue" aria-label="Play this queue">
+              <span class="queue-play-glyph" aria-hidden="true"></span>
+              <span class="queue-play-label">Play</span>
+            </button>
+            <div class="add-menu-wrap">
+              <button id="btn-add-menu" class="ghost-btn" title="Add"
+                      aria-haspopup="true" aria-expanded="false">+ Add</button>
+              <div id="add-menu" class="add-menu" hidden role="menu">
+                <button class="add-menu-item" data-act="new" role="menuitem">New task…</button>
+                <button class="add-menu-item" data-act="from" role="menuitem">Add from playlist…</button>
+                <button class="add-menu-item" data-act="import-repo" role="menuitem">Import from repository…</button>
+              </div>
             </div>
           </div>
         </div>
