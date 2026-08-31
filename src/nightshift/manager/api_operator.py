@@ -622,7 +622,7 @@ def register_operator_api(
 
     @app.post("/api/tasks/{task}/reset")
     async def reset_task(task: str, queue: str | None = None) -> JSONResponse:
-        """Clear the DB ``blocked``/``repo_unavailable`` overlay for a task.
+        """Clear the DB ``blocked``/``repo_unavailable``/``ci_red`` overlay.
 
         This is the explicit release action for non-auto-clearing blocked
         states (validation-failed, unroutable, bad-repo-reference). It does
@@ -638,6 +638,7 @@ def register_operator_api(
         prior = await store.get_task_state(target, task)
         if not prior or prior.get("state") not in (
             TaskHoldKind.BLOCKED, TaskHoldKind.REPO_UNAVAILABLE,
+            TaskHoldKind.CI_RED,
         ):
             return JSONResponse(
                 {"error": "task is not currently blocked"}, status_code=404,

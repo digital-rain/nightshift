@@ -238,6 +238,7 @@ class NightshiftStore(Protocol):
         state: str = "running",
         enhanced: bool = False,
         workflow: dict[str, Any] | None = None,
+        kind: str | None = None,
     ) -> dict[str, Any] | None: ...
     async def get_attempt(self, attempt_id: str) -> dict[str, Any] | None: ...
     async def update_attempt(self, attempt_id: str, **fields: Any) -> None: ...
@@ -298,6 +299,19 @@ class NightshiftStore(Protocol):
 
     # queue rename (migrate every row keyed on a queue name)
     async def rename_queue(self, old: str, new: str) -> None: ...
+
+    # Repo CI state (the dispatch gate's input, refreshed by the reconciler).
+    async def repo_ci(self) -> dict[str, dict[str, Any]]: ...
+    async def set_repo_ci(
+        self,
+        repo: str,
+        *,
+        state: str,
+        head_sha: str | None,
+        url: str | None,
+        detail: str | None,
+    ) -> str | None: ...
+    async def set_repo_ci_fix(self, repo: str, *, fix_task: str, fix_sha: str) -> None: ...
 
     # events
     async def append_event(
@@ -512,6 +526,7 @@ class SqlStoreBase:
         state: str = "running",
         enhanced: bool = False,
         workflow: dict[str, Any] | None = None,
+        kind: str | None = None,
     ) -> dict[str, Any] | None:
         # The ON CONFLICT predicate must match the partial unique index
         # (attempts_live_task_uniq) in migration 20260731000004 *verbatim*
@@ -524,10 +539,10 @@ class SqlStoreBase:
                 INSERT INTO nightshift.attempts
                     (id, task, queue, worker_id, backend, model, repo,
                      required_mcps, validate_cmd, state, title, body, notes,
-                     enhanced, base_ref, workflow, started_at, acquired_at,
+                     enhanced, base_ref, workflow, kind, started_at, acquired_at,
                      heartbeat_at, deadline_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11,
-                        $12, $13, $14, $15, $17::jsonb, now(), now(), now(),
+                        $12, $13, $14, $15, $17::jsonb, $18, now(), now(), now(),
                         CASE WHEN $10 IN ({_ATTEMPT_LIVE_SQL})
                              THEN now() + ($16 || ' seconds')::interval END)
                 ON CONFLICT (queue, task) WHERE state IN ({_ATTEMPT_LIVE_SQL})
@@ -538,6 +553,7 @@ class SqlStoreBase:
                 json.dumps(required_mcps or []), validate_cmd, state, title, body,
                 notes, enhanced, base_ref, str(int(ttl_seconds)),
                 json.dumps(workflow) if workflow is not None else None,
+                kind,
             )
         return _attempt_row(row) if row else None
 
@@ -855,6 +871,69 @@ class SqlStoreBase:
                     f"UPDATE nightshift.{table} SET queue = $2 WHERE queue = $1",
                     old, new,
                 )
+
+    # ---- repo CI state ------------------------------------------------------ #
+
+    async def repo_ci(self) -> dict[str, dict[str, Any]]:
+        async with self._connection() as conn:
+            rows = await conn.fetch(
+                "SELECT repo, state, head_sha, url, detail, fix_task, fix_sha, "
+                "updated_at FROM nightshift.repo_ci"
+            )
+        return {r["repo"]: dict(r) for r in rows}
+
+    async def set_repo_ci(
+        self,
+        repo: str,
+        *,
+        state: str,
+        head_sha: str | None,
+        url: str | None,
+        detail: str | None,
+    ) -> str | None:
+        """Upsert the repo's CI row, returning the state it replaced.
+
+        The previous state is the transition edge every caller needs: green->red
+        spawns a fix task, red->green resumes dispatch. Returns ``None`` the
+        first time a repo is seen.
+        """
+        async with self._transaction() as conn:
+            prior = await conn.fetchrow(
+                "SELECT state FROM nightshift.repo_ci WHERE repo = $1", repo
+            )
+            previous = prior["state"] if prior else None
+            # A state change clears the fix marker: the next red is a new
+            # failure and deserves its own fix task.
+            if previous != state:
+                await conn.execute(
+                    """
+                    INSERT INTO nightshift.repo_ci
+                        (repo, state, head_sha, url, detail, fix_task, fix_sha, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, NULL, NULL, now())
+                    ON CONFLICT (repo) DO UPDATE SET
+                        state = EXCLUDED.state, head_sha = EXCLUDED.head_sha,
+                        url = EXCLUDED.url, detail = EXCLUDED.detail,
+                        fix_task = NULL, fix_sha = NULL, updated_at = EXCLUDED.updated_at
+                    """,
+                    repo, state, head_sha, url, detail,
+                )
+            else:
+                await conn.execute(
+                    """
+                    UPDATE nightshift.repo_ci
+                    SET head_sha = $2, url = $3, detail = $4, updated_at = now()
+                    WHERE repo = $1
+                    """,
+                    repo, head_sha, url, detail,
+                )
+        return previous
+
+    async def set_repo_ci_fix(self, repo: str, *, fix_task: str, fix_sha: str) -> None:
+        async with self._transaction() as conn:
+            await conn.execute(
+                "UPDATE nightshift.repo_ci SET fix_task = $2, fix_sha = $3 WHERE repo = $1",
+                repo, fix_task, fix_sha,
+            )
 
     # ---- events ------------------------------------------------------------ #
 

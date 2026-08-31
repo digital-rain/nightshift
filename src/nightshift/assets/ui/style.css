@@ -1419,6 +1419,17 @@ body[data-view="detail"] #screen-detail { display: flex; flex: 1; }
 }
 .pl-item:hover { border-color: var(--accent); }
 .pl-item.active { border-color: var(--accent); background: var(--accent-soft); }
+/* Build-status dot (ciDot(), app.js): green/red mirror CI green/red, amber is
+   PENDING, white (a hollow ring on the elevated-panel fill) is UNKNOWN, and
+   gray is "not monitored" (or monitored with no CI row yet). Colour is never
+   the only signal -- ciDot() always sets a title + aria-label too. `.pl-item`
+   is already a `gap`-spaced flex row, so no margin is needed here. */
+.ci-dot { width: .6rem; height: .6rem; border-radius: 50%; flex: 0 0 auto; border: 1px solid transparent; }
+.ci-dot-green { background: var(--ok); }
+.ci-dot-red   { background: var(--err); }
+.ci-dot-amber { background: var(--warn); }
+.ci-dot-white { background: var(--bg-elev); border-color: var(--text-dim); }
+.ci-dot-gray  { background: var(--text-dim); }
 .pl-main { flex: 1; min-width: 0; }
 .pl-name { font-weight: 600; }
 .pl-meta { color: var(--text-dim); font-size: 12px; margin-top: 2px; }

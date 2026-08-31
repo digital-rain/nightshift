@@ -37,6 +37,11 @@ RUN_VIEW_KEYS = (
     # Per-phase wall-clock split in seconds (Outcome.timings) — feeds the run
     # detail's Worker/Validate time rows and the analytics time KPIs.
     "timings",
+    # Task classification carried from the brief's `kind:` frontmatter
+    # (currently only "ci_resolution"); NULL for ordinary tasks and every
+    # pre-existing row. Feeds the History badge and the Stats CI-resolution
+    # category.
+    "kind",
 )
 
 # The exact pre-Phase-8 lease-row key set and order (the retired store's acquire_lease
@@ -73,6 +78,9 @@ ANALYTICS_RUN_KEYS = (
     "cache_read_input_tokens", "cache_creation_input_tokens",
     "cost_usd", "usage", "failure_kind", "started_at", "finished_at",
     "enhanced", "rating", "timings",
+    # See RUN_VIEW_KEYS above: the brief's `kind:` frontmatter, carried onto
+    # the attempt, split out by the Stats CI-resolution card.
+    "kind",
 )
 
 

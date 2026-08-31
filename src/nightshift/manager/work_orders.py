@@ -17,7 +17,11 @@ from nightshift.docs_resolve import (
     render_docs_pin,
     resolve_task_docs,
 )
-from nightshift.manager.scheduler import parse_required_mcps, queue_label
+from nightshift.manager.scheduler import (
+    TaskCandidate,
+    parse_required_mcps,
+    queue_label,
+)
 from nightshift.preflight import resolve_preflight_cmd
 from nightshift.queue_config import format_validate_cmd, resolve_validate_cmd
 from nightshift.spawn_daily import resolve_config, split_frontmatter
@@ -59,6 +63,23 @@ def task_meta(tasks_root: Path, task: str, queue: str | None) -> dict[str, Any]:
         return split_frontmatter(path.read_text(errors="replace"))[0]
     except OSError:
         return {}
+
+
+def is_ci_fix_task(
+    tasks_root: Path, cand: TaskCandidate, ci_rows: dict[str, dict[str, Any]]
+) -> bool:
+    """Is ``cand`` the CI-resolution brief its repo's gate must let through?
+
+    Matching on the task name alone would also exempt a same-stem brief in a
+    *different* queue bound to the same red repo, so the brief's own
+    ``kind: ci_resolution`` tag (written by :func:`_tag_ci_resolution` at spawn
+    time, in the spawn queue only) is what settles it.
+    """
+    row = ci_rows.get(cand.repo or "") or {}
+    if not cand.repo or not row.get("fix_task") or cand.task != row["fix_task"]:
+        return False
+    meta = task_meta(tasks_root, cand.task, cand.queue)
+    return meta.get("kind") == "ci_resolution" and meta.get("repo") == cand.repo
 
 
 def build_work_order(

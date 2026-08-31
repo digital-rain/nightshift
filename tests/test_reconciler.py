@@ -329,7 +329,7 @@ def test_restart_parks_mid_land_run_for_resolve(tmp_path: Path) -> None:
 # (including reads added later without thought) fails loudly.
 _POLL_READS = frozenset({
     "queue_pauses", "queue_dedication", "live_attempts", "list_blocked",
-    "tasks_backing_off", "retryable_tasks", "get_task_state",
+    "tasks_backing_off", "retryable_tasks", "get_task_state", "repo_ci",
 })
 
 

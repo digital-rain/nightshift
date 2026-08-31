@@ -173,12 +173,12 @@
     return `?queue=${encodeURIComponent(queue)}`;
   }
 
-  // DB holds (blocked / repo_unavailable) clear via Reset. Frontmatter
+  // DB holds (blocked / repo_unavailable / ci_red) clear via Reset. Frontmatter
   // quarantined/failed rows still have a brief and belong in the queue view —
   // no dismiss control here (Reset 404s on them).
   function isResettableHold(b) {
     const s = (b && b.state) || "blocked";
-    return s === "blocked" || s === "repo_unavailable";
+    return s === "blocked" || s === "repo_unavailable" || s === "ci_red";
   }
 
   async function dismissBlocked(b, btn) {

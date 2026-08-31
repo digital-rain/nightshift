@@ -131,6 +131,7 @@ class TaskHoldKind(StrEnum):
     FAILED = "failed"
     QUARANTINED = "quarantined"
     REPO_UNAVAILABLE = "repo_unavailable"
+    CI_RED = "ci_red"
 
 
 class FailureKind(StrEnum):

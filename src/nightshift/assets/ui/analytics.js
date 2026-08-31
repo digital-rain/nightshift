@@ -27,7 +27,11 @@
  * time stat below skips absent phases rather than counting them as zero.
  * Optional (manager records only): enhanced (bool — the brief went through
  * the enhance-on-create rewrite) and rating ('up' | 'down' | null — the
- * operator's thumbs verdict), which drive the "Brief enhancement" panel.
+ * operator's thumbs verdict), which drive the "Brief enhancement" panel; and
+ * kind ('ci_resolution' | null/absent — carried from the brief's `kind:`
+ * frontmatter), which drives the "CI resolution" split. Runs without it (every
+ * pre-existing record, and every worker-UI local record) are ordinary task
+ * throughput.
  *
  * The tuning KPI is cost per LANDED change; `landed` is true only for a real
  * change reaching main (not a no-change completion), so the manager derives it
@@ -596,6 +600,47 @@
     panel.append(table);
     panel.append(el("div", "an-note",
       "Thumbs are manual operator ratings on runs; land rate and cost compare enhanced-on-create briefs against raw ones."));
+    container.append(panel);
+  }
+
+  // ---- CI resolution (auto-spawned fix runs) ------------------------------ //
+
+  function isCiResolution(r) {
+    return r.kind === "ci_resolution";
+  }
+
+  // CI-resolution runs are a distinct workload: they are reactive, usually
+  // short, and their success rate is the real health metric for the gate.
+  // Blending them into ordinary task stats would flatter both numbers, so
+  // renderBody excludes them from every panel above and this one reports them
+  // on their own. Renders nothing when the window has none (every pre-existing
+  // run, and every worker-UI local record, carries no `kind` at all).
+  function renderCiResolution(container, runs) {
+    const ci = runs.filter(isCiResolution);
+    if (!ci.length) return;
+    const agg = aggregate(ci);
+    const panel = el("div", "an-panel");
+    panel.append(el("h3", "an-panel-title", "CI resolution"));
+    const row = el("div", "an-kpi-row");
+    row.append(kpiCard("Runs", String(agg.runs), agg.landedRuns + " landed"));
+    row.append(kpiCard(
+      "Land rate",
+      agg.landRate !== null ? fmtPct(agg.landRate) : "—",
+      agg.runs + " runs"
+    ));
+    row.append(kpiCard(
+      "Time / run",
+      fmtDur(agg.avgDuration),
+      agg.durRuns ? fmtDur(agg.durTotal) + " total" : "no timings yet"
+    ));
+    row.append(kpiCard(
+      "Cost",
+      agg.hasCost ? fmtMoney(agg.cost) : "—",
+      agg.hasCost ? fmtMoney(agg.costPerLanded) + " / landed" : agg.runs + " runs"
+    ));
+    panel.append(row);
+    panel.append(el("div", "an-note",
+      "Auto-spawned to resolve a failing CI run on main; excluded from the panels above so ordinary task throughput isn't blended with reactive fix work."));
     container.append(panel);
   }
 
@@ -1204,21 +1249,28 @@
         body.append(el("p", "an-empty", "No runs in this window."));
         return;
       }
-      renderKpiHeader(body, aggregate(current), aggregate(prior));
-      renderTrends(body, current);
-      renderBreakdown(body, "By model", current, (r) => r.model);
-      renderBreakdown(body, "By backend", current, (r) => r.backend);
-      renderBreakdown(body, "By queue", current, (r) => r.queue);
-      if (distinct(current, (r) => r.worker_id).length > 1) {
-        renderBreakdown(body, "By worker", current, (r) => r.worker_id);
+      // CI-resolution runs are reactive fix work, not ordinary throughput:
+      // exclude them from every panel below (they'd flatter both this
+      // window's numbers and the delta against `prior`) and give them their
+      // own card instead (renderCiResolution, fed the unfiltered `current`).
+      const taskCurrent = current.filter((r) => !isCiResolution(r));
+      const taskPrior = prior.filter((r) => !isCiResolution(r));
+      renderKpiHeader(body, aggregate(taskCurrent), aggregate(taskPrior));
+      renderTrends(body, taskCurrent);
+      renderBreakdown(body, "By model", taskCurrent, (r) => r.model);
+      renderBreakdown(body, "By backend", taskCurrent, (r) => r.backend);
+      renderBreakdown(body, "By queue", taskCurrent, (r) => r.queue);
+      if (distinct(taskCurrent, (r) => r.worker_id).length > 1) {
+        renderBreakdown(body, "By worker", taskCurrent, (r) => r.worker_id);
       }
-      renderTimeBreakdown(body, "Time by model", current, (r) => r.model);
-      renderTimeBreakdown(body, "Time by backend", current, (r) => r.backend);
-      renderTimeBreakdown(body, "Time by queue", current, (r) => r.queue);
-      renderEnhancement(body, current);
-      renderWaste(body, current);
-      renderRunShape(body, current);
-      renderTurnComposition(body, current);
+      renderTimeBreakdown(body, "Time by model", taskCurrent, (r) => r.model);
+      renderTimeBreakdown(body, "Time by backend", taskCurrent, (r) => r.backend);
+      renderTimeBreakdown(body, "Time by queue", taskCurrent, (r) => r.queue);
+      renderEnhancement(body, taskCurrent);
+      renderCiResolution(body, current);
+      renderWaste(body, taskCurrent);
+      renderRunShape(body, taskCurrent);
+      renderTurnComposition(body, taskCurrent);
     }
 
     async function reload() {

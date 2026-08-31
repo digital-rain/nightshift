@@ -101,9 +101,11 @@ from nightshift.manager.work_orders import (
     _DOCS_PIN_KEY,
     DocsBlocked,
     build_work_order,
+    is_ci_fix_task,
     task_meta,
 )
 from nightshift.model_id import provider_of
+from nightshift.queue_config import ci_monitoring_enabled
 from nightshift.spawn_daily import (
     is_failed,
     load_queue_config,
@@ -446,6 +448,7 @@ def register_worker_api(
             validate_cmd=planned_validate or None,
             enhanced=bool(order.get("enhanced", False)),
             workflow=wf_persisted,
+            kind=d_meta.get("kind") or None,
         )
         if attempt is None:
             return None
@@ -636,6 +639,33 @@ def register_worker_api(
                             cand.queue, cand.task, TaskHoldKind.BLOCKED,
                             blocked_reason=cand.workflow_error,
                         )
+
+        # CI gate: tasks whose monitored repo has a red main are held out of
+        # dispatch on the same seam as unavailable repos. Only RED gates, so
+        # CI latency never stalls a queue, and the CI-resolution task itself is
+        # never excluded -- it is the thing that turns the repo green. Filtered
+        # to repos at least one queue currently monitors, so a stale red row
+        # left behind after monitoring was switched off never gates dispatch.
+        monitored_repos: set[str] = set()
+        for q in _all_queues():
+            tasks_rel = playlists_mod.tasks_rel(q)
+            config = load_queue_config(tasks_root, tasks_rel)
+            if ci_monitoring_enabled(config):
+                repo = config.get("repo")
+                if repo:
+                    monitored_repos.add(repo)
+        ci_rows = await store.repo_ci()
+        red = {
+            r for r, row in ci_rows.items()
+            if row.get("state") == "red" and r in monitored_repos
+        }
+        if red:
+            for cands in candidates_by_queue.values():
+                for cand in cands:
+                    if cand.repo in red and not is_ci_fix_task(
+                        tasks_root, cand, ci_rows
+                    ):
+                        repo_excluded.add((cand.queue, cand.task))
 
         active = await store.live_attempts()
         leased = {(_queue_from_label(le["queue"]), le["task"]) for le in active}

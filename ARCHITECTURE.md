@@ -103,6 +103,19 @@ sequenceDiagram
   end
 ```
 
+### The CI-state gate
+
+A queue bound to a repo can switch **CI monitoring** on (per queue binding, in that queue's `config.json`; off by default).
+The reconciler then refreshes that repo's GitHub Actions state for `main` on the `cadences.ci_refresh_seconds` cadence, through the `gh` seam in `src/nightshift/ci.py` — the only place `gh` is invoked as a subprocess, mirroring the `GitRunner` invariant for `git`.
+The verdict is persisted per repo in `nightshift.repo_ci`.
+
+The gate is **fail-open**: only `RED` holds dispatch, while `PENDING`, `UNKNOWN`, and `GREEN` all dispatch normally, so CI latency never stalls a queue.
+A red repo's tasks are held as `TaskHoldKind.CI_RED` on the same seam that already holds `repo_unavailable` tasks, and excluded read-only in `worker_poll`.
+On the transition into red the reconciler spawns exactly one CI-resolution brief for that commit — tagged `kind: ci_resolution`, deduped on `head_sha`, and carried onto the attempt row so History and Stats report it as its own category.
+That brief is exempt from the gate it exists to clear; holding it would deadlock the repo.
+
+Resume-on-green carries no code of its own: the gate reads current state on every poll, so a green refresh re-admits the repo's tasks automatically.
+
 ### Execution outcomes
 
 | Outcome | Meaning | Landing |

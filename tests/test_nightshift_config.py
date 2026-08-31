@@ -11,6 +11,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from nightshift.config.manager import ManagerSettings
+from nightshift.queue_config import ci_monitoring_enabled, set_ci_monitoring
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MANAGER_TEMPLATE = ROOT / "src" / "nightshift" / "assets" / "config" / "manager.json"
@@ -45,3 +48,45 @@ def test_template_scheduled_models_allow_filter() -> None:
     assert isinstance(config["scheduled_models_allow"], list)
     assert config["scheduled_models_allow"]
     assert "diff_cap_lines" in config
+
+
+def test_ci_monitoring_defaults_off() -> None:
+    assert ci_monitoring_enabled({}) is False
+    assert ci_monitoring_enabled({"validate": "just validate"}) is False
+
+
+def test_ci_monitoring_reads_the_flag() -> None:
+    assert ci_monitoring_enabled({"ci_monitoring": True}) is True
+    assert ci_monitoring_enabled({"ci_monitoring": False}) is False
+
+
+def test_ci_refresh_cadence_default() -> None:
+    assert ManagerSettings().cadences.ci_refresh_seconds == 120.0
+
+
+def test_set_ci_monitoring_creates_a_missing_queue_dir(tmp_path: Path) -> None:
+    """The switch endpoint must not 500 on a queue whose dir is not there yet."""
+    set_ci_monitoring(tmp_path, "newqueue", True)
+    written = json.loads((tmp_path / "newqueue" / "config.json").read_text())
+    assert written["ci_monitoring"] is True
+    assert ci_monitoring_enabled(written) is True
+
+
+def test_set_ci_monitoring_survives_a_malformed_config(tmp_path: Path) -> None:
+    """A corrupt config.json degrades to {} rather than raising into the handler."""
+    queue = tmp_path / "main"
+    queue.mkdir()
+    (queue / "config.json").write_text("{not json at all")
+    set_ci_monitoring(tmp_path, "main", True)
+    assert json.loads((queue / "config.json").read_text())["ci_monitoring"] is True
+
+
+def test_set_ci_monitoring_preserves_sibling_keys(tmp_path: Path) -> None:
+    queue = tmp_path / "main"
+    queue.mkdir()
+    (queue / "config.json").write_text(json.dumps({"repo": "longitude", "validate": "just validate"}))
+    set_ci_monitoring(tmp_path, "main", True)
+    written = json.loads((queue / "config.json").read_text())
+    assert written["repo"] == "longitude"
+    assert written["validate"] == "just validate"
+    assert written["ci_monitoring"] is True

@@ -54,6 +54,26 @@ def resolve_validate_cmd(config: dict) -> list[str] | None:
     return shlex.split(raw)
 
 
+def ci_monitoring_enabled(config: dict) -> bool:
+    """Whether this queue watches its bound repo's CI on main.
+
+    Absent key means off: monitoring is opt-in per queue, because it costs a
+    ``gh`` call per refresh and only makes sense for a queue bound to a repo
+    with GitHub Actions.
+    """
+    return bool(config.get("ci_monitoring", False))
+
+
+def set_ci_monitoring(tasks_root: Path, tasks_rel: str, enabled: bool) -> None:
+    """Persist the queue's monitoring switch into its own config.json.
+
+    Delegates to :func:`save_queue_config_value` so the switch inherits its
+    guards: it creates a missing queue dir and degrades a malformed
+    ``config.json`` to ``{}`` rather than raising into the request handler.
+    """
+    save_queue_config_value(tasks_root, "ci_monitoring", bool(enabled), tasks_rel)
+
+
 def format_validate_cmd(argv: list[str] | None) -> str:
     """Shell command string for a work order, or ``""`` when validation is disabled."""
     if argv is None:

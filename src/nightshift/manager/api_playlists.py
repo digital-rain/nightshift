@@ -24,8 +24,10 @@ from nightshift.manager.scheduler import queue_label
 from nightshift.manager.store import NightshiftStore
 from nightshift.manager.wire import EmitFn, normalize_repo
 from nightshift.queue_config import (
+    ci_monitoring_enabled,
     normalize_validate_command,
     save_queue_config_value,
+    set_ci_monitoring,
 )
 from nightshift.spawn_daily import load_queue_config
 from nightshift.task_files import list_queue
@@ -33,6 +35,14 @@ from nightshift.task_files import list_queue
 
 class PlaylistCreate(BaseModel):
     name: str
+
+
+class QueueCiMonitoringBody(BaseModel):
+    """Body for ``PUT /api/queue/ci-monitoring``. ``queue=None`` targets the
+    main queue (mirrors every other queue-scoped body in this API)."""
+
+    queue: str | None = None
+    enabled: bool
 
 
 class PlaylistUpdate(BaseModel):
@@ -75,8 +85,26 @@ def register_playlist_api(
 ) -> None:
     """Register the playlist and repo endpoints (see module docstring)."""
     @app.get("/api/playlists")
-    def get_playlists() -> JSONResponse:
-        return JSONResponse(playlists_mod.list_playlists(tasks_root))
+    async def get_playlists() -> JSONResponse:
+        """The playlists list, each entry gaining ``ci_state``: the repo's
+        latest CI state (``"green"|"red"|"pending"|"unknown"``) when the
+        playlist's bound repo is monitored, else ``None`` -- covering both
+        "not monitored" and "monitored but no CI row recorded yet", the same
+        ambiguity ``/api/repos`` already accepts for its ``ci`` field.
+
+        "Monitored" is repo-level (mirrors the reconciler's own gate): a
+        playlist's repo counts as monitored when *any* queue bound to it --
+        not necessarily this one -- has ``ci_monitoring`` on.
+        """
+        entries = playlists_mod.list_playlists(tasks_root)
+        monitored = _monitored_repo_names()
+        ci_rows = await _store().repo_ci() if monitored else {}
+        for entry in entries:
+            cfg = load_queue_config(tasks_root, playlists_mod.tasks_rel(entry["name"]))
+            repo = cfg.get("repo")
+            row = ci_rows.get(repo) if repo and repo in monitored else None
+            entry["ci_state"] = row.get("state") if row else None
+        return JSONResponse(entries)
 
     @app.post("/api/playlists")
     async def post_playlist(req: PlaylistCreate) -> JSONResponse:
@@ -108,6 +136,7 @@ def register_playlist_api(
             "disabled": playlists_mod.is_disabled(tasks_root, name),
             "description": cfg.get("description"),
             "notes": cfg.get("notes"),
+            "ci_monitoring": ci_monitoring_enabled(cfg),
         }
 
     @app.get("/api/main/info")
@@ -122,6 +151,7 @@ def register_playlist_api(
             "repository": cfg.get("repo"),
             "validate": cfg.get("validate"),
             "disabled": False,
+            "ci_monitoring": ci_monitoring_enabled(cfg),
         })
 
     @app.get("/api/playlists/{name}/tasks")
@@ -253,13 +283,30 @@ def register_playlist_api(
 
     # ----- repos (multi-repo workspace) ----------------------------------- #
 
-    def _repos_payload() -> dict[str, Any]:
+    def _monitored_repo_names() -> set[str]:
+        """Repos with at least one queue whose ``ci_monitoring`` switch is on.
+
+        Mirrors the reconciler's own ``_monitored_repos`` (minus the per-queue
+        grouping and the availability filter, neither of which this payload
+        needs -- the caller only walks repos already known to the workspace)."""
+        out: set[str] = set()
+        for q in _all_queues():
+            config = load_queue_config(tasks_root, playlists_mod.tasks_rel(q))
+            repo = config.get("repo")
+            if repo and ci_monitoring_enabled(config):
+                out.add(repo)
+        return out
+
+    async def _repos_payload() -> dict[str, Any]:
         """The known-repos set, per-queue repo bindings, and warnings.
 
         The known set is the workspace's direct children with ``.git``; per-queue
         repo comes from each queue's ``config.json``. A queue whose configured
         repo is set but absent surfaces a single warning (matching the
-        one-warning-per-queue pause rule)."""
+        one-warning-per-queue pause rule). Each repo also carries ``monitored``
+        (a queue bound to it has CI monitoring on) and, only when monitored,
+        its latest ``ci`` state row (``None`` otherwise -- an unmonitored repo
+        has no fresh row to trust)."""
         known = repos.known_repos(workspace)
         queues_payload: list[dict[str, Any]] = []
         warnings: list[dict[str, Any]] = []
@@ -267,20 +314,64 @@ def register_playlist_api(
             label = queue_label(q)
             repo = _queue_repo(q)
             available = bool(repo) and repos.repo_available(workspace, repo)
-            queues_payload.append({"queue": label, "repo": repo, "available": available})
+            config = load_queue_config(tasks_root, playlists_mod.tasks_rel(q))
+            queues_payload.append({
+                "queue": label,
+                "repo": repo,
+                "available": available,
+                "ci_monitoring": ci_monitoring_enabled(config),
+            })
             if repo and not available:
                 warnings.append({"queue": label, "repo": repo})
+        monitored = _monitored_repo_names()
+        ci_rows = await _store().repo_ci()
+        repos_payload = []
+        for name in known:
+            is_monitored = name in monitored
+            row = ci_rows.get(name) if is_monitored else None
+            repos_payload.append({
+                "name": name,
+                "available": True,
+                "monitored": is_monitored,
+                "ci": None if not row else {
+                    "state": row.get("state"),
+                    "head_sha": row.get("head_sha"),
+                    "url": row.get("url"),
+                    "detail": row.get("detail"),
+                    "fix_task": row.get("fix_task"),
+                },
+            })
         return {
             "workspace": str(workspace),
             "tasks_repo": tasks_repo,
-            "repos": [{"name": name, "available": True} for name in known],
+            "repos": repos_payload,
             "queues": queues_payload,
             "warnings": warnings,
         }
 
     @app.get("/api/repos")
-    def get_repos() -> JSONResponse:
-        return JSONResponse(_repos_payload())
+    async def get_repos() -> JSONResponse:
+        return JSONResponse(await _repos_payload())
+
+    @app.put("/api/queue/ci-monitoring")
+    async def put_queue_ci_monitoring(body: QueueCiMonitoringBody) -> JSONResponse:
+        """Turn CI monitoring on/off for one queue.
+
+        Persists into that queue's own ``config.json`` beside ``repo`` and
+        ``validate``. Turning it off leaves any ``ci_red`` hold on this queue's
+        tasks for exactly one more tick -- the reconciler recomputes the
+        monitored-repo set every refresh, so the clear loop drops the hold on
+        the next pass once the repo is no longer in that set.
+        """
+        target = _queue_from_label(body.queue)
+        if target is not None and not playlists_mod.exists(tasks_root, target):
+            return JSONResponse({"error": "queue not found"}, status_code=404)
+        set_ci_monitoring(tasks_root, playlists_mod.tasks_rel(target), body.enabled)
+        await _commit(f"nightshift: set ci-monitoring {queue_label(target)}")
+        await _emit(
+            "queue_changed", queue=target, payload={"ci_monitoring": body.enabled}
+        )
+        return JSONResponse(await _repos_payload())
 
     @app.post("/api/repos/rescan")
     async def rescan_repos() -> JSONResponse:
@@ -301,4 +392,4 @@ def register_playlist_api(
         # rebinding would leave it deduping against a stale object forever.
         app.state.repo_warnings.clear()
         await _emit("repos_changed", payload={"resumed": resumed})
-        return JSONResponse(_repos_payload())
+        return JSONResponse(await _repos_payload())

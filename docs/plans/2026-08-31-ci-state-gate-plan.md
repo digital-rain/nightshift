@@ -1,5 +1,5 @@
 ---
-status: draft
+status: validating
 date: 2026-08-31
 ---
 
@@ -56,7 +56,7 @@ date: 2026-08-31
 - Consumes: nothing (leaf module).
 - Produces: `class CiState(StrEnum)` with members `GREEN`, `RED`, `PENDING`, `UNKNOWN`; `@dataclass(frozen=True) class CiStatus` with fields `state: CiState`, `head_sha: str | None`, `url: str | None`, `detail: str | None`; `class GhRunner` with `__init__(self, repo_root: Path)` and `run(self, *args: str) -> tuple[int, str, str]`; `def status_from_runs(payload: str) -> CiStatus`; `def check_repo_ci(repo_root: Path, *, branch: str = "main", runner: GhRunner | None = None) -> CiStatus`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 """Tests for the gh seam: gh JSON -> CiStatus."""
@@ -121,12 +121,12 @@ def test_garbage_payload_is_unknown():
     assert status_from_runs("not json").state is CiState.UNKNOWN
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/test_ci_seam.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'nightshift.ci'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 """The CI seam: nightshift's only window onto a repo's GitHub Actions state.
@@ -261,12 +261,12 @@ def check_repo_ci(
     return status_from_runs(out)
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/test_ci_seam.py -v`
 Expected: 8 passed.
 
-- [ ] **Step 5: Add a `check_repo_ci` test with a stub runner**
+- [x] **Step 5: Add a `check_repo_ci` test with a stub runner**
 
 ```python
 from pathlib import Path
@@ -298,12 +298,12 @@ def test_gh_failure_degrades_to_unknown():
     assert "not found" in (st.detail or "")
 ```
 
-- [ ] **Step 6: Run to green, then lint**
+- [x] **Step 6: Run to green, then lint**
 
 Run: `.venv/bin/python -m pytest tests/test_ci_seam.py -v && .venv/bin/python -m ruff check src/nightshift/ci.py tests/test_ci_seam.py`
 Expected: 10 passed, ruff clean.
 
-- [ ] **Step 7: Commit** — `ci seam: gh run list -> CiStatus, fail-open on every error path`
+- [x] **Step 7: Commit** — `ci seam: gh run list -> CiStatus, fail-open on every error path`
 
 ## Task 2: Persist per-repo CI state
 
@@ -320,7 +320,7 @@ Expected: 10 passed, ruff clean.
   - `async def set_repo_ci(self, repo: str, *, state: str, head_sha: str | None, url: str | None, detail: str | None) -> str | None` — upserts and returns the **previous** state string (`None` on first sight), which is how the caller detects a transition.
   - `async def set_repo_ci_fix(self, repo: str, *, fix_task: str, fix_sha: str) -> None` — records the spawned fix task for dedupe.
 
-- [ ] **Step 1: Write the migration**
+- [x] **Step 1: Write the migration**
 
 ```sql
 -- migrate:up
@@ -346,7 +346,7 @@ CREATE TABLE IF NOT EXISTS nightshift.repo_ci (
 DROP TABLE IF EXISTS nightshift.repo_ci;
 ```
 
-- [ ] **Step 2: Mirror the table in the SQLite inline schema**
+- [x] **Step 2: Mirror the table in the SQLite inline schema**
 
 Add beside the `nightshift.queue_state` block in `store_sqlite.py`:
 
@@ -363,7 +363,7 @@ CREATE TABLE nightshift.repo_ci (
 );
 ```
 
-- [ ] **Step 3: Write the failing store test**
+- [x] **Step 3: Write the failing store test**
 
 Append to `tests/test_nightshift_store.py`:
 
@@ -397,12 +397,12 @@ async def test_repo_ci_fix_marker(store):
     assert rows["longitude"]["fix_sha"] == "bbb"
 ```
 
-- [ ] **Step 4: Run to verify it fails**
+- [x] **Step 4: Run to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/test_nightshift_store.py -k repo_ci -v`
 Expected: FAIL — `AttributeError: 'SqliteStore' object has no attribute 'set_repo_ci'`
 
-- [ ] **Step 5: Add the protocol entries**
+- [x] **Step 5: Add the protocol entries**
 
 In `NightshiftStore` (`store.py`), beside `queue_pauses` / `set_queue_pause`:
 
@@ -416,7 +416,7 @@ In `NightshiftStore` (`store.py`), beside `queue_pauses` / `set_queue_pause`:
     async def set_repo_ci_fix(self, repo: str, *, fix_task: str, fix_sha: str) -> None: ...
 ```
 
-- [ ] **Step 6: Implement once on `SqlStoreBase`**
+- [x] **Step 6: Implement once on `SqlStoreBase`**
 
 ```python
     async def repo_ci(self) -> dict[str, dict[str, Any]]:
@@ -470,17 +470,17 @@ In `NightshiftStore` (`store.py`), beside `queue_pauses` / `set_queue_pause`:
 
 > **Placement note:** `_fetch`, `_execute`, and `_now` are the existing `SqlStoreBase` helpers used by `queue_pauses` / `set_queue_pause` — match their exact names and parameter-placeholder style as they appear in the file; SQLite and Postgres share this body, which is why it lives on the base and not on `PgStore`.
 
-- [ ] **Step 7: Run to green**
+- [x] **Step 7: Run to green**
 
 Run: `.venv/bin/python -m pytest tests/test_nightshift_store.py -k repo_ci -v`
 Expected: 2 passed.
 
-- [ ] **Step 8: Verify the Postgres migration round-trips**
+- [x] **Step 8: Verify the Postgres migration round-trips**
 
 Run: `just migrate && just rollback && just migrate`
 Expected: all three succeed; `repo_ci` exists after the final migrate.
 
-- [ ] **Step 9: Commit** — `store: per-repo CI state with transition-returning upsert`
+- [x] **Step 9: Commit** — `store: per-repo CI state with transition-returning upsert`
 
 ## Task 3: Per-queue CI monitoring config
 
@@ -495,7 +495,7 @@ Expected: all three succeed; `repo_ci` exists after the final migrate.
 
 **Why per-queue:** a queue is already bound to exactly one repo, and it already carries its own operator-editable settings (`validate`, `order`, `sort`) in `.tasks/<queue>/config.json`. The monitoring switch belongs in the same place, edited through the same screens.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 from nightshift.queue_config import ci_monitoring_enabled
@@ -515,12 +515,12 @@ def test_ci_refresh_cadence_default():
     assert ManagerSettings().cadences.ci_refresh_seconds == 120.0
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/test_nightshift_config.py -k ci_ -v`
 Expected: FAIL — `ImportError: cannot import name 'ci_monitoring_enabled'`
 
-- [ ] **Step 3: Implement the queue-config accessors**
+- [x] **Step 3: Implement the queue-config accessors**
 
 In `queue_config.py`:
 
@@ -543,7 +543,7 @@ def set_ci_monitoring(tasks_root: Path, tasks_rel: str, enabled: bool) -> None:
     path.write_text(json.dumps(config, indent=2) + "\n")
 ```
 
-- [ ] **Step 4: Add the cadence**
+- [x] **Step 4: Add the cadence**
 
 In `Cadences` (`config/manager.py`):
 
@@ -557,7 +557,7 @@ In `Cadences` (`config/manager.py`):
         apply="restart"))
 ```
 
-- [ ] **Step 5: Run to green, then document**
+- [x] **Step 5: Run to green, then document**
 
 Run: `.venv/bin/python -m pytest tests/test_nightshift_config.py -k ci_ -v`
 
@@ -573,7 +573,7 @@ and in the per-queue settings section:
 | `ci_monitoring` | `false` | Watch this queue's bound repo for a failing GitHub Actions run on `main`: hold the queue's tasks while it is red and queue a CI-resolution task. Toggled from Repos → Queue bindings, or the playlist's detail page. |
 ```
 
-- [ ] **Step 6: Commit** — `config: per-queue ci_monitoring switch + ci_refresh_seconds cadence`
+- [x] **Step 6: Commit** — `config: per-queue ci_monitoring switch + ci_refresh_seconds cadence`
 
 ## Task 4: The reconciler refresh duty
 
@@ -585,7 +585,7 @@ and in the per-queue settings section:
 - Consumes: `check_repo_ci`, `CiState`, `CiStatus` (Task 1); `store.repo_ci` / `set_repo_ci` (Task 2); `queue_config.ci_monitoring_enabled` (Task 3); the existing `playlists_mod.tasks_rel(q)`, `load_queue_config`, `repos.resolve_repo`, `repos.repo_available`, `repos.repo_root`.
 - Produces: `Reconciler._refresh_repo_ci()`; `Reconciler._monitored_repos() -> dict[str, set[str | None]]` (repo → the queues watching it); `Reconciler._ci_checked_at: dict[str, float]`; the `repo_ci` event kind.
 
-- [ ] **Step 1: Write the shared test harness**
+- [x] **Step 1: Write the shared test harness**
 
 Create `tests/test_ci_gate.py`, mirroring `tests/test_reconciler.py`'s harness (`TestClient(create_app(...))`, duties via `client.app.state.reconciler`, sync tests, coroutines through `client.portal.call`).
 
@@ -676,7 +676,7 @@ def _poll(client: TestClient, worker_id: str = "w1") -> dict | None:
 
 > If `build_workspace` does not accept per-queue `config.json` keys through its `queues=` mapping, extend it there — `tests/_workspace.py` is the canonical fixture builder (root `AGENTS.md`, Working norms); do not build a second helper in this file.
 
-- [ ] **Step 2: Write the failing duty tests**
+- [x] **Step 2: Write the failing duty tests**
 
 ```python
 def test_refresh_records_state_for_a_monitored_queue(gate):
@@ -719,12 +719,12 @@ def test_throttle_suppresses_an_immediate_recheck(gate):
     assert stub.calls == 1
 ```
 
-- [ ] **Step 3: Run to verify it fails**
+- [x] **Step 3: Run to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/test_ci_gate.py -v`
 Expected: FAIL — `AttributeError: module 'nightshift.manager.reconciler' has no attribute 'check_repo_ci'`.
 
-- [ ] **Step 4: Add imports and the throttle map**
+- [x] **Step 4: Add imports and the throttle map**
 
 `asyncio` and `repos` are already imported in `reconciler.py`; `time` is **not**:
 
@@ -743,7 +743,7 @@ In `Reconciler.__init__`, beside the other `self._…` assignments:
         self._ci_checked_at: dict[str, float] = {}
 ```
 
-- [ ] **Step 5: Implement the duty**
+- [x] **Step 5: Implement the duty**
 
 ```python
     def _monitored_repos(self) -> dict[str, set[str | None]]:
@@ -823,12 +823,12 @@ Add the forward stub that Task 5 replaces:
         return None
 ```
 
-- [ ] **Step 6: Run to green**
+- [x] **Step 6: Run to green**
 
 Run: `.venv/bin/python -m pytest tests/test_ci_gate.py -v`
 Expected: 5 passed.
 
-- [ ] **Step 7: Commit** — `reconciler: refresh CI for monitored repos, throttled, event on transition`
+- [x] **Step 7: Commit** — `reconciler: refresh CI for monitored repos, throttled, event on transition`
 
 ## Task 5: Spawn the CI-resolution task
 
@@ -840,7 +840,7 @@ Expected: 5 passed.
 - Consumes: `create_task(tasks_root, title, text, tasks_rel="main") -> dict`; `store.set_repo_ci_fix` (Task 2).
 - Produces: `Reconciler._spawn_ci_fix(repo, status, *, queues)`; the `repo_ci_fix_spawned` event; a brief carrying `kind: ci_resolution` frontmatter — the tag Task 10 categorises History and Stats on.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 def test_red_spawns_one_ci_resolution_task(gate):
@@ -883,12 +883,12 @@ def test_red_green_red_spawns_a_second_task(gate):
     assert len(list(_tasks_dir(ws).glob("fix-ci-*.md"))) == 2
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/test_ci_gate.py -k spawn -v`
 Expected: FAIL — `fix_task` is `None`; the stub returns without spawning.
 
-- [ ] **Step 3: Replace the stub**
+- [x] **Step 3: Replace the stub**
 
 ```python
     async def _spawn_ci_fix(
@@ -959,12 +959,12 @@ def _tag_ci_resolution(
 
 > `split_frontmatter` is already exported from `nightshift.spawn_daily`; add the matching `join_frontmatter` there if it does not exist yet, next to its splitter — one frontmatter seam, not two.
 
-- [ ] **Step 4: Run to green**
+- [x] **Step 4: Run to green**
 
 Run: `.venv/bin/python -m pytest tests/test_ci_gate.py -v`
 Expected: 8 passed.
 
-- [ ] **Step 5: Commit** — `reconciler: spawn one tagged ci_resolution task per failing sha`
+- [x] **Step 5: Commit** — `reconciler: spawn one tagged ci_resolution task per failing sha`
 
 ## Task 6: The dispatch hold
 
@@ -979,7 +979,7 @@ Expected: 8 passed.
 
 **Why this shape:** `repo_unavailable` is the existing idiom for "a repo-level condition is holding these tasks" — a `TaskHoldKind` written and cleared by the reconciler, excluded read-only in `worker_poll` (which says so: *"the corresponding hold writes and warnings are the reconciler's"*), and rendered by `STATE_LABELS`/`statusClass` as a pill. A red repo is the same kind of condition, so it gets the same treatment rather than a parallel mechanism.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 def test_red_holds_the_queues_tasks(gate):
@@ -1023,12 +1023,12 @@ def test_unmonitored_queue_dispatches_through_red(unmonitored):
     assert _poll(client) is not None
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/test_ci_gate.py -k "hold or gates or resume" -v`
 Expected: FAIL — `get_task_state` returns `None`; work is handed out.
 
-- [ ] **Step 3: Add the hold kind**
+- [x] **Step 3: Add the hold kind**
 
 In `lifecycle.py`, beside `REPO_UNAVAILABLE`:
 
@@ -1036,7 +1036,7 @@ In `lifecycle.py`, beside `REPO_UNAVAILABLE`:
     CI_RED = "ci_red"
 ```
 
-- [ ] **Step 4: Write and clear the hold in `_reconcile_holds`**
+- [x] **Step 4: Write and clear the hold in `_reconcile_holds`**
 
 Read the red set once, near the duty's other reads:
 
@@ -1085,7 +1085,7 @@ def test_the_ci_resolution_task_is_not_held_by_its_own_gate(gate):
     assert order and order["task"] == fix     # the fix is what dispatches
 ```
 
-- [ ] **Step 5: Extend the read-only dispatch exclusion**
+- [x] **Step 5: Extend the read-only dispatch exclusion**
 
 In `worker_poll`, after the existing `repo_excluded` loop and **before** `blocked |= repo_excluded` — the DB hold already blocks these, so this is the belt-and-braces path that matches `repo_unavailable`'s:
 
@@ -1105,12 +1105,12 @@ In `worker_poll`, after the existing `repo_excluded` loop and **before** `blocke
                         repo_excluded.add((cand.queue, cand.task))
 ```
 
-- [ ] **Step 6: Run to green + full gate**
+- [x] **Step 6: Run to green + full gate**
 
 Run: `.venv/bin/python -m pytest tests/test_ci_gate.py -v && just validate`
 Expected: 14 passed, suite green, ruff clean.
 
-- [ ] **Step 7: Commit** — `gate: hold a red repo's tasks as ci_red, never the fix task itself`
+- [x] **Step 7: Commit** — `gate: hold a red repo's tasks as ci_red, never the fix task itself`
 
 ## Task 7: Repos page — MONITORING and HOLD badges
 
@@ -1122,7 +1122,7 @@ Expected: 14 passed, suite green, ruff clean.
 **Interfaces:**
 - Produces: each entry in the `/api/repos` `repos` array gains `monitored: bool` and `ci: {"state","head_sha","url","detail","fix_task"} | None`; the UI status vocabulary gains `ci_red`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 def test_repos_payload_carries_monitoring_and_ci(gate):
@@ -1143,12 +1143,12 @@ def test_unmonitored_repo_reports_monitored_false(unmonitored):
     assert repos["longitude"]["ci"] is None
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/test_ci_gate.py -k repos_payload -v`
 Expected: FAIL — `KeyError: 'monitored'`
 
-- [ ] **Step 3: Extend `_repos_payload`**
+- [x] **Step 3: Extend `_repos_payload`**
 
 `_repos_payload` is currently sync and `/api/repos` is a sync endpoint. Read CI state through the app's portal-free path by making both async (the sibling `rescan_repos` is already `async def`, so the pattern is established):
 
@@ -1177,7 +1177,7 @@ Expected: FAIL — `KeyError: 'monitored'`
         return payload
 ```
 
-- [ ] **Step 4: Render the badges**
+- [x] **Step 4: Render the badges**
 
 In `app.js`, extend `repoRow` so the row carries availability plus, when monitored, a monitoring badge and the hold badge:
 
@@ -1226,11 +1226,11 @@ Teach the shared status vocabulary the hold kind, beside `repo_unavailable`:
   if (status === "ci_red") return "paused";
 ```
 
-- [ ] **Step 5: Run to green**
+- [x] **Step 5: Run to green**
 
 Run: `.venv/bin/python -m pytest tests/test_ci_gate.py -v && just validate`
 
-- [ ] **Step 6: Commit** — `repos page: Monitoring badge + CI Hold badge; ci_red in the status vocabulary`
+- [x] **Step 6: Commit** — `repos page: Monitoring badge + CI Hold badge; ci_red in the status vocabulary`
 
 ## Task 8: The CI MONITORING switch (queue bindings + playlist detail)
 
@@ -1242,7 +1242,7 @@ Run: `.venv/bin/python -m pytest tests/test_ci_gate.py -v && just validate`
 **Interfaces:**
 - Produces: `PUT /api/queue/ci-monitoring` accepting `{"queue": str|null, "enabled": bool}`, persisting via `queue_config.set_ci_monitoring` and returning the refreshed repos payload; a YES/NO segmented control on both screens.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 def test_toggling_monitoring_persists_and_takes_effect(unmonitored):
@@ -1271,12 +1271,12 @@ def test_toggling_off_stops_polling_and_clears_holds(gate):
     assert _poll(client) is not None
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/test_ci_gate.py -k monitoring -v`
 Expected: FAIL — 404/405 on the unknown route.
 
-- [ ] **Step 3: Add the endpoint**
+- [x] **Step 3: Add the endpoint**
 
 Beside `PUT /api/queue/repo`, matching its body-model and error style:
 
@@ -1303,7 +1303,7 @@ class QueueCiMonitoringBody(BaseModel):
     enabled: bool
 ```
 
-- [ ] **Step 4: Add the segmented control to the queue-binding row**
+- [x] **Step 4: Add the segmented control to the queue-binding row**
 
 `repoQueueRow` already builds a head with the queue label and a default-repo selector. Add the switch beside it, reusing the existing `seg-opt` segmented-control styling used elsewhere in this UI:
 
@@ -1333,7 +1333,7 @@ function ciMonitoringControl(q) {
 
 and append it in `repoQueueRow` after the repo selector. `_repos_payload` must include `ci_monitoring` on each queue entry — add it where the queue bindings are built.
 
-- [ ] **Step 5: Add the same control to the playlist detail page**
+- [x] **Step 5: Add the same control to the playlist detail page**
 
 The detail body already renders a "Validate command" field via `playlistInfoField`. Add the switch directly beneath it so both operator paths carry the same control:
 
@@ -1350,12 +1350,12 @@ The detail body already renders a "Validate command" field via `playlistInfoFiel
 
 The playlist-info payload must carry `ci_monitoring`; add it where `info.validate` is populated.
 
-- [ ] **Step 6: Run to green**
+- [x] **Step 6: Run to green**
 
 Run: `.venv/bin/python -m pytest tests/test_ci_gate.py -v && just validate`
 Expected: 18 passed.
 
-- [ ] **Step 7: Commit** — `ui: CI monitoring switch on queue bindings and playlist detail`
+- [x] **Step 7: Commit** — `ui: CI monitoring switch on queue bindings and playlist detail`
 
 ## Task 9: Playlists page — the build-status dot
 
@@ -1371,7 +1371,7 @@ Expected: 18 passed.
 
 **The colour mapping, verbatim from the operator:** green and red for green/red, **amber** for `PENDING`, **white** for `UNKNOWN`, **gray** when the repo is not monitored.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 @pytest.mark.parametrize("state,expected", [
@@ -1394,12 +1394,12 @@ def test_unmonitored_playlist_has_no_ci_state(unmonitored):
     assert pls["main"]["ci_state"] is None
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/test_ci_gate.py -k playlist_carries -v`
 Expected: FAIL — `KeyError: 'ci_state'`
 
-- [ ] **Step 3: Add `ci_state` to the playlists payload**
+- [x] **Step 3: Add `ci_state` to the playlists payload**
 
 Where each playlist entry is built, with the repo's row read once for the whole list:
 
@@ -1410,7 +1410,7 @@ Where each playlist entry is built, with the repo's row read once for the whole 
         )
 ```
 
-- [ ] **Step 4: Render the dot**
+- [x] **Step 4: Render the dot**
 
 ```javascript
 // Build-status dot for a playlist bound to a monitored repo.
@@ -1438,7 +1438,7 @@ In `playlistRow`, prepend it so the dot leads the row:
   li.append(ciDot(pl.ci_state));
 ```
 
-- [ ] **Step 5: Add the CSS**
+- [x] **Step 5: Add the CSS**
 
 ```css
 .ci-dot { width: .6rem; height: .6rem; border-radius: 50%; display: inline-block;
@@ -1450,12 +1450,12 @@ In `playlistRow`, prepend it so the dot leads the row:
 .ci-dot-gray  { background: var(--muted, #6e7681); }
 ```
 
-- [ ] **Step 6: Run to green**
+- [x] **Step 6: Run to green**
 
 Run: `.venv/bin/python -m pytest tests/test_ci_gate.py -v && just validate`
 Expected: 24 passed.
 
-- [ ] **Step 7: Commit** — `playlists: build-status dot (green/red/amber/white/gray)`
+- [x] **Step 7: Commit** — `playlists: build-status dot (green/red/amber/white/gray)`
 
 ## Task 10: CI resolution in History and Stats
 
@@ -1473,7 +1473,7 @@ Expected: 24 passed.
 
 **Why a column:** History and Stats read attempts, not briefs. `workflow` is the existing precedent for a classification that flows from task frontmatter onto the attempt record, so `kind` follows it rather than inventing a join back to the brief file.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 def test_ci_resolution_attempt_is_tagged(gate):
@@ -1494,12 +1494,12 @@ def test_ordinary_attempt_has_no_kind(unmonitored):
     assert not attempt.get("kind")
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/test_ci_gate.py -k attempt -v`
 Expected: FAIL — `KeyError: 'kind'`
 
-- [ ] **Step 3: Add the column**
+- [x] **Step 3: Add the column**
 
 Migration `20260831000002_nightshift_attempt_kind.sql`:
 
@@ -1523,11 +1523,11 @@ And in the SQLite inline attempts schema, beside `workflow`:
     kind           text,
 ```
 
-- [ ] **Step 4: Carry the brief's `kind` onto the attempt**
+- [x] **Step 4: Carry the brief's `kind` onto the attempt**
 
 In `_lease_and_build`, where the brief's frontmatter is already read for title/model, pass `kind=meta.get("kind")` through to the attempt insert, and add `kind` to the attempt row builder in `store.py` alongside `workflow`.
 
-- [ ] **Step 5: Badge it in History**
+- [x] **Step 5: Badge it in History**
 
 In the History row builder, beside the existing status pill:
 
@@ -1541,7 +1541,7 @@ In the History row builder, beside the existing status pill:
   }
 ```
 
-- [ ] **Step 6: Split the Stats category**
+- [x] **Step 6: Split the Stats category**
 
 `analytics.js` already partitions runs (e.g. `failure_kind === "validation_error"`). Add the CI-resolution split beside it so the Stats page reports these separately — count, success rate, median duration, cost — rather than blending them into ordinary throughput:
 
@@ -1555,24 +1555,24 @@ In the History row builder, beside the existing status pill:
 
 Render a "CI resolution" card next to the existing summary cards, using the same card builder, reporting: runs, landed %, median wall-clock, total cost.
 
-- [ ] **Step 7: Run to green**
+- [x] **Step 7: Run to green**
 
 Run: `.venv/bin/python -m pytest tests/test_ci_gate.py -v && just validate && just migrate && just rollback && just migrate`
 Expected: 26 passed, suite green, migration round-trips.
 
-- [ ] **Step 8: Commit** — `history + stats: ci_resolution as its own run category`
+- [x] **Step 8: Commit** — `history + stats: ci_resolution as its own run category`
 
 ## Task 11: Enable monitoring and resume queued jobs
 
 **Files:**
 - Modify: `.tasks/<queue>/config.json` (operator state, through the UI)
 
-- [ ] **Step 1: Confirm `gh` is authenticated on the manager host**
+- [x] **Step 1: Confirm `gh` is authenticated on the manager host**
 
 Run: `gh auth status && gh run list --branch main --limit 1 --json status,conclusion,headSha`
 Expected: authenticated; a JSON array with one run.
 
-- [ ] **Step 2: Smoke with monitoring off**
+- [x] **Step 2: Smoke with monitoring off**
 
 Run: `just smoke`
 Expected: pass — monitoring is opt-in per queue and off by default, so this proves the change is inert until switched on.

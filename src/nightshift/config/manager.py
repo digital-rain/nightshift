@@ -48,6 +48,13 @@ class Cadences:
             "the remote tip moved; otherwise the manager waits this long before "
             "checking again. 0 disables throttling (not recommended)."),
         apply="restart"))
+    ci_refresh_seconds: float = field(default=120.0, metadata=meta(
+        category="Cadences", label="CI refresh seconds",
+        desc=(
+            "Minimum interval between GitHub Actions status checks per "
+            "monitored repo. Each check is one `gh run list` call. Repos are "
+            "polled only while a queue bound to them has CI monitoring on."),
+        apply="restart"))
 
 
 @dataclass(frozen=True)
@@ -305,6 +312,7 @@ def load_manager_settings(workspace: Path) -> ManagerSettings:
             cad_data.get("git_refresh_seconds", cad_data.get("origin_sync_seconds")),
             15.0,
         ),
+        ci_refresh_seconds=_as_float(cad_data.get("ci_refresh_seconds"), 120.0),
     )
 
     # Parsed once at the config boundary: an unknown mode fails the load loudly
@@ -487,6 +495,7 @@ def save_manager_settings(workspace: Path, settings: ManagerSettings) -> None:
             "worker_stale_seconds": settings.cadences.worker_stale_seconds,
             "refresh_ms": settings.cadences.refresh_ms,
             "git_refresh_seconds": settings.cadences.git_refresh_seconds,
+            "ci_refresh_seconds": settings.cadences.ci_refresh_seconds,
         },
         "default_model": settings.operator.default_model,
         "enhance_brief_model": settings.operator.enhance_brief_model,

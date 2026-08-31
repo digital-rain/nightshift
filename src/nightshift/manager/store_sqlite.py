@@ -189,7 +189,8 @@ CREATE TABLE nightshift.attempts (
     released_at    text,
     branch_ref     text,
     head_sha       text,
-    workflow       text
+    workflow       text,
+    kind           text
 );
 
 CREATE UNIQUE INDEX nightshift.attempts_live_task_uniq
@@ -238,6 +239,17 @@ CREATE TABLE nightshift.queue_state (
     paused_reason   text,
     mode            text,
     updated_at      text NOT NULL
+);
+
+CREATE TABLE nightshift.repo_ci (
+    repo        TEXT PRIMARY KEY,
+    state       TEXT NOT NULL,
+    head_sha    TEXT,
+    url         TEXT,
+    detail      TEXT,
+    fix_task    TEXT,
+    fix_sha     TEXT,
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE nightshift.enhancements (

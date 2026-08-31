@@ -899,6 +899,75 @@ def test_clear_task_backoff_only_touches_the_backoff() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# repo CI state (Task 2: CI-state gate)
+# --------------------------------------------------------------------------- #
+
+
+def test_repo_ci_roundtrip_and_transition() -> None:
+    store = SqliteStore()
+
+    # First write: no previous state.
+    prev = _run(store.set_repo_ci(
+        "longitude", state="green", head_sha="aaa", url="u1", detail="pytest: success"
+    ))
+    assert prev is None
+
+    rows = _run(store.repo_ci())
+    assert rows["longitude"]["state"] == "green"
+    assert rows["longitude"]["head_sha"] == "aaa"
+
+    # Second write returns the state it replaced -- this is the transition edge.
+    prev = _run(store.set_repo_ci(
+        "longitude", state="red", head_sha="bbb", url="u2", detail="pytest: failure"
+    ))
+    assert prev == "green"
+    rows = _run(store.repo_ci())
+    assert rows["longitude"]["state"] == "red"
+    assert rows["longitude"]["fix_task"] is None
+
+
+def test_repo_ci_same_state_write_is_not_a_transition_and_keeps_fix_marker() -> None:
+    store = SqliteStore()
+    _run(store.set_repo_ci("longitude", state="red", head_sha="bbb", url=None, detail=None))
+    _run(store.set_repo_ci_fix("longitude", fix_task="fix-longitude-ci-bbb", fix_sha="bbb"))
+
+    # A same-state refresh (still red, same or new sha) must not clear the
+    # fix marker -- only an actual transition does that.
+    prev = _run(store.set_repo_ci(
+        "longitude", state="red", head_sha="bbb", url="u2", detail="still failing"
+    ))
+    assert prev == "red"
+    rows = _run(store.repo_ci())
+    assert rows["longitude"]["fix_task"] == "fix-longitude-ci-bbb"
+    assert rows["longitude"]["fix_sha"] == "bbb"
+    assert rows["longitude"]["url"] == "u2"
+    assert rows["longitude"]["detail"] == "still failing"
+
+
+def test_repo_ci_fix_marker() -> None:
+    store = SqliteStore()
+    _run(store.set_repo_ci("longitude", state="red", head_sha="bbb", url=None, detail=None))
+    _run(store.set_repo_ci_fix("longitude", fix_task="fix-longitude-ci-bbb", fix_sha="bbb"))
+    rows = _run(store.repo_ci())
+    assert rows["longitude"]["fix_task"] == "fix-longitude-ci-bbb"
+    assert rows["longitude"]["fix_sha"] == "bbb"
+
+
+def test_repo_ci_transition_to_new_state_clears_fix_marker() -> None:
+    store = SqliteStore()
+    _run(store.set_repo_ci("longitude", state="red", head_sha="bbb", url=None, detail=None))
+    _run(store.set_repo_ci_fix("longitude", fix_task="fix-longitude-ci-bbb", fix_sha="bbb"))
+
+    # Going green clears the marker; a later red for a new sha deserves its
+    # own fix task.
+    prev = _run(store.set_repo_ci("longitude", state="green", head_sha="ccc", url=None, detail=None))
+    assert prev == "red"
+    rows = _run(store.repo_ci())
+    assert rows["longitude"]["fix_task"] is None
+    assert rows["longitude"]["fix_sha"] is None
+
+
+# --------------------------------------------------------------------------- #
 # migration shape
 # --------------------------------------------------------------------------- #
 

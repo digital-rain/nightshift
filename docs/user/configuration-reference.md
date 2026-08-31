@@ -155,6 +155,7 @@ Every key is editable in the manager Settings UI, which writes back to this file
 | `cadences.worker_stale_seconds` | `45.0` | Silence after which a worker is marked `offline`. |
 | `cadences.refresh_ms` | `20000` | UI safety-poll fallback (SSE is the primary live channel). |
 | `cadences.git_refresh_seconds` | `15.0` | Minimum seconds between origin/main fetch checks per target repo. Each check fetches and fast-forwards local `main` **only when it is strictly behind** `origin/main`; unpushed or divergent local commits (e.g. a direct cherry-pick on `main`) are left alone. `0` disables throttling. Legacy key `origin_sync_seconds` is still read as a fallback. |
+| `cadences.ci_refresh_seconds` | `120.0` | Minimum seconds between `gh run list` checks per monitored repo. |
 
 Cadences are config-driven, never hardcoded.
 The manager sends them to each worker at checkin, so changing them here changes worker behavior too.
@@ -337,6 +338,7 @@ Per-queue `config.json` keys layer over `<tasks_root>/config.json` (a store-wide
 | `preflight` | Environment preflight command run in the worktree before the agent (default `uv sync --frozen`; empty string disables). |
 | `max_turns` | Default turn cap for the queue's tasks. |
 | `workflow_models` | Map of workflow *role* → model pin for this queue (e.g. `{"planner": "anthropic/claude-opus-4-8", "implementor": "claude-code/claude-sonnet-4-6"}`). Resolved per the §3.2 ladder: a brief's own `model`/`planner_model` wins, then this map, then the manager defaults. |
+| `ci_monitoring` | Default `false`. Watch this queue's bound repo for a failing GitHub Actions run on `main`: hold the queue's tasks while it is red and queue a CI-resolution task. Toggled from Repos → Queue bindings, or the playlist's detail page. |
 
 Queue presentation settings, edited from the operator UI:
 

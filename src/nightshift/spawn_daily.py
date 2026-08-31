@@ -175,6 +175,22 @@ def split_frontmatter(text: str) -> tuple[dict, str]:
     return meta, parts[2].lstrip("\n")
 
 
+def join_frontmatter(meta: dict, body: str) -> str:
+    """Re-serialise a brief's frontmatter + body — the inverse of
+    ``split_frontmatter``. Lives beside its splitter so there is one
+    frontmatter seam, not two."""
+    if not meta:
+        return body
+    lines = []
+    for key, value in meta.items():
+        if isinstance(value, bool):
+            rendered = "true" if value else "false"
+        else:
+            rendered = str(value)
+        lines.append(f"{key}: {rendered}")
+    return "---\n" + "\n".join(lines) + "\n---\n\n" + body
+
+
 def extract_items(body: str) -> tuple[str, list[str]]:
     """Split body into preamble and list items.
 

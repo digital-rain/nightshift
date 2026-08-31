@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from functools import partial
@@ -59,6 +60,7 @@ from typing import Any
 
 from nightshift import playlists as playlists_mod
 from nightshift import repos
+from nightshift.ci import CiState, CiStatus, check_repo_ci
 from nightshift.config.manager import ManagerConfig
 from nightshift.git import GitRunner
 from nightshift.git.executor import ExecutorPool
@@ -91,9 +93,17 @@ from nightshift.manager.scheduler import (
     unroutable,
 )
 from nightshift.manager.store import NightshiftStore
-from nightshift.manager.work_orders import task_meta
-from nightshift.spawn_daily import resolve_config
+from nightshift.manager.work_orders import is_ci_fix_task, task_meta
+from nightshift.queue_config import ci_monitoring_enabled
+from nightshift.spawn_daily import (
+    join_frontmatter,
+    load_queue_config,
+    resolve_config,
+    slugify,
+    split_frontmatter,
+)
 from nightshift.task_files import (
+    create_task,
     drop_completed_task,
     frontmatter_held_tasks,
     task_is_evergreen,
@@ -119,6 +129,20 @@ def reap_finished_resolves(resolves: dict[str, dict[str, Any]]) -> None:
     ``create_app``'s resolve spawner (which reaps before the per-repo cap)."""
     for rid in [rid for rid, r in resolves.items() if r["proc"].poll() is not None]:
         resolves.pop(rid, None)
+
+
+def _tag_ci_resolution(
+    tasks_root: Path, tasks_rel: str, task: str, repo: str
+) -> None:
+    """Add ``kind: ci_resolution`` + ``repo:`` to a freshly created brief's
+    frontmatter. This is the tag the attempt record carries into History and
+    the Stats page's CI-resolution category (Task 10).
+    """
+    path = tasks_root / tasks_rel / f"{task}.md"
+    meta, body = split_frontmatter(path.read_text())
+    meta["kind"] = "ci_resolution"
+    meta["repo"] = repo
+    path.write_text(join_frontmatter(meta, body))
 
 
 class Reconciler:
@@ -159,6 +183,8 @@ class Reconciler:
         self._repo_warnings = repo_warnings
         self._sync_throttle = sync_throttle
         self._tasks_repo = tasks_repo
+        # Per-repo wall-clock of the last gh check (cadences.ci_refresh_seconds).
+        self._ci_checked_at: dict[str, float] = {}
 
     # ------------------------------------------------------------------ #
     # Entry points
@@ -190,6 +216,7 @@ class Reconciler:
 
     async def reconcile_once(self) -> None:
         await self._run_duty("deadline expiry", self._expire_deadlines)
+        await self._run_duty("repo CI refresh", self._refresh_repo_ci)
         await self._run_duty("hold set/clear", self._reconcile_holds)
         await self._run_duty("worker liveness", self._mark_workers_offline)
         await self._run_duty("resolve reaping", self._reap_resolves)
@@ -455,6 +482,144 @@ class Reconciler:
         await self._registry().reap_stale()
 
     # ------------------------------------------------------------------ #
+    # Repo CI refresh (the CI-state gate's input; runs before hold set/clear
+    # so Task 6's holds are written against this tick's freshly-checked state)
+    # ------------------------------------------------------------------ #
+
+    def _monitored_repos(self) -> dict[str, set[str | None]]:
+        """Repo -> the queues watching it. Two queues bound to one repo share a
+        single gh check; a queue with monitoring off contributes nothing."""
+        out: dict[str, set[str | None]] = {}
+        for q in self._all_queues():
+            tasks_rel = playlists_mod.tasks_rel(q)
+            config = load_queue_config(self._tasks_root, tasks_rel)
+            if not ci_monitoring_enabled(config):
+                continue
+            repo = config.get("repo")
+            if not repo or not repos.repo_available(self._workspace, repo):
+                continue
+            out.setdefault(repo, set()).add(q)
+        return out
+
+    async def _refresh_repo_ci(self) -> None:
+        """Refresh GitHub Actions state for every monitored repo.
+
+        Throttled per repo by ``cadences.ci_refresh_seconds``. A workspace with
+        no monitored queue makes no subprocess call at all, so a host without
+        ``gh`` never pays for the feature. Only a *state change* emits an event.
+        """
+        monitored = self._monitored_repos()
+        if not monitored:
+            return
+        store = self._store()
+        interval = float(self._cfg.cadences.ci_refresh_seconds or 0)
+        now = time.time()
+        for repo in sorted(monitored):
+            last = self._ci_checked_at.get(repo)
+            if last is not None and interval > 0 and (now - last) < interval:
+                continue
+            self._ci_checked_at[repo] = now
+            status = await asyncio.to_thread(
+                check_repo_ci, repos.repo_root(self._workspace, repo)
+            )
+            previous = await store.set_repo_ci(
+                repo,
+                state=str(status.state),
+                head_sha=status.head_sha,
+                url=status.url,
+                detail=status.detail,
+            )
+            if previous == str(status.state):
+                continue
+            await self._emit(
+                "repo_ci",
+                payload={
+                    "repo": repo,
+                    "state": str(status.state),
+                    "previous": previous,
+                    "head_sha": status.head_sha,
+                    "url": status.url,
+                    "detail": status.detail,
+                },
+            )
+            if status.state is CiState.RED:
+                await self._spawn_ci_fix(repo, status, queues=monitored[repo])
+
+    async def _spawn_ci_fix(
+        self, repo: str, status: CiStatus, *, queues: set[str | None]
+    ) -> None:
+        """Queue one CI-resolution task for a red main, deduped on the sha.
+
+        The task goes into the monitored queue itself — that queue is already
+        bound to this repo, so its validate command and worker routing are the
+        right ones. A *paused* queue is a last resort: spawning into one closes
+        the gate with no dispatchable fix, which is the deadlock this task
+        exists to avoid.
+
+        Idempotent. ``set_repo_ci`` clears the fix marker on any state change,
+        so this is re-entered for a repo that goes red -> unknown -> red at the
+        SAME sha (one ``gh`` timeout is enough) with the marker already NULL.
+        The title is deterministic per sha, so ``create_task`` then collides:
+        that collision means "the brief for this sha already exists", and the
+        marker is re-adopted rather than dropped — without it the existing
+        brief loses its by-name exemption, is held ``ci_red`` itself, and
+        nothing can ever turn the repo green again.
+        """
+        store = self._store()
+        pauses = await store.queue_pauses()
+        ordered = sorted(queues, key=lambda q: (q is not None, q or ""))
+        unpaused = [q for q in ordered if queue_label(q) not in pauses]
+        target = (unpaused or ordered)[0]
+        tasks_rel = playlists_mod.tasks_rel(target)
+        short = (status.head_sha or "unknown")[:8]
+        title = f"fix ci: {repo} main is red at {short}"
+        body = (
+            f"/fix CI is failing on `{repo}` `main`.\n\n"
+            f"- **Failing commit:** `{status.head_sha or 'unknown'}`\n"
+            f"- **Detail:** {status.detail or 'no detail reported'}\n"
+            f"- **Run:** {status.url or 'no run URL reported'}\n\n"
+            "Reproduce the failure locally, find the root cause, fix it, and "
+            "verify against the same check that failed. Nightshift is holding "
+            "this queue's other tasks until `main` is green again.\n"
+        )
+        try:
+            created = await asyncio.to_thread(
+                create_task, self._tasks_root, title, body, tasks_rel
+            )
+        except FileExistsError as exc:
+            # The brief for this sha is already on disk (``create_task`` raises
+            # with the stem it refused). Re-adopt it: the marker, not the file,
+            # is what carries the exemption.
+            existing = str(exc.args[0]) if exc.args else slugify(title)
+            _log.info(
+                "reconciler: re-adopting existing ci fix brief %s for %s",
+                existing, repo,
+            )
+            await store.set_repo_ci_fix(
+                repo, fix_task=existing, fix_sha=status.head_sha or ""
+            )
+            return
+        except ValueError:
+            _log.warning(
+                "reconciler: could not create a ci fix brief for %s", repo,
+                exc_info=True,
+            )
+            return
+        # Tag the brief so History and the Stats page can categorise its runs.
+        await asyncio.to_thread(
+            _tag_ci_resolution, self._tasks_root, tasks_rel, created["task"], repo
+        )
+        await store.set_repo_ci_fix(
+            repo, fix_task=created["task"], fix_sha=status.head_sha or ""
+        )
+        await self._emit(
+            "repo_ci_fix_spawned",
+            queue=target,
+            task=created["task"],
+            payload={"repo": repo, "head_sha": status.head_sha},
+        )
+
+    # ------------------------------------------------------------------ #
     # 2. Hold set/clear (moved out of worker_poll)
     # ------------------------------------------------------------------ #
 
@@ -478,6 +643,13 @@ class Reconciler:
                     quarantined.add(
                         (self._queue_from_label(row["queue"]), row["task"])
                     )
+
+        monitored = self._monitored_repos()
+        ci_rows = await store.repo_ci()
+        red_repos = {
+            repo for repo, row in ci_rows.items()
+            if row.get("state") == "red" and repo in monitored
+        }
 
         dedication = await store.queue_dedication()
         available_models = await reg.available_models()
@@ -549,6 +721,24 @@ class Reconciler:
                             task=cand.task,
                             payload={"repo": cand.repo},
                         )
+                elif cand.repo and cand.repo in red_repos:
+                    # The CI-resolution task must not hold itself: it is the one
+                    # task that can turn the repo green, so it is exempt from
+                    # the very gate it exists to clear — and from that gate
+                    # ONLY: the branches above still apply to it.
+                    if is_ci_fix_task(self._tasks_root, cand, ci_rows):
+                        continue
+                    existing = await store.get_task_state(cand.queue, cand.task)
+                    # Never take over a hold this arm does not own: overwriting
+                    # an operator-actionable `blocked` row NULLs its reason
+                    # (breaking reset) and lets the green-side clear DELETE it,
+                    # auto-releasing a task blocked for another reason. A row
+                    # with no state is a bare retry counter, which owns no hold.
+                    if (existing or {}).get("state") is None:
+                        await store.set_task_state(
+                            cand.queue, cand.task, TaskHoldKind.CI_RED,
+                            repo=cand.repo,
+                        )
 
         # Clear the holds this loop owns once they no longer apply. Silent
         # (matching the dispatch-time clear); operator-set blocks and
@@ -556,6 +746,12 @@ class Reconciler:
         for row in await store.tasks_in_state(TaskHoldKind.REPO_UNAVAILABLE):
             repo = row.get("repo")
             if repo and repos.repo_available(self._workspace, repo):
+                await store.clear_task_state(
+                    self._queue_from_label(row.get("queue")), row["task"]
+                )
+        for row in await store.tasks_in_state(TaskHoldKind.CI_RED):
+            repo = row.get("repo")
+            if not repo or repo not in red_repos:
                 await store.clear_task_state(
                     self._queue_from_label(row.get("queue")), row["task"]
                 )

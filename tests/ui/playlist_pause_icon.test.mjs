@@ -32,6 +32,7 @@ function slice(start, after) {
 const pausedSrc = slice("function isQueuePaused(name) {", "function currentTaskRecord()");
 // playlistSpinner through playlistPauseButton — the row's two paused affordances.
 const glyphSrc = slice("function playlistSpinner(running, paused) {", "function renderPlaylists()");
+const ciDotSrc = slice("function ciDot(ciState) {", "const CHART_PALETTE");
 const rowSrc = slice("function playlistRow(pl) {", "// Fill the add-queue repo dropdown");
 
 // The icon must be the shipped transport pause glyph, not a test stand-in.
@@ -95,6 +96,7 @@ function buildRow(players, pl = { name: "nightly", task_count: 3 }) {
     `${svgLine}
      ${pausedSrc}
      ${glyphSrc}
+     ${ciDotSrc}
      ${rowSrc}
      return { playlistRow, isQueuePaused };`,
   );
@@ -143,12 +145,15 @@ test("a paused queue's row shows the pause icon just left of the +", () => {
 //    would otherwise look exactly like one that's making progress.
 test("the row's ring freezes while the queue is paused", () => {
   const paused = buildRow({ nightly: { state: "paused", pause_reason: "operator" } });
-  const held = paused.row.children[0];
+  // Located by class, not by index: the CI build-status dot now leads the row,
+  // so the ring is no longer children[0]. The invariant under test is the
+  // ring's frozen state, not its position.
+  const held = kids(paused.row, "q-spinner")[0];
   assert.ok(held.classList.contains("spinning") && held.classList.contains("paused"));
   assert.equal(held.title, "Paused");
 
   const playing = buildRow({ nightly: { state: "playing", pause_reason: null } });
-  const live = playing.row.children[0];
+  const live = kids(playing.row, "q-spinner")[0];
   assert.ok(live.classList.contains("spinning") && !live.classList.contains("paused"));
   assert.equal(live.title, "Running");
 });

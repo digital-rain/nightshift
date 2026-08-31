@@ -9,6 +9,7 @@ from nightshift.spawn_daily import (
     find_autosplit_sources,
     inspect_source,
     is_disabled,
+    join_frontmatter,
     load_queue_config,
     matrix_from_task_names,
     recover_matrix,
@@ -53,6 +54,21 @@ def test_split_frontmatter_parses_model() -> None:
     assert meta["model"] == "claude-opus-4-6"
     assert meta["automerge"] is False
     assert "## TO DO:" in body
+
+
+def test_join_frontmatter_round_trips_through_the_splitter() -> None:
+    text = "---\nmodel: claude-opus-4-6\nautomerge: false\nsplit: 3\n---\n\n## TO DO:\n"
+    meta, body = split_frontmatter(text)
+    meta["kind"] = "ci_resolution"
+    again, again_body = split_frontmatter(join_frontmatter(meta, body))
+    assert again == meta
+    assert again["automerge"] is False
+    assert again["split"] == 3
+    assert again_body == body
+
+
+def test_join_frontmatter_returns_bare_body_without_meta() -> None:
+    assert join_frontmatter({}, "## TO DO:\n") == "## TO DO:\n"
 
 
 def test_extract_items_various_formats() -> None:

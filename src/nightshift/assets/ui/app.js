@@ -191,6 +191,12 @@ const STATE_LABELS = {
   // A task whose resolved target repo isn't present in the workspace is paused
   // (auto-resumable), never failed — it reads as "Paused" with the warn pill.
   repo_unavailable: "Paused",
+  // A task whose monitored repo has a failing CI run on main is held (auto-
+  // resumable when CI goes green), never failed. "CI hold" names the state
+  // (like the other labels here — Paused, Blocked — describe the state, not
+  // the cause) while staying distinct from "Paused" so the operator can tell
+  // the two pauses apart at a glance.
+  ci_red: "CI hold",
   completed: "Completed",
   error: "Failed",
   stopped: "Cancelled",
@@ -202,10 +208,12 @@ function stateLabel(status) {
 }
 // The CSS class that colours a status pill. Most statuses map to a same-named
 // class, but a few synonyms collapse onto a shared visual: `repo_unavailable`
-// (a paused, auto-resumable task) reuses the `.status.paused` warn treatment.
-// `blocked` (needs user action before it can run) reuses the error treatment.
+// and `ci_red` (both paused, auto-resumable holds) reuse the `.status.paused`
+// warn treatment. `blocked` (needs user action before it can run) reuses the
+// error treatment.
 function statusClass(status) {
   if (status === "repo_unavailable") return "paused";
+  if (status === "ci_red") return "paused";
   if (status === "blocked") return "error";
   if (status === "failed") return "error";
   if (status === "quarantined") return "quarantined";
@@ -216,6 +224,31 @@ function statusPill(status) {
   span.className = "status " + statusClass(status);
   span.textContent = stateLabel(status);
   return span;
+}
+
+// Build-status dot for a Playlists row (`playlistRow`, below): the bound
+// repo's CI state at a glance. Unlike `statusPill`, the dot carries no visible
+// text of its own, so colour can never be the only signal -- it always gets a
+// `title` (hover) and `aria-label` (screen reader) spelling the state out,
+// the same "colour plus a readable label" pattern `ciBadge`/`statusPill` use
+// elsewhere. Five states: green/red mirror CI green/red, amber is PENDING (a
+// run in flight), white is UNKNOWN (no runs yet, or `gh` couldn't answer),
+// and gray is the fallback for `ci_state === null` -- either the playlist's
+// repo isn't monitored, or it is but no CI row has been recorded yet.
+function ciDot(ciState) {
+  const dot = document.createElement("span");
+  const cls = {
+    green: "ci-dot-green",
+    red: "ci-dot-red",
+    pending: "ci-dot-amber",
+    unknown: "ci-dot-white",
+  }[ciState] || "ci-dot-gray";
+  dot.className = "ci-dot " + cls;
+  dot.setAttribute("role", "img");
+  const label = ciState ? `CI ${ciState}` : "CI not monitored for this playlist";
+  dot.title = label;
+  dot.setAttribute("aria-label", label);
+  return dot;
 }
 
 // Classified failure reasons (engine `failure_kind`) → short operator-facing
@@ -1413,6 +1446,30 @@ function availabilityBadge(available) {
   return span;
 }
 
+// A neutral outlined tag (reusing `.repo-tag`, the same look as the "tasks
+// store" tag) marking that some queue bound to this repo watches its CI.
+function monitoringBadge() {
+  const span = document.createElement("span");
+  span.className = "repo-tag";
+  span.textContent = "Monitoring";
+  span.title = "A queue bound to this repo is watching its CI on main";
+  return span;
+}
+
+// Only a red repo gets a badge here -- green/pending/unknown are unremarkable
+// and a badge per state would be noise on this screen. Reuses the shared warn
+// treatment (`.status.paused`), matching `ci_red`'s pill elsewhere.
+function ciBadge(ci) {
+  if (!ci || ci.state !== "red") return null;
+  const span = document.createElement("span");
+  span.className = "status paused";
+  span.textContent = "Hold";
+  span.title = ci.detail
+    ? `CI red: ${ci.detail} — dispatch held for this repo`
+    : "CI red — dispatch held for this repo";
+  return span;
+}
+
 function renderRepos() {
   const wsEl = $("repos-workspace");
   if (!wsEl) return;  // screen markup not present in this build
@@ -1472,7 +1529,19 @@ function repoRow(r, tasksRepo) {
     tag.textContent = "tasks store";
     main.append(tag);
   }
-  li.append(main, availabilityBadge(r.available));
+  if (r.monitored) main.append(monitoringBadge());
+  // `.repo-item` is a two-child `justify-between` flex row (name block, then
+  // this one) -- the hold badge joins the trailing badge inside this wrapper
+  // rather than as a third `li` child, so it doesn't get shoved to the far
+  // edge by the flex layout instead of sitting beside availability.
+  const trailing = document.createElement("div");
+  trailing.style.display = "flex";
+  trailing.style.alignItems = "center";
+  trailing.style.gap = "8px";
+  trailing.append(availabilityBadge(r.available));
+  const hold = ciBadge(r.ci);
+  if (hold) trailing.append(hold);
+  li.append(main, trailing);
   return li;
 }
 
@@ -1504,7 +1573,71 @@ function repoQueueRow(q) {
   select.addEventListener("change", () => setQueueRepo(q.queue, select.value, err));
   ctl.append(span, select);
   li.append(ctl, err);
+
+  const ciCtl = document.createElement("div");
+  ciCtl.className = "repo-queue-ctl";
+  const ciSpan = document.createElement("span");
+  ciSpan.className = "repo-queue-ctl-label";
+  ciSpan.textContent = "CI monitoring";
+  ciCtl.append(ciSpan, ciMonitoringControl(q.queue, q.ci_monitoring, () => loadRepos()));
+  li.append(ciCtl);
   return li;
+}
+
+// A YES/NO segmented control for a queue's `ci_monitoring` switch (persisted
+// in config.json beside `repo`/`validate`), shared by the Repos page's
+// queue-binding row (above) and the playlist detail page (below). Persists
+// immediately via PUT /api/queue/ci-monitoring, matching this page's other
+// live-persisting controls (Default repo, sort mode) -- there's no draft
+// state to lose here, unlike the playlist-info page's Name/Repository/
+// Validate/Description/Notes fields, which stage until the operator hits
+// Save. `queueLabel` is "main" for the default queue; `onChanged(enabled)`
+// runs after a successful PUT so each call site can refresh its own view.
+function ciMonitoringControl(queueLabel, enabled, onChanged) {
+  const wrap = document.createElement("div");
+  const seg = document.createElement("div");
+  seg.className = "segmented";
+  seg.setAttribute("role", "group");
+  seg.setAttribute("aria-label", "CI monitoring");
+  const err = document.createElement("p");
+  err.className = "error repo-queue-error";
+  err.hidden = true;
+
+  const buttons = [["Yes", true], ["No", false]].map(([text, value]) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "seg-opt";
+    btn.textContent = text;
+    btn.dataset.ciEnabled = String(value);
+    seg.append(btn);
+    return btn;
+  });
+  const paint = (on) => {
+    for (const btn of buttons) {
+      const active = (btn.dataset.ciEnabled === "true") === on;
+      btn.classList.toggle("on", active);
+      btn.setAttribute("aria-pressed", active ? "true" : "false");
+    }
+  };
+  paint(Boolean(enabled));
+  for (const btn of buttons) {
+    btn.addEventListener("click", async () => {
+      const value = btn.dataset.ciEnabled === "true";
+      if (btn.classList.contains("on")) return;
+      const body = { queue: queueLabel === "main" ? null : queueLabel, enabled: value };
+      const { ok, data } = await sendJSON("/api/queue/ci-monitoring", "PUT", body);
+      if (!ok) {
+        err.textContent = (data && data.error) || "could not change CI monitoring";
+        err.hidden = false;
+        return;
+      }
+      err.hidden = true;
+      paint(value);
+      if (typeof onChanged === "function") onChanged(value, data);
+    });
+  }
+  wrap.append(seg, err);
+  return wrap;
 }
 
 // Persist a queue's default target repo. The default queue's label is "main";
@@ -3219,6 +3352,16 @@ function historyRow(run, task) {
     mtag.title = `Model: ${task.model}`;
     title.append(mtag);
   }
+  // The auto-spawned CI-resolution run gets its own tag beside the title, same
+  // idiom as the workflow/repo/model tags above. Absent on ordinary runs and
+  // on every run that predates the `kind` column.
+  if (task.kind === "ci_resolution") {
+    const ktag = document.createElement("span");
+    ktag.className = "hrow-tag hrow-ci";
+    ktag.textContent = "CI fix";
+    ktag.title = "Auto-spawned to resolve a failing CI run on main";
+    title.append(ktag);
+  }
   const meta = document.createElement("div");
   meta.className = "hrow-meta";
   const badge = task.status === "error" ? failureBadge(task.failure_kind) : null;
@@ -3730,6 +3873,7 @@ function playlistRow(pl) {
   });
   li.addEventListener("dblclick", () => activatePlaylist(pl.name, "queue"));
 
+  li.append(ciDot(pl.ci_state));
   li.append(playlistSpinner(isQueueRunning(pl.name), isQueuePaused(pl.name)));
 
   const main = document.createElement("div");
@@ -3972,7 +4116,7 @@ function buildPlaylistInfoContent(info) {
     "playlist-info-repo", "the workspace repo this playlist's tasks target");
   const validateField = playlistInfoField("Validate command", info.validate || "",
     "playlist-info-validate", "e.g. just validate");
-  body.append(nameField, repoField, validateField);
+  body.append(nameField, repoField, validateField, ciMonitoringField(info));
 
   // Description + notes are playlist prose (persisted in the queue config); the
   // library (main queue) has no config path for them, so they show only for a
@@ -4009,6 +4153,27 @@ function playlistInfoField(label, value, id, placeholder) {
   input.value = value || "";
   if (placeholder) input.placeholder = placeholder;
   field.append(span, input);
+  return field;
+}
+
+// The playlist/library detail page's CI-monitoring field: the same shared
+// control as the Repos page's queue-binding row (ciMonitoringControl, above),
+// just below "Validate command" so both operator paths carry the switch. It
+// persists on click, not on Save, so a successful toggle only updates the
+// cached `state.playlistInfoData` -- rebuilding the whole panel from a
+// refetch here would discard any unsaved edits sitting in the Name/
+// Repository/Validate/Description/Notes fields above and below it.
+function ciMonitoringField(info) {
+  const field = document.createElement("div");
+  field.className = "detail-field";
+  const span = document.createElement("span");
+  span.className = "detail-field-label";
+  span.textContent = "CI monitoring";
+  const isLibrary = state.playlistInfoName === LIBRARY_QUEUE;
+  const queueLabel = isLibrary ? "main" : info.name;
+  field.append(span, ciMonitoringControl(queueLabel, info.ci_monitoring, (value) => {
+    if (state.playlistInfoData) state.playlistInfoData.ci_monitoring = value;
+  }));
   return field;
 }
 
@@ -7163,6 +7328,11 @@ function startAutoRefresh() {
     loadRuns();
     loadQueue();
     loadPlaylists();
+    // The Repos page's Monitoring/CI-Hold badges are CI state, which changes
+    // on the reconciler's cadence rather than on an operator action -- without
+    // this the badges only moved on a view switch. Scoped to the active view
+    // so every other screen keeps its existing request budget.
+    if (state.view === "repos") loadRepos();
   }, refreshMs);
 }
 
