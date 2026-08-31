@@ -1007,18 +1007,42 @@ Expected: ruff clean, whole suite green.
 ## Task 7: Operator surfacing
 
 **Files:**
+- Modify: `src/nightshift/lifecycle.py` (`TaskHoldKind`, ~127)
+- Modify: `src/nightshift/manager/reconciler.py` (`_reconcile_holds`, the repo-availability block ~513 and the hold-clear loop ~556)
 - Modify: `src/nightshift/manager/api_operator.py` (`_state_payload`, ~837)
-- Modify: `src/nightshift/assets/ui/` (the panel that renders queue pauses)
+- Modify: `src/nightshift/assets/ui/app.js` (`STATE_LABELS` ~185, `statusClass` ~207)
 - Modify: `ARCHITECTURE.md` (§Task lifecycle)
 - Test: `tests/test_ci_gate.py`
 
 **Interfaces:**
-- Consumes: `store.repo_ci()` (Task 2).
-- Produces: a `repo_ci` key on `/api/state`: `{repo: {"state", "head_sha", "url", "detail", "fix_task"}}`.
+- Consumes: `store.repo_ci()` (Task 2); the existing `store.set_task_state` / `store.clear_task_state` / `store.tasks_in_state`.
+- Produces: `TaskHoldKind.CI_RED = "ci_red"`; a `repo_ci` key on `/api/state`; the `ci_red` entries in the UI's status vocabulary.
 
-- [ ] **Step 1: Write the failing test**
+**Why this shape:** the codebase already has a complete idiom for "a repo-level condition is holding these tasks" — `repo_unavailable`. It is a `TaskHoldKind` written by the reconciler's `_reconcile_holds`, cleared by the same duty when the condition lifts, excluded from dispatch read-only in `worker_poll`, and rendered in the UI as a status pill via `STATE_LABELS` / `statusClass`. The CI gate is the same kind of condition and gets the same treatment — **not** a bespoke banner. Task 6 already supplied the read-only dispatch exclusion, which is the half that matches `worker_poll`'s stated contract ("the corresponding hold writes and warnings are the reconciler's"). This task supplies the other half.
+
+- [ ] **Step 1: Write the failing tests**
 
 ```python
+def test_red_repo_marks_its_tasks_ci_red(gate):
+    _ws, store, stub, client = gate
+    stub.status = CiStatus(CiState.RED, head_sha="bbb", detail="pytest: failure")
+    _reconcile(client)
+    row = _call(client, store.get_task_state, None, "alpha")
+    assert row["state"] == "ci_red"
+
+
+def test_green_clears_the_ci_red_hold(gate):
+    _ws, store, stub, client = gate
+    stub.status = CiStatus(CiState.RED, head_sha="bbb", detail="fail")
+    _reconcile(client)
+    assert _call(client, store.get_task_state, None, "alpha")["state"] == "ci_red"
+
+    _open_throttle(client)
+    stub.status = CiStatus(CiState.GREEN, head_sha="ccc")
+    _reconcile(client)
+    assert not _call(client, store.get_task_state, None, "alpha")
+
+
 def test_state_payload_carries_repo_ci(gate):
     _ws, store, _stub, client = gate
     _call(client, store.set_repo_ci, "longitude", state="red",
@@ -1031,24 +1055,66 @@ def test_state_payload_carries_repo_ci(gate):
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `.venv/bin/python -m pytest tests/test_ci_gate.py -k state_payload -v`
-Expected: FAIL — `KeyError: 'repo_ci'`
+Run: `.venv/bin/python -m pytest tests/test_ci_gate.py -k "ci_red or state_payload" -v`
+Expected: FAIL — `get_task_state` returns `None` (no hold is written), and `KeyError: 'repo_ci'`.
 
-- [ ] **Step 3: Add `repo_ci` to `_state_payload`**
+- [ ] **Step 3: Add the hold kind**
 
-`_state_payload` already reads `pauses = await store.queue_pauses()` at ~841. Add the CI read beside it:
+In `lifecycle.py`, beside `REPO_UNAVAILABLE`:
+
+```python
+    CI_RED = "ci_red"
+```
+
+- [ ] **Step 4: Write and clear the hold in `_reconcile_holds`**
+
+The repo-availability block already walks every candidate. Extend it — after the `elif cand.repo and not repos.repo_available(...)` arm — with the CI arm:
+
+```python
+                elif cand.repo and cand.repo in red_repos:
+                    existing = await store.get_task_state(cand.queue, cand.task)
+                    if not existing or existing.get("state") != TaskHoldKind.CI_RED:
+                        await store.set_task_state(
+                            cand.queue, cand.task, TaskHoldKind.CI_RED,
+                            repo=cand.repo,
+                        )
+```
+
+`red_repos` is read once at the top of the same duty, beside the existing reads:
+
+```python
+        red_repos: set[str] = set()
+        if self._cfg.ci_gate:
+            red_repos = {
+                repo for repo, row in (await store.repo_ci()).items()
+                if row.get("state") == "red"
+            }
+```
+
+And the clear, beside the existing `REPO_UNAVAILABLE` clear loop (same silent-clear rule):
+
+```python
+        for row in await store.tasks_in_state(TaskHoldKind.CI_RED):
+            repo = row.get("repo")
+            if not repo or repo not in red_repos:
+                await store.clear_task_state(
+                    self._queue_from_label(row.get("queue")), row["task"]
+                )
+```
+
+> Ordering note: `reconcile_once` must run `repo CI refresh` **before** `hold set/clear`, so the holds are written against the state this tick fetched. Move the duty registration from Task 4 Step 6 to sit above `self._reconcile_holds` in `reconcile_once`.
+
+- [ ] **Step 5: Add `repo_ci` to `_state_payload`**
+
+`_state_payload` already reads `pauses = await store.queue_pauses()` at ~841. Add beside it:
 
 ```python
         ci_rows = await store.repo_ci()
 ```
 
-and the key to the returned dict:
+and the key on the returned dict (which currently returns `{**focused_state, "active_playlist": focused, "queues": queues}`):
 
 ```python
-        return {
-            **focused_state,
-            "active_playlist": focused,
-            "queues": queues,
             "repo_ci": {
                 repo: {
                     "state": row.get("state"),
@@ -1059,51 +1125,44 @@ and the key to the returned dict:
                 }
                 for repo, row in ci_rows.items()
             },
-        }
 ```
 
-- [ ] **Step 4: Render it in the operator UI**
+- [ ] **Step 6: Teach the UI vocabulary the new status**
 
-In the panel that already renders queue pauses (static asset — served fresh on reload, no build step):
+In `app.js`, `STATE_LABELS` (~185) — beside the `repo_unavailable` entry and its comment:
 
 ```javascript
-function renderRepoCi(status) {
-  const el = document.getElementById('repo-ci-banner');
-  if (!el) return;
-  const red = Object.entries(status.repo_ci || {}).filter(([, r]) => r.state === 'red');
-  if (!red.length) { el.hidden = true; return; }
-  el.hidden = false;
-  el.innerHTML = red.map(([repo, r]) => {
-    const link = r.url ? `<a href="${r.url}" target="_blank" rel="noopener">run</a>` : '';
-    const fix = r.fix_task ? ` — fix queued: <code>${r.fix_task}</code>` : '';
-    return `<div class="repo-ci-red"><strong>${repo}</strong> main is red
-            (${r.detail || 'no detail'}) ${link}${fix} — dispatch held</div>`;
-  }).join('');
-}
+  // A task whose target repo has a failing CI run on main is paused
+  // (auto-resumable when CI goes green), never failed. Distinct label from
+  // repo_unavailable so the operator can tell the two pauses apart at a glance.
+  ci_red: "CI red",
 ```
 
-Add the container beside the queue-pause banner in the same template, and call `renderRepoCi(status)` from the existing status-render path:
+In `statusClass` (~207), reuse the same warn treatment:
 
-```html
-<div id="repo-ci-banner" hidden></div>
+```javascript
+  if (status === "ci_red") return "paused";
 ```
 
-- [ ] **Step 5: Run to green**
+> No new CSS: `ci_red` deliberately reuses the existing `.status.paused` warn pill, exactly as `repo_unavailable` does. No new DOM, no banner — the queue rows the operator already reads carry the state.
+
+- [ ] **Step 7: Run to green**
 
 Run: `.venv/bin/python -m pytest tests/test_ci_gate.py -v && just validate`
-Expected: 15 passed, suite green.
+Expected: 17 passed, suite green, ruff clean.
 
-- [ ] **Step 6: Add the paragraph to `ARCHITECTURE.md` §Task lifecycle**
+- [ ] **Step 8: Add the paragraph to `ARCHITECTURE.md` §Task lifecycle**
 
 ```markdown
-When `ci_gate` is enabled, the scheduler additionally excludes every task whose
-target repo has a failing GitHub Actions run on `main`. The reconciler refreshes
-that state per repo (`cadences.ci_refresh_seconds`), spawns one `/fix` task per
-failing commit, and dispatch resumes on its own once `main` is green — there is
-no explicit resume path, because the poll gate reads live state.
+When `ci_gate` is enabled, the reconciler refreshes each repo's GitHub Actions
+state on `main` (`cadences.ci_refresh_seconds`) and holds that repo's tasks
+`ci_red` — the same hold-and-clear shape as `repo_unavailable`, rendered as a
+"CI red" pill in the queue. `worker_poll` excludes held tasks read-only, one
+`/fix` task is spawned per failing commit, and the hold clears itself once
+`main` is green, so dispatch resumes with no operator action.
 ```
 
-- [ ] **Step 7: Commit** — `ui + docs: surface red repos and the queued fix task`
+- [ ] **Step 9: Commit** — `ui: surface the CI hold as a ci_red pill, matching repo_unavailable`
 
 ## Task 8: Enable the gate and resume queued jobs
 
