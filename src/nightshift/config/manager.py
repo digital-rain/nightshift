@@ -58,6 +58,16 @@ class Cadences:
             "re-files its fix task within one poll if the brief was deleted. "
             "Stored as cadences.ci_refresh_seconds."),
         apply="restart"))
+    auto_import_seconds: float = field(default=60.0, metadata=meta(
+        category="Cadences", label="Auto-import seconds",
+        desc=(
+            "How often a queue bound to a host task queue checks its repo's "
+            ".tasks/<host> inbox for new briefs. Each check pulls at most one "
+            "brief, and only once the previous one has run, so this is the "
+            "latency of noticing new published work — not its dispatch rate. "
+            "Auto-import is switched per repo on the Repos page; a workspace "
+            "with none switched on never pays for the check."),
+        apply="restart"))
 
 
 @dataclass(frozen=True)
@@ -318,6 +328,7 @@ def load_manager_settings(workspace: Path) -> ManagerSettings:
             15.0,
         ),
         ci_refresh_seconds=_as_float(cad_data.get("ci_refresh_seconds"), 120.0),
+        auto_import_seconds=_as_float(cad_data.get("auto_import_seconds"), 60.0),
     )
 
     # Parsed once at the config boundary: an unknown mode fails the load loudly
@@ -501,6 +512,7 @@ def save_manager_settings(workspace: Path, settings: ManagerSettings) -> None:
             "refresh_ms": settings.cadences.refresh_ms,
             "git_refresh_seconds": settings.cadences.git_refresh_seconds,
             "ci_refresh_seconds": settings.cadences.ci_refresh_seconds,
+            "auto_import_seconds": settings.cadences.auto_import_seconds,
         },
         "default_model": settings.operator.default_model,
         "enhance_brief_model": settings.operator.enhance_brief_model,

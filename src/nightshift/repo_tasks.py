@@ -42,6 +42,7 @@ from nightshift.git.landing import (
 from nightshift.git.refs import main_sha
 from nightshift.git.sync import sync_main_locked
 from nightshift.lifecycle import LAND_SUCCESS_KINDS, LandingMode
+from nightshift.playlists import is_valid_name
 from nightshift.queue_config import load_order, save_order
 from nightshift.spawn_daily import is_disabled, split_frontmatter, task_priority
 from nightshift.task_files import resolve_title
@@ -93,6 +94,12 @@ def _inboxes(queue_name: str) -> list[_Inbox]:
         for root in (REPO_TASKS_DIR, DOCS_TASKS_DIR)
         for path in (root, f"{root}/{queue_name}")
     ]
+
+
+def host_inbox(host_queue: str) -> str:
+    """The repo-relative inbox path of a named ``.tasks/`` host queue — the
+    single tree the auto-importer drains (see :mod:`nightshift.auto_import`)."""
+    return f"{REPO_TASKS_DIR}/{host_queue}"
 
 
 def _local_order(git: GitRunner, treeish: str) -> list[str]:
@@ -151,6 +158,77 @@ def _parse_brief(git: GitRunner, treeish: str, name: str) -> tuple[dict, str] | 
     return meta, text
 
 
+def list_repo_task_queues(workspace: Path, repo: str) -> list[str]:
+    """The ``.tasks/<name>/`` host-queue subdirs published on the repo's
+    canonical ``main``, sorted.
+
+    These are the queues the Repos page offers as a queue's *host task queue*
+    binding. Read from the ``main`` tree for the same reason the brief scan is
+    (:func:`scan_repo_tasks`): the operator checkout may be parked anywhere. A
+    subdir whose name is not a valid slug is skipped — the name is
+    concatenated into an inbox path, so this is the traversal guard on the
+    discovery side.
+    """
+    repo_root = workspace / repo
+    base = main_sha(repo_root)
+    if base is None:
+        return []
+    listing = GitRunner(repo_root).run("ls-tree", "-z", f"{base}:{REPO_TASKS_DIR}")
+    if not listing.ok:
+        return []
+    out: list[str] = []
+    for entry in listing.stdout.split("\0"):
+        meta, _, name = entry.partition("\t")
+        if meta.split()[1:2] == ["tree"] and is_valid_name(name):
+            out.append(name)
+    return sorted(out)
+
+
+def _scan_inboxes(
+    workspace: Path,
+    repo: str,
+    inboxes: list[_Inbox],
+    tasks_root: Path,
+    dest_rel: str,
+) -> list[RepoTask]:
+    """Scan the given inbox trees of a repo's canonical ``main`` into
+    importable briefs — the shared core of :func:`scan_repo_tasks` (every
+    inbox a queue drains) and :func:`scan_repo_inbox` (one named host queue).
+    """
+    repo_root = workspace / repo
+    git = GitRunner(repo_root)
+    base = main_sha(repo_root)
+    if base is None:
+        return []
+
+    dest_dir = tasks_root / dest_rel
+    existing = (
+        {p.read_text(errors="replace") for p in dest_dir.glob("*.md")}
+        if dest_dir.is_dir()
+        else set()
+    )
+
+    out: list[RepoTask] = []
+    for inbox in inboxes:
+        treeish = f"{base}:{inbox.path}"
+        for name in _scan_tree(git, treeish, ordered=inbox.ordered):
+            parsed = _parse_brief(git, treeish, name)
+            if parsed is None:
+                continue
+            meta, text = parsed
+            stem = name[: -len(".md")]
+            out.append(RepoTask(
+                name=stem,
+                title=resolve_title(stem, meta),
+                source=f"{inbox.path}/{name}",
+                priority=task_priority(meta),
+                disabled=is_disabled(meta),
+                duplicate=text in existing,
+                text=text,
+            ))
+    return out
+
+
 def scan_repo_tasks(
     workspace: Path,
     repo: str,
@@ -170,38 +248,28 @@ def scan_repo_tasks(
     nothing. Read-only — the import itself is :func:`copy_repo_tasks` +
     :func:`remove_repo_tasks_locked`.
     """
-    repo_root = workspace / repo
-    git = GitRunner(repo_root)
-    base = main_sha(repo_root)
-    if base is None:
-        return []
-
-    dest_dir = tasks_root / dest_rel
-    existing = (
-        {p.read_text(errors="replace") for p in dest_dir.glob("*.md")}
-        if dest_dir.is_dir()
-        else set()
+    return _scan_inboxes(
+        workspace, repo, _inboxes(queue_name), tasks_root, dest_rel
     )
 
-    out: list[RepoTask] = []
-    for inbox in _inboxes(queue_name):
-        treeish = f"{base}:{inbox.path}"
-        for name in _scan_tree(git, treeish, ordered=inbox.ordered):
-            parsed = _parse_brief(git, treeish, name)
-            if parsed is None:
-                continue
-            meta, text = parsed
-            stem = name[: -len(".md")]
-            out.append(RepoTask(
-                name=stem,
-                title=resolve_title(stem, meta),
-                source=f"{inbox.path}/{name}",
-                priority=task_priority(meta),
-                disabled=is_disabled(meta),
-                duplicate=text in existing,
-                text=text,
-            ))
-    return out
+
+def scan_repo_inbox(
+    workspace: Path,
+    repo: str,
+    inbox: str,
+    tasks_root: Path,
+    dest_rel: str,
+) -> list[RepoTask]:
+    """Scan exactly one inbox tree, in its published order.
+
+    The auto-importer's read side: it drains a single named host queue
+    (``.tasks/<host>``, see :func:`host_inbox`) rather than every inbox a
+    manual import offers, so a repo's other host queues are never pulled into
+    a queue that did not bind them.
+    """
+    return _scan_inboxes(
+        workspace, repo, [_Inbox(inbox, ordered=True)], tasks_root, dest_rel
+    )
 
 
 def select_repo_tasks(

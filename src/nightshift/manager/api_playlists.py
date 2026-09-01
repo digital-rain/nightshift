@@ -9,6 +9,7 @@ emitter, content-store committer, queue helpers) is injected by
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from nightshift import playlists as playlists_mod
 from nightshift import repos
+from nightshift.auto_import import (
+    HOST_QUEUE_KEY,
+    auto_import_repos,
+    resolve_host_queue,
+    set_auto_import,
+)
 from nightshift.lifecycle import TaskHoldKind
 from nightshift.manager.scheduler import queue_label
 from nightshift.manager.store import NightshiftStore
@@ -29,6 +36,7 @@ from nightshift.queue_config import (
     save_queue_config_value,
     set_ci_monitoring,
 )
+from nightshift.repo_tasks import list_repo_task_queues
 from nightshift.spawn_daily import load_queue_config
 from nightshift.task_files import list_queue
 
@@ -43,6 +51,24 @@ class QueueCiMonitoringBody(BaseModel):
 
     queue: str | None = None
     enabled: bool
+
+
+class RepoAutoImportBody(BaseModel):
+    """Body for ``PUT /api/repos/auto-import`` — the repo-level switch that
+    turns a target repo's ``.tasks/`` inbox into queues Nightshift services."""
+
+    repo: str
+    enabled: bool
+
+
+class QueueHostQueueBody(BaseModel):
+    """Body for ``PUT /api/queue/host-queue``. ``host_queue`` is the
+    ``.tasks/<name>`` subdir this queue drains; ``""``/``null`` clears the
+    binding to an explicit "none" (which is *not* the same as leaving the key
+    unset — see :func:`nightshift.auto_import.resolve_host_queue`)."""
+
+    queue: str | None = None
+    host_queue: str | None = None
 
 
 class PlaylistUpdate(BaseModel):
@@ -328,8 +354,24 @@ def register_playlist_api(
         one-warning-per-queue pause rule). Each repo also carries ``monitored``
         (a queue bound to it has CI monitoring on) and, only when monitored,
         its latest ``ci`` state row (``None`` otherwise -- an unmonitored repo
-        has no fresh row to trust)."""
+        has no fresh row to trust).
+
+        Auto-import rides along on both halves: each repo carries its switch
+        (``auto_import``) plus, only when the switch is on, the host queues it
+        publishes (``task_queues``, one ``ls-tree`` per switched-on repo); each
+        queue carries the host queue it drains (``host_queue``, resolved -- so
+        the UI shows the same default the importer will act on) and the
+        options its bound repo offers.
+        """
         known = repos.known_repos(workspace)
+        enabled = set(auto_import_repos(tasks_root))
+        # One tree read per switched-on, present repo, shared by the repo rows
+        # and every queue bound to it. Repos with the switch off cost nothing.
+        host_queues: dict[str, list[str]] = {
+            name: await asyncio.to_thread(list_repo_task_queues, workspace, name)
+            for name in known
+            if name in enabled
+        }
         queues_payload: list[dict[str, Any]] = []
         warnings: list[dict[str, Any]] = []
         for q in _all_queues():
@@ -337,11 +379,19 @@ def register_playlist_api(
             repo = _queue_repo(q)
             available = bool(repo) and repos.repo_available(workspace, repo)
             config = load_queue_config(tasks_root, playlists_mod.tasks_rel(q))
+            offered = host_queues.get(repo or "", [])
+            auto_import = bool(repo) and repo in enabled
             queues_payload.append({
                 "queue": label,
                 "repo": repo,
                 "available": available,
                 "ci_monitoring": ci_monitoring_enabled(config),
+                "auto_import": auto_import,
+                "host_queue": (
+                    resolve_host_queue(config, label, available=offered)
+                    if auto_import else None
+                ),
+                "host_queues": offered,
             })
             if repo and not available:
                 warnings.append({"queue": label, "repo": repo})
@@ -355,6 +405,8 @@ def register_playlist_api(
                 "name": name,
                 "available": True,
                 "monitored": is_monitored,
+                "auto_import": name in enabled,
+                "task_queues": host_queues.get(name, []),
                 "ci": None if not row else {
                     "state": row.get("state"),
                     "head_sha": row.get("head_sha"),
@@ -373,6 +425,63 @@ def register_playlist_api(
 
     @app.get("/api/repos")
     async def get_repos() -> JSONResponse:
+        return JSONResponse(await _repos_payload())
+
+    @app.put("/api/repos/auto-import")
+    async def put_repo_auto_import(body: RepoAutoImportBody) -> JSONResponse:
+        """Turn ``.tasks/`` auto-import on/off for one repo.
+
+        Repo-level rather than per-queue: the inbox belongs to the repo, and
+        the switch is what makes its host queues selectable at all. Turning it
+        off stops the importer immediately but leaves each queue's
+        ``host_queue`` binding in place, so switching back on resumes exactly
+        where it left off. Briefs already pulled are ordinary tasks and are
+        unaffected.
+        """
+        if not repos.is_valid_repo_ref(body.repo):
+            return JSONResponse(
+                {"error": (
+                    f"invalid repo reference {body.repo!r}: a repo must be a bare "
+                    "workspace child name (no paths, '..', '/', or absolute paths)"
+                )},
+                status_code=400,
+            )
+        set_auto_import(tasks_root, body.repo, body.enabled)
+        verb = "enable" if body.enabled else "disable"
+        await _commit(f"nightshift: {verb} auto-import {body.repo}")
+        await _emit(
+            "queue_changed",
+            payload={"repo": body.repo, "auto_import": body.enabled},
+        )
+        return JSONResponse(await _repos_payload())
+
+    @app.put("/api/queue/host-queue")
+    async def put_queue_host_queue(body: QueueHostQueueBody) -> JSONResponse:
+        """Bind one queue to a ``.tasks/<name>`` host queue on its repo.
+
+        A blank value stores the explicit "none" that keeps this queue out of
+        auto-import while its repo's switch stays on for other queues. The
+        name is slug-guarded here rather than at read time: it is concatenated
+        into an inbox path, and an authoring error belongs where it is
+        authored.
+        """
+        target = _queue_from_label(body.queue)
+        if target is not None and not playlists_mod.exists(tasks_root, target):
+            return JSONResponse({"error": "queue not found"}, status_code=404)
+        name = (body.host_queue or "").strip()
+        if name and not playlists_mod.is_valid_name(name):
+            return JSONResponse(
+                {"error": (
+                    f"invalid host queue {name!r}: a .tasks/ queue must be a bare "
+                    "directory name matching [a-z0-9][a-z0-9-]*"
+                )},
+                status_code=400,
+            )
+        save_queue_config_value(
+            tasks_root, HOST_QUEUE_KEY, name, playlists_mod.tasks_rel(target)
+        )
+        await _commit(f"nightshift: set host-queue {queue_label(target)}")
+        await _emit("queue_changed", queue=target, payload={"host_queue": name})
         return JSONResponse(await _repos_payload())
 
     @app.put("/api/queue/ci-monitoring")

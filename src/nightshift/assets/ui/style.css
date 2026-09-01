@@ -1572,6 +1572,16 @@ body[data-view="detail"] #screen-detail { display: flex; flex: 1; }
   letter-spacing: 0.04em;
   color: var(--text-dim);
 }
+/* The per-repo `.tasks/` auto-import switch, inline with the row's trailing
+   badges. Wraps label-first on a narrow pane so the segment is never clipped. */
+.repo-auto-import {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 /* Per-queue binding rows: the queue label + availability on top, the
    default-repo selector (and any inline error) below. */
 .repo-queue-item {

@@ -9,10 +9,12 @@ root    := justfile_directory()
 workspace := env_var_or_default("NIGHTSHIFT_WORKSPACE", justfile_directory())
 mig_dir := justfile_directory() / "src/nightshift/assets/migrations"
 
-# Drop ambient PYTHONPATH so {{py}} resolves packages from this project's
-# .venv. A sibling repo's .localrc (e.g. longitude) may still be exporting
-# its own site-packages into the shell after `cd` + `activate`.
-export PYTHONPATH := ""
+# Pin PYTHONPATH to THIS checkout's src, replacing whatever the shell had: a
+# sibling repo's .localrc may be exporting its own site-packages, and the
+# shared .venv's editable install resolves `nightshift` to the PRIMARY checkout
+# by absolute path — so a bare scrub made every worktree validate the
+# primary's source instead of its own.
+export PYTHONPATH := root / "src"
 
 # List available recipes.
 default:

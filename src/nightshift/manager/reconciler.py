@@ -23,6 +23,10 @@ reads (build candidates → pick → create the attempt → return):
    reaped from ``app.state.resolves``.
 4. **Worker liveness** — silent workers are marked offline
    (``registry.reap_stale``), moved out of the poll path.
+5. **Host-queue auto-import** — a queue bound to a repo's ``.tasks/<host>``
+   inbox pulls one published brief per pass, on its own cadence, and removes
+   the source from the repo's ``main``. See :mod:`nightshift.auto_import` for
+   the round-robin and frontmatter rules.
 
 The startup pass additionally *recovers* attempts interrupted mid-land (Phase
 8): an attempt stuck in state LANDING can only be a previous process's
@@ -60,12 +64,19 @@ from typing import Any
 
 from nightshift import playlists as playlists_mod
 from nightshift import repos
+from nightshift.auto_import import (
+    auto_import_repos,
+    pending_imports,
+    resolve_host_queue,
+    write_imported_brief,
+)
 from nightshift.ci import CiState, CiStatus, check_repo_ci
 from nightshift.config.manager import ManagerConfig
 from nightshift.git import GitRunner
 from nightshift.git.executor import ExecutorPool
 from nightshift.git.landing import find_landed_attempt
 from nightshift.git.refs import branch_exists
+from nightshift.git.store import commit_tasks
 from nightshift.git.sync import SyncThrottle
 from nightshift.git.transport import prune_rendezvous_branch, wip_ref
 from nightshift.git.worktrees import cleanup_task_worktree, worktree_branch
@@ -99,6 +110,13 @@ from nightshift.manager.work_orders import (
     task_meta,
 )
 from nightshift.queue_config import ci_monitoring_enabled
+from nightshift.repo_tasks import (
+    RepoTask,
+    host_inbox,
+    list_repo_task_queues,
+    remove_repo_tasks_locked,
+    scan_repo_inbox,
+)
 from nightshift.spawn_daily import (
     join_frontmatter,
     load_queue_config,
@@ -197,6 +215,9 @@ class Reconciler:
         # Per-repo wall-clock of the last gh check (cadences.ci_refresh_seconds).
         self._ci_checked_at: dict[str, float] = {}
         self._ci_transient_misses: dict[str, int] = {}
+        # Per-destination-queue wall-clock of the last host-inbox check
+        # (cadences.auto_import_seconds).
+        self._auto_import_checked_at: dict[str, float] = {}
         # Tasks already announced as "green, but this fix is still in
         # flight" -- the green branch runs every tick, and the notice is
         # worth exactly one event per stale run, not one per poll.
@@ -233,6 +254,9 @@ class Reconciler:
     async def reconcile_once(self) -> None:
         await self._run_duty("deadline expiry", self._expire_deadlines)
         await self._run_duty("repo CI refresh", self._refresh_repo_ci)
+        # Before hold set/clear so a brief pulled this tick is reconciled as a
+        # candidate immediately rather than a full poll interval later.
+        await self._run_duty("host queue auto-import", self._auto_import_host_queues)
         await self._run_duty("hold set/clear", self._reconcile_holds)
         await self._run_duty("worker liveness", self._mark_workers_offline)
         await self._run_duty("resolve reaping", self._reap_resolves)
@@ -767,6 +791,117 @@ class Reconciler:
             task=created["task"],
             payload={"repo": repo, "head_sha": status.head_sha},
         )
+
+    # ------------------------------------------------------------------ #
+    # Host-queue auto-import (see nightshift.auto_import)
+    # ------------------------------------------------------------------ #
+
+    async def _auto_import_host_queues(self) -> None:
+        """Pull one brief per bound queue from its repo's ``.tasks/<host>``.
+
+        Throttled per destination queue by ``cadences.auto_import_seconds``,
+        and short-circuited when no repo has the switch on — a workspace not
+        using the feature makes no git call for it. The one-in-flight
+        round-robin gate is checked *before* the inbox scan, so a queue still
+        working through its previous pick costs nothing either.
+        """
+        enabled = set(auto_import_repos(self._tasks_root))
+        if not enabled:
+            return
+        interval = float(self._cfg.cadences.auto_import_seconds or 0)
+        now = time.time()
+        for queue in self._all_queues():
+            label = queue_label(queue)
+            tasks_rel = playlists_mod.tasks_rel(queue)
+            config = load_queue_config(self._tasks_root, tasks_rel)
+            repo = config.get("repo")
+            if not repo or repo not in enabled:
+                continue
+            last = self._auto_import_checked_at.get(label)
+            if last is not None and interval > 0 and (now - last) < interval:
+                continue
+            if not repos.repo_available(self._workspace, repo):
+                continue
+            self._auto_import_checked_at[label] = now
+            # Round-robin: the host queue gets its next slot only once the
+            # previous pick has run (its brief is dropped on land).
+            if pending_imports(self._tasks_root, tasks_rel):
+                continue
+            available = await asyncio.to_thread(
+                list_repo_task_queues, self._workspace, repo
+            )
+            host = resolve_host_queue(config, label, available=available)
+            if host is None:
+                continue
+            entries = await asyncio.to_thread(
+                scan_repo_inbox,
+                self._workspace, repo, host_inbox(host),
+                self._tasks_root, tasks_rel,
+            )
+            if entries:
+                await self._auto_import_one(queue, repo, host, entries[0])
+
+    async def _auto_import_one(
+        self, queue: str | None, repo: str, host: str, entry: RepoTask
+    ) -> None:
+        """Move one published brief into the queue: copy + commit the content
+        store first (the brief is durable from there), then remove the source
+        from the repo's ``main`` as a repo-executor job.
+
+        A brief whose exact text is already in the destination is not copied
+        again — the operator drained it by hand at some point — but its source
+        is still removed, so the inbox converges instead of re-offering it
+        every tick.
+        """
+        label = queue_label(queue)
+        tasks_rel = playlists_mod.tasks_rel(queue)
+        stem: str | None = None
+        if not entry.duplicate:
+            stem = await asyncio.to_thread(
+                partial(
+                    write_imported_brief,
+                    self._tasks_root,
+                    tasks_rel,
+                    name=entry.name,
+                    text=entry.text,
+                    repo=repo,
+                    source=entry.source,
+                    default_model=self._cfg.default_model,
+                )
+            )
+            await self._commit_store(
+                f"nightshift: auto-import {stem} from {repo}/{entry.source}"
+            )
+        removal = await asyncio.wrap_future(self._executors.submit(repo, partial(
+            remove_repo_tasks_locked,
+            self._workspace,
+            repo,
+            [entry.source],
+            f"nightshift: auto-import {entry.name} into queue {label}",
+        )))
+        if removal["warning"]:
+            _log.warning("reconciler: auto-import: %s", removal["warning"])
+        await self._emit(
+            "queue_changed",
+            queue=queue,
+            task=stem,
+            payload={
+                "auto_imported": stem,
+                "repo": repo,
+                "host_queue": host,
+                "source": entry.source,
+                "removed": removal["removed"],
+                "warning": removal["warning"],
+            },
+        )
+
+    async def _commit_store(self, message: str) -> None:
+        """Commit content-store churn as a tasks-repo executor job, mirroring
+        the operator API's ``_commit`` (the tasks repo is a repo like any
+        other, so its commits serialize with every job targeting it)."""
+        await asyncio.wrap_future(self._executors.submit(
+            self._tasks_repo, partial(commit_tasks, self._tasks_root, message)
+        ))
 
     # ------------------------------------------------------------------ #
     # 2. Hold set/clear (moved out of worker_poll)

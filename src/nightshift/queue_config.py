@@ -195,6 +195,19 @@ def save_queue_config_value(
     return value
 
 
+def save_store_config_value(tasks_root: Path, key: str, value: object) -> object:
+    """Set a single key in the *store-level* ``<tasks_root>/config.json`` —
+    the system-wide layer :func:`nightshift.spawn_daily.load_store_config`
+    reads and every queue inherits from.
+
+    The write counterpart of that loader, and the home of settings that are
+    workspace-wide rather than per queue (the auto-import repo set). Same
+    preserve-siblings / ``None`` removes semantics as
+    :func:`save_queue_config_value`.
+    """
+    return save_queue_config_value(tasks_root, key, value, ".")
+
+
 def load_sort_mode(tasks_root: Path, tasks_rel: str = "main") -> str:
     """Return a queue's sort mode from its `config.json` (``manual`` default).
 

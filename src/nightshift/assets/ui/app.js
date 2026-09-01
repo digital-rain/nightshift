@@ -1538,11 +1538,33 @@ function repoRow(r, tasksRepo) {
   trailing.style.display = "flex";
   trailing.style.alignItems = "center";
   trailing.style.gap = "8px";
+  trailing.append(autoImportControl(r.name, r.auto_import));
   trailing.append(availabilityBadge(r.available));
   const hold = ciBadge(r.ci);
   if (hold) trailing.append(hold);
   li.append(main, trailing);
   return li;
+}
+
+// The per-repo `.tasks/` auto-import switch. Repo-level (not per queue): the
+// inbox belongs to the repo, and turning it on is what makes its host queues
+// selectable in the queue-binding rows below -- so a flip re-renders the whole
+// page, not just this row.
+function autoImportControl(repo, enabled) {
+  const wrap = document.createElement("div");
+  wrap.className = "repo-auto-import";
+  const label = document.createElement("span");
+  label.className = "repo-queue-ctl-label";
+  label.textContent = "Auto-import .tasks";
+  wrap.append(label, yesNoSegment({
+    ariaLabel: `Auto-import .tasks for ${repo}`,
+    enabled,
+    url: "/api/repos/auto-import",
+    body: (value) => ({ repo, enabled: value }),
+    failure: "could not change auto-import",
+    onChanged: () => loadRepos(),
+  }));
+  return wrap;
 }
 
 // One per-queue binding row: the queue label + its bound repo's availability,
@@ -1574,6 +1596,26 @@ function repoQueueRow(q) {
   ctl.append(span, select);
   li.append(ctl, err);
 
+  // Host task queue: only offered once the bound repo's auto-import switch is
+  // on -- without it there is nothing to bind to, and an inert dropdown on
+  // every row would read as a feature that silently does nothing.
+  if (q.auto_import) {
+    const hostCtl = document.createElement("label");
+    hostCtl.className = "repo-queue-ctl";
+    const hostSpan = document.createElement("span");
+    hostSpan.className = "repo-queue-ctl-label";
+    hostSpan.textContent = "Host task queue";
+    const hostErr = document.createElement("p");
+    hostErr.className = "error repo-queue-error";
+    hostErr.hidden = true;
+    const hostSelect = hostQueueSelect(q.host_queue, q.host_queues || []);
+    hostSelect.addEventListener(
+      "change", () => setQueueHostQueue(q.queue, hostSelect.value, hostErr),
+    );
+    hostCtl.append(hostSpan, hostSelect);
+    li.append(hostCtl, hostErr);
+  }
+
   const ciCtl = document.createElement("div");
   ciCtl.className = "repo-queue-ctl";
   const ciSpan = document.createElement("span");
@@ -1584,21 +1626,19 @@ function repoQueueRow(q) {
   return li;
 }
 
-// A YES/NO segmented control for a queue's `ci_monitoring` switch (persisted
-// in config.json beside `repo`/`validate`), shared by the Repos page's
-// queue-binding row (above) and the playlist detail page (below). Persists
-// immediately via PUT /api/queue/ci-monitoring, matching this page's other
-// live-persisting controls (Default repo, sort mode) -- there's no draft
+// A YES/NO segmented control that persists immediately, matching this page's
+// other live-persisting controls (Default repo, sort mode) -- there's no draft
 // state to lose here, unlike the playlist-info page's Name/Repository/
-// Validate/Description/Notes fields, which stage until the operator hits
-// Save. `queueLabel` is "main" for the default queue; `onChanged(enabled)`
-// runs after a successful PUT so each call site can refresh its own view.
-function ciMonitoringControl(queueLabel, enabled, onChanged) {
+// Validate/Description/Notes fields, which stage until the operator hits Save.
+// `body(value)` builds the PUT payload, `onChanged(value, data)` runs after a
+// successful write so each call site can refresh its own view, and a failure
+// is surfaced inline (the paint doesn't move) rather than tearing down the row.
+function yesNoSegment({ ariaLabel, enabled, url, body, failure, onChanged }) {
   const wrap = document.createElement("div");
   const seg = document.createElement("div");
   seg.className = "segmented";
   seg.setAttribute("role", "group");
-  seg.setAttribute("aria-label", "CI monitoring");
+  seg.setAttribute("aria-label", ariaLabel);
   const err = document.createElement("p");
   err.className = "error repo-queue-error";
   err.hidden = true;
@@ -1608,13 +1648,13 @@ function ciMonitoringControl(queueLabel, enabled, onChanged) {
     btn.type = "button";
     btn.className = "seg-opt";
     btn.textContent = text;
-    btn.dataset.ciEnabled = String(value);
+    btn.dataset.segValue = String(value);
     seg.append(btn);
     return btn;
   });
   const paint = (on) => {
     for (const btn of buttons) {
-      const active = (btn.dataset.ciEnabled === "true") === on;
+      const active = (btn.dataset.segValue === "true") === on;
       btn.classList.toggle("on", active);
       btn.setAttribute("aria-pressed", active ? "true" : "false");
     }
@@ -1622,12 +1662,11 @@ function ciMonitoringControl(queueLabel, enabled, onChanged) {
   paint(Boolean(enabled));
   for (const btn of buttons) {
     btn.addEventListener("click", async () => {
-      const value = btn.dataset.ciEnabled === "true";
+      const value = btn.dataset.segValue === "true";
       if (btn.classList.contains("on")) return;
-      const body = { queue: queueLabel === "main" ? null : queueLabel, enabled: value };
-      const { ok, data } = await sendJSON("/api/queue/ci-monitoring", "PUT", body);
+      const { ok, data } = await sendJSON(url, "PUT", body(value));
       if (!ok) {
-        err.textContent = (data && data.error) || "could not change CI monitoring";
+        err.textContent = (data && data.error) || failure;
         err.hidden = false;
         return;
       }
@@ -1638,6 +1677,66 @@ function ciMonitoringControl(queueLabel, enabled, onChanged) {
   }
   wrap.append(seg, err);
   return wrap;
+}
+
+// The queue's `ci_monitoring` switch (persisted in config.json beside
+// `repo`/`validate`), shared by the Repos page's queue-binding row (above) and
+// the playlist detail page (below). `queueLabel` is "main" for the default
+// queue; `onChanged(enabled)` runs after a successful PUT.
+function ciMonitoringControl(queueLabel, enabled, onChanged) {
+  return yesNoSegment({
+    ariaLabel: "CI monitoring",
+    enabled,
+    url: "/api/queue/ci-monitoring",
+    body: (value) => ({
+      queue: queueLabel === "main" ? null : queueLabel, enabled: value,
+    }),
+    failure: "could not change CI monitoring",
+    onChanged,
+  });
+}
+
+// A <select> of the `.tasks/<name>` host queues the bound repo publishes.
+// `current` is the *resolved* binding the importer will act on, so the default
+// (the subdir named after this queue) shows up pre-selected without the
+// operator having saved anything. A `current` the repo doesn't publish -- a
+// deliberate binding made before the subdir exists -- is preserved as an extra
+// option, the same round-tripping `repoSelect` does for an absent repo.
+function hostQueueSelect(current, offered) {
+  const select = document.createElement("select");
+  select.className = "ctl-select repo-select";
+  const cur = current || "";
+  const values = [""];
+  for (const name of offered) values.push(name);
+  if (cur && !values.includes(cur)) values.push(cur);
+  for (const v of values) {
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = v === ""
+      ? "— none —"
+      : (offered.includes(v) ? `.tasks/${v}` : `.tasks/${v} (absent)`);
+    select.append(opt);
+  }
+  select.value = cur;
+  return select;
+}
+
+// Persist a queue's host task queue. An empty selection stores the explicit
+// "none" that keeps this queue out of auto-import while its repo's switch
+// stays on for other queues.
+async function setQueueHostQueue(label, value, errEl) {
+  const body = { queue: label === "main" ? null : label, host_queue: value || "" };
+  const { ok, data } = await sendJSON("/api/queue/host-queue", "PUT", body);
+  if (!ok) {
+    if (errEl) {
+      errEl.textContent = (data && data.error) || "could not set host task queue";
+      errEl.hidden = false;
+    }
+    return;
+  }
+  if (errEl) errEl.hidden = true;
+  state.repos = data;
+  renderRepos();
 }
 
 // Persist a queue's default target repo. The default queue's label is "main";
