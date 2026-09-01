@@ -49,11 +49,14 @@ class Cadences:
             "checking again. 0 disables throttling (not recommended)."),
         apply="restart"))
     ci_refresh_seconds: float = field(default=120.0, metadata=meta(
-        category="Cadences", label="CI refresh seconds",
+        category="Build monitor", label="CI poll seconds",
         desc=(
-            "Minimum interval between GitHub Actions status checks per "
-            "monitored repo. Each check is one `gh run list` call. Repos are "
-            "polled only while a queue bound to them has CI monitoring on."),
+            "How often the build monitor checks a monitored repo's GitHub "
+            "Actions state on main (two `gh` calls per check: the branch tip, "
+            "then its runs). Monitoring itself is switched per queue binding "
+            "on the Repos page; only RED holds dispatch, and a still-red repo "
+            "re-files its fix task within one poll if the brief was deleted. "
+            "Stored as cadences.ci_refresh_seconds."),
         apply="restart"))
 
 

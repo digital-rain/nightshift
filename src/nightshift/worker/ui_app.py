@@ -58,7 +58,12 @@ def _workspace_tier(workspace: Path) -> dict:
     }
 
 
-def create_worker_app(cfg: WorkerConfig, local: LocalStore) -> FastAPI:
+def create_worker_app(
+    cfg: WorkerConfig, local: LocalStore, loop: Any | None = None
+) -> FastAPI:
+    """``loop`` is the WorkerLoop whose poll thread this UI reports on. It is
+    optional so existing callers/tests keep working; without it ``/api/info``
+    simply reports no loop health."""
     app = FastAPI(title="Nightshift Worker")
     # Operator-requested-restart state. ``restart_requested`` tells
     # ``__main__`` to re-exec after the server exits; ``restart_pending`` means
@@ -87,6 +92,9 @@ def create_worker_app(cfg: WorkerConfig, local: LocalStore) -> FastAPI:
                 "brand_tag": "Nightshift Worker",
                 "refresh_ms": cfg.refresh_ms,
                 "restart_pending": bool(app.state.restart_pending),
+                # A worker whose poll loop is wedged answers this endpoint
+                # exactly like a healthy one, so say which it is.
+                "loop": loop.loop_health() if loop is not None else None,
             }
         )
 

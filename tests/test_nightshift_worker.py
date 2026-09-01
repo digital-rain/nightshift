@@ -725,3 +725,92 @@ def test_local_store_session_memory_roundtrip_and_drop(tmp_path: Path) -> None:
     local.drop_sessions("10.x")
     assert local.session_for("10.x", "planner") is None
     assert local.session_for("10.y", "planner") == "sess-other"
+
+
+# --------------------------------------------------------------------------
+# Poll-loop supervision. Observed live (2026-09-01): the loop runs on a daemon
+# thread nothing supervises, so one un-retried failure -- a check-in racing a
+# manager restart by five seconds -- killed the thread while uvicorn kept
+# serving the worker UI. The worker looked healthy and never polled again.
+# --------------------------------------------------------------------------
+
+import threading
+import time as _time
+
+import nightshift.worker.loop as loop_mod
+
+
+class _FlakyClient:
+    """check-in fails ``failures`` times then succeeds; poll hands out nothing."""
+
+    def __init__(self, failures: int) -> None:
+        self.failures = failures
+        self.checkins = 0
+        self.polls = 0
+
+    def checkin(self, worker_id, *, backend, queues, priorities,
+                models=None, mcps=None, meta=None):
+        self.checkins += 1
+        if self.checkins <= self.failures:
+            raise ConnectionError("manager not accepting connections yet")
+        return {"cadences": {"poll_seconds": 0.01, "heartbeat_seconds": 0.01}}
+
+    def poll(self, worker_id, **kw):
+        self.polls += 1
+        return {}
+
+    def heartbeat(self, worker_id, **kw):
+        return None
+
+
+def _run_loop(tmp_path, monkeypatch, client):
+    monkeypatch.setattr(loop_mod, "_LOOP_BACKOFF_START", 0.01)
+    monkeypatch.setattr(loop_mod, "_LOOP_BACKOFF_CAP", 0.02)
+    cfg = WorkerConfig(workspace=tmp_path, worker_id="w1", manager_url="http://test")
+    loop = WorkerLoop(cfg, client, LocalStore(tmp_path))
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    return loop, thread
+
+
+def _wait_for(cond, timeout=5.0):
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if cond():
+            return True
+        _time.sleep(0.005)
+    return False
+
+
+def test_loop_survives_a_failed_checkin_and_recovers(tmp_path, monkeypatch):
+    client = _FlakyClient(failures=2)
+    loop, thread = _run_loop(tmp_path, monkeypatch, client)
+    try:
+        assert _wait_for(lambda: client.polls >= 1), (
+            "the loop must retry check-in and reach polling, not die"
+        )
+        assert client.checkins >= 3  # two failures + the success
+        health = loop.loop_health()
+        assert health["checked_in"] is True
+        assert health["consecutive_errors"] == 0
+        assert "ConnectionError" in (health["last_error"] or "")
+    finally:
+        loop.stop()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+
+
+def test_loop_reports_ill_health_while_stuck(tmp_path, monkeypatch):
+    client = _FlakyClient(failures=10**9)
+    loop, thread = _run_loop(tmp_path, monkeypatch, client)
+    try:
+        assert _wait_for(lambda: loop.consecutive_errors >= 2)
+        health = loop.loop_health()
+        assert health["checked_in"] is False
+        assert "manager not accepting connections" in health["last_error"]
+        assert health["last_error_at"] is not None
+        assert thread.is_alive(), "retrying, not dead"
+    finally:
+        loop.stop()
+        thread.join(timeout=5)
+    assert not thread.is_alive()

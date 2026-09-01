@@ -530,13 +530,26 @@ class Reconciler:
             status = await asyncio.to_thread(
                 check_repo_ci, repos.repo_root(self._workspace, repo)
             )
-            # A transient gh failure is the absence of information, not
-            # information about an absence. Writing UNKNOWN here would clear
-            # the repo's holds and its fix marker on every network blip, so a
-            # red repo would briefly re-admit its own tasks. Hold the last
-            # known state until gh has failed _CI_TRANSIENT_TOLERANCE times in
-            # a row, then degrade to UNKNOWN (still fail-open).
-            if status.transient:
+            recorded = (await store.repo_ci()).get(repo) or {}
+            # Two kinds of non-answer are held rather than written, because
+            # writing them would clear the repo's holds and its fix marker on
+            # every blip, briefly re-admitting a red repo's tasks:
+            #  - gh itself failed (status.transient) -- a timeout or a dead
+            #    network says nothing about the branch;
+            #  - the list API returned no runs for a sha we already hold a
+            #    completed verdict for. Runs cannot un-run, so an empty answer
+            #    at the same sha is GitHub list lag (observed live during a
+            #    re-run), not a new state.
+            # Either way the last known state stands until the miss has
+            # repeated _CI_TRANSIENT_TOLERANCE times, then the fresh answer is
+            # written through (still fail-open; a deliberately deleted run
+            # eventually wins).
+            suspect = status.transient or (
+                status.no_runs_at_tip
+                and recorded.get("head_sha") == status.head_sha
+                and recorded.get("state") in (str(CiState.RED), str(CiState.GREEN))
+            )
+            if suspect:
                 misses = self._ci_transient_misses.get(repo, 0) + 1
                 self._ci_transient_misses[repo] = misses
                 if misses < _CI_TRANSIENT_TOLERANCE:
@@ -551,6 +564,20 @@ class Reconciler:
                 detail=status.detail,
             )
             if previous == str(status.state):
+                # No transition, so nothing to announce -- but a still-red repo
+                # whose fix brief has been deleted (operator tidy-up, a failed
+                # run cleaned away) would otherwise stay red forever with
+                # nothing queued to fix it: the marker still names a brief, so
+                # the dedupe suppresses a respawn, and only a state change
+                # clears the marker. Re-file it.
+                if status.state is CiState.RED:
+                    if self._ci_fix_brief_missing(
+                        recorded.get("fix_task"), monitored[repo]
+                    ):
+                        await store.set_repo_ci_fix(repo, fix_task="", fix_sha="")
+                        await self._spawn_ci_fix(
+                            repo, status, queues=monitored[repo]
+                        )
                 continue
             await self._emit(
                 "repo_ci",
@@ -565,6 +592,22 @@ class Reconciler:
             )
             if status.state is CiState.RED:
                 await self._spawn_ci_fix(repo, status, queues=monitored[repo])
+
+    def _ci_fix_brief_missing(
+        self, fix_task: str | None, queues: set[str | None]
+    ) -> bool:
+        """True when the recorded fix brief is no longer on disk.
+
+        The marker is bookkeeping; the brief is the work. If the brief is gone
+        the marker is stale, and leaving it in place strands a red repo with no
+        queued fix.
+        """
+        if not fix_task:
+            return False
+        return not any(
+            (self._tasks_root / playlists_mod.tasks_rel(q) / f"{fix_task}.md").exists()
+            for q in queues
+        )
 
     async def _spawn_ci_fix(
         self, repo: str, status: CiStatus, *, queues: set[str | None]

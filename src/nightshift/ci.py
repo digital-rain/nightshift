@@ -53,6 +53,11 @@ class CiStatus:
     # information, not information about an absence. Callers keep their last
     # known state across a transient blip instead of churning holds.
     transient: bool = False
+    # True when the run list held no runs at the tip. Right after a push this
+    # is honest PENDING; but if a completed verdict was already recorded at
+    # this same sha, runs cannot have un-run, and the caller should treat the
+    # empty answer as GitHub list-API lag rather than a state change.
+    no_runs_at_tip: bool = False
 
 
 class GhRunner:
@@ -126,6 +131,7 @@ def status_from_runs(payload: str, *, tip_sha: str | None = None) -> CiStatus:
             CiState.PENDING,
             head_sha=head_sha,
             detail=f"no run yet for {str(head_sha)[:8]}",
+            no_runs_at_tip=True,
         )
 
     def _mk(state: CiState, run: dict, detail: str) -> CiStatus:

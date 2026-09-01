@@ -813,3 +813,100 @@ def test_a_repo_unavailable_hold_also_surfaces(gate):
     pls = {p["name"]: p for p in client.get("/api/playlists").json()}
     assert pls["side"]["hold"]["kind"] == "repo_unavailable"
     assert pls["side"]["hold"]["tasks"] == 1
+
+
+# --------------------------------------------------------------------------
+# Operability fixes from the first live-red day (2026-09-01).
+# --------------------------------------------------------------------------
+
+def _fix_brief(ws: Path):
+    briefs = list(_tasks_dir(ws).glob("fix-ci-*.md"))
+    assert len(briefs) <= 1
+    return briefs[0] if briefs else None
+
+
+def test_a_deleted_fix_brief_is_refiled_while_still_red(gate):
+    """Observed live: the operator deleted an expired fix brief expecting a
+    respawn. The marker still named the deleted brief and spawn only fired on
+    a red *transition*, so a still-red repo stayed red forever with nothing
+    queued to fix it."""
+    ws, store, stub, client = gate
+    stub.status = CiStatus(CiState.RED, head_sha="bbb", detail="pytest: failure")
+    _open_throttle(client)
+    _reconcile(client)
+    brief = _fix_brief(ws)
+    assert brief is not None
+
+    brief.unlink()  # operator tidy-up
+    _open_throttle(client)
+    _reconcile(client)  # same red state: no transition
+    refiled = _fix_brief(ws)
+    assert refiled is not None, "a red repo must never sit with no queued fix"
+    row = _call(client, store.repo_ci)["longitude"]
+    assert row["fix_task"] == refiled.stem
+
+
+def test_an_intact_fix_brief_is_not_respawned_on_refresh(gate):
+    """The re-file check must not double-spawn while the brief exists."""
+    ws, store, stub, client = gate
+    stub.status = CiStatus(CiState.RED, head_sha="bbb", detail="pytest: failure")
+    _open_throttle(client)
+    _reconcile(client)
+    first = _fix_brief(ws)
+    _open_throttle(client)
+    _reconcile(client)
+    assert _fix_brief(ws) == first
+    assert len(list(_tasks_dir(ws).glob("fix-ci-*.md"))) == 1
+
+
+def test_an_empty_run_list_at_a_recorded_sha_does_not_flip_state(gate):
+    """Observed live: during a GitHub re-run the list API briefly returned no
+    runs for the tip, though completed runs existed at that sha. Runs cannot
+    un-run, so that answer is list lag -- writing it would release holds and
+    clear the fix marker for a repo that never changed."""
+    ws, store, stub, client = gate
+    stub.status = CiStatus(CiState.RED, head_sha="bbb", detail="pytest: failure")
+    _open_throttle(client)
+    _reconcile(client)
+
+    stub.status = CiStatus(
+        CiState.PENDING, head_sha="bbb", detail="no run yet for bbb",
+        no_runs_at_tip=True,
+    )
+    _open_throttle(client)
+    _reconcile(client)
+    assert _call(client, store.repo_ci)["longitude"]["state"] == "red"
+
+
+def test_a_persistently_empty_run_list_eventually_writes_through(gate):
+    """A run an admin really deleted must win in the end (fail-open)."""
+    ws, store, stub, client = gate
+    stub.status = CiStatus(CiState.RED, head_sha="bbb", detail="pytest: failure")
+    _open_throttle(client)
+    _reconcile(client)
+    stub.status = CiStatus(
+        CiState.PENDING, head_sha="bbb", detail="no run yet for bbb",
+        no_runs_at_tip=True,
+    )
+    for _ in range(3):
+        _open_throttle(client)
+        _reconcile(client)
+    assert _call(client, store.repo_ci)["longitude"]["state"] == "pending"
+
+
+def test_no_runs_at_a_new_sha_is_honest_pending_and_writes_now(gate):
+    """A fresh push with no workflow run yet is real PENDING -- damping it
+    would resurrect the stale-green flap the tip anchoring fixed."""
+    ws, store, stub, client = gate
+    stub.status = CiStatus(CiState.GREEN, head_sha="bbb")
+    _open_throttle(client)
+    _reconcile(client)
+    stub.status = CiStatus(
+        CiState.PENDING, head_sha="new-push", detail="no run yet for new-push",
+        no_runs_at_tip=True,
+    )
+    _open_throttle(client)
+    _reconcile(client)
+    row = _call(client, store.repo_ci)["longitude"]
+    assert row["state"] == "pending"
+    assert row["head_sha"] == "new-push"

@@ -8,6 +8,7 @@ across long runs), then submits exactly once. Landing is the manager's job.
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -23,7 +24,17 @@ from nightshift.worker.execute import execute_work_order
 from nightshift.worker.local_store import LocalStore
 
 
+_log = logging.getLogger("nightshift.worker.loop")
+
 _LOG_FLUSH_LINES = 20
+
+# The poll loop runs on a daemon thread while uvicorn serves the worker UI.
+# An escaping exception used to kill that thread outright: the process stayed
+# up, the UI kept answering, and the worker looked healthy while never polling
+# again -- an invisible permanent stall that only a `ps` thread count revealed.
+# Errors are retried with a capped backoff instead, and surfaced on the UI.
+_LOOP_BACKOFF_START = 5.0
+_LOOP_BACKOFF_CAP = 120.0
 
 # Outcome fields that stay off the worker's local JSONL history rows: they are
 # transport/diagnostic detail the local Now/History UI never shows. Keeps the
@@ -54,6 +65,11 @@ class WorkerLoop:
         self._stop = threading.Event()
         self._queue_failures: dict[str, int] = {}
         self._backoff_queues: set[str] = set()
+        # Poll-loop health, surfaced on the worker UI (see `loop_health`).
+        self._checked_in = False
+        self.consecutive_errors = 0
+        self.last_error: str | None = None
+        self.last_error_at: float | None = None
 
     def checkin(self) -> None:
         checkin_meta: dict[str, Any] = {"pid": _safe_pid()}
@@ -80,13 +96,50 @@ class WorkerLoop:
         self._stop.set()
 
     def run_forever(self) -> None:
-        self.checkin()
+        """Poll until stopped, surviving errors rather than dying on them.
+
+        Nothing supervises this thread, so an escaping exception is not a crash
+        the operator can see -- it is a worker that answers its UI, reports its
+        config, and silently never takes work again. Every iteration (the
+        opening check-in included) is therefore retried with a capped backoff,
+        and the last error is kept for the UI to show.
+        """
+        backoff = _LOOP_BACKOFF_START
         while not self._stop.is_set():
-            did_work = self.run_once()
+            try:
+                if not self._checked_in:
+                    self.checkin()
+                    self._checked_in = True
+                did_work = self.run_once()
+            except Exception as exc:  # noqa: BLE001 -- the whole point is to not die
+                # A failed check-in must be retried as a check-in, not skipped.
+                self._checked_in = False
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                self.last_error_at = time.time()
+                self.consecutive_errors += 1
+                _log.exception(
+                    "worker loop error (%d in a row); retrying in %.0fs",
+                    self.consecutive_errors, backoff,
+                )
+                self._stop.wait(backoff)
+                backoff = min(backoff * 2, _LOOP_BACKOFF_CAP)
+                continue
+            self.consecutive_errors = 0
+            backoff = _LOOP_BACKOFF_START
             if not did_work:
                 # Idle: heartbeat + wait one poll interval.
                 self.client.heartbeat(self.cfg.worker_id)
                 self._stop.wait(self.poll_seconds)
+
+    def loop_health(self) -> dict[str, Any]:
+        """What the UI shows about the poll loop: whether it is retrying, and
+        why. A worker whose loop is wedged must never look healthy."""
+        return {
+            "checked_in": self._checked_in,
+            "consecutive_errors": self.consecutive_errors,
+            "last_error": self.last_error,
+            "last_error_at": self.last_error_at,
+        }
 
     def run_once(self) -> bool:
         """Poll once; execute + submit if work was handed out. Returns True if a

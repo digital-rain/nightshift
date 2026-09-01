@@ -68,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
             loop.stop()
         return 0
 
-    app = create_worker_app(cfg, local)
+    app = create_worker_app(cfg, local, loop)
     ui_host = args.ui_host or cfg.ui_host
     ui_port = args.ui_port or cfg.ui_port
     print(f"[nightshift-worker] UI running on http://{ui_host}:{ui_port}")
