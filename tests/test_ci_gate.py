@@ -1085,3 +1085,30 @@ def test_an_undispatchable_fix_brief_does_not_wedge_the_gate(gate, flag):
     assert _call(client, store.repo_ci)["longitude"]["fix_task"] == (
         "fix-ci-longitude-main-is-red-at-ccc"
     )
+
+
+def test_the_fix_task_work_order_carries_its_kind(gate):
+    """The worker stamps its own local history row from the work order, so the
+    classification has to ride the order -- otherwise the worker UI's Stats
+    page files reactive CI-fix work as ordinary throughput (the manager's page
+    reads it off the attempt row and would disagree)."""
+    _ws, store, stub, client = gate
+    stub.status = CiStatus(CiState.RED, head_sha="bbb", detail="fail")
+    _open_throttle(client)
+    _reconcile(client)
+    fix = _call(client, store.repo_ci)["longitude"]["fix_task"]
+
+    _checkin(client)
+    order = _poll(client)
+    assert order and order["task"] == fix
+    assert order["kind"] == "ci_resolution"
+
+
+def test_an_ordinary_work_order_carries_a_null_kind(unmonitored):
+    """Present, not absent: the analytics record shape stays uniform across
+    every row, so an untagged brief reports null rather than dropping the key."""
+    _ws, _store, _stub, client = unmonitored
+    _checkin(client)
+    order = _poll(client)
+    assert order and order["task"] == "alpha"
+    assert order["kind"] is None

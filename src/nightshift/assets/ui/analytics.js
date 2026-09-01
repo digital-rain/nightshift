@@ -23,9 +23,11 @@
  *     started_at, finished_at, timings, kind }
  *
  * `kind` is the brief's classification ("ci_resolution" for the gate's
- * auto-spawned fixes, null otherwise). The worker adapter's local JSONL does
- * not carry it, so the CI cards degrade to "—" and the CI trend row is hidden
- * on that host rather than showing zeros.
+ * auto-spawned fixes, null otherwise). Both adapters carry it: the manager
+ * projects it off the attempt row, the worker copies it off the work order
+ * into its local JSONL. Records written before it existed have no `kind` at
+ * all, so they simply count as ordinary work -- the CI cards read "—" and the
+ * CI trend row stays hidden until tagged runs appear.
  * `timings` is the per-phase wall-clock split in seconds recorded by the
  * worker loop ({worker, preflight, validate, total} — only phases the run
  * entered); null/absent on runs that predate the instrumentation, so every

@@ -350,6 +350,9 @@ class WorkerLoop:
                 "title": order.get("title", task),
                 "repo": order.get("repo", ""),
                 **outcome.model_dump(exclude=_LOCAL_HISTORY_EXCLUDE),
+                # After the Outcome spread: Outcome carries no `kind`, and the
+                # brief's classification must win regardless.
+                "kind": order.get("kind"),
                 "commit_sha": result.get("sha"),
                 "landed": bool(result.get("landed")),
                 "quarantined": bool(result.get("quarantined")),

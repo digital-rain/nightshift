@@ -277,6 +277,13 @@ def build_work_order(
         # Whether this brief went through the enhance-on-create pass; carried
         # onto the attempt row so outcomes can be compared enhanced-vs-raw.
         "enhanced": bool(meta.get("enhanced", False)),
+        # The brief's classification ("ci_resolution" for the CI gate's
+        # auto-spawned fixes, else None). The manager reads this straight off
+        # the same frontmatter when it opens the attempt; it rides the order so
+        # the worker can stamp its *local* history row too -- without it the
+        # worker UI's Stats page cannot tell reactive fix work from ordinary
+        # throughput, and its CI cards stay empty.
+        "kind": (str(meta.get("kind")).strip() or None) if meta.get("kind") else None,
         "repo": repo,
         "task_path": f"{tasks_repo}/{tasks_rel}/{task}.md",
         "base_ref": base_ref,

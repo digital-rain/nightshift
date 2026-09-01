@@ -104,6 +104,11 @@ PREVIOUS_LOCAL_FINISH_KEYS = frozenset({
     # Additive telemetry: the per-phase wall-clock split (rides along like
     # the token fields — not in _LOCAL_HISTORY_EXCLUDE).
     "timings",
+    # Additive: the brief's classification, copied off the work order
+    # ("ci_resolution" for the CI gate's auto-spawned fixes, else None). The
+    # worker UI's Stats page reads it to keep reactive fix work out of ordinary
+    # throughput, exactly as the manager's does.
+    "kind",
 })
 
 
@@ -204,6 +209,9 @@ def test_local_finish_record_matches_previous_on_disk_keys(tmp_path: Path) -> No
     assert row["status"] == "completed"
     assert row["model"] == "claude-code/claude-sonnet-4-6"
     assert row["landed"] is False  # the capturing client landed nothing
+    # An ordinary brief carries a null classification -- present, not absent,
+    # so the analytics record shape is uniform across every row.
+    assert row["kind"] is None
     # Transport/diagnostic-only Outcome fields must stay off the disk format.
     assert not {"landable", "branch_ref", "head_sha", "failure_reason", "validate_cmd"} & set(row)
 
@@ -220,6 +228,10 @@ def test_local_finish_record_carries_analytics_fields(tmp_path: Path) -> None:
         "cache_read_input_tokens", "cache_creation_input_tokens",
         "cost_usd", "usage", "failure_kind", "started_at", "finished_at",
         "timings",
+        # The brief's classification: the analytics module splits CI-resolution
+        # runs out of every ordinary panel and reports them on their own, so a
+        # record without it silently files reactive fix work as throughput.
+        "kind",
     }
     client = _CapturingClient()
     cfg = WorkerConfig(workspace=tmp_path, worker_id="w1", manager_url="http://x")
@@ -245,6 +257,11 @@ def test_local_finish_record_carries_analytics_fields(tmp_path: Path) -> None:
     row = local.history()[0]
     missing = ANALYTICS_CONSUMED - set(row)
     assert not missing, f"analytics fields missing from worker record: {missing}"
+
+    # The classification is copied off the work order, so a CI-resolution brief
+    # is recognisable in the worker's own history -- not just the manager's.
+    loop._submit({**order, "kind": "ci_resolution"}, outcome)
+    assert local.history()[0]["kind"] == "ci_resolution"
 
 
 def test_telemetry_slice_matches_the_old_worker_submit_repack() -> None:
