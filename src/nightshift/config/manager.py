@@ -84,8 +84,10 @@ class OperatorConfig:
         default="anthropic/claude-sonnet-4-6", metadata=meta(
             category="Models", label="Enhance brief model",
             desc=(
-                "Model for the enhance-on-create brief rewrite (a one-shot "
-                "manager-side completion; bare <vendor>/<model> id)."),
+                "Model for the enhance-on-create brief rewrite (a one-shot, "
+                "tool-less manager-side completion). Qualified provider/model "
+                "id; the pass drives claude-code (CLI print mode) or the "
+                "anthropic / ollama-cloud / ollama APIs."),
             env="NIGHTSHIFT_ENHANCE_MODEL",
             validate="model_id"))
     planner_model: str = field(default="", metadata=meta(
