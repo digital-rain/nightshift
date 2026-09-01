@@ -49,6 +49,10 @@ class CiStatus:
     head_sha: str | None = None
     url: str | None = None
     detail: str | None = None
+    # True when ``gh`` itself could not answer (non-zero exit): the absence of
+    # information, not information about an absence. Callers keep their last
+    # known state across a transient blip instead of churning holds.
+    transient: bool = False
 
 
 class GhRunner:
@@ -81,8 +85,17 @@ class GhRunner:
         return proc.returncode, proc.stdout, proc.stderr
 
 
-def status_from_runs(payload: str) -> CiStatus:
+def status_from_runs(payload: str, *, tip_sha: str | None = None) -> CiStatus:
     """Map one ``gh run list --json ...`` payload to a :class:`CiStatus`.
+
+    ``tip_sha`` is the branch's actual head. Runs are evidence about the commit
+    they ran on, so only runs at the tip decide the verdict. Inferring the tip
+    from run order instead is wrong: ``gh run list`` sorts by run *creation*,
+    so workflows for different commits interleave (a slow ``CI Lint`` for an
+    older commit can be created after a fast ``CI Validate`` for a newer one),
+    and the state then flaps between commits. When the tip has no runs yet the
+    answer is PENDING -- CI has not reported on this commit -- never the
+    previous commit's GREEN.
 
     Pure: this is the whole decision table, and it is what the tests pin.
     """
@@ -97,15 +110,23 @@ def status_from_runs(payload: str) -> CiStatus:
     if not isinstance(first, dict):
         return CiStatus(CiState.UNKNOWN, detail="unexpected gh payload shape")
 
-    # ``gh run list`` returns newest-first, so runs[0] is at the tip. Every run
-    # at that same head sha is evidence about the same commit: a green
-    # secondary workflow (nightly, docs, CodeQL) must never mask a failing CI
-    # run beside it, and a failure at an older sha is already history.
-    head_sha = first.get("headSha") or None
+    # Every run at the tip is evidence about the same commit: a green secondary
+    # workflow (nightly, docs, CodeQL) must never mask a failing CI run beside
+    # it, and a run at an older sha is already history.
+    head_sha = tip_sha or (first.get("headSha") or None)
     at_head = [
         r for r in runs
         if isinstance(r, dict) and (r.get("headSha") or None) == head_sha
     ]
+    if not at_head:
+        # The tip is real but nothing has run on it yet -- the window between a
+        # push and its first workflow. Fail-open PENDING, never the previous
+        # commit's verdict.
+        return CiStatus(
+            CiState.PENDING,
+            head_sha=head_sha,
+            detail=f"no run yet for {str(head_sha)[:8]}",
+        )
 
     def _mk(state: CiState, run: dict, detail: str) -> CiStatus:
         return CiStatus(
@@ -149,11 +170,29 @@ def status_from_runs(payload: str) -> CiStatus:
     return _mk(CiState.UNKNOWN, run, f"{_name(run)}: {conclusion or 'no conclusion'}")
 
 
+def tip_sha(gh: GhRunner, branch: str) -> str | None:
+    """The branch's actual head sha, or ``None`` when ``gh`` cannot say.
+
+    ``{owner}``/``{repo}`` are substituted by ``gh`` from the repo's own remote,
+    the same way ``gh run list`` resolves it.
+    """
+    rc, out, _ = gh.run(
+        "api", f"repos/{{owner}}/{{repo}}/commits/{branch}", "--jq", ".sha"
+    )
+    if rc != 0:
+        return None
+    return out.strip() or None
+
+
 def check_repo_ci(
     repo_root: Path, *, branch: str = "main", runner: GhRunner | None = None
 ) -> CiStatus:
     """Latest CI verdict for ``branch`` in the repo at ``repo_root``."""
     gh = runner or GhRunner(repo_root)
+    # Anchor on the real tip. If gh cannot resolve it we fall back to inferring
+    # it from run order, which is better than nothing but can flap between
+    # commits -- see status_from_runs.
+    tip = tip_sha(gh, branch)
     rc, out, err = gh.run(
         "run",
         "list",
@@ -167,5 +206,9 @@ def check_repo_ci(
         "status,conclusion,headSha,url,workflowName",
     )
     if rc != 0:
-        return CiStatus(CiState.UNKNOWN, detail=(err or out).strip()[:_DETAIL_LIMIT])
-    return status_from_runs(out)
+        return CiStatus(
+            CiState.UNKNOWN,
+            detail=(err or out).strip()[:_DETAIL_LIMIT],
+            transient=True,
+        )
+    return status_from_runs(out, tip_sha=tip)

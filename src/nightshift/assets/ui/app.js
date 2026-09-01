@@ -3892,6 +3892,25 @@ function playlistRow(pl) {
     badge.textContent = "paused";
     main.append(badge);
   }
+  // A repo-level hold stops this playlist dispatching without changing
+  // anything else on the row, so the queue would otherwise just look idle.
+  // These holds never reach the Blocked page (it filters state = 'blocked'),
+  // so this badge is the only place they surface.
+  // Appended inside `pl-main`, not to the row: the row's own children are
+  // positional (dot, spinner, main, pause, +, info).
+  if (pl.hold && pl.hold.tasks > 0) {
+    const badge = document.createElement("span");
+    const ci = pl.hold.kind === "ci_red";
+    badge.className = "badge " + (ci ? "hold-ci" : "hold-repo");
+    const n = pl.hold.tasks;
+    badge.textContent = `${ci ? "CI hold" : "repo missing"} \u00b7 ${n}`;
+    badge.title = ci
+      ? `${n} ${n === 1 ? "task is" : "tasks are"} held until this repo's main is green again.`
+        + (pl.hold.detail ? `\n${pl.hold.detail}` : "")
+        + (pl.hold.url ? `\n${pl.hold.url}` : "")
+      : `${n} ${n === 1 ? "task is" : "tasks are"} held: the bound repo is not present in the workspace.`;
+    main.append(badge);
+  }
   li.append(main);
 
   // Paused queues carry a persistent pause icon just left of the "+", so the

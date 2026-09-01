@@ -16,6 +16,7 @@ from starlette.testclient import TestClient
 
 from _workspace import build_workspace
 from nightshift.ci import CiState, CiStatus
+from nightshift.lifecycle import TaskHoldKind
 from nightshift.manager.app import create_app
 from nightshift.manager.store_sqlite import SqliteStore
 from nightshift.queue_config import set_ci_monitoring
@@ -674,3 +675,141 @@ def test_ordinary_attempt_has_no_kind(unmonitored):
     order = _poll(client)
     attempt = _call(client, store.get_attempt, order["run_id"])
     assert not attempt.get("kind")
+
+
+# --------------------------------------------------------------------------
+# Transient gh failures must not churn state. Observed live on 2026-09-01:
+# one `gh run list` timeout flipped a repo green -> unknown -> green, which
+# clears every hold and the fix marker for a repo that never actually changed.
+# --------------------------------------------------------------------------
+
+def _state_of(client, store, repo="longitude"):
+    return (_call(client, store.repo_ci).get(repo) or {}).get("state")
+
+
+def test_one_transient_gh_failure_keeps_the_last_known_state(gate):
+    ws, store, stub, client = gate
+    stub.status = CiStatus(CiState.RED, head_sha="bbb", detail="pytest: failure")
+    _open_throttle(client)
+    _reconcile(client)
+    assert _state_of(client, store) == "red"
+
+    # gh goes down: UNKNOWN carrying transient=True.
+    stub.status = CiStatus(CiState.UNKNOWN, detail="gh timed out", transient=True)
+    _open_throttle(client)
+    _reconcile(client)
+    assert _state_of(client, store) == "red", (
+        "a single gh blip must not release a red repo's holds"
+    )
+
+
+def test_repeated_transient_failures_eventually_degrade_to_unknown(gate):
+    ws, store, stub, client = gate
+    stub.status = CiStatus(CiState.RED, head_sha="bbb", detail="pytest: failure")
+    _open_throttle(client)
+    _reconcile(client)
+    assert _state_of(client, store) == "red"
+
+    stub.status = CiStatus(CiState.UNKNOWN, detail="gh timed out", transient=True)
+    for _ in range(3):
+        _open_throttle(client)
+        _reconcile(client)
+    assert _state_of(client, store) == "unknown", (
+        "gh persistently broken must fail open rather than pin a stale red"
+    )
+
+
+def test_a_real_unknown_still_writes_through(gate):
+    """Not every UNKNOWN is transient: gh answering 'no runs' is real news."""
+    ws, store, stub, client = gate
+    stub.status = CiStatus(CiState.RED, head_sha="bbb", detail="pytest: failure")
+    _open_throttle(client)
+    _reconcile(client)
+    assert _state_of(client, store) == "red"
+
+    stub.status = CiStatus(CiState.UNKNOWN, detail="no workflow runs on branch")
+    _open_throttle(client)
+    _reconcile(client)
+    assert _state_of(client, store) == "unknown"
+
+
+def test_a_recovered_gh_resets_the_miss_counter(gate):
+    ws, store, stub, client = gate
+    stub.status = CiStatus(CiState.RED, head_sha="bbb", detail="pytest: failure")
+    _open_throttle(client)
+    _reconcile(client)
+
+    stub.status = CiStatus(CiState.UNKNOWN, detail="blip", transient=True)
+    for _ in range(2):
+        _open_throttle(client)
+        _reconcile(client)
+    # Recovery before the tolerance is reached.
+    stub.status = CiStatus(CiState.RED, head_sha="bbb", detail="pytest: failure")
+    _open_throttle(client)
+    _reconcile(client)
+    # Two more blips must not tip it over: the counter restarted.
+    stub.status = CiStatus(CiState.UNKNOWN, detail="blip", transient=True)
+    for _ in range(2):
+        _open_throttle(client)
+        _reconcile(client)
+    assert _state_of(client, store) == "red"
+
+
+# --------------------------------------------------------------------------
+# A held playlist must say so. ci_red / repo_unavailable rows never reach
+# /api/blocked (it filters state = 'blocked'), so without this the queue just
+# looks idle while its tasks sit undispatched.
+# --------------------------------------------------------------------------
+
+def _side_playlist(ws, repo="longitude"):
+    (ws / "nightshift-tasks" / "side").mkdir(exist_ok=True)
+    (ws / "nightshift-tasks" / "side" / "config.json").write_text(
+        json.dumps({"repo": repo, "order": []})
+    )
+
+
+def test_playlist_reports_its_ci_hold(gate):
+    ws, store, _stub, client = gate
+    _side_playlist(ws)
+    _call(client, store.set_repo_ci, "longitude", state="red", head_sha="aaa",
+          url="https://gh/run/1", detail="CI Validate: failure")
+    _call(client, store.set_task_state, "side", "alpha", TaskHoldKind.CI_RED,
+          repo="longitude")
+
+    pls = {p["name"]: p for p in client.get("/api/playlists").json()}
+    hold = pls["side"]["hold"]
+    assert hold["kind"] == "ci_red"
+    assert hold["tasks"] == 1
+    # The reason travels with it, so the row can explain itself.
+    assert hold["detail"] == "CI Validate: failure"
+    assert hold["url"] == "https://gh/run/1"
+
+
+def test_playlist_counts_every_held_task(gate):
+    ws, store, _stub, client = gate
+    _side_playlist(ws)
+    _call(client, store.set_repo_ci, "longitude", state="red", head_sha="aaa",
+          url=None, detail=None)
+    for task in ("alpha", "beta", "gamma"):
+        _call(client, store.set_task_state, "side", task, TaskHoldKind.CI_RED,
+              repo="longitude")
+    pls = {p["name"]: p for p in client.get("/api/playlists").json()}
+    assert pls["side"]["hold"]["tasks"] == 3
+
+
+def test_an_unheld_playlist_reports_no_hold(gate):
+    ws, store, _stub, client = gate
+    _side_playlist(ws)
+    pls = {p["name"]: p for p in client.get("/api/playlists").json()}
+    assert pls["side"]["hold"] is None
+
+
+def test_a_repo_unavailable_hold_also_surfaces(gate):
+    """The same invisibility applies to repo_unavailable, so it rides along."""
+    ws, store, _stub, client = gate
+    _side_playlist(ws)
+    _call(client, store.set_task_state, "side", "alpha",
+          TaskHoldKind.REPO_UNAVAILABLE, repo="longitude")
+    pls = {p["name"]: p for p in client.get("/api/playlists").json()}
+    assert pls["side"]["hold"]["kind"] == "repo_unavailable"
+    assert pls["side"]["hold"]["tasks"] == 1

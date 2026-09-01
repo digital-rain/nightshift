@@ -95,15 +95,37 @@ def register_playlist_api(
         "Monitored" is repo-level (mirrors the reconciler's own gate): a
         playlist's repo counts as monitored when *any* queue bound to it --
         not necessarily this one -- has ``ci_monitoring`` on.
+
+        Each entry also gains ``hold``: ``None``, or
+        ``{"kind", "tasks", "detail"?, "url"?}`` describing the repo-level hold
+        keeping this playlist's tasks out of dispatch. Without it a held
+        playlist is indistinguishable from an idle one -- these holds never
+        reach ``/api/blocked``, which filters on ``state = 'blocked'``.
         """
+        store = _store()
         entries = playlists_mod.list_playlists(tasks_root)
         monitored = _monitored_repo_names()
-        ci_rows = await _store().repo_ci() if monitored else {}
+        ci_rows = await store.repo_ci() if monitored else {}
+        # A repo-level hold stops a playlist dispatching without changing
+        # anything the row already shows, so the playlist just goes quiet.
+        # Count the held tasks per queue and carry the reason, so the page can
+        # say *why* nothing is running.
+        held: dict[str | None, dict[str, Any]] = {}
+        for kind in (TaskHoldKind.CI_RED, TaskHoldKind.REPO_UNAVAILABLE):
+            for row in await store.tasks_in_state(kind):
+                slot = held.setdefault(
+                    row.get("queue"), {"kind": str(kind), "tasks": 0}
+                )
+                slot["tasks"] += 1
         for entry in entries:
             cfg = load_queue_config(tasks_root, playlists_mod.tasks_rel(entry["name"]))
             repo = cfg.get("repo")
             row = ci_rows.get(repo) if repo and repo in monitored else None
             entry["ci_state"] = row.get("state") if row else None
+            hold = held.get(entry["name"])
+            if hold and hold["kind"] == TaskHoldKind.CI_RED and row:
+                hold = {**hold, "detail": row.get("detail"), "url": row.get("url")}
+            entry["hold"] = hold
         return JSONResponse(entries)
 
     @app.post("/api/playlists")

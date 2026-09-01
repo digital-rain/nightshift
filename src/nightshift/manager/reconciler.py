@@ -145,6 +145,13 @@ def _tag_ci_resolution(
     path.write_text(join_frontmatter(meta, body))
 
 
+
+# Consecutive failed `gh` calls tolerated before a repo's CI state degrades to
+# UNKNOWN. Below this the last known state stands, so one timeout cannot churn
+# a repo's holds.
+_CI_TRANSIENT_TOLERANCE = 3
+
+
 class Reconciler:
     """The one periodic recovery/hygiene loop, owned by the manager app."""
 
@@ -185,6 +192,7 @@ class Reconciler:
         self._tasks_repo = tasks_repo
         # Per-repo wall-clock of the last gh check (cadences.ci_refresh_seconds).
         self._ci_checked_at: dict[str, float] = {}
+        self._ci_transient_misses: dict[str, int] = {}
 
     # ------------------------------------------------------------------ #
     # Entry points
@@ -522,6 +530,19 @@ class Reconciler:
             status = await asyncio.to_thread(
                 check_repo_ci, repos.repo_root(self._workspace, repo)
             )
+            # A transient gh failure is the absence of information, not
+            # information about an absence. Writing UNKNOWN here would clear
+            # the repo's holds and its fix marker on every network blip, so a
+            # red repo would briefly re-admit its own tasks. Hold the last
+            # known state until gh has failed _CI_TRANSIENT_TOLERANCE times in
+            # a row, then degrade to UNKNOWN (still fail-open).
+            if status.transient:
+                misses = self._ci_transient_misses.get(repo, 0) + 1
+                self._ci_transient_misses[repo] = misses
+                if misses < _CI_TRANSIENT_TOLERANCE:
+                    continue
+            else:
+                self._ci_transient_misses.pop(repo, None)
             previous = await store.set_repo_ci(
                 repo,
                 state=str(status.state),

@@ -1501,6 +1501,10 @@ body[data-view="detail"] #screen-detail { display: flex; flex: 1; }
 .pause-banner[hidden] { display: none; }
 .pause-banner-actions { flex: none; }
 .badge.paused-failures { color: var(--warn); border-color: var(--warn); }
+/* Repo-level holds on a playlist row: red CI, or a missing repo. These
+   never reach the Blocked page, so the row badge is their only surface. */
+.badge.hold-ci { color: var(--err); border-color: var(--err); }
+.badge.hold-repo { color: var(--text-dim); border-color: var(--border); }
 /* Read-only workspace path (operator config — never edited from the UI). */
 .repos-workspace-row {
   display: flex;
