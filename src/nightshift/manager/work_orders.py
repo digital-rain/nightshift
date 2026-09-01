@@ -7,6 +7,7 @@ endpoint or store wiring.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +25,14 @@ from nightshift.manager.scheduler import (
 )
 from nightshift.preflight import resolve_preflight_cmd
 from nightshift.queue_config import format_validate_cmd, resolve_validate_cmd
-from nightshift.spawn_daily import resolve_config, split_frontmatter
+from nightshift.spawn_daily import (
+    is_completed,
+    is_disabled,
+    is_failed,
+    is_quarantined,
+    resolve_config,
+    split_frontmatter,
+)
 from nightshift.task_files import (
     read_artifacts,
     resolve_title,
@@ -52,6 +60,7 @@ __all__ = [
     "_DOCS_PIN_DIRTY_KEY",
     "_DOCS_PIN_KEY",
     "build_work_order",
+    "open_ci_fix_briefs",
     "task_meta",
 ]
 
@@ -80,6 +89,49 @@ def is_ci_fix_task(
         return False
     meta = task_meta(tasks_root, cand.task, cand.queue)
     return meta.get("kind") == "ci_resolution" and meta.get("repo") == cand.repo
+
+
+def open_ci_fix_briefs(
+    tasks_root: Path, repo: str, queues: Iterable[str | None]
+) -> list[tuple[str, str | None]]:
+    """Every *outstanding* CI-resolution brief for ``repo``, as (task, queue).
+
+    "Outstanding" means the brief is on disk and could still be dispatched:
+    completed, quarantined, failed and disabled briefs are excluded, because a
+    brief in any of those states will never run and treating it as outstanding
+    would wedge the gate shut — a red repo with a quarantined fix brief would
+    suppress every future spawn and could never go green again.
+
+    Identity is the brief's own ``kind: ci_resolution`` + ``repo:`` frontmatter
+    (written by the reconciler at spawn time), not its stem: the stem carries a
+    sha, and the whole point of this scan is to find fixes filed against a
+    *different* sha than the one currently red.
+
+    Sorted by (queue, task) so callers that adopt "the" open brief are
+    deterministic.
+    """
+    out: list[tuple[str, str | None]] = []
+    for queue in queues:
+        tasks_dir = tasks_root / playlists_mod.tasks_rel(queue)
+        if not tasks_dir.is_dir():
+            continue
+        for path in tasks_dir.glob("*.md"):
+            try:
+                text = path.read_text(errors="replace")
+            except OSError:
+                continue
+            meta = split_frontmatter(text)[0] if text.startswith("---") else {}
+            if meta.get("kind") != "ci_resolution" or meta.get("repo") != repo:
+                continue
+            if (
+                is_completed(meta)
+                or is_quarantined(meta)
+                or is_failed(meta)
+                or is_disabled(meta)
+            ):
+                continue
+            out.append((path.stem, queue))
+    return sorted(out, key=lambda pair: (queue_label(pair[1]), pair[0]))
 
 
 def build_work_order(

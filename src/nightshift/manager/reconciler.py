@@ -93,7 +93,11 @@ from nightshift.manager.scheduler import (
     unroutable,
 )
 from nightshift.manager.store import NightshiftStore
-from nightshift.manager.work_orders import is_ci_fix_task, task_meta
+from nightshift.manager.work_orders import (
+    is_ci_fix_task,
+    open_ci_fix_briefs,
+    task_meta,
+)
 from nightshift.queue_config import ci_monitoring_enabled
 from nightshift.spawn_daily import (
     join_frontmatter,
@@ -193,6 +197,10 @@ class Reconciler:
         # Per-repo wall-clock of the last gh check (cadences.ci_refresh_seconds).
         self._ci_checked_at: dict[str, float] = {}
         self._ci_transient_misses: dict[str, int] = {}
+        # Tasks already announced as "green, but this fix is still in
+        # flight" -- the green branch runs every tick, and the notice is
+        # worth exactly one event per stale run, not one per poll.
+        self._ci_fix_stale_announced: dict[str, set[str]] = {}
 
     # ------------------------------------------------------------------ #
     # Entry points
@@ -563,6 +571,13 @@ class Reconciler:
                 url=status.url,
                 detail=status.detail,
             )
+            # A green main retires the auto-spawned fix work, and does so on
+            # every green tick rather than only on the red->green edge: a
+            # manager that was down while the repo went green would otherwise
+            # never see the edge, and the stale brief would dispatch on the
+            # next poll. Idempotent -- no outstanding brief is a no-op.
+            if status.state is CiState.GREEN:
+                await self._retire_ci_fixes(repo, queues=monitored[repo])
             if previous == str(status.state):
                 # No transition, so nothing to announce -- but a still-red repo
                 # whose fix brief has been deleted (operator tidy-up, a failed
@@ -609,6 +624,53 @@ class Reconciler:
             for q in queues
         )
 
+    async def _retire_ci_fixes(
+        self, repo: str, *, queues: set[str | None]
+    ) -> None:
+        """Green main -> every outstanding CI-fix brief for this repo is moot.
+
+        The gate spawns this work; the gate retires it. Without this the fix
+        brief outlives the failure it names: one fix lands and turns main
+        green, and a second brief filed against an earlier sha is still queued,
+        so a worker picks it up and an agent goes looking for a CI failure that
+        no longer exists.
+
+        A brief with a live attempt is left alone -- stopping an agent
+        mid-flight is the operator's call, not the reconciler's -- but it is
+        announced once so a stale run is visible rather than silent.
+        """
+        outstanding = await asyncio.to_thread(
+            open_ci_fix_briefs, self._tasks_root, repo, tuple(queues)
+        )
+        # Prune this repo's announcements down to what is still outstanding, so
+        # a brief that comes back later is announced again.
+        announced = self._ci_fix_stale_announced.setdefault(repo, set())
+        announced &= {task for task, _ in outstanding}
+        if not outstanding:
+            return
+        live = {a["task"] for a in await self._store().live_attempts()}
+        for task, queue in outstanding:
+            if task in live:
+                if task in announced:
+                    continue
+                announced.add(task)
+                _log.info(
+                    "reconciler: %s main is green but %s is still in flight; "
+                    "leaving the running attempt alone", repo, task,
+                )
+                await self._emit(
+                    "repo_ci_fix_retired", queue=queue, task=task,
+                    payload={"repo": repo, "dropped": False,
+                             "reason": "attempt in flight"},
+                )
+                continue
+            await self._drop_brief(task, queue)
+            announced.discard(task)
+            await self._emit(
+                "repo_ci_fix_retired", queue=queue, task=task,
+                payload={"repo": repo, "dropped": True},
+            )
+
     async def _spawn_ci_fix(
         self, repo: str, status: CiStatus, *, queues: set[str | None]
     ) -> None:
@@ -630,6 +692,29 @@ class Reconciler:
         nothing can ever turn the repo green again.
         """
         store = self._store()
+        # One open fix per repo. The marker is keyed on the failing sha and is
+        # cleared by every state change, so a repo that goes red -> pending
+        # (main moved) -> red at a NEW sha arrives here with an empty marker
+        # while the previous fix brief is still queued or running -- and would
+        # spawn a second agent onto the same main. The failure is a property of
+        # the branch, not of a sha: adopt the open brief instead. This
+        # serializes CI fixes per repo, which is what we want anyway (two fix
+        # agents landing on one main collide); a breakage the running fix does
+        # not address is picked up by the next poll once its brief is gone.
+        open_fixes = await asyncio.to_thread(
+            open_ci_fix_briefs, self._tasks_root, repo, tuple(queues)
+        )
+        if open_fixes:
+            existing = open_fixes[0][0]
+            _log.info(
+                "reconciler: %s already has an open ci fix brief (%s); "
+                "adopting it instead of spawning for %s",
+                repo, existing, (status.head_sha or "unknown")[:8],
+            )
+            await store.set_repo_ci_fix(
+                repo, fix_task=existing, fix_sha=status.head_sha or ""
+            )
+            return
         pauses = await store.queue_pauses()
         ordered = sorted(queues, key=lambda q: (q is not None, q or ""))
         unpaused = [q for q in ordered if queue_label(q) not in pauses]

@@ -199,6 +199,9 @@ def test_same_red_sha_does_not_respawn(gate):
 
 
 def test_red_green_red_spawns_a_second_task(gate):
+    """A fresh failure after a green gets its own brief -- and only its own:
+    the green in the middle retires the first, so the queue never accumulates
+    fix briefs for failures that have already been resolved."""
     ws, _store, stub, client = gate
     stub.status = CiStatus(CiState.RED, head_sha="bbb", detail="fail one")
     _open_throttle(client)
@@ -209,7 +212,8 @@ def test_red_green_red_spawns_a_second_task(gate):
     _open_throttle(client)
     stub.status = CiStatus(CiState.RED, head_sha="ddd", detail="fail two")
     _reconcile(client)
-    assert len(list(_tasks_dir(ws).glob("fix-ci-*.md"))) == 2
+    briefs = [p.stem for p in _tasks_dir(ws).glob("fix-ci-*.md")]
+    assert briefs == ["fix-ci-longitude-main-is-red-at-ddd"]
 
 
 # --------------------------------------------------------------------------- #
@@ -910,3 +914,174 @@ def test_no_runs_at_a_new_sha_is_honest_pending_and_writes_now(gate):
     row = _call(client, store.repo_ci)["longitude"]
     assert row["state"] == "pending"
     assert row["head_sha"] == "new-push"
+
+
+# --------------------------------------------------------------------------- #
+# Fix-brief lifecycle: retire on green, one open fix per repo
+# --------------------------------------------------------------------------- #
+#
+# Observed live: the gate spawned `fix ci ... at de740296`; main then moved to
+# b9c32051 (still red), which is a red -> pending -> red state change, so
+# `set_repo_ci` cleared the sha-keyed marker and a SECOND brief was filed. The
+# first fix landed and turned main green -- and the second brief, naming a
+# failure that no longer existed, was dispatched anyway.
+
+
+def _fix_briefs(ws: Path, queue: str = "main") -> list[str]:
+    return sorted(p.stem for p in _tasks_dir(ws, queue).glob("fix-ci-*.md"))
+
+
+def _retire_events(client: TestClient, store, cursor: int) -> list[dict]:
+    return [
+        e
+        for e in _call(client, store.events_since, cursor)
+        if e.get("kind") == "repo_ci_fix_retired"
+    ]
+
+
+def _seed_fix_brief(ws: Path, stem: str, queue: str = "main") -> Path:
+    """Write a brief carrying the same `kind:`/`repo:` tags the reconciler
+    stamps at spawn time -- identity is the frontmatter, not the stem."""
+    path = _tasks_dir(ws, queue) / f"{stem}.md"
+    path.write_text(
+        "---\ntitle: fix ci: longitude main is red\nkind: ci_resolution\n"
+        "repo: longitude\n---\n\n/fix CI is failing.\n"
+    )
+    return path
+
+
+def _set_flag(ws: Path, stem: str, flag: str, queue: str = "main") -> None:
+    path = _tasks_dir(ws, queue) / f"{stem}.md"
+    head, _, rest = path.read_text().partition("---\n")[2].partition("---\n")
+    path.write_text(f"---\n{head}{flag}: true\n---\n{rest}")
+
+
+def test_green_retires_the_outstanding_fix_brief(gate):
+    """The gate spawns this work, so the gate retires it: once main is green
+    the brief names a failure that no longer exists."""
+    ws, store, stub, client = gate
+    stub.status = CiStatus(CiState.RED, head_sha="bbb", detail="fail")
+    _open_throttle(client)
+    _reconcile(client)
+    assert _fix_briefs(ws) == ["fix-ci-longitude-main-is-red-at-bbb"]
+
+    cursor = _call(client, store.max_event_id)
+    stub.status = CiStatus(CiState.GREEN, head_sha="ccc")
+    _open_throttle(client)
+    _reconcile(client)
+
+    assert _fix_briefs(ws) == []
+    events = _retire_events(client, store, cursor)
+    assert len(events) == 1
+    assert events[0]["payload"] == {"repo": "longitude", "dropped": True}
+    assert events[0]["task"] == "fix-ci-longitude-main-is-red-at-bbb"
+
+
+def test_green_retires_a_brief_the_manager_never_saw_go_red(gate):
+    """Retirement runs on every green tick, not only on the red->green edge: a
+    manager that was down while main went green would otherwise never see the
+    edge, and the stale brief would dispatch on the next poll."""
+    ws, store, stub, client = gate
+    stub.status = CiStatus(CiState.RED, head_sha="bbb", detail="fail")
+    _open_throttle(client)
+    _reconcile(client)
+    # Land in green twice: the first reconcile consumes the edge, the second is
+    # a steady-state green tick. Re-file the brief in between so only the
+    # edge-less tick can retire it.
+    stub.status = CiStatus(CiState.GREEN, head_sha="ccc")
+    _open_throttle(client)
+    _reconcile(client)
+    _seed_fix_brief(ws, "fix-ci-longitude-main-is-red-at-bbb")
+    assert _fix_briefs(ws) == ["fix-ci-longitude-main-is-red-at-bbb"]
+
+    _open_throttle(client)
+    _reconcile(client)
+    assert _fix_briefs(ws) == []
+
+
+def test_green_leaves_an_in_flight_fix_alone_but_announces_it(gate):
+    """Stopping an agent mid-run is the operator's call, not the reconciler's.
+    The stale run is announced once so it is visible rather than silent."""
+    ws, store, stub, client = gate
+    stub.status = CiStatus(CiState.RED, head_sha="bbb", detail="fail")
+    _open_throttle(client)
+    _reconcile(client)
+    fix = _call(client, store.repo_ci)["longitude"]["fix_task"]
+    _checkin(client)
+    order = _poll(client)
+    assert order and order["task"] == fix     # now in flight
+
+    cursor = _call(client, store.max_event_id)
+    stub.status = CiStatus(CiState.GREEN, head_sha="ccc")
+    _open_throttle(client)
+    _reconcile(client)
+
+    assert _fix_briefs(ws) == [fix]           # brief survives
+    events = _retire_events(client, store, cursor)
+    assert len(events) == 1
+    assert events[0]["payload"]["dropped"] is False
+    assert events[0]["payload"]["reason"] == "attempt in flight"
+
+    # Announced once, not once per poll -- a green repo is the steady state.
+    cursor = _call(client, store.max_event_id)
+    _open_throttle(client)
+    _reconcile(client)
+    assert _retire_events(client, store, cursor) == []
+
+
+def test_a_new_red_sha_adopts_the_open_fix_brief(gate):
+    """The live duplicate, reproduced: red at one sha, main moves (pending),
+    red at a NEW sha. `set_repo_ci` cleared the marker on each change, so the
+    spawn path is re-entered with the previous brief still open. One open fix
+    per repo -- adopt it rather than filing a second."""
+    ws, store, stub, client = gate
+    stub.status = CiStatus(CiState.RED, head_sha="de740296", detail="fail one")
+    _open_throttle(client)
+    _reconcile(client)
+    first = _call(client, store.repo_ci)["longitude"]["fix_task"]
+    assert first == "fix-ci-longitude-main-is-red-at-de740296"
+
+    stub.status = CiStatus(CiState.PENDING, head_sha="b9c32051")
+    _open_throttle(client)
+    _reconcile(client)
+    assert not _call(client, store.repo_ci)["longitude"]["fix_task"]
+
+    stub.status = CiStatus(CiState.RED, head_sha="b9c32051", detail="fail two")
+    _open_throttle(client)
+    _reconcile(client)
+
+    assert _fix_briefs(ws) == [first]
+    row = _call(client, store.repo_ci)["longitude"]
+    # Re-adopted, and re-pointed at the sha that is red *now* -- without the
+    # marker the open brief loses its by-name exemption and is held by its own
+    # gate, which nothing can then clear.
+    assert row["fix_task"] == first and row["fix_sha"] == "b9c32051"
+    assert not _call(client, store.get_task_state, None, first)
+    _checkin(client)
+    order = _poll(client)
+    assert order and order["task"] == first
+
+
+@pytest.mark.parametrize("flag", ["quarantined", "completed", "failed", "disabled"])
+def test_an_undispatchable_fix_brief_does_not_wedge_the_gate(gate, flag):
+    """A brief that can never run must not count as the repo's open fix: if it
+    did, a red repo would suppress every future spawn and could never be
+    turned green again."""
+    ws, store, stub, client = gate
+    stub.status = CiStatus(CiState.RED, head_sha="bbb", detail="fail")
+    _open_throttle(client)
+    _reconcile(client)
+    first = _call(client, store.repo_ci)["longitude"]["fix_task"]
+    _set_flag(ws, first, flag)
+
+    stub.status = CiStatus(CiState.PENDING, head_sha="ccc")
+    _open_throttle(client)
+    _reconcile(client)
+    stub.status = CiStatus(CiState.RED, head_sha="ccc", detail="fail again")
+    _open_throttle(client)
+    _reconcile(client)
+
+    assert "fix-ci-longitude-main-is-red-at-ccc" in _fix_briefs(ws)
+    assert _call(client, store.repo_ci)["longitude"]["fix_task"] == (
+        "fix-ci-longitude-main-is-red-at-ccc"
+    )
