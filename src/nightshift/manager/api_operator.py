@@ -15,6 +15,7 @@ import os
 import time
 import uuid
 from collections.abc import Callable
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -1224,7 +1225,14 @@ def register_operator_api(
         # (the single-process server has no /api/info, so it keeps "Nightshift").
         # refresh_ms drives the UI's safety-poll cadence (AGENTS.md: cadences are
         # config-driven, never hardcoded) — same value workers get at checkin.
+        # server_now anchors every "how long ago" the UI draws. Timestamps in
+        # our payloads are the *manager host's* clock, so subtracting the
+        # browser's Date.now() from them is only right while the two agree. A
+        # drifted host clock (chrony slews rather than steps after a VM
+        # suspend) silently inflated every age by the drift; the UI now
+        # subtracts against this instead, and warns when the gap is large.
         return JSONResponse({
             "brand_name": "Nightshift Manager",
             "refresh_ms": cfg.cadences.refresh_ms,
+            "server_now": datetime.now(UTC).isoformat(),
         })

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +96,10 @@ def create_worker_app(
                 # A worker whose poll loop is wedged answers this endpoint
                 # exactly like a healthy one, so say which it is.
                 "loop": loop.loop_health() if loop is not None else None,
+                # Same anchor as the manager's /api/info: this UI's "ago"
+                # strings are host timestamps, so the browser subtracts
+                # against the host's clock, not its own.
+                "server_now": datetime.now(UTC).isoformat(),
             }
         )
 

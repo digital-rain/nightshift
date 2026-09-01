@@ -1854,15 +1854,21 @@ function executionCard() {
   head.append(actions);
 
   // Live "<phase> · 14m 03s" clock, driven by a 1s ticker (tickElapsed).
-  if (rec && rec.phase_started_at && status === "running" && state.player.state !== "paused") {
+  // `phase_started_at` is emitted by nothing server-side (no column, no
+  // projection) — it was only ever aspirational, so this clock never rendered
+  // and a running task showed no elapsed time at all. Fall back to the
+  // attempt's own start, which every record carries: the label still names the
+  // current phase, the clock just measures from the top of the attempt.
+  const since = rec && (rec.phase_started_at || rec.started_at);
+  if (since && status === "running" && state.player.state !== "paused") {
     const labels = phaseLabels(rec);
     const phaseLabel = (labels[phaseIndex(rec)] || labels[0]).label;
     const el = document.createElement("div");
     el.className = "exec-elapsed";
     el.id = "now-elapsed";
-    el.dataset.since = rec.phase_started_at;
+    el.dataset.since = since;
     el.dataset.phase = phaseLabel;
-    el.textContent = `${phaseLabel} \u00b7 ${formatElapsed(Date.now() - Date.parse(rec.phase_started_at))}`;
+    el.textContent = `${phaseLabel} \u00b7 ${formatElapsed(serverNow() - Date.parse(since))}`;
     head.append(el);
   }
   card.append(head);
@@ -3455,15 +3461,58 @@ function compactTokens(value) {
 function tickElapsed() {
   const el = document.getElementById("now-elapsed");
   if (!el || !el.dataset.since) return;
-  const ms = Date.now() - Date.parse(el.dataset.since);
+  const ms = serverNow() - Date.parse(el.dataset.since);
   if (ms >= 0) el.textContent = `${el.dataset.phase} \u00b7 ${formatElapsed(ms)}`;
+}
+
+// ---- server clock anchor ------------------------------------------------ //
+// Every timestamp the UI renders an age for (started_at, finished_at, phase
+// clocks) is stamped by the *manager host's* clock. Subtracting the browser's
+// Date.now() from one is therefore only correct while the two clocks agree —
+// and they can silently disagree by hours: a suspended VM comes back slow, and
+// chrony slews rather than steps, so nothing ever catches up. That drift went
+// straight into the display, ageing a task that started 20 minutes ago to
+// "10h ago". Anchor the arithmetic to the server's clock instead, and surface
+// the gap when it is big enough to also be skewing scheduled work.
+let clockOffsetMs = 0;                    // serverNow - browserNow
+const CLOCK_SKEW_WARN_MS = 120000;        // 2 minutes
+
+function serverNow() {
+  return Date.now() + clockOffsetMs;
+}
+
+// Re-sampled on every /api/info poll, not just at boot: the operator fixing the
+// host clock mid-session steps it by the whole drift, and the UI must follow.
+function applyServerClock(info) {
+  if (!info || !info.server_now) return;
+  const t = Date.parse(info.server_now);
+  if (Number.isNaN(t)) return;
+  clockOffsetMs = t - Date.now();
+  renderClockSkewBanner();
+}
+
+function renderClockSkewBanner() {
+  const el = $("clock-skew-banner");
+  if (!el) return;
+  const off = Math.abs(clockOffsetMs);
+  if (off < CLOCK_SKEW_WARN_MS) {
+    el.hidden = true;
+    el.textContent = "";
+    return;
+  }
+  const behind = clockOffsetMs < 0;
+  el.textContent =
+    `Manager host clock is ${formatElapsed(off)} ${behind ? "behind" : "ahead of"} this browser. `
+    + "Times shown are corrected, but scheduled work on the host fires against its own "
+    + "clock — resync it (chrony/NTP) on the manager host.";
+  el.hidden = false;
 }
 
 function formatWhen(iso) {
   if (!iso) return "";
   const t = Date.parse(iso);
   if (Number.isNaN(t)) return "";
-  const diff = Date.now() - t;
+  const diff = serverNow() - t;
   const min = Math.round(diff / 60000);
   if (min < 1) return "just now";
   if (min < 60) return `${min}m ago`;
@@ -7352,6 +7401,9 @@ function startAutoRefresh() {
     // this the badges only moved on a view switch. Scoped to the active view
     // so every other screen keeps its existing request budget.
     if (state.view === "repos") loadRepos();
+    // Cheap, and the only way a mid-session clock correction on the host ever
+    // reaches the ages already on screen.
+    getJSON("/api/info").then(applyServerClock).catch(() => {});
   }, refreshMs);
 }
 
@@ -7369,6 +7421,7 @@ async function applyBranding() {
     if (info && typeof info.refresh_ms === "number" && info.refresh_ms > 0) {
       refreshMs = info.refresh_ms;
     }
+    applyServerClock(info);
   } catch { /* no /api/info (single-process server): keep static branding */ }
 }
 

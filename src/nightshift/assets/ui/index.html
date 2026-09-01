@@ -84,6 +84,10 @@
       </div>
     </header>
 
+    <!-- Host clock drift warning: shown on every screen, because a skewed
+         manager clock affects far more than one view (see applyServerClock). -->
+    <div id="clock-skew-banner" class="clock-skew-banner" hidden></div>
+
     <main class="screens">
       <section id="screen-now" class="screen screen-now" aria-label="Now">
         <div class="now-layout">

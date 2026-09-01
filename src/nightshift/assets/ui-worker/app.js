@@ -52,6 +52,7 @@ async function loadInfo() {
     if (typeof info.refresh_ms === "number" && info.refresh_ms > 0) {
       refreshMs = info.refresh_ms;
     }
+    applyServerClock(info);
     // Reflect a server-side deferred (draining) restart so the button keeps its
     // attention style across a browser reload while the current task finishes.
     if (info.restart_pending) {
@@ -160,11 +161,27 @@ function formatDuration(start, end) {
   return formatElapsed(ms);
 }
 
+// Ages here are computed against the *worker host's* clock, not the browser's
+// — see the operator UI's applyServerClock for why: a drifted host clock
+// silently inflates every "ago" by the drift.
+let clockOffsetMs = 0;                    // serverNow - browserNow
+
+function serverNow() {
+  return Date.now() + clockOffsetMs;
+}
+
+function applyServerClock(info) {
+  if (!info || !info.server_now) return;
+  const t = Date.parse(info.server_now);
+  if (Number.isNaN(t)) return;
+  clockOffsetMs = t - Date.now();
+}
+
 function formatWhen(iso) {
   if (!iso) return "";
   const t = Date.parse(iso);
   if (Number.isNaN(t)) return "";
-  const diff = Date.now() - t;
+  const diff = serverNow() - t;
   const min = Math.round(diff / 60000);
   if (min < 1) return "just now";
   if (min < 60) return `${min}m ago`;
@@ -413,6 +430,9 @@ function escapeHtml(s) {
 }
 
 async function tick() {
+  // Clock-only re-sample (not the whole loadInfo): the operator correcting the
+  // host clock mid-session must reach the ages already on screen.
+  getJSON("/api/info").then(applyServerClock).catch(() => {});
   await refreshNow();
   if (document.body.dataset.view === "history") {
     await refreshHistory();

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,20 @@ def _seed(tmp_path: Path, tasks: dict[str, str]) -> Path:
     is bound to the ``main`` queue, so a dispatched task lands there.
     """
     return build_workspace(tmp_path, tasks=tasks)
+
+
+def test_worker_info_stamps_server_now(tmp_path: Path) -> None:
+    """The worker UI renders "ago" strings from host timestamps, so it needs the
+    host's own clock to subtract against -- otherwise a drifted worker host
+    inflates every age by the drift."""
+    build_workspace(tmp_path, tasks={})
+    cfg = WorkerConfig(workspace=tmp_path, worker_id="w1", manager_url="http://x")
+    app = create_worker_app(cfg, LocalStore(tmp_path))
+    with TestClient(app) as client:
+        info = client.get("/api/info").json()
+        stamped = datetime.fromisoformat(info["server_now"])
+        assert stamped.tzinfo is not None
+        assert abs((datetime.now(UTC) - stamped).total_seconds()) < 60
 
 
 # --------------------------------------------------------------------------- #

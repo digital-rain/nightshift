@@ -185,6 +185,13 @@ def test_operator_endpoints(tmp_path: Path) -> None:
         info = client.get("/api/info").json()
         assert info["brand_name"] == "Nightshift Manager"
         assert info["refresh_ms"] == 20000
+        # server_now anchors the UI's "ago" arithmetic to the manager host's
+        # clock. Without it a drifted host clock (a suspended VM chrony slews
+        # instead of stepping) ages every timestamp by the drift -- a task
+        # started 20 minutes ago rendered as "10h ago".
+        stamped = datetime.fromisoformat(info["server_now"])
+        assert stamped.tzinfo is not None
+        assert abs((datetime.now(UTC) - stamped).total_seconds()) < 60
 
 
 def test_settings_wip_ref_prefix_roundtrip(tmp_path: Path) -> None:
