@@ -228,4 +228,70 @@ test("empty seeded queue scope falls back to all queues", () => {
   assert.match(scopedText, /Cost \/ landed change/);
 });
 
+// ---- CI-resolution cost ------------------------------------------------------
+// The gate auto-spawns "fix ci: <repo> main is red at <sha>" work, tagged
+// `kind: ci_resolution` on the brief and carried onto the attempt. That is the
+// cost of keeping main green -- money the queue spends on itself -- so Stats
+// reports it apart from feature spend: a KPI card (total + per-run) and a
+// per-day trend row. Two days of runs, because the trend panel needs a trend.
+
+const day = 24 * 60;
+const ciRun = (n, minsAgo, opts) => ({
+  task: `fix-ci-${n}`, queue: "q", model: "m", backend: "nightshift",
+  worker_id: "w1", status: "completed", landed: true, kind: "ci_resolution",
+  turns: 4, input_tokens: opts.input, output_tokens: opts.output,
+  cost_usd: opts.cost, failure_kind: null,
+  started_at: iso(minsAgo), finished_at: iso(minsAgo - opts.mins),
+});
+
+// Two CI resolutions today and one yesterday, so the trend has two points.
+// The default window is 7d, so the card totals all three: $0.30 + $0.50 +
+// $0.20 = $1.00 over 3 runs = $0.33/run.
+const ciRuns = [
+  ciRun(1, 60, { cost: 0.3, input: 1000, output: 100, mins: 10 }),
+  ciRun(2, 120, { cost: 0.5, input: 3000, output: 200, mins: 30 }),
+  ciRun(3, day + 90, { cost: 0.2, input: 500, output: 50, mins: 5 }),
+];
+
+const ci = new FakeNode("div");
+window.Analytics.render(ci, { fetchRuns: async () => [...ciRuns, runA, runB] });
+await new Promise((r) => setTimeout(r, 0));
+const ciText = textOf(ci);
+
+test("the CI card reports total spend and the per-run rate to clear a red main", () => {
+  assert.match(ciText, /Cost to clear CI {2}\$1\.00/);            // 0.30+0.50+0.20
+  assert.match(ciText, /\$0\.33 \/ run to clear CI failures/);    // 1.00 / 3
+});
+
+// The two workloads must not bleed into each other. CI runs are held out of
+// every other panel (renderBody), and untagged feature work is held out of the
+// CI card: runA ($0.05) + runB ($0.40) total $0.45 and no more.
+test("the CI card and the fleet cards do not blend the two workloads", () => {
+  assert.match(ciText, /Total spend {2}\$0\.45/);
+  assert.doesNotMatch(ciText, /Cost to clear CI {2}\$1\.45/);
+});
+
+test("the CI trend row renders spend, tokens and time per day", () => {
+  assert.match(ciText, /Spend on CI resolution/);
+  assert.match(ciText, /Avg tokens\/CI resolution/);
+  assert.match(ciText, /Avg time\/CI resolution/);
+  // Yesterday's lone CI run is $0.20; today's two are $0.80. A day on which
+  // only CI-fix work ran must still appear on the axis -- dropping it would
+  // understate the gate's cost and mislabel which day is "latest".
+  assert.match(ciText, /Spend on CI resolution.*\$0\.20.*\$0\.80 \(latest day\)/s);
+});
+
+// A workspace with CI monitoring off would otherwise carry three permanently
+// flat charts and a card averaging nothing.
+const noCi = new FakeNode("div");
+window.Analytics.render(noCi, { fetchRuns: async () => [runA, runB, runLegacy] });
+await new Promise((r) => setTimeout(r, 0));
+const noCiText = textOf(noCi);
+
+test("with no CI resolutions the card says so and the trend row is absent", () => {
+  assert.match(noCiText, /Cost to clear CI/);
+  assert.match(noCiText, /no CI resolutions yet/);
+  assert.doesNotMatch(noCiText, /Spend on CI resolution/);
+});
+
 console.log(`\n${passed} passed`);

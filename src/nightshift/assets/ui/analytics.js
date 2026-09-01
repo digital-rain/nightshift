@@ -20,7 +20,12 @@
  *   { task, queue, model, backend, worker_id, status, landed (bool),
  *     turns, input_tokens, output_tokens, cache_read_input_tokens,
  *     cache_creation_input_tokens, cost_usd, usage, failure_kind,
- *     started_at, finished_at, timings }
+ *     started_at, finished_at, timings, kind }
+ *
+ * `kind` is the brief's classification ("ci_resolution" for the gate's
+ * auto-spawned fixes, null otherwise). The worker adapter's local JSONL does
+ * not carry it, so the CI cards degrade to "—" and the CI trend row is hidden
+ * on that host rather than showing zeros.
  * `timings` is the per-phase wall-clock split in seconds recorded by the
  * worker loop ({worker, preflight, validate, total} — only phases the run
  * entered); null/absent on runs that predate the instrumentation, so every
@@ -217,6 +222,9 @@
       avgValidate: valCount ? valSum / valCount : null,
       valTotal: valSum,
       valRuns: valCount,
+      // Cost per *run*, distinct from costPerLanded: CI-resolution work is
+      // measured per attempt at clearing a red main, landed or not.
+      costPerRun: terminal.length ? cost / terminal.length : null,
     };
   }
 
@@ -312,7 +320,7 @@
     return card;
   }
 
-  function renderKpiHeader(container, cur, prior) {
+  function renderKpiHeader(container, cur, prior, ci, ciPrior) {
     const row = el("div", "an-kpi-row");
     row.append(
       kpiCard(
@@ -409,6 +417,23 @@
         deltaBadge(cur.avgValidate, prior.avgValidate, { lowerIsBetter: true })
       )
     );
+    // Cost to clear CI: the twelfth card, filling the row the eleven above
+    // left short. CI-resolution runs are excluded from every other card here
+    // (see renderBody), so this one is fed its own aggregate: the total says
+    // what keeping main green cost this window, the per-run rate says what one
+    // red main costs to clear.
+    row.append(
+      kpiCard(
+        "Cost to clear CI",
+        ci && ci.runs ? fmtMoney(ci.cost) : "—",
+        ci && ci.runs
+          ? fmtMoney(ci.costPerRun) + " / run to clear CI failures"
+          : "no CI resolutions yet",
+        ci && ciPrior
+          ? deltaBadge(ci.cost, ciPrior.cost, { lowerIsBetter: true })
+          : null
+      )
+    );
     container.append(row);
   }
 
@@ -420,7 +445,7 @@
     return new Date(t).toISOString().slice(0, 10);
   }
 
-  function renderTrends(container, runs) {
+  function bucketByDay(runs) {
     const byDay = new Map();
     for (const r of runs.filter(isTerminal)) {
       const k = dayKey(r.started_at);
@@ -428,15 +453,29 @@
       if (!byDay.has(k)) byDay.set(k, []);
       byDay.get(k).push(r);
     }
-    const days = Array.from(byDay.keys()).sort();
+    return byDay;
+  }
+
+  // `ciRuns` is the CI-resolution slice renderBody holds back from every other
+  // panel; it gets its own row of cells sharing this panel's x-axis.
+  function renderTrends(container, runs, ciRuns) {
+    const byDay = bucketByDay(runs);
+    const ciByDay = bucketByDay(ciRuns || []);
+    // The axis is the union of both slices' days: a day on which only CI-fix
+    // work ran is a real day, and dropping it would silently understate the
+    // gate's cost (and mislabel which day is "latest").
+    const days = Array.from(
+      new Set([...byDay.keys(), ...ciByDay.keys()])
+    ).sort();
     if (days.length < 2) return; // a single day isn't a trend
-    const costSeries = days.map((d) => aggregate(byDay.get(d)).landedCost);
+    const dayRuns = (m, d) => m.get(d) || [];
+    const costSeries = days.map((d) => aggregate(dayRuns(byDay, d)).landedCost);
     const tokenSeries = days.map((d) => {
-      const a = aggregate(byDay.get(d));
+      const a = aggregate(dayRuns(byDay, d));
       return a.avgTokens || 0;
     });
     const landSeries = days.map((d) => {
-      const a = aggregate(byDay.get(d));
+      const a = aggregate(dayRuns(byDay, d));
       return a.landRate || 0;
     });
 
@@ -448,13 +487,22 @@
     grid.append(trendCell("Land rate", landSeries.map((v) => v * 100), days, (v) => v.toFixed(0) + "%"));
     // Time trends: overall always (the run window covers all history); the
     // implementation/validation splits only once instrumented runs exist.
-    const aggByDay = days.map((d) => aggregate(byDay.get(d)));
+    const aggByDay = days.map((d) => aggregate(dayRuns(byDay, d)));
     grid.append(trendCell("Avg time/task", aggByDay.map((a) => a.avgDuration || 0), days, fmtDur));
     if (aggByDay.some((a) => a.implRuns > 0)) {
       grid.append(trendCell("Implementation/task", aggByDay.map((a) => a.avgImpl || 0), days, fmtDur));
     }
     if (aggByDay.some((a) => a.valRuns > 0)) {
       grid.append(trendCell("Validation/task", aggByDay.map((a) => a.avgValidate || 0), days, fmtDur));
+    }
+    // CI-resolution row: what the gate cost per day. Conditional like the
+    // phase splits above -- a workspace with CI monitoring off would otherwise
+    // carry three permanently flat charts.
+    const ciByDayAgg = days.map((d) => aggregate(dayRuns(ciByDay, d)));
+    if (ciByDayAgg.some((a) => a.runs > 0)) {
+      grid.append(trendCell("Spend on CI resolution", ciByDayAgg.map((a) => a.cost || 0), days, fmtMoney));
+      grid.append(trendCell("Avg tokens/CI resolution", ciByDayAgg.map((a) => a.avgTokens || 0), days, fmtTokens));
+      grid.append(trendCell("Avg time/CI resolution", ciByDayAgg.map((a) => a.avgDuration || 0), days, fmtDur));
     }
     panel.append(grid);
     container.append(panel);
@@ -1255,8 +1303,13 @@
       // own card instead (renderCiResolution, fed the unfiltered `current`).
       const taskCurrent = current.filter((r) => !isCiResolution(r));
       const taskPrior = prior.filter((r) => !isCiResolution(r));
-      renderKpiHeader(body, aggregate(taskCurrent), aggregate(taskPrior));
-      renderTrends(body, taskCurrent);
+      const ciCurrent = current.filter(isCiResolution);
+      const ciPrior = prior.filter(isCiResolution);
+      renderKpiHeader(
+        body, aggregate(taskCurrent), aggregate(taskPrior),
+        aggregate(ciCurrent), aggregate(ciPrior),
+      );
+      renderTrends(body, taskCurrent, ciCurrent);
       renderBreakdown(body, "By model", taskCurrent, (r) => r.model);
       renderBreakdown(body, "By backend", taskCurrent, (r) => r.backend);
       renderBreakdown(body, "By queue", taskCurrent, (r) => r.queue);
