@@ -207,6 +207,26 @@ EXTRA_BIN_DIRS = (
 )
 
 
+def build_claude_text_argv(system: str, user: str, model: str) -> list[str]:
+    """The ``claude`` print-mode argv for a tool-less one-shot text completion.
+
+    Deliberately unlike :func:`build_claude_argv` (the agentic worker
+    invocation): ``--tools ""`` disables every built-in tool, so the call can
+    only emit text — no worktree, no file edits. ``--output-format json``
+    returns a single object carrying the reply (``result``) and
+    Anthropic-shaped ``usage``.
+    """
+    return [
+        "claude",
+        "-p", user,
+        "--model", model,
+        "--system-prompt", system,
+        "--tools", "",
+        "--dangerously-skip-permissions",
+        "--output-format", "json",
+    ]
+
+
 def resolve_claude_bin(config: dict | None = None) -> str:
     """Resolve the ``claude`` executable robustly.
 

@@ -7,6 +7,14 @@ seam where Nightshift decides *who* does the work.
 
 These are registered:
 
+Backends whose upstream can answer a plain prompt also expose
+``complete_text(system, user, *, model, env, timeout, config=None)`` — a
+synchronous, tool-less one-shot completion returning ``(text, usage)`` for
+manager-side prose passes (brief enhancement). The API backends delegate to
+:mod:`nightshift.agent.transport`; ``claude-code`` runs the CLI in print mode.
+It raises ``TransportError`` on failure; backends without the method (the
+other agentic CLIs, the harness) simply don't support one-shot text.
+
 - ``claude-code``   — Claude Code CLI (default; fully **agentic**: edits files, runs bash).
 - ``cursor``        — Cursor's headless agent (``cursor-agent``; **agentic**).
 - ``antigravity``   — Google Antigravity CLI (``agy``; **agentic**). Successor to
@@ -35,6 +43,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -391,6 +400,49 @@ def build_cursor_argv(prompt: str, model: str, config: dict[str, Any]) -> list[s
     return argv
 
 
+def _output_tail(output: Any, limit: int = 300) -> str:
+    """The last, most diagnostic slice of a CLI output blob (bounded)."""
+    text = str(output or "").strip()
+    if not text:
+        return "(no output)"
+    return text[-limit:]
+
+
+class _TransportTextCompletion:
+    """``complete_text`` via the harness vendor adapter (API backends).
+
+    The backend's ``name`` doubles as the transport vendor token, so the seam
+    is one delegation: qualify the bare model with it and let
+    :func:`nightshift.agent.transport.complete` speak the vendor's API.
+    Imported lazily — the transport module imports helpers from here.
+    """
+
+    name: str
+
+    def complete_text(
+        self,
+        system: str,
+        user: str,
+        *,
+        model: str,
+        env: dict[str, str],
+        timeout: float | None,
+        config: dict[str, Any] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        from nightshift.agent import transport
+
+        completion = transport.complete(
+            [{"role": "user", "content": user}],
+            tools=[],
+            knobs={"max_tokens": 8192},
+            model=f"{self.name}/{model}",
+            system=system,
+            env=env,
+            timeout=timeout,
+        )
+        return completion.text or "", completion.usage or {}
+
+
 class ClaudeCodeBackend:
     name = "claude-code"
     agentic = True
@@ -400,6 +452,61 @@ class ClaudeCodeBackend:
 
     def available(self, config: dict[str, Any] | None = None) -> bool:
         return bool(shutil.which("claude") or (config or {}).get("claude_bin"))
+
+    def complete_text(
+        self,
+        system: str,
+        user: str,
+        *,
+        model: str,
+        env: dict[str, str],
+        timeout: float | None,
+        config: dict[str, Any] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """One tool-less print-mode completion (see the seam contract above).
+
+        Runs in a throwaway cwd so the CLI picks up no project ``CLAUDE.md``
+        from whatever directory the caller happens to serve — the completion
+        sees the prompt and nothing else. Raises ``TransportError`` on any
+        launch/exit/parse failure.
+        """
+        from nightshift.agent.transport import TransportError
+
+        argv = prompts.build_claude_text_argv(system, user, model)
+        argv[0] = prompts.resolve_claude_bin(config)
+        try:
+            with tempfile.TemporaryDirectory(prefix="nightshift-oneshot-") as cwd:
+                proc = subprocess.run(
+                    argv, cwd=cwd, env=env or None, capture_output=True,
+                    text=True, timeout=timeout,
+                )
+        except FileNotFoundError as exc:
+            raise TransportError(f"claude CLI not found: {exc}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise TransportError(
+                f"claude CLI timed out after {timeout:.0f}s"
+            ) from exc
+        except OSError as exc:
+            raise TransportError(f"claude CLI failed to launch: {exc}") from exc
+        if proc.returncode != 0:
+            raise TransportError(
+                f"claude CLI exited {proc.returncode}: "
+                f"{_output_tail(proc.stderr or proc.stdout)}"
+            )
+        try:
+            payload = json.loads(proc.stdout or "")
+        except json.JSONDecodeError:
+            raise TransportError(
+                f"claude CLI returned unparseable output: {_output_tail(proc.stdout)}"
+            ) from None
+        if not isinstance(payload, dict):
+            raise TransportError("claude CLI returned an unexpected JSON shape")
+        if payload.get("is_error"):
+            raise TransportError(
+                f"claude CLI reported an error: {_output_tail(payload.get('result'))}"
+            )
+        usage = payload.get("usage")
+        return str(payload.get("result") or ""), usage if isinstance(usage, dict) else {}
 
     def run(
         self,
@@ -500,7 +607,7 @@ class AntigravityBackend:
         )
 
 
-class AnthropicBackend:
+class AnthropicBackend(_TransportTextCompletion):
     name = "anthropic"
     agentic = False
     tool_capable = False
@@ -677,7 +784,7 @@ def _ollama_generate(
     )
 
 
-class OllamaBackend:
+class OllamaBackend(_TransportTextCompletion):
     name = "ollama"
     agentic = False
     tool_capable = False
@@ -707,7 +814,7 @@ class OllamaBackend:
         )
 
 
-class OllamaCloudBackend:
+class OllamaCloudBackend(_TransportTextCompletion):
     name = "ollama-cloud"
     agentic = False
     tool_capable = False
@@ -897,6 +1004,11 @@ def get_backend(name: str | None) -> Any:
 def known_providers() -> set[str]:
     """Set of valid provider tokens (== backend names)."""
     return {b.name for b in _BACKENDS}
+
+
+def text_capable_providers() -> list[str]:
+    """Provider tokens whose backend can do a one-shot ``complete_text``."""
+    return [b.name for b in _BACKENDS if hasattr(b, "complete_text")]
 
 
 def require_backend(provider: str) -> Any:
