@@ -285,16 +285,29 @@ def cherry_produce(
 
 
 def delete_produce(
-    repo_root: Path, paths: Sequence[str], message: str
+    repo_root: Path,
+    paths: Sequence[str],
+    message: str,
+    *,
+    rewrite: Callable[[str, Sequence[str]], dict[str, str]] | None = None,
 ) -> Callable[[str], ProduceResult]:
     """The repo-task-import producer: a commit object that deletes ``paths``
     from the base tree (the drained ``.tasks/`` inbox files), built in a
     temporary index so no checkout or real index is ever touched.
 
-    Paths absent from the base are ignored; when none are present the
-    production collapses to the base itself — the idempotent replay path
+    Paths absent from the base are ignored; when none are present *and*
+    ``rewrite`` asks for no content, the production collapses to the base
+    itself — the idempotent replay path
     (:func:`~nightshift.git.landing.integrate_and_push_locked` then moves
     nothing and reports success).
+
+    ``rewrite(base, deleted) -> {path: text}`` is the optional companion edit
+    the same commit carries: files the removal must *update* rather than drop
+    (the drained inbox's ``config.json`` order — see
+    :func:`~nightshift.repo_tasks.prune_inbox_orders`). It is called with the
+    base being produced onto and the paths actually being deleted from it, so
+    a re-produce after a CAS miss recomputes against the fresh tip instead of
+    replaying a stale blob over a publisher's concurrent edit.
     """
 
     def produce(base: str) -> ProduceResult:
@@ -309,16 +322,31 @@ def delete_produce(
         if not present.ok:
             return failure(present.detail)
         existing = [p for p in present.stdout.splitlines() if p.strip()]
-        if not existing:
+        edits = rewrite(base, existing) if rewrite is not None else {}
+        if not existing and not edits:
             return ProduceResult(
                 sha=base, display_sha=git.out("rev-parse", "--short", base) or base,
             )
         with tempfile.TemporaryDirectory(prefix="nightshift-delete-") as tmp:
             env = {"GIT_INDEX_FILE": str(Path(tmp) / "index")}
-            for step in (
-                git.run("read-tree", base, env=env),
-                git.run("update-index", "--force-remove", "--", *existing, env=env),
-            ):
+            steps = [git.run("read-tree", base, env=env)]
+            if existing:
+                steps.append(
+                    git.run("update-index", "--force-remove", "--", *existing, env=env)
+                )
+            for n, (path, text) in enumerate(sorted(edits.items())):
+                scratch = Path(tmp) / f"edit-{n}"
+                scratch.write_text(text)
+                blob = git.run("hash-object", "-w", "--no-filters", str(scratch))
+                steps.append(blob)
+                if not blob.ok:
+                    break
+                steps.append(git.run(
+                    "update-index", "--add",
+                    "--cacheinfo", f"100644,{blob.stdout.strip()},{path}",
+                    env=env,
+                ))
+            for step in steps:
                 if not step.ok:
                     return failure(step.detail)
             tree = git.run("write-tree", env=env)

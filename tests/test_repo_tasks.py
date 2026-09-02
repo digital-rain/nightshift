@@ -470,6 +470,133 @@ def test_republished_identical_brief_dedupes(tmp_path: Path) -> None:
     assert briefs == ["alpha.md"]
 
 
+# --------------------------------------------------------------------------- #
+# Inbox order pruning
+# --------------------------------------------------------------------------- #
+
+
+def _published_config(repo_root: Path, path: str) -> dict:
+    """The inbox ``config.json`` as published on the repo's ``main``."""
+    return json.loads(git(repo_root, "cat-file", "blob", f"main:{path}"))
+
+
+def test_import_prunes_the_drained_stems_from_the_inbox_order(tmp_path: Path) -> None:
+    """A drained brief leaves nothing behind: the removal commit drops its stem
+    from the inbox's ``config.json`` order too, in both the root and the
+    queue-dir inbox, keeping the other keys and the surviving entries."""
+    ws = build_workspace(tmp_path)
+    repo_root = ws / "longitude"
+    _publish(repo_root, {
+        ".tasks/alpha.md": "Do alpha.\n",
+        ".tasks/keeper.md": "Do keeper.\n",
+        ".tasks/config.json": json.dumps(
+            {"validate": "just validate", "order": ["keeper", "alpha"], "sort": "priority"},
+            indent=2,
+        ) + "\n",
+        ".tasks/main/beta.md": "Do beta.\n",
+        ".tasks/main/config.json": json.dumps({"order": ["beta"]}, indent=2) + "\n",
+    })
+    with _client(ws) as client:
+        data = client.post(
+            "/api/queue/repo-tasks/import",
+            json={"sources": [".tasks/alpha.md", ".tasks/main/beta.md"]},
+        ).json()
+        assert [t["task"] for t in data["imported"]] == ["alpha", "beta"]
+        assert data["removed"] is True
+
+    root = _published_config(repo_root, ".tasks/config.json")
+    # The drained stem is gone; the unpicked brief keeps its place, and the
+    # publisher's other settings are untouched.
+    assert root == {
+        "validate": "just validate", "order": ["keeper"], "sort": "priority",
+    }
+    assert list(root) == ["validate", "order", "sort"]
+    assert _published_config(repo_root, ".tasks/main/config.json") == {"order": []}
+    assert ".tasks/keeper.md" in git(repo_root, "ls-tree", "-r", "--name-only", "main")
+
+
+def test_import_heals_order_entries_an_earlier_import_left_behind(
+    tmp_path: Path,
+) -> None:
+    """The prune rule is the resulting tree, not just this batch: stems with no
+    brief left in the inbox — what every import before this behaviour existed
+    left behind — go with it."""
+    ws = build_workspace(tmp_path)
+    repo_root = ws / "longitude"
+    _publish(repo_root, {
+        ".tasks/alpha.md": "Do alpha.\n",
+        ".tasks/config.json": json.dumps(
+            {"order": ["long-gone", "alpha", "also-gone"]}, indent=2
+        ) + "\n",
+    })
+    with _client(ws) as client:
+        assert client.post("/api/queue/repo-tasks/import").json()["removed"] is True
+    assert _published_config(repo_root, ".tasks/config.json") == {"order": []}
+
+
+def test_a_docs_tasks_import_rewrites_no_config(tmp_path: Path) -> None:
+    """``docs/tasks`` briefs carry no json control file, so draining them
+    touches no ``config.json`` — including the legacy inbox's."""
+    ws = build_workspace(tmp_path)
+    repo_root = ws / "longitude"
+    _publish(repo_root, {
+        "docs/tasks/alpha.md": "Do alpha.\n",
+        "docs/tasks/config.json": json.dumps({"order": ["alpha"]}, indent=2) + "\n",
+        ".tasks/config.json": json.dumps({"order": ["stale"]}, indent=2) + "\n",
+    })
+    before = git(repo_root, "rev-parse", "main^{tree}")
+    with _client(ws) as client:
+        assert client.post("/api/queue/repo-tasks/import").json()["removed"] is True
+    assert _published_config(repo_root, "docs/tasks/config.json") == {"order": ["alpha"]}
+    assert _published_config(repo_root, ".tasks/config.json") == {"order": ["stale"]}
+    # The only tree change is the brief's removal.
+    assert git(repo_root, "diff", "--name-only", f"{before}", "main") == (
+        "docs/tasks/alpha.md"
+    )
+
+
+def test_an_unreadable_inbox_config_is_left_exactly_as_published(
+    tmp_path: Path,
+) -> None:
+    """Best-effort, like the read side: a malformed (or order-less) control
+    file is never rewritten — the briefs still drain."""
+    ws = build_workspace(tmp_path)
+    repo_root = ws / "longitude"
+    _publish(repo_root, {
+        ".tasks/alpha.md": "Do alpha.\n",
+        ".tasks/config.json": "{ not json at all\n",
+    })
+    blob = git(repo_root, "rev-parse", "main:.tasks/config.json")
+    with _client(ws) as client:
+        assert client.post("/api/queue/repo-tasks/import").json()["removed"] is True
+    assert git(repo_root, "rev-parse", "main:.tasks/config.json") == blob
+    assert ".tasks/alpha.md" not in git(repo_root, "ls-tree", "-r", "--name-only", "main")
+
+
+def test_a_replayed_removal_still_prunes_the_order(tmp_path: Path) -> None:
+    """The crash-recovery shape: the files went but the commit that should have
+    pruned the order did not. A re-import of the same inbox has no file left to
+    delete and still lands the pruned order."""
+    ws = build_workspace(tmp_path)
+    repo_root = ws / "longitude"
+    _publish(repo_root, {
+        ".tasks/alpha.md": "Do alpha.\n",
+        ".tasks/config.json": json.dumps({"order": ["alpha"]}, indent=2) + "\n",
+    })
+    with _client(ws) as client:
+        client.post("/api/queue/repo-tasks/import")
+        # Tooling republishes the identical brief: nothing new to copy, but the
+        # order it re-listed is pruned again with the file.
+        _publish(repo_root, {
+            ".tasks/alpha.md": "Do alpha.\n",
+            ".tasks/config.json": json.dumps({"order": ["alpha"]}, indent=2) + "\n",
+        }, message="republish")
+        data = client.post("/api/queue/repo-tasks/import").json()
+        assert data["deduped"] == ["alpha"]
+        assert data["removed"] is True
+    assert _published_config(repo_root, ".tasks/config.json") == {"order": []}
+
+
 def test_import_is_inert_without_a_repo(tmp_path: Path) -> None:
     ws = build_workspace(tmp_path, main_repo=None)
     with _client(ws) as client:

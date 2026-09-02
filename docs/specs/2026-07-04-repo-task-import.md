@@ -30,9 +30,8 @@ Import is a *move with git authority on both sides*:
 
 - the brief becomes canonical in the content store
   (`nightshift-tasks/<queue>/`), committed like any other queue churn;
-- the source file is removed from the target repo's `main` by the manager
-  (the sole writer to `main`), committed and pushed to `origin` so the
-  removal is never lost.
+- the source file is removed from the target repo's `main` by the manager (the sole writer to `main`), committed and pushed to `origin` so the removal is never lost;
+- the same commit prunes the drained stems from the inbox's `config.json` `order`, so a drained inbox never lists briefs it no longer has.
 
 After an import a brief exists in exactly one place. Re-importing is
 idempotent (see *Dedupe*).
@@ -89,19 +88,32 @@ a time (imports are rare, operator-initiated actions):
    git executor (so it can never interleave with a land or sync):
    - sync `origin/main` first (best-effort) so the commit lands on the fresh
      tip;
-   - `delete_produce(paths)` — a third producer next to `squash_produce` /
-     `cherry_produce`: builds the base tree minus the source files in a
-     temporary index (never touches the working tree), `commit-tree`s it, and
-     rides `integrate_and_push_locked` with local-CAS semantics
-     (`LandingMode.NONE`), checkout advanced best-effort exactly like a land;
+   - `delete_produce(paths, rewrite=…)` — a third producer next to `squash_produce` / `cherry_produce`: builds the base tree minus the source files in a temporary index (never touches the working tree), `commit-tree`s it, and rides `integrate_and_push_locked` with local-CAS semantics (`LandingMode.NONE`), checkout advanced best-effort exactly like a land;
+   - the `rewrite` companion edit (`prune_inbox_orders`) puts the drained inboxes' pruned `config.json` back into that same tree.
+     It is computed inside the producer, from the base being produced onto, so a re-produce after a rejected push recomputes against the fresh tip rather than replaying a stale blob over a publisher's concurrent edit;
    - **push `main` to `origin` best-effort.** A failed push keeps the local
      commit and surfaces a warning in the response — never unwound; dedupe
      covers any replay.
 4. Emit `queue_changed`; respond
    `{imported, deduped, removed, warning, missing}`.
 
-A removal where none of the paths exist on `main` collapses to the base
-commit (no empty commit) — the idempotent replay path.
+A removal where none of the paths exist on `main` *and* no config needs
+pruning collapses to the base commit (no empty commit) — the idempotent replay
+path.
+A replay whose files are already gone but whose order still lists them lands
+the prune alone, which is how a crash between the two heals.
+
+### Order pruning
+
+The prune rule is the resulting tree: a stem stays in an inbox's `order` only
+while its `<stem>.md` survives in that inbox.
+So the commit drops what it drains, and in the same pass heals entries an
+earlier import left behind — dead weight that anything walking the list
+positionally has to step over.
+Everything else is left alone: only `.tasks` inboxes carry an order at all
+(`docs/tasks` sources rewrite nothing), a missing or unparsable `config.json`
+is never touched, other keys and the surviving entries' relative order are
+preserved, and a config that needs no change is not rewritten.
 
 ## API
 
@@ -161,6 +173,7 @@ Against `tests/_workspace.py` fixtures (`tests/test_repo_tasks.py`):
 - end-to-end API: briefs land in the content store (committed), source files
   removed from repo `main` (commit present, clean checkout advanced), order
   appended — for `docs/tasks` sources too, leaving neighbouring docs untouched;
+- order pruning: drained stems leave the root and queue-dir `config.json` orders (other keys and unpicked entries intact), stems with no brief left are healed with them, `docs/tasks` imports rewrite no config, a malformed config is left byte-identical, and a replayed removal still lands the prune;
 - never-lose: removal push failure → import still succeeds with a warning;
   second import after re-publish dedupes instead of duplicating;
 - inert paths: queue without a repo, absent repo, no inbox at all.

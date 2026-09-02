@@ -318,6 +318,28 @@ def test_a_quarantined_brief_is_skipped_and_stays_published(tmp_path) -> None:
         assert ".tasks/main/held.md" in tree
 
 
+def test_the_drain_prunes_the_host_queues_own_order(tmp_path) -> None:
+    """Draining a brief takes its entry in the host queue's ``config.json``
+    order with it, so a queue this feature has emptied does not accumulate a
+    list of briefs it no longer has. What stays published stays listed."""
+    ws = build_workspace(tmp_path, tasks={"native": "do the native thing"})
+    _publish(ws / "longitude", {
+        ".tasks/main/alpha.md": "Do alpha.\n",
+        ".tasks/main/held.md": "---\nquarantined: true\n---\n\nHeld.\n",
+        ".tasks/main/config.json": json.dumps(
+            {"validate": "just validate", "order": ["held", "alpha"]}, indent=2
+        ) + "\n",
+    })
+    set_auto_import(_tasks_root(ws), "longitude", True)
+    with TestClient(create_app(ws, store=SqliteStore())) as client:
+        _reconcile(client)
+        assert _stems(ws) == ["alpha", "native"]
+    published = json.loads(
+        git(ws / "longitude", "cat-file", "blob", "main:.tasks/main/config.json")
+    )
+    assert published == {"validate": "just validate", "order": ["held"]}
+
+
 def test_briefs_published_after_a_pass_are_picked_up_by_the_next(imported) -> None:
     """The drain recurs: the inbox is rescanned every open cadence window, so
     work published during the day keeps flowing in without an operator."""

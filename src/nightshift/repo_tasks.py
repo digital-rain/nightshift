@@ -11,9 +11,9 @@ frontmatter.
 
 Import is a *move* with git authority on both sides: the brief becomes
 canonical in the content store (``nightshift-tasks/<queue>/``) and the source
-file is removed from the repo's ``main`` by the manager (the sole writer to
-``main``), so a brief exists in exactly one place, can never run twice, and
-is never lost. The scan reads the inboxes from the same authority the removal
+file — with its entry in the inbox's ``config.json`` order — is removed from
+the repo's ``main`` by the manager (the sole writer to ``main``), so a brief
+exists in exactly one place, can never run twice, and is never lost. The scan reads the inboxes from the same authority the removal
 writes to — the ``main`` *tree*, never the operator checkout, which may be
 parked on any branch. See ``docs/spec/2026-07-04-repo-task-import.md``.
 
@@ -29,6 +29,7 @@ removal orchestration; the HTTP surface lives in
 from __future__ import annotations
 
 import json
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -127,6 +128,22 @@ def _local_order(git: GitRunner, treeish: str) -> list[str]:
     return [str(name) for name in order] if isinstance(order, list) else []
 
 
+def _md_blobs(git: GitRunner, treeish: str) -> dict[str, str]:
+    """``{stem: filename}`` for the ``*.md`` blobs of one inbox tree
+    (``<sha>:<inbox>``) — ``{}`` when the tree does not exist. Subdirectories
+    are not blobs, so a queue-dir layout's briefs belong to their own inbox,
+    never the root's."""
+    listing = git.run("ls-tree", "-z", treeish)
+    if not listing.ok:
+        return {}
+    by_stem: dict[str, str] = {}
+    for entry in listing.stdout.split("\0"):
+        meta, _, name = entry.partition("\t")
+        if meta.split()[1:2] == ["blob"] and name.endswith(".md"):
+            by_stem[name[: -len(".md")]] = name
+    return by_stem
+
+
 def _scan_tree(git: GitRunner, treeish: str, *, ordered: bool = True) -> list[str]:
     """The ``*.md`` blob names of one inbox tree (``<sha>:<inbox>``) in its
     published order: stems listed in the tree's ``config.json`` ``order``
@@ -136,14 +153,7 @@ def _scan_tree(git: GitRunner, treeish: str, *, ordered: bool = True) -> list[st
     inbox publishes in filename order, so an unrelated ``config.json`` sitting
     in it never reorders the briefs.
     """
-    listing = git.run("ls-tree", "-z", treeish)
-    if not listing.ok:
-        return []
-    by_stem: dict[str, str] = {}
-    for entry in listing.stdout.split("\0"):
-        meta, _, name = entry.partition("\t")
-        if meta.split()[1:2] == ["blob"] and name.endswith(".md"):
-            by_stem[name[: -len(".md")]] = name
+    by_stem = _md_blobs(git, treeish)
     local = _local_order(git, treeish) if ordered else []
     rank = {name: i for i, name in enumerate(local)}
     listed = sorted((s for s in by_stem if s in rank), key=lambda s: rank[s])
@@ -339,6 +349,73 @@ def copy_repo_tasks(
     return imported
 
 
+def _json_indent(text: str) -> int | str:
+    """The indent of the first indented line of a json document (so a rewrite
+    keeps the publisher's own formatting instead of churning the whole file).
+    Two spaces when nothing indented is found."""
+    for line in text.splitlines():
+        lead = line[: len(line) - len(line.lstrip())]
+        if lead and line.strip():
+            return lead
+    return 2
+
+
+def prune_inbox_orders(
+    repo_root: Path, sources: Sequence[str]
+) -> Callable[[str, Sequence[str]], dict[str, str]]:
+    """The removal commit's companion edit (:func:`delete_produce`'s
+    ``rewrite``): every drained ``.tasks`` inbox's ``config.json`` with the
+    stems it no longer has a brief for dropped from ``order``.
+
+    Deleting the ``*.md`` files alone leaves the publisher's ``order`` naming
+    briefs that no longer exist — dead weight that grows with every import and
+    that anything walking the list positionally has to step over. The rule is
+    the resulting tree: a stem stays only while its ``<stem>.md`` survives in
+    the inbox. That prunes what this commit drains *and* heals entries an
+    earlier import (which only ever deleted files) left behind, in the one
+    commit that is already touching the inbox.
+
+    Conservative everywhere else: only ``.tasks`` inboxes carry an order at
+    all (``docs/tasks`` is plain markdown, so those sources rewrite nothing),
+    a missing or unparsable ``config.json`` is left exactly as it is, other
+    keys and the surviving entries' relative order are untouched, and a config
+    that needs no change is not rewritten.
+    """
+
+    def rewrite(base: str, deleted: Sequence[str]) -> dict[str, str]:
+        git = GitRunner(repo_root)
+        gone = set(deleted)
+        edits: dict[str, str] = {}
+        for inbox in sorted({s.rpartition("/")[0] for s in sources}):
+            if inbox != REPO_TASKS_DIR and not inbox.startswith(f"{REPO_TASKS_DIR}/"):
+                continue
+            path = f"{inbox}/config.json"
+            raw = git.run("cat-file", "blob", f"{base}:{path}")
+            if not raw.ok:
+                continue
+            try:
+                data = json.loads(raw.stdout)
+            except ValueError:
+                continue
+            order = data.get("order") if isinstance(data, dict) else None
+            if not isinstance(order, list):
+                continue
+            surviving = {
+                stem
+                for stem, name in _md_blobs(git, f"{base}:{inbox}").items()
+                if f"{inbox}/{name}" not in gone
+            }
+            kept = [stem for stem in order if str(stem) in surviving]
+            if kept == order:
+                continue
+            data["order"] = kept
+            body = json.dumps(data, indent=_json_indent(raw.stdout), ensure_ascii=False)
+            edits[path] = f"{body}\n" if raw.stdout.endswith("\n") else body
+        return edits
+
+    return rewrite
+
+
 def remove_repo_tasks_locked(
     workspace: Path,
     repo: str,
@@ -358,6 +435,11 @@ def remove_repo_tasks_locked(
     removal or push is surfaced as ``warning`` and never unwound — the import
     already made the briefs durable in the content store, and a replayed
     import dedupes instead of duplicating.
+
+    The commit deletes the brief files *and* prunes the stems they left behind
+    in the inbox's ``config.json`` order (:func:`prune_inbox_orders`), so a
+    drained inbox is left consistent rather than listing briefs that no longer
+    exist.
     """
     repo_root = workspace / repo
     has_remote = GitRunner(repo_root).run("remote", "get-url", remote).ok
@@ -365,7 +447,10 @@ def remove_repo_tasks_locked(
         sync_main_locked(workspace, repo, remote)
     outcome = integrate_and_push_locked(
         RepoContext(workspace=workspace, repo=repo),
-        delete_produce(repo_root, sources, message),
+        delete_produce(
+            repo_root, sources, message,
+            rewrite=prune_inbox_orders(repo_root, sources),
+        ),
         mode=LandingMode.NONE,
     )
     removed = outcome.kind in LAND_SUCCESS_KINDS

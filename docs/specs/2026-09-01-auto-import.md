@@ -80,7 +80,7 @@ Per bound queue, per pass:
    source this queue has already imported: normalise each one's frontmatter,
    stamp its provenance, write it into the queue appended to the end of the
    execution order, then commit the content store once for the batch.
-4. Remove the batch's sources from the repo's `main` as one repo-executor job.
+4. Remove the batch's sources from the repo's `main` as one repo-executor job — the shared removal, so the same commit prunes the drained stems from the host queue's `config.json` order.
 
 Ordering matters and matches the manual import: the briefs are durable in the
 content store *before* the removal runs.
