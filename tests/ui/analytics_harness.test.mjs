@@ -253,8 +253,17 @@ const ciRuns = [
   ciRun(3, day + 90, { cost: 0.2, input: 500, output: 50, mins: 5 }),
 ];
 
+// runA/runB are both from today; the trend panel needs two days on its axis,
+// so give the task slice a run yesterday too.
+const taskYesterday = {
+  ...runA, task: "a-yesterday", cost_usd: 0.02,
+  started_at: iso(day + 100), finished_at: iso(day + 95),
+};
+
 const ci = new FakeNode("div");
-window.Analytics.render(ci, { fetchRuns: async () => [...ciRuns, runA, runB] });
+window.Analytics.render(ci, {
+  fetchRuns: async () => [...ciRuns, runA, runB, taskYesterday],
+});
 await new Promise((r) => setTimeout(r, 0));
 const ciText = textOf(ci);
 
@@ -267,18 +276,38 @@ test("the CI card reports total spend and the per-run rate to clear a red main",
 // every other panel (renderBody), and untagged feature work is held out of the
 // CI card: runA ($0.05) + runB ($0.40) total $0.45 and no more.
 test("the CI card and the fleet cards do not blend the two workloads", () => {
-  assert.match(ciText, /Total spend {2}\$0\.45/);
-  assert.doesNotMatch(ciText, /Cost to clear CI {2}\$1\.45/);
+  assert.match(ciText, /Total spend {2}\$0\.47/);   // 0.05 + 0.40 + 0.02
+  assert.doesNotMatch(ciText, /Cost to clear CI {2}\$1\.47/);
 });
 
 test("the CI trend row renders spend, tokens and time per day", () => {
   assert.match(ciText, /Spend on CI resolution/);
   assert.match(ciText, /Avg tokens\/CI resolution/);
   assert.match(ciText, /Avg time\/CI resolution/);
-  // Yesterday's lone CI run is $0.20; today's two are $0.80. A day on which
-  // only CI-fix work ran must still appear on the axis -- dropping it would
-  // understate the gate's cost and mislabel which day is "latest".
+  // The CI row shares the task slice's x-axis: yesterday's lone CI run is
+  // $0.20, today's two are $0.80, read against the same two days as the rows
+  // above it.
   assert.match(ciText, /Spend on CI resolution.*\$0\.20.*\$0\.80 \(latest day\)/s);
+});
+
+// The axis is the task slice's days, deliberately -- so every cell in the
+// panel is read against one x-axis and "latest day" means the same thing in
+// all of them. A CI-only day therefore carries no column here; its spend is
+// still counted by the card and the CI resolution panel, which are
+// window-totals rather than per-day series.
+const ciOnlyDay = new FakeNode("div");
+window.Analytics.render(ciOnlyDay, {
+  fetchRuns: async () => [
+    runA, runB,                                  // task work, today only
+    ciRun(9, day + 60, { cost: 0.7, input: 100, output: 10, mins: 5 }),
+  ],
+});
+await new Promise((r) => setTimeout(r, 0));
+const ciOnlyText = textOf(ciOnlyDay);
+
+test("a CI-only day does not widen the trend axis, but still counts in the card", () => {
+  assert.doesNotMatch(ciOnlyText, /Daily trend/);        // one task day is no trend
+  assert.match(ciOnlyText, /Cost to clear CI {2}\$0\.70/);
 });
 
 // A workspace with CI monitoring off would otherwise carry three permanently

@@ -463,12 +463,13 @@
   function renderTrends(container, runs, ciRuns) {
     const byDay = bucketByDay(runs);
     const ciByDay = bucketByDay(ciRuns || []);
-    // The axis is the union of both slices' days: a day on which only CI-fix
-    // work ran is a real day, and dropping it would silently understate the
-    // gate's cost (and mislabel which day is "latest").
-    const days = Array.from(
-      new Set([...byDay.keys(), ...ciByDay.keys()])
-    ).sort();
+    // The axis is the task slice's days. The CI row shares it rather than
+    // widening it, so every cell in this panel is read against one x-axis and
+    // the "latest day" label means the same thing in all of them. The
+    // trade-off is deliberate: a day on which *only* CI-fix work ran carries
+    // no column here, and its spend shows up in the CI resolution panel's
+    // window totals instead of on this chart.
+    const days = Array.from(byDay.keys()).sort();
     if (days.length < 2) return; // a single day isn't a trend
     const dayRuns = (m, d) => m.get(d) || [];
     const costSeries = days.map((d) => aggregate(dayRuns(byDay, d)).landedCost);
