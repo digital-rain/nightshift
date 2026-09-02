@@ -147,7 +147,7 @@ def test_copy_suffixes_collisions_and_appends_order(tmp_path: Path) -> None:
     def entry(name: str, text: str, *, duplicate: bool = False) -> RepoTask:
         return RepoTask(
             name=name, title=name, source=f".tasks/{name}.md", priority=5,
-            disabled=False, duplicate=duplicate, text=text,
+            disabled=False, quarantined=False, duplicate=duplicate, text=text,
         )
 
     imported = copy_repo_tasks(tasks_root, "main", [
@@ -171,7 +171,7 @@ def test_copy_suffixes_collisions_and_appends_order(tmp_path: Path) -> None:
 def _entry(name: str, source: str) -> RepoTask:
     return RepoTask(
         name=name, title=name, source=source, priority=5,
-        disabled=False, duplicate=False, text=f"{name}\n",
+        disabled=False, quarantined=False, duplicate=False, text=f"{name}\n",
     )
 
 

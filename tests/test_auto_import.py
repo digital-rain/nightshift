@@ -1,9 +1,9 @@
 """Auto-import — draining a repo's ``.tasks/<host>`` inbox on a cadence.
 
 Three layers: the pure rules in :mod:`nightshift.auto_import` (host-queue
-resolution, frontmatter normalisation, round-robin placement), the reconciler
-duty end to end (a published brief becomes a queued task and leaves the repo's
-``main``), and the Repos-page API surface the operator drives it from.
+resolution, frontmatter normalisation, FIFO placement), the reconciler duty
+end to end (every fresh published brief becomes a queued task and leaves the
+repo's ``main``), and the Repos-page API surface the operator drives it from.
 """
 
 from __future__ import annotations
@@ -17,12 +17,9 @@ from starlette.testclient import TestClient
 from _workspace import build_workspace, git, git_commit_all
 from nightshift.auto_import import (
     HOST_QUEUE_KEY,
-    IMPORTED_HOLD_KEY,
     PROVENANCE_KEY,
     auto_import_repos,
-    blocking_imports,
     imported_brief_text,
-    insert_round_robin,
     normalize_frontmatter,
     pending_imports,
     resolve_host_queue,
@@ -195,84 +192,32 @@ def test_keywords_are_recognized_and_unknown_keys_pass_through() -> None:
     assert meta["after"] == "setup"
 
 
-def test_published_quarantine_is_demoted_to_a_disable() -> None:
-    """Quarantine is a statement about a run *this* manager made, and an
-    imported brief has none — its History would be empty and its
-    ``quarantine_reason`` would point at another system's logs. Disabled says
-    the true thing (arrived held, wants an operator) and, unlike quarantine,
-    does not hold the round-robin slot shut."""
-    meta = normalize_frontmatter(
-        {"quarantined": True, "quarantine_reason": "no progress after 2 runs"},
-        stem="held", repo="longitude", default_model="auto",
-    )
-    assert meta["quarantined"] is False
-    assert meta["disabled"] is True
-    # The publisher's reason survives verbatim, as provenance rather than as a
-    # claim about a quarantine this manager imposed.
-    assert meta[IMPORTED_HOLD_KEY] == "no progress after 2 runs"
-    assert "quarantine_reason" not in meta
-
-
-def test_demotion_leaves_an_unheld_brief_alone() -> None:
-    """No flag keys are invented for a brief that never carried them, and an
-    explicit ``quarantined: false`` is not promoted into a disable."""
-    for published in ({}, {"quarantined": False}):
-        meta = normalize_frontmatter(
-            dict(published), stem="s", repo="longitude", default_model="auto",
-        )
-        assert "disabled" not in meta
-        assert IMPORTED_HOLD_KEY not in meta
-
-
-def test_demotion_survives_the_brief_rewrite() -> None:
-    """End to end through :func:`imported_brief_text`, since that is what the
-    duty actually writes to disk."""
+def test_a_published_disable_survives_the_brief_rewrite() -> None:
+    """A brief published ``disabled: true`` imports with the flag intact — it
+    queues here and waits for this operator's eye. End to end through
+    :func:`imported_brief_text`, since that is what the duty writes to disk.
+    (A published *quarantine* never reaches the rewrite at all: the importer
+    skips those briefs at the scan — see the reconciler tests below.)"""
     text = imported_brief_text(
-        "---\nquarantined: true\nquarantine_reason: budget\n---\n\nFix it.\n",
+        "---\ndisabled: true\n---\n\nFix it.\n",
         stem="held", repo="longitude",
         source=".tasks/longitude/held.md", default_model="auto",
     )
     meta = split_frontmatter(text)[0]
-    assert (meta["quarantined"], meta["disabled"]) == (False, True)
-    assert meta[IMPORTED_HOLD_KEY] == "budget"
+    assert meta["disabled"] is True
+    # And no hold keys are invented for a brief that never carried them.
+    plain = normalize_frontmatter({}, stem="s", repo="longitude", default_model="auto")
+    assert "disabled" not in plain
+    assert "quarantined" not in plain
 
 
 # --------------------------------------------------------------------------- #
-# Round-robin placement
+# Replay guard
 # --------------------------------------------------------------------------- #
-
-
-def _seed(ws: Path, stems: list[str]) -> Path:
-    queue_dir = _tasks_root(ws) / "main"
-    for stem in stems:
-        (queue_dir / f"{stem}.md").write_text(f"do {stem}\n")
-    save_order(_tasks_root(ws), stems, "main")
-    return queue_dir
-
-
-def test_import_lands_one_slot_behind_the_head(tmp_path: Path) -> None:
-    """The queue's own next task keeps its place; the host's takes the slot
-    after it, so dispatch alternates native / host / native / host. An empty
-    queue has nothing to alternate with, so the import goes first."""
-    ws = build_workspace(tmp_path)
-    queue_dir = _seed(ws, ["n1", "n2", "n3"])
-    (queue_dir / "h1.md").write_text("do h1\n")
-    assert insert_round_robin(_tasks_root(ws), "main", "h1") \
-        == ["n1", "h1", "n2", "n3"]
-
-    empty = build_workspace(tmp_path / "empty")
-    (_tasks_root(empty) / "main" / "h1.md").write_text("do h1\n")
-    assert insert_round_robin(_tasks_root(empty), "main", "h1") == ["h1"]
-
-
-def test_placement_skips_a_disabled_head(tmp_path: Path) -> None:
-    """The head is what the queue would actually *dispatch* next, so a
-    disabled brief is not the task the import alternates with."""
-    ws = build_workspace(tmp_path)
-    queue_dir = _seed(ws, ["n1", "n2"])
-    (queue_dir / "n1.md").write_text("---\ndisabled: true\n---\n\ndo n1\n")
-    (queue_dir / "h1.md").write_text("do h1\n")
-    assert insert_round_robin(_tasks_root(ws), "main", "h1") == ["n1", "n2", "h1"]
+#
+# FIFO placement itself is the manual import's copy step (copy_repo_tasks,
+# covered in test_repo_tasks.py); the end-to-end ordering assertions below
+# exercise it through the reconciler duty.
 
 
 def test_pending_imports_reports_only_stamped_briefs(tmp_path: Path) -> None:
@@ -286,29 +231,6 @@ def test_pending_imports_reports_only_stamped_briefs(tmp_path: Path) -> None:
     assert pending_imports(_tasks_root(ws), "main") == {
         "longitude/.tasks/nightly/pulled.md": "pulled",
     }
-
-
-@pytest.mark.parametrize(("frontmatter", "blocks"), [
-    ("", True),
-    ("disabled: true\n", False),
-    ("quarantined: true\n", False),
-    ("completed: true\n", False),
-    ("failed: true\n", True),          # still dispatchable (Phase B retries it)
-])
-def test_only_a_live_import_holds_the_round_robin_slot(
-    tmp_path: Path, frontmatter: str, blocks: bool
-) -> None:
-    """The slot is held by a pick that can still run. One that cannot — held
-    by an operator, or already finished — has had its turn; waiting on it
-    would stall the inbox until somebody noticed, because those flags are
-    cleared by hand and not by the run that drops the brief."""
-    ws = build_workspace(tmp_path)
-    (_tasks_root(ws) / "main" / "pulled.md").write_text(
-        f"---\n{PROVENANCE_KEY}: longitude/.tasks/main/pulled.md\n{frontmatter}---\n\nwork\n"
-    )
-    pending = pending_imports(_tasks_root(ws), "main")
-    assert pending == {"longitude/.tasks/main/pulled.md": "pulled"}
-    assert bool(blocking_imports(_tasks_root(ws), "main", pending)) is blocks
 
 
 # --------------------------------------------------------------------------- #
@@ -334,108 +256,117 @@ def _host_workspace(tmp_path: Path) -> Path:
 @pytest.fixture
 def imported(tmp_path):
     """The workspace above with the manager running. Entering the client runs
-    the reconciler's startup pass, so one brief has *already* been pulled by
-    the time a test body starts — every assertion below is written against
-    that first pass having happened."""
+    the reconciler's startup pass, so the whole inbox has *already* been
+    drained by the time a test body starts — every assertion below is written
+    against that first pass having happened."""
     ws = _host_workspace(tmp_path)
     with TestClient(create_app(ws, store=SqliteStore())) as client:
         yield ws, client
 
 
-def test_duty_pulls_one_brief_and_removes_the_source(imported) -> None:
+def test_duty_drains_the_whole_inbox_and_removes_the_sources(imported) -> None:
+    """One pass imports everything the host queue publishes, like a manual
+    import — not one pick per pass."""
     ws, client = imported
     _reconcile(client)
-    assert _stems(ws) == ["alpha", "native"]
+    assert _stems(ws) == ["alpha", "beta", "native"]
     body = (_tasks_root(ws) / "main" / "alpha.md").read_text()
     meta = split_frontmatter(body)[0]
     assert meta["title"] == "Alpha"
     assert meta["priority"] == 2
     assert meta["repo"] == "longitude"
     assert meta[PROVENANCE_KEY] == "longitude/.tasks/main/alpha.md"
-    # The source is gone from the repo's main, so it can never run twice, and
-    # the copy is committed in the content store rather than left dirty.
-    tree = git(ws / "longitude", "ls-tree", "-r", "--name-only", "main")
-    assert ".tasks/main/alpha.md" not in tree.splitlines()
-    assert ".tasks/main/beta.md" in tree.splitlines()
+    # The sources are gone from the repo's main, so they can never run twice,
+    # and the copies are committed in the content store rather than left dirty.
+    tree = git(ws / "longitude", "ls-tree", "-r", "--name-only", "main").splitlines()
+    assert ".tasks/main/alpha.md" not in tree
+    assert ".tasks/main/beta.md" not in tree
     tracked = git(_tasks_root(ws), "ls-tree", "-r", "--name-only", "HEAD").splitlines()
     assert "main/alpha.md" in tracked
+    assert "main/beta.md" in tracked
 
 
-def test_duty_takes_the_slot_behind_the_queues_own_head(imported) -> None:
+def test_imports_append_fifo_behind_the_queues_own_tasks(imported) -> None:
+    """The queue's own tasks keep their places; the pulled briefs join the
+    back of the line in the host queue's publish order."""
     ws, client = imported
     _reconcile(client)
-    assert load_order(_tasks_root(ws), "main") == ["native", "alpha"]
+    assert load_order(_tasks_root(ws), "main") == ["native", "alpha", "beta"]
 
 
-def test_duty_holds_the_next_brief_until_the_last_one_has_run(imported) -> None:
-    """One host pick in flight at a time — otherwise a busy inbox would flood
-    the queue it is supposed to take turns with."""
+def test_a_quarantined_brief_is_skipped_and_stays_published(tmp_path) -> None:
+    """A published ``quarantined: true`` is the publisher's "do not run this":
+    never imported, never removed — it sits in the host queue, re-skipped on
+    every pass, until the publisher clears or deletes it. A published
+    ``disabled: true`` imports normally, flag intact."""
+    ws = build_workspace(tmp_path, tasks={"native": "do the native thing"})
+    _publish(ws / "longitude", {
+        ".tasks/main/held.md": "---\nquarantined: true\n---\n\nHeld.\n",
+        ".tasks/main/parked.md": "---\ndisabled: true\n---\n\nParked.\n",
+    })
+    set_auto_import(_tasks_root(ws), "longitude", True)
+    with TestClient(create_app(ws, store=SqliteStore())) as client:
+        _reconcile(client)
+        _open_throttle(client)
+        _reconcile(client)     # a second pass re-skips, it does not remove
+        assert _stems(ws) == ["native", "parked"]
+        meta = split_frontmatter(
+            (_tasks_root(ws) / "main" / "parked.md").read_text()
+        )[0]
+        assert meta["disabled"] is True
+        tree = git(ws / "longitude", "ls-tree", "-r", "--name-only", "main").splitlines()
+        assert ".tasks/main/held.md" in tree
+
+
+def test_briefs_published_after_a_pass_are_picked_up_by_the_next(imported) -> None:
+    """The drain recurs: the inbox is rescanned every open cadence window, so
+    work published during the day keeps flowing in without an operator."""
     ws, client = imported
-    _reconcile(client)
-    _open_throttle(client)
-    _reconcile(client)
-    assert _stems(ws) == ["alpha", "native"]
-    # The pulled brief runs and its file is consumed; the host gets its turn.
-    (_tasks_root(ws) / "main" / "alpha.md").unlink()
-    _open_throttle(client)
-    _reconcile(client)
-    assert _stems(ws) == ["beta", "native"]
-
-
-def test_a_held_import_does_not_stall_the_inbox(imported) -> None:
-    """The regression this pair of rules exists for. A pick that stops being
-    runnable used to hold the slot forever — its brief is dropped on land, and
-    a held task never lands — so the host queue silently stopped draining."""
-    ws, client = imported
-    _reconcile(client)
-    assert _stems(ws) == ["alpha", "native"]
-    # The operator (or the demotion above) parks the pulled brief. It stays in
-    # the queue, so it is still `pending`, but it can no longer dispatch.
-    alpha = _tasks_root(ws) / "main" / "alpha.md"
-    alpha.write_text("---\ndisabled: true\n" + alpha.read_text().split("---\n", 1)[1])
-    _open_throttle(client)
     _reconcile(client)
     assert _stems(ws) == ["alpha", "beta", "native"]
+    _publish(ws / "longitude", {".tasks/main/gamma.md": "Do gamma.\n"},
+             message="published later")
+    _open_throttle(client)
+    _reconcile(client)
+    assert _stems(ws) == ["alpha", "beta", "gamma", "native"]
+    assert load_order(_tasks_root(ws), "main") \
+        == ["native", "alpha", "beta", "gamma"]
 
 
 def test_a_source_whose_removal_failed_is_not_imported_twice(imported) -> None:
-    """The replay guard, on the path the liveness gate opened up: the copy
-    landed but the removal did not, so the source is still published. It is
-    skipped by provenance — brief text cannot catch it, because an import is
-    rewritten on the way in and never matches its source verbatim."""
+    """The replay guard: the copy landed but the removal did not, so the
+    source is still published. It is skipped by provenance — brief text cannot
+    catch it, because an import is rewritten on the way in and never matches
+    its source verbatim."""
     ws, client = imported
     _reconcile(client)
     published = ".tasks/main/alpha.md"
     _publish(ws / "longitude", {published: "Do alpha.\n"}, message="removal failed")
-    # Park the import so the slot is free and the scan actually runs.
-    alpha = _tasks_root(ws) / "main" / "alpha.md"
-    alpha.write_text("---\ndisabled: true\n" + alpha.read_text().split("---\n", 1)[1])
     _open_throttle(client)
     _reconcile(client)
-    # `beta` is pulled past it; no second copy of alpha under a `-2` suffix.
+    # No second copy of alpha under a `-2` suffix.
     assert _stems(ws) == ["alpha", "beta", "native"]
 
 
 def test_duty_never_drains_a_host_queue_this_queue_did_not_bind(imported) -> None:
     ws, client = imported
-    for _ in range(3):   # long enough to drain `.tasks/main` dry
-        for brief in (_tasks_root(ws) / "main").glob("*.md"):
-            if brief.stem != "native":
-                brief.unlink()
-        _open_throttle(client)
-        _reconcile(client)
+    _reconcile(client)
+    _open_throttle(client)
+    _reconcile(client)
     tree = git(ws / "longitude", "ls-tree", "-r", "--name-only", "main").splitlines()
+    assert ".tasks/main/alpha.md" not in tree, ".tasks/main should be drained dry"
     assert ".tasks/nightly/gamma.md" in tree
 
 
 def test_duty_is_throttled_between_passes(imported) -> None:
     """Two reconciles inside one ``auto_import_seconds`` window read the inbox
-    once — the second pass leaves the second brief published."""
+    once — a brief published between them waits for the window to open."""
     ws, client = imported
     _reconcile(client)
-    (_tasks_root(ws) / "main" / "alpha.md").unlink()
+    _publish(ws / "longitude", {".tasks/main/gamma.md": "Do gamma.\n"},
+             message="published later")
     _reconcile(client)          # throttle still closed
-    assert _stems(ws) == ["native"]
+    assert _stems(ws) == ["alpha", "beta", "native"]
 
 
 def test_switch_off_stops_the_importer(tmp_path) -> None:
@@ -446,24 +377,29 @@ def test_switch_off_stops_the_importer(tmp_path) -> None:
         assert _stems(ws) == ["native"]
 
 
-def test_explicit_none_keeps_a_bound_queue_out_of_auto_import(imported) -> None:
-    ws, client = imported
-    (_tasks_root(ws) / "main" / "alpha.md").unlink()
-    client.put("/api/queue/host-queue", json={"queue": "main", "host_queue": ""})
-    _open_throttle(client)
-    _reconcile(client)
-    assert _stems(ws) == ["native"]
+def test_explicit_none_keeps_a_bound_queue_out_of_auto_import(tmp_path) -> None:
+    ws = build_workspace(tmp_path, tasks={"native": "do the native thing"})
+    _publish(ws / "longitude", {".tasks/main/alpha.md": "Do alpha.\n"})
+    with TestClient(create_app(ws, store=SqliteStore())) as client:
+        client.put("/api/queue/host-queue", json={"queue": "main", "host_queue": ""})
+        client.put(
+            "/api/repos/auto-import", json={"repo": "longitude", "enabled": True}
+        )
+        _open_throttle(client)
+        _reconcile(client)
+        assert _stems(ws) == ["native"]
 
 
-def test_a_brief_already_in_the_queue_is_not_copied_twice(imported) -> None:
+def test_a_brief_already_in_the_queue_is_not_copied_twice(tmp_path) -> None:
     """The operator drained this one by hand earlier: the source is still
     removed so the inbox converges, but no second copy is written."""
-    ws, client = imported
-    (_tasks_root(ws) / "main" / "alpha.md").write_text(
+    ws = _host_workspace(tmp_path)
+    (_tasks_root(ws) / "main" / "hand-pulled.md").write_text(
         "---\ntitle: Alpha\npriority: 2\n---\n\nDo alpha.\n"
     )
-    _reconcile(client)
-    assert _stems(ws) == ["alpha", "native"]
+    with TestClient(create_app(ws, store=SqliteStore())) as client:
+        _reconcile(client)
+    assert _stems(ws) == ["beta", "hand-pulled", "native"]
     tree = git(ws / "longitude", "ls-tree", "-r", "--name-only", "main").splitlines()
     assert ".tasks/main/alpha.md" not in tree
 
@@ -481,8 +417,8 @@ def test_pulled_brief_is_dispatchable_like_any_other_task(imported) -> None:
         ).json()["work"]
         if work:
             seen.add(work["task"])
-    # Native first (it kept the head), then the pulled brief -- the round-robin
-    # the placement encodes, observed through the real dispatch path.
+    # Native first (it kept its place at the head), then the first pulled
+    # brief -- the FIFO append, observed through the real dispatch path.
     assert list(seen) and seen == {"native", "alpha"}
 
 
@@ -593,23 +529,24 @@ def test_scan_repo_inbox_reads_only_the_named_host_queue(tmp_path: Path) -> None
 
 
 def test_partial_removal_failure_does_not_re_import(tmp_path, monkeypatch) -> None:
-    """The copy is durable before the removal runs. When the removal fails the
-    source is still published — but the pulled brief is still in the queue, so
-    the round-robin gate keeps the next pass from running the same work twice.
-    """
+    """The copies are durable before the removal runs. When the removal fails
+    the sources are still published — but the pulled briefs are still in the
+    queue, so the replay guard keeps the next pass from running the same work
+    twice."""
     ws = _host_workspace(tmp_path)
     monkeypatch.setattr(
         "nightshift.manager.reconciler.remove_repo_tasks_locked", _failed_removal
     )
     with TestClient(create_app(ws, store=SqliteStore())) as client:
-        assert _stems(ws) == ["alpha", "native"]
+        assert _stems(ws) == ["alpha", "beta", "native"]
         tree = git(
             ws / "longitude", "ls-tree", "-r", "--name-only", "main"
         ).splitlines()
         assert ".tasks/main/alpha.md" in tree
+        assert ".tasks/main/beta.md" in tree
         _open_throttle(client)
         _reconcile(client)
-        assert _stems(ws) == ["alpha", "native"]
+        assert _stems(ws) == ["alpha", "beta", "native"]
 
 
 def _failed_removal(*args, **kwargs) -> dict:
@@ -680,9 +617,9 @@ def test_an_explicit_none_binding_keeps_the_badge_off(tmp_path: Path) -> None:
 def test_the_badge_survives_an_empty_inbox(tmp_path: Path) -> None:
     """The badge reports the standing binding, not this instant's backlog.
 
-    An empty inbox is the normal steady state — auto-import pulls one brief at
-    a time and deletes each source, and a drained directory stops existing in
-    the repo tree at all. Reporting the switch as off there would blink the
+    An empty inbox is the normal steady state — auto-import drains every
+    published brief and deletes each source, and a drained directory stops
+    existing in the repo tree at all. Reporting the switch as off there would blink the
     badge out precisely when it had finished its work, and the operator would
     read that as "it stopped".
     """

@@ -4,9 +4,11 @@ The manual import (:mod:`nightshift.repo_tasks`) is an operator action: open
 the picker, tick briefs, drain them all at once. Auto-import is the same
 machinery on a clock. A repo the operator has switched on publishes work into
 ``.tasks/<host-queue>/``; a Nightshift queue bound to that repo names one of
-those host queues, and from then on the manager pulls briefs out of it one at
-a time, runs them like any other task, and removes each source from the repo's
-``main`` — so the repo's own inbox doubles as a queue Nightshift services.
+those host queues, and from then on the manager drains it on a cadence: every
+fresh brief the pass finds is copied in, runs like any other task, and has its
+source removed from the repo's ``main`` — so the repo's own inbox doubles as a
+queue Nightshift services. The scan recurs, so briefs published after a pass
+are picked up by the next one rather than waiting on an operator.
 
 Two settings drive it, both in the content store so they commit with the rest
 of the queue configuration:
@@ -19,21 +21,27 @@ of the queue configuration:
   (:func:`resolve_host_queue`), which is the binding the operator almost
   always wants; an explicit empty string means "none, leave the inbox alone".
 
-**Round-robin.** A host queue must not starve the queue it feeds into, so the
-importer keeps at most one *live* imported brief in flight per queue
-(:func:`blocking_imports`) and inserts each new one directly behind the
-destination queue's current head (:func:`insert_round_robin`). Liveness, not
-mere presence, is the gate: a pick that can no longer dispatch (disabled,
-quarantined, completed) has had its turn, and holding the slot open for it
-would stall the inbox until an operator noticed.
+**FIFO drain.** Each pass imports *everything* fresh the host queue publishes,
+through the manual import's own copy step
+(:func:`nightshift.repo_tasks.copy_repo_tasks`): the briefs are appended to
+the end of the destination queue's execution order in their published order.
+The queue's own tasks keep their places — manually added work still runs, and
+an operator who wants a pulled brief sooner re-prioritises it by hand.
+
+**Holds.** A brief published ``quarantined: true`` is not imported at all: the
+publisher said "do not run this", and Nightshift honours it by leaving the
+brief in the host queue — re-skipped every pass, never removed — until the
+publisher clears or deletes it. A brief published ``disabled: true`` *is*
+imported, flag intact: it queues here and waits for this operator's eye.
+(Nightshift's own quarantine flag stays reserved for a task *this* manager
+stopped, which is why an inherited one is refused at the door rather than
+carried in.)
 
 **Frontmatter.** Briefs in a repo's inbox are written by whoever publishes
 them, so their frontmatter is untrusted. :func:`normalize_frontmatter` fills
 in a title, model, priority, and target repo, replacing anything unusable with
 the resolved default rather than blocking the task on an authoring error
-nobody here can fix, and demotes a published quarantine to a plain disable —
-Nightshift's quarantine means *this* manager stopped the task, and inheriting
-the word from another system's run would claim a run this Nightshift never had.
+nobody here can fix.
 
 See ``docs/specs/2026-09-01-auto-import.md`` for the operator surface and the
 reasoning behind both rules.
@@ -45,12 +53,7 @@ from pathlib import Path
 
 from nightshift.model_id import is_qualified
 from nightshift.playlists import is_valid_name
-from nightshift.queue_config import (
-    SORT_MANUAL,
-    order_stems,
-    save_order,
-    save_store_config_value,
-)
+from nightshift.queue_config import save_store_config_value
 from nightshift.repos import is_valid_repo_ref
 from nightshift.spawn_daily import (
     DEFAULT_PRIORITY,
@@ -60,7 +63,7 @@ from nightshift.spawn_daily import (
     load_store_config,
     split_frontmatter,
 )
-from nightshift.task_files import live_ordered_queue, resolve_title
+from nightshift.task_files import resolve_title
 
 
 # Store-level config key: the repos whose ``.tasks/`` inbox is auto-imported.
@@ -70,18 +73,9 @@ AUTO_IMPORT_REPOS_KEY = "auto_import_repos"
 HOST_QUEUE_KEY = "host_queue"
 
 # Stamped onto every auto-imported brief as ``<repo>/<source>``: the provenance
-# record, and the in-flight marker the round-robin reads (a brief carrying it
-# came from a host queue and has not run yet).
+# record, and the key the replay guard matches on (a brief carrying it came
+# from a host queue and has not run yet — see :func:`pending_imports`).
 PROVENANCE_KEY = "imported_from"
-
-# Stamped alongside :data:`PROVENANCE_KEY` when a published brief arrived
-# already quarantined: the publisher's verbatim reason, kept as provenance
-# after the flag itself is demoted to ``disabled`` (see
-# :func:`normalize_frontmatter`). Not ``quarantine_reason`` — that field
-# belongs to a quarantine this manager imposed, and leaving it set on a task
-# whose ``quarantined`` is false is the stale, misleading state the demotion
-# exists to avoid.
-IMPORTED_HOLD_KEY = "imported_hold"
 
 # Model keywords that pin nothing concrete (the scheduler's ``AGNOSTIC_MODELS``
 # vocabulary): a published ``model: auto`` is usable, not unrecognised.
@@ -203,40 +197,17 @@ def _normalized_model(raw: object, default_model: str) -> str:
     return default_model
 
 
-def _demote_quarantine(out: dict) -> None:
-    """Rewrite a published ``quarantined: true`` as ``disabled: true``.
-
-    A repo's inbox is often fed by another Nightshift-shaped system, and a
-    brief it quarantined carries the flag into the import verbatim. Inheriting
-    it is wrong twice over: this manager never ran the task, so the History
-    page has nothing to show behind the state, and ``quarantine_reason`` points
-    at run logs held somewhere else. Disabled says what is actually true — the
-    brief arrived held and wants an operator's eye before it dispatches — while
-    reserving quarantine for a task *this* manager stopped.
-
-    The publisher's reason survives verbatim under
-    :data:`IMPORTED_HOLD_KEY`. Mutates ``out``; a brief that was not published
-    quarantined is left exactly as it is, gaining no flag keys it never had.
-    """
-    if not out.get("quarantined"):
-        return
-    out["quarantined"] = False
-    out["disabled"] = True
-    reason = str(out.pop("quarantine_reason", "") or "").strip()
-    if reason:
-        out[IMPORTED_HOLD_KEY] = reason
-
-
 def normalize_frontmatter(
     meta: dict, *, stem: str, repo: str, default_model: str
 ) -> dict:
     """Fill in a published brief's frontmatter, replacing unusable values.
 
     Returns a new dict: ``title``/``model``/``priority``/``repo`` are always
-    present and always valid, and a published quarantine is demoted to a
-    disable (:func:`_demote_quarantine`); every other key the publisher wrote
-    is carried through unchanged (inert to dispatch, and dropping it would lose
-    author intent for fields Nightshift may learn later).
+    present and always valid; every other key the publisher wrote — a
+    ``disabled`` hold included — is carried through unchanged (inert to
+    dispatch, and dropping it would lose author intent for fields Nightshift
+    may learn later). A published quarantine never reaches this function: the
+    importer skips those briefs at the scan instead of importing them.
     """
     out = dict(meta)
     out["title"] = str(meta.get("title") or "").strip() or resolve_title(stem, {})
@@ -244,7 +215,6 @@ def normalize_frontmatter(
     out["priority"] = _normalized_priority(meta.get("priority"))
     published_repo = str(meta.get("repo") or "").strip()
     out["repo"] = published_repo if is_valid_repo_ref(published_repo) else repo
-    _demote_quarantine(out)
     return out
 
 
@@ -263,7 +233,7 @@ def imported_brief_text(
 
 
 # --------------------------------------------------------------------------- #
-# Round-robin placement
+# Replay guard
 # --------------------------------------------------------------------------- #
 
 
@@ -277,9 +247,6 @@ def pending_imports(tasks_root: Path, tasks_rel: str) -> dict[str, str]:
     check on the provenance string rather than on brief text, because an
     auto-imported brief is rewritten on the way in (normalised frontmatter
     plus the provenance stamp) and so never matches its source verbatim.
-
-    Presence here does *not* by itself hold the round-robin slot — see
-    :func:`blocking_imports`.
     """
     queue_dir = tasks_root / tasks_rel
     if not queue_dir.is_dir():
@@ -295,77 +262,3 @@ def pending_imports(tasks_root: Path, tasks_rel: str) -> dict[str, str]:
     return out
 
 
-def blocking_imports(
-    tasks_root: Path, tasks_rel: str, pending: dict[str, str]
-) -> dict[str, str]:
-    """The subset of ``pending`` that still holds the round-robin slot.
-
-    An import holds the slot only while it can still dispatch. A pick the
-    queue will never run again — disabled (including a published quarantine
-    demoted on the way in, :func:`normalize_frontmatter`), quarantined by this
-    manager, or completed — has had its turn, and gating on its mere presence
-    would stall the host inbox indefinitely: those flags are cleared by an
-    operator, not by the run that would otherwise drop the brief.
-
-    Liveness is :func:`~nightshift.task_files.live_ordered_queue`, the same
-    scan dispatch itself uses, so the gate can never disagree with what the
-    queue would actually pick up.
-    """
-    live = set(live_ordered_queue(tasks_root, tasks_rel))
-    return {prov: stem for prov, stem in pending.items() if stem in live}
-
-
-def insert_round_robin(tasks_root: Path, tasks_rel: str, stem: str) -> list[str]:
-    """Place a freshly imported brief one slot behind the queue's head.
-
-    The head is whatever the queue would dispatch next, so the import takes
-    the slot *after* it: the queue's own task runs, then the host's, and with
-    the one-in-flight gate the pattern repeats. Inserting at the front instead
-    would displace a task already about to run, and appending would let a busy
-    queue starve its host inbox indefinitely.
-
-    An empty queue puts the import at the front — there is nothing to
-    alternate with. Returns the persisted order.
-    """
-    queue_dir = tasks_root / tasks_rel
-    others = [p.stem for p in queue_dir.glob("*.md") if p.stem != stem]
-    full = order_stems(tasks_root, others, tasks_rel, sort=SORT_MANUAL)
-    runnable = [s for s in live_ordered_queue(tasks_root, tasks_rel) if s != stem]
-    head = runnable[0] if runnable else None
-    index = full.index(head) + 1 if head is not None and head in full else 0
-    full.insert(index, stem)
-    return save_order(tasks_root, full, tasks_rel)
-
-
-def write_imported_brief(
-    tasks_root: Path,
-    tasks_rel: str,
-    *,
-    name: str,
-    text: str,
-    repo: str,
-    source: str,
-    default_model: str,
-) -> str:
-    """Write one published brief into the destination queue and slot it into
-    the round-robin position. Returns the stem actually written.
-
-    A name already taken in the destination gets a ``-2`` suffix, matching
-    :func:`nightshift.repo_tasks.copy_repo_tasks`'s collision policy — the
-    host queue and the Nightshift queue are independent namespaces and a
-    collision between them is not a duplicate.
-    """
-    queue_dir = tasks_root / tasks_rel
-    queue_dir.mkdir(parents=True, exist_ok=True)
-    stem = name
-    n = 2
-    while (queue_dir / f"{stem}.md").exists():
-        stem = f"{name}-{n}"
-        n += 1
-    (queue_dir / f"{stem}.md").write_text(
-        imported_brief_text(
-            text, stem=stem, repo=repo, source=source, default_model=default_model
-        )
-    )
-    insert_round_robin(tasks_root, tasks_rel, stem)
-    return stem

@@ -24,9 +24,9 @@ reads (build candidates → pick → create the attempt → return):
 4. **Worker liveness** — silent workers are marked offline
    (``registry.reap_stale``), moved out of the poll path.
 5. **Host-queue auto-import** — a queue bound to a repo's ``.tasks/<host>``
-   inbox pulls one published brief per pass, on its own cadence, and removes
-   the source from the repo's ``main``. See :mod:`nightshift.auto_import` for
-   the round-robin and frontmatter rules.
+   inbox drains every fresh published brief per pass, on its own cadence, and
+   removes each source from the repo's ``main``. See
+   :mod:`nightshift.auto_import` for the FIFO and frontmatter rules.
 
 The startup pass additionally *recovers* attempts interrupted mid-land (Phase
 8): an attempt stuck in state LANDING can only be a previous process's
@@ -57,6 +57,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -66,10 +67,9 @@ from nightshift import playlists as playlists_mod
 from nightshift import repos
 from nightshift.auto_import import (
     auto_import_repos,
-    blocking_imports,
+    imported_brief_text,
     pending_imports,
     resolve_host_queue,
-    write_imported_brief,
 )
 from nightshift.ci import CiState, CiStatus, check_repo_ci
 from nightshift.config.manager import ManagerConfig
@@ -113,6 +113,7 @@ from nightshift.manager.work_orders import (
 from nightshift.queue_config import ci_monitoring_enabled
 from nightshift.repo_tasks import (
     RepoTask,
+    copy_repo_tasks,
     host_inbox,
     list_repo_task_queues,
     remove_repo_tasks_locked,
@@ -798,18 +799,20 @@ class Reconciler:
     # ------------------------------------------------------------------ #
 
     async def _auto_import_host_queues(self) -> None:
-        """Pull one brief per bound queue from its repo's ``.tasks/<host>``.
+        """Drain each bound queue's ``.tasks/<host>`` inbox into the queue.
 
         Throttled per destination queue by ``cadences.auto_import_seconds``,
         and short-circuited when no repo has the switch on — a workspace not
-        using the feature makes no git call for it. The one-in-flight
-        round-robin gate is checked *before* the inbox scan, so a queue still
-        working through its previous pick costs nothing either.
+        using the feature makes no git call for it. Every open pass imports
+        *all* the fresh briefs the inbox publishes, exactly as a manual import
+        would, appending them to the end of the queue's execution order in
+        their published order; the cadence makes it a standing drain, so
+        briefs published between passes are picked up by the next one.
 
-        The gate counts only *live* imports (:func:`blocking_imports`): a pick
-        that can no longer dispatch is out of the way, and the inbox keeps
-        draining. The full pending map still filters the scan, so a source
-        whose removal failed after its copy landed is not imported twice.
+        A published quarantine is refused outright: the brief stays in the
+        host queue, re-skipped every pass, until the publisher clears or
+        removes it. The pending map filters the scan, so a source whose
+        removal failed after its copy landed is not imported twice.
         """
         enabled = set(auto_import_repos(self._tasks_root))
         if not enabled:
@@ -829,13 +832,6 @@ class Reconciler:
             if not repos.repo_available(self._workspace, repo):
                 continue
             self._auto_import_checked_at[label] = now
-            # Round-robin: the host queue gets its next slot once the previous
-            # pick has run (its brief is dropped on land) or has stopped being
-            # runnable at all (disabled/quarantined/completed — an operator
-            # owns it now, and waiting on it would stall the inbox).
-            pending = pending_imports(self._tasks_root, tasks_rel)
-            if blocking_imports(self._tasks_root, tasks_rel, pending):
-                continue
             available = await asyncio.to_thread(
                 list_repo_task_queues, self._workspace, repo
             )
@@ -847,19 +843,30 @@ class Reconciler:
                 self._workspace, repo, host_inbox(host),
                 self._tasks_root, tasks_rel,
             )
+            if not entries:
+                # The steady state: a drained inbox. Don't pay the destination
+                # queue's frontmatter scan just to filter an empty list.
+                continue
             # Replay guard: a source already imported into this queue is still
             # published only because its removal failed, so skip past it rather
-            # than running the same brief twice.
-            fresh = [e for e in entries if f"{repo}/{e.source}" not in pending]
+            # than running the same brief twice. A published quarantine is the
+            # publisher's hold — skipped and left published.
+            pending = pending_imports(self._tasks_root, tasks_rel)
+            fresh = [
+                e for e in entries
+                if not e.quarantined and f"{repo}/{e.source}" not in pending
+            ]
             if fresh:
-                await self._auto_import_one(queue, repo, host, fresh[0])
+                await self._auto_import_batch(queue, repo, host, fresh)
 
-    async def _auto_import_one(
-        self, queue: str | None, repo: str, host: str, entry: RepoTask
+    async def _auto_import_batch(
+        self, queue: str | None, repo: str, host: str, entries: list[RepoTask]
     ) -> None:
-        """Move one published brief into the queue: copy + commit the content
-        store first (the brief is durable from there), then remove the source
-        from the repo's ``main`` as a repo-executor job.
+        """Move the pass's fresh briefs into the queue: copy them all via the
+        manual import's own :func:`copy_repo_tasks` + commit the content store
+        once (the briefs are durable from there), then remove every source
+        from the repo's ``main`` in one repo-executor job — the manual
+        import's copy-then-remove shape, on the importer's clock.
 
         A brief whose exact text is already in the destination is not copied
         again — the operator drained it by hand at some point — but its source
@@ -868,45 +875,56 @@ class Reconciler:
         """
         label = queue_label(queue)
         tasks_rel = playlists_mod.tasks_rel(queue)
-        stem: str | None = None
-        if not entry.duplicate:
-            stem = await asyncio.to_thread(
-                partial(
-                    write_imported_brief,
-                    self._tasks_root,
-                    tasks_rel,
-                    name=entry.name,
-                    text=entry.text,
-                    repo=repo,
-                    source=entry.source,
-                    default_model=self._cfg.default_model,
-                )
-            )
+        # Rewrite every brief up front (normalised frontmatter + provenance
+        # stamp), then hand the batch to the manual import's own copy step:
+        # one write pass, one order append, one collision policy.
+        rewritten = [
+            replace(entry, text=imported_brief_text(
+                entry.text,
+                stem=entry.name,
+                repo=repo,
+                source=entry.source,
+                default_model=self._cfg.default_model,
+            ))
+            for entry in entries
+        ]
+        imported = await asyncio.to_thread(
+            copy_repo_tasks, self._tasks_root, tasks_rel, rewritten
+        )
+        stems: dict[str, str | None] = dict.fromkeys(e.source for e in entries)
+        stems.update(zip(
+            (e.source for e in rewritten if not e.duplicate),
+            (t["task"] for t in imported),
+            strict=True,
+        ))
+        if imported:
             await self._commit_store(
-                f"nightshift: auto-import {stem} from {repo}/{entry.source}"
+                "nightshift: auto-import "
+                f"{', '.join(t['task'] for t in imported)} from {repo}/{host}"
             )
         removal = await asyncio.wrap_future(self._executors.submit(repo, partial(
             remove_repo_tasks_locked,
             self._workspace,
             repo,
-            [entry.source],
-            f"nightshift: auto-import {entry.name} into queue {label}",
+            [entry.source for entry in entries],
+            f"nightshift: auto-import {len(entries)} brief(s) into queue {label}",
         )))
         if removal["warning"]:
             _log.warning("reconciler: auto-import: %s", removal["warning"])
-        await self._emit(
-            "queue_changed",
-            queue=queue,
-            task=stem,
-            payload={
-                "auto_imported": stem,
-                "repo": repo,
-                "host_queue": host,
-                "source": entry.source,
-                "removed": removal["removed"],
-                "warning": removal["warning"],
-            },
-        )
+        for entry in entries:
+            await self._emit(
+                "queue_changed",
+                queue=queue,
+                task=stems[entry.source],
+                payload={
+                    "auto_imported": stems[entry.source],
+                    "repo": repo,
+                    "host_queue": host,
+                    "source": entry.source,
+                    "removed": removal["removed"],
+                    "warning": removal["warning"],
+                },
+            )
 
     async def _commit_store(self, message: str) -> None:
         """Commit content-store churn as a tasks-repo executor job, mirroring

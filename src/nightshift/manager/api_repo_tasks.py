@@ -79,6 +79,7 @@ def register_repo_tasks_api(
             "source": e.source,
             "priority": e.priority,
             "disabled": e.disabled,
+            "quarantined": e.quarantined,
             "duplicate": e.duplicate,
         }
 

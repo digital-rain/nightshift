@@ -7,9 +7,7 @@ operator opens the picker and ticks briefs.
 A repo whose tooling publishes work continuously into `.tasks/<queue>/` needs
 that drain to happen on its own.
 
-Auto-import is the existing import machinery on a clock, taking one brief at a
-time so the host queue and the Nightshift queue take turns rather than one
-flooding the other.
+Auto-import is the existing import machinery on a clock: each pass drains everything fresh the host queue publishes, exactly as a manual import would, and the pass recurs on a cadence — so work published throughout the day keeps flowing in, and the host queue empties rather than backing up.
 
 ## Surface
 
@@ -53,8 +51,7 @@ would blink it out at exactly the moment auto-import had caught up. See
 **Cadences.**
 `cadences.auto_import_seconds` (default 60) is how often a bound queue checks
 its inbox.
-It is the latency of *noticing* new published work, not a dispatch rate: each
-check pulls at most one brief, and only once the previous one has run.
+It is the latency of *noticing* new published work: each open check drains every fresh brief the inbox publishes, and the next check picks up whatever was published since.
 
 ## Storage
 
@@ -63,7 +60,6 @@ check pulls at most one brief, and only once the previous one has run.
 | Repo switch | `<tasks_root>/config.json` (the store-level layer) | `auto_import_repos: ["longitude", …]` |
 | Host binding | `<tasks_root>/<queue>/config.json` | `host_queue: "longitude"` (`""` = explicit none) |
 | Provenance | the imported brief's own frontmatter | `imported_from: <repo>/<source-path>` |
-| Inherited hold | the imported brief's own frontmatter | `imported_hold: <publisher's quarantine reason>` |
 
 Both settings live in the content store, so they commit and travel with the
 rest of the queue configuration.
@@ -78,43 +74,36 @@ A workspace with no repo switched on makes no git call for the feature at all.
 Per bound queue, per pass:
 
 1. Skip unless the queue's repo has the switch on and is present.
-2. Skip if the queue still holds a *live* imported brief — the round-robin
-   gate (below).
-3. Discover the repo's host queues, resolve this queue's binding, and scan
+2. Discover the repo's host queues, resolve this queue's binding, and scan
    exactly that one inbox tree of the repo's `main`.
-4. Take the first brief whose source this queue has not already imported:
-   normalise its frontmatter, stamp its provenance, write it into the queue,
-   commit the content store.
-5. Remove the source from the repo's `main` as a repo-executor job.
+3. Take every fresh brief — skipping published quarantines (below) and any
+   source this queue has already imported: normalise each one's frontmatter,
+   stamp its provenance, write it into the queue appended to the end of the
+   execution order, then commit the content store once for the batch.
+4. Remove the batch's sources from the repo's `main` as one repo-executor job.
 
-Ordering matters and matches the manual import: the brief is durable in the
+Ordering matters and matches the manual import: the briefs are durable in the
 content store *before* the removal runs.
-A failed removal is a warning, never unwound. The still-published source is
-not pulled a second time: step 4 skips any source already stamped into this
+A failed removal is a warning, never unwound. The still-published sources are
+not pulled a second time: step 3 skips any source already stamped into this
 queue (`imported_from`), which is the check that has to do the work, because an
 import is rewritten on the way in and so never matches its source text
 verbatim.
 
-### Round-robin
+### FIFO drain
 
-Two rules together produce strict alternation:
+Imports append to the *end* of the destination queue's execution order, in the host queue's publish order — via the manual import's own copy step (`copy_repo_tasks`), so the two paths cannot drift.
+The queue's own tasks keep their places, so manually added work still runs exactly where the operator put it, and an operator who wants a pulled brief sooner re-prioritises it by hand — the same lever every task has.
+A queue holding `[n1, n2]` that drains `[h1, h2]` becomes `[n1, n2, h1, h2]`; an empty queue just starts the line.
 
-* **One in flight.** A queue holding a *live* imported brief pulls nothing
-  new. A landed task's brief is dropped from the store, so the usual reading of
-  "live" is just "the file is still there" — but the test is the same liveness
-  scan dispatch uses, so a brief that can no longer run (disabled, quarantined,
-  completed) does not hold the slot. Those flags are cleared by an operator and
-  never by a run, so gating on the file's mere presence would stall the inbox
-  indefinitely the first time somebody parked an import.
-* **Behind the head.** A new import is inserted one slot after whatever the
-  queue would dispatch next, not at the front.
+### Holds
 
-So a queue holding `[n1, n2, n3]` becomes `[n1, h1, n2, n3]`; `n1` runs, `h1`
-runs, the gate opens, and `[n2, n3]` becomes `[n2, h2, n3]`.
-Inserting at the front instead would displace a task already about to run;
-appending would let a busy queue starve its inbox indefinitely.
-An empty queue puts the import at the front — there is nothing to alternate
-with.
+A brief published `quarantined: true` is not imported at all.
+Quarantine is the publisher saying "do not run this", and Nightshift honours it at the door: the brief stays in the host queue, re-skipped on every pass and never removed, until the publisher clears the flag or deletes the file.
+(Nightshift's own quarantine stays reserved for a task *this* manager stopped — importing one would put a verdict in the queue that this History has no run behind.)
+The manual picker still offers such a brief, tagged `quarantined` and unticked by default, so importing one is a deliberate override rather than a side effect of drain-all.
+
+A brief published `disabled: true` *is* imported, flag intact: it queues here held, and waits for this operator's eye before it dispatches.
 
 ### Frontmatter
 
@@ -130,17 +119,7 @@ means nothing — both would block work that nobody downstream can unblock, so
 each takes the configured default instead.
 Agnostic model keywords (`auto`, `max`) and provider-qualified ids are kept.
 
-A published `quarantined: true` is demoted to `disabled: true`, and the
-publisher's `quarantine_reason` is preserved verbatim as `imported_hold`.
-Quarantine is a statement about a run *this* manager made: it names a run this
-History has no row for, and its reason points at logs held by whatever system
-published the brief. An operator meeting that task has no thread to pull.
-Disabled says what is actually true — the brief arrived held and wants an eye
-on it before it dispatches — and, unlike quarantine, reads as operator-owned
-rather than as a verdict Nightshift reached.
-Briefs that were not published held gain no flag keys they never had.
-
-Keys outside that set pass through untouched.
+Keys outside that set — a published `disabled` hold included — pass through untouched.
 They are inert to dispatch, and dropping them would lose author intent for
 fields Nightshift may learn later.
 

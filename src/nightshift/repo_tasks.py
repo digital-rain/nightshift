@@ -44,7 +44,12 @@ from nightshift.git.sync import sync_main_locked
 from nightshift.lifecycle import LAND_SUCCESS_KINDS, LandingMode
 from nightshift.playlists import is_valid_name
 from nightshift.queue_config import load_order, save_order
-from nightshift.spawn_daily import is_disabled, split_frontmatter, task_priority
+from nightshift.spawn_daily import (
+    is_disabled,
+    is_quarantined,
+    split_frontmatter,
+    task_priority,
+)
 from nightshift.task_files import resolve_title
 
 
@@ -76,6 +81,11 @@ class RepoTask:
     source: str
     priority: int
     disabled: bool
+    # Published ``quarantined: true`` — the publisher's "do not run this". The
+    # auto-importer refuses these outright (skipped, never removed); the manual
+    # picker still offers them, tagged and unticked, so importing one is a
+    # deliberate override of the publisher's hold.
+    quarantined: bool
     # Exact text already present in the destination queue: import removes the
     # source without writing a second copy (the idempotent-replay/crash-
     # recovery path).
@@ -223,6 +233,7 @@ def _scan_inboxes(
                 source=f"{inbox.path}/{name}",
                 priority=task_priority(meta),
                 disabled=is_disabled(meta),
+                quarantined=is_quarantined(meta),
                 duplicate=text in existing,
                 text=text,
             ))

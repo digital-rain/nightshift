@@ -6477,8 +6477,10 @@ function repoImportRow(t) {
   check.type = "checkbox";
   check.className = "repoimport-check";
   // Ticked by default: draining the whole inbox is the common case, so the
-  // operator de-selects the exceptions rather than picking one by one.
-  check.checked = true;
+  // operator de-selects the exceptions rather than picking one by one. A
+  // publisher-quarantined brief is the standing exception — importing it
+  // overrides the publisher's hold, so that is an opt-in tick, not a default.
+  check.checked = !t.quarantined;
   // `source` (the repo-relative path), not the task stem, is a brief's identity
   // in the inbox: the same stem can be published both flat and under the
   // queue's subdir, and those are two distinct briefs.
@@ -6493,6 +6495,12 @@ function repoImportRow(t) {
     tag.className = "addfrom-tag";
     tag.textContent = "in queue";
     tag.title = "Identical brief already in this queue — the repo copy will just be removed.";
+    li.append(tag);
+  } else if (t.quarantined) {
+    const tag = document.createElement("span");
+    tag.className = "addfrom-tag";
+    tag.textContent = "quarantined";
+    tag.title = "The publisher quarantined this brief — auto-import skips it; tick to import it anyway.";
     li.append(tag);
   } else if (t.disabled) {
     const tag = document.createElement("span");
