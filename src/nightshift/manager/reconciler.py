@@ -66,6 +66,7 @@ from nightshift import playlists as playlists_mod
 from nightshift import repos
 from nightshift.auto_import import (
     auto_import_repos,
+    blocking_imports,
     pending_imports,
     resolve_host_queue,
     write_imported_brief,
@@ -804,6 +805,11 @@ class Reconciler:
         using the feature makes no git call for it. The one-in-flight
         round-robin gate is checked *before* the inbox scan, so a queue still
         working through its previous pick costs nothing either.
+
+        The gate counts only *live* imports (:func:`blocking_imports`): a pick
+        that can no longer dispatch is out of the way, and the inbox keeps
+        draining. The full pending map still filters the scan, so a source
+        whose removal failed after its copy landed is not imported twice.
         """
         enabled = set(auto_import_repos(self._tasks_root))
         if not enabled:
@@ -823,9 +829,12 @@ class Reconciler:
             if not repos.repo_available(self._workspace, repo):
                 continue
             self._auto_import_checked_at[label] = now
-            # Round-robin: the host queue gets its next slot only once the
-            # previous pick has run (its brief is dropped on land).
-            if pending_imports(self._tasks_root, tasks_rel):
+            # Round-robin: the host queue gets its next slot once the previous
+            # pick has run (its brief is dropped on land) or has stopped being
+            # runnable at all (disabled/quarantined/completed — an operator
+            # owns it now, and waiting on it would stall the inbox).
+            pending = pending_imports(self._tasks_root, tasks_rel)
+            if blocking_imports(self._tasks_root, tasks_rel, pending):
                 continue
             available = await asyncio.to_thread(
                 list_repo_task_queues, self._workspace, repo
@@ -838,8 +847,12 @@ class Reconciler:
                 self._workspace, repo, host_inbox(host),
                 self._tasks_root, tasks_rel,
             )
-            if entries:
-                await self._auto_import_one(queue, repo, host, entries[0])
+            # Replay guard: a source already imported into this queue is still
+            # published only because its removal failed, so skip past it rather
+            # than running the same brief twice.
+            fresh = [e for e in entries if f"{repo}/{e.source}" not in pending]
+            if fresh:
+                await self._auto_import_one(queue, repo, host, fresh[0])
 
     async def _auto_import_one(
         self, queue: str | None, repo: str, host: str, entry: RepoTask

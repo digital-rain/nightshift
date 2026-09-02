@@ -20,15 +20,20 @@ of the queue configuration:
   always wants; an explicit empty string means "none, leave the inbox alone".
 
 **Round-robin.** A host queue must not starve the queue it feeds into, so the
-importer keeps at most one un-run imported brief in flight per queue
-(:func:`pending_imports`) and inserts each new one directly behind the
-destination queue's current head (:func:`insert_round_robin`).
+importer keeps at most one *live* imported brief in flight per queue
+(:func:`blocking_imports`) and inserts each new one directly behind the
+destination queue's current head (:func:`insert_round_robin`). Liveness, not
+mere presence, is the gate: a pick that can no longer dispatch (disabled,
+quarantined, completed) has had its turn, and holding the slot open for it
+would stall the inbox until an operator noticed.
 
 **Frontmatter.** Briefs in a repo's inbox are written by whoever publishes
 them, so their frontmatter is untrusted. :func:`normalize_frontmatter` fills
 in a title, model, priority, and target repo, replacing anything unusable with
 the resolved default rather than blocking the task on an authoring error
-nobody here can fix.
+nobody here can fix, and demotes a published quarantine to a plain disable —
+Nightshift's quarantine means *this* manager stopped the task, and inheriting
+the word from another system's run would claim a run this Nightshift never had.
 
 See ``docs/specs/2026-09-01-auto-import.md`` for the operator surface and the
 reasoning behind both rules.
@@ -68,6 +73,15 @@ HOST_QUEUE_KEY = "host_queue"
 # record, and the in-flight marker the round-robin reads (a brief carrying it
 # came from a host queue and has not run yet).
 PROVENANCE_KEY = "imported_from"
+
+# Stamped alongside :data:`PROVENANCE_KEY` when a published brief arrived
+# already quarantined: the publisher's verbatim reason, kept as provenance
+# after the flag itself is demoted to ``disabled`` (see
+# :func:`normalize_frontmatter`). Not ``quarantine_reason`` — that field
+# belongs to a quarantine this manager imposed, and leaving it set on a task
+# whose ``quarantined`` is false is the stale, misleading state the demotion
+# exists to avoid.
+IMPORTED_HOLD_KEY = "imported_hold"
 
 # Model keywords that pin nothing concrete (the scheduler's ``AGNOSTIC_MODELS``
 # vocabulary): a published ``model: auto`` is usable, not unrecognised.
@@ -160,15 +174,40 @@ def _normalized_model(raw: object, default_model: str) -> str:
     return default_model
 
 
+def _demote_quarantine(out: dict) -> None:
+    """Rewrite a published ``quarantined: true`` as ``disabled: true``.
+
+    A repo's inbox is often fed by another Nightshift-shaped system, and a
+    brief it quarantined carries the flag into the import verbatim. Inheriting
+    it is wrong twice over: this manager never ran the task, so the History
+    page has nothing to show behind the state, and ``quarantine_reason`` points
+    at run logs held somewhere else. Disabled says what is actually true — the
+    brief arrived held and wants an operator's eye before it dispatches — while
+    reserving quarantine for a task *this* manager stopped.
+
+    The publisher's reason survives verbatim under
+    :data:`IMPORTED_HOLD_KEY`. Mutates ``out``; a brief that was not published
+    quarantined is left exactly as it is, gaining no flag keys it never had.
+    """
+    if not out.get("quarantined"):
+        return
+    out["quarantined"] = False
+    out["disabled"] = True
+    reason = str(out.pop("quarantine_reason", "") or "").strip()
+    if reason:
+        out[IMPORTED_HOLD_KEY] = reason
+
+
 def normalize_frontmatter(
     meta: dict, *, stem: str, repo: str, default_model: str
 ) -> dict:
     """Fill in a published brief's frontmatter, replacing unusable values.
 
     Returns a new dict: ``title``/``model``/``priority``/``repo`` are always
-    present and always valid; every other key the publisher wrote is carried
-    through unchanged (inert to dispatch, and dropping it would lose author
-    intent for fields Nightshift may learn later).
+    present and always valid, and a published quarantine is demoted to a
+    disable (:func:`_demote_quarantine`); every other key the publisher wrote
+    is carried through unchanged (inert to dispatch, and dropping it would lose
+    author intent for fields Nightshift may learn later).
     """
     out = dict(meta)
     out["title"] = str(meta.get("title") or "").strip() or resolve_title(stem, {})
@@ -176,6 +215,7 @@ def normalize_frontmatter(
     out["priority"] = _normalized_priority(meta.get("priority"))
     published_repo = str(meta.get("repo") or "").strip()
     out["repo"] = published_repo if is_valid_repo_ref(published_repo) else repo
+    _demote_quarantine(out)
     return out
 
 
@@ -201,11 +241,16 @@ def imported_brief_text(
 def pending_imports(tasks_root: Path, tasks_rel: str) -> dict[str, str]:
     """Auto-imported briefs still sitting in a queue, ``provenance -> stem``.
 
-    A landed task's brief is dropped from the store, so a non-empty result
-    means the queue's previous host pick has not run yet — the round-robin
-    gate, and the replay guard for a removal that failed after the copy
-    succeeded (the source is still published, and re-importing it would run
-    the same work twice).
+    A landed task's brief is dropped from the store, so an entry here means
+    that source's import has not landed yet. This is the **replay guard**: a
+    removal that failed after the copy succeeded leaves the source published,
+    and re-importing it would run the same work twice. The importer keys that
+    check on the provenance string rather than on brief text, because an
+    auto-imported brief is rewritten on the way in (normalised frontmatter
+    plus the provenance stamp) and so never matches its source verbatim.
+
+    Presence here does *not* by itself hold the round-robin slot — see
+    :func:`blocking_imports`.
     """
     queue_dir = tasks_root / tasks_rel
     if not queue_dir.is_dir():
@@ -219,6 +264,26 @@ def pending_imports(tasks_root: Path, tasks_rel: str) -> dict[str, str]:
         if provenance:
             out[str(provenance)] = path.stem
     return out
+
+
+def blocking_imports(
+    tasks_root: Path, tasks_rel: str, pending: dict[str, str]
+) -> dict[str, str]:
+    """The subset of ``pending`` that still holds the round-robin slot.
+
+    An import holds the slot only while it can still dispatch. A pick the
+    queue will never run again — disabled (including a published quarantine
+    demoted on the way in, :func:`normalize_frontmatter`), quarantined by this
+    manager, or completed — has had its turn, and gating on its mere presence
+    would stall the host inbox indefinitely: those flags are cleared by an
+    operator, not by the run that would otherwise drop the brief.
+
+    Liveness is :func:`~nightshift.task_files.live_ordered_queue`, the same
+    scan dispatch itself uses, so the gate can never disagree with what the
+    queue would actually pick up.
+    """
+    live = set(live_ordered_queue(tasks_root, tasks_rel))
+    return {prov: stem for prov, stem in pending.items() if stem in live}
 
 
 def insert_round_robin(tasks_root: Path, tasks_rel: str, stem: str) -> list[str]:

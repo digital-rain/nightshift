@@ -47,6 +47,7 @@ check pulls at most one brief, and only once the previous one has run.
 | Repo switch | `<tasks_root>/config.json` (the store-level layer) | `auto_import_repos: ["longitude", …]` |
 | Host binding | `<tasks_root>/<queue>/config.json` | `host_queue: "longitude"` (`""` = explicit none) |
 | Provenance | the imported brief's own frontmatter | `imported_from: <repo>/<source-path>` |
+| Inherited hold | the imported brief's own frontmatter | `imported_hold: <publisher's quarantine reason>` |
 
 Both settings live in the content store, so they commit and travel with the
 rest of the queue configuration.
@@ -61,27 +62,34 @@ A workspace with no repo switched on makes no git call for the feature at all.
 Per bound queue, per pass:
 
 1. Skip unless the queue's repo has the switch on and is present.
-2. Skip if the queue still holds an un-run imported brief — the round-robin
+2. Skip if the queue still holds a *live* imported brief — the round-robin
    gate (below).
 3. Discover the repo's host queues, resolve this queue's binding, and scan
    exactly that one inbox tree of the repo's `main`.
-4. Take the first brief: normalise its frontmatter, stamp its provenance,
-   write it into the queue, commit the content store.
+4. Take the first brief whose source this queue has not already imported:
+   normalise its frontmatter, stamp its provenance, write it into the queue,
+   commit the content store.
 5. Remove the source from the repo's `main` as a repo-executor job.
 
 Ordering matters and matches the manual import: the brief is durable in the
 content store *before* the removal runs.
-A failed removal is a warning, never unwound — the round-robin gate stops the
-still-published source being pulled a second time while the first copy is
-waiting to run.
+A failed removal is a warning, never unwound. The still-published source is
+not pulled a second time: step 4 skips any source already stamped into this
+queue (`imported_from`), which is the check that has to do the work, because an
+import is rewritten on the way in and so never matches its source text
+verbatim.
 
 ### Round-robin
 
 Two rules together produce strict alternation:
 
-* **One in flight.** A queue holding an un-run imported brief pulls nothing
-  new. A landed task's brief is dropped from the store, so "un-run" is just
-  "the file is still there".
+* **One in flight.** A queue holding a *live* imported brief pulls nothing
+  new. A landed task's brief is dropped from the store, so the usual reading of
+  "live" is just "the file is still there" — but the test is the same liveness
+  scan dispatch uses, so a brief that can no longer run (disabled, quarantined,
+  completed) does not hold the slot. Those flags are cleared by an operator and
+  never by a run, so gating on the file's mere presence would stall the inbox
+  indefinitely the first time somebody parked an import.
 * **Behind the head.** A new import is inserted one slot after whatever the
   queue would dispatch next, not at the front.
 
@@ -105,6 +113,16 @@ would pin the task to something no worker advertises, and `priority: urgent`
 means nothing — both would block work that nobody downstream can unblock, so
 each takes the configured default instead.
 Agnostic model keywords (`auto`, `max`) and provider-qualified ids are kept.
+
+A published `quarantined: true` is demoted to `disabled: true`, and the
+publisher's `quarantine_reason` is preserved verbatim as `imported_hold`.
+Quarantine is a statement about a run *this* manager made: it names a run this
+History has no row for, and its reason points at logs held by whatever system
+published the brief. An operator meeting that task has no thread to pull.
+Disabled says what is actually true — the brief arrived held and wants an eye
+on it before it dispatches — and, unlike quarantine, reads as operator-owned
+rather than as a verdict Nightshift reached.
+Briefs that were not published held gain no flag keys they never had.
 
 Keys outside that set pass through untouched.
 They are inert to dispatch, and dropping them would lose author intent for

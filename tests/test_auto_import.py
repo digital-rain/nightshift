@@ -17,8 +17,10 @@ from starlette.testclient import TestClient
 from _workspace import build_workspace, git, git_commit_all
 from nightshift.auto_import import (
     HOST_QUEUE_KEY,
+    IMPORTED_HOLD_KEY,
     PROVENANCE_KEY,
     auto_import_repos,
+    blocking_imports,
     imported_brief_text,
     insert_round_robin,
     normalize_frontmatter,
@@ -193,6 +195,48 @@ def test_keywords_are_recognized_and_unknown_keys_pass_through() -> None:
     assert meta["after"] == "setup"
 
 
+def test_published_quarantine_is_demoted_to_a_disable() -> None:
+    """Quarantine is a statement about a run *this* manager made, and an
+    imported brief has none — its History would be empty and its
+    ``quarantine_reason`` would point at another system's logs. Disabled says
+    the true thing (arrived held, wants an operator) and, unlike quarantine,
+    does not hold the round-robin slot shut."""
+    meta = normalize_frontmatter(
+        {"quarantined": True, "quarantine_reason": "no progress after 2 runs"},
+        stem="held", repo="longitude", default_model="auto",
+    )
+    assert meta["quarantined"] is False
+    assert meta["disabled"] is True
+    # The publisher's reason survives verbatim, as provenance rather than as a
+    # claim about a quarantine this manager imposed.
+    assert meta[IMPORTED_HOLD_KEY] == "no progress after 2 runs"
+    assert "quarantine_reason" not in meta
+
+
+def test_demotion_leaves_an_unheld_brief_alone() -> None:
+    """No flag keys are invented for a brief that never carried them, and an
+    explicit ``quarantined: false`` is not promoted into a disable."""
+    for published in ({}, {"quarantined": False}):
+        meta = normalize_frontmatter(
+            dict(published), stem="s", repo="longitude", default_model="auto",
+        )
+        assert "disabled" not in meta
+        assert IMPORTED_HOLD_KEY not in meta
+
+
+def test_demotion_survives_the_brief_rewrite() -> None:
+    """End to end through :func:`imported_brief_text`, since that is what the
+    duty actually writes to disk."""
+    text = imported_brief_text(
+        "---\nquarantined: true\nquarantine_reason: budget\n---\n\nFix it.\n",
+        stem="held", repo="longitude",
+        source=".tasks/longitude/held.md", default_model="auto",
+    )
+    meta = split_frontmatter(text)[0]
+    assert (meta["quarantined"], meta["disabled"]) == (False, True)
+    assert meta[IMPORTED_HOLD_KEY] == "budget"
+
+
 # --------------------------------------------------------------------------- #
 # Round-robin placement
 # --------------------------------------------------------------------------- #
@@ -242,6 +286,29 @@ def test_pending_imports_reports_only_stamped_briefs(tmp_path: Path) -> None:
     assert pending_imports(_tasks_root(ws), "main") == {
         "longitude/.tasks/nightly/pulled.md": "pulled",
     }
+
+
+@pytest.mark.parametrize(("frontmatter", "blocks"), [
+    ("", True),
+    ("disabled: true\n", False),
+    ("quarantined: true\n", False),
+    ("completed: true\n", False),
+    ("failed: true\n", True),          # still dispatchable (Phase B retries it)
+])
+def test_only_a_live_import_holds_the_round_robin_slot(
+    tmp_path: Path, frontmatter: str, blocks: bool
+) -> None:
+    """The slot is held by a pick that can still run. One that cannot — held
+    by an operator, or already finished — has had its turn; waiting on it
+    would stall the inbox until somebody noticed, because those flags are
+    cleared by hand and not by the run that drops the brief."""
+    ws = build_workspace(tmp_path)
+    (_tasks_root(ws) / "main" / "pulled.md").write_text(
+        f"---\n{PROVENANCE_KEY}: longitude/.tasks/main/pulled.md\n{frontmatter}---\n\nwork\n"
+    )
+    pending = pending_imports(_tasks_root(ws), "main")
+    assert pending == {"longitude/.tasks/main/pulled.md": "pulled"}
+    assert bool(blocking_imports(_tasks_root(ws), "main", pending)) is blocks
 
 
 # --------------------------------------------------------------------------- #
@@ -313,6 +380,40 @@ def test_duty_holds_the_next_brief_until_the_last_one_has_run(imported) -> None:
     _open_throttle(client)
     _reconcile(client)
     assert _stems(ws) == ["beta", "native"]
+
+
+def test_a_held_import_does_not_stall_the_inbox(imported) -> None:
+    """The regression this pair of rules exists for. A pick that stops being
+    runnable used to hold the slot forever — its brief is dropped on land, and
+    a held task never lands — so the host queue silently stopped draining."""
+    ws, client = imported
+    _reconcile(client)
+    assert _stems(ws) == ["alpha", "native"]
+    # The operator (or the demotion above) parks the pulled brief. It stays in
+    # the queue, so it is still `pending`, but it can no longer dispatch.
+    alpha = _tasks_root(ws) / "main" / "alpha.md"
+    alpha.write_text("---\ndisabled: true\n" + alpha.read_text().split("---\n", 1)[1])
+    _open_throttle(client)
+    _reconcile(client)
+    assert _stems(ws) == ["alpha", "beta", "native"]
+
+
+def test_a_source_whose_removal_failed_is_not_imported_twice(imported) -> None:
+    """The replay guard, on the path the liveness gate opened up: the copy
+    landed but the removal did not, so the source is still published. It is
+    skipped by provenance — brief text cannot catch it, because an import is
+    rewritten on the way in and never matches its source verbatim."""
+    ws, client = imported
+    _reconcile(client)
+    published = ".tasks/main/alpha.md"
+    _publish(ws / "longitude", {published: "Do alpha.\n"}, message="removal failed")
+    # Park the import so the slot is free and the scan actually runs.
+    alpha = _tasks_root(ws) / "main" / "alpha.md"
+    alpha.write_text("---\ndisabled: true\n" + alpha.read_text().split("---\n", 1)[1])
+    _open_throttle(client)
+    _reconcile(client)
+    # `beta` is pulled past it; no second copy of alpha under a `-2` suffix.
+    assert _stems(ws) == ["alpha", "beta", "native"]
 
 
 def test_duty_never_drains_a_host_queue_this_queue_did_not_bind(imported) -> None:
