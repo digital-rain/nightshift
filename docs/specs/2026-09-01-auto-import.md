@@ -13,7 +13,8 @@ flooding the other.
 
 ## Surface
 
-Everything is on the Repos page (gear → Repos).
+The controls are all on the Repos page (gear → Repos); the state they
+produce is shown back on the queue itself.
 
 **Known repos.**
 Each row gains an `Auto-import .tasks` YES/NO segment.
@@ -33,6 +34,21 @@ on `main`.
   for the queues beside it.
 * A binding whose subdir is absent is preserved and shown tagged, the same way
   a queue's `repo` binding survives the repo being absent.
+
+**Badge.**
+A queue that is draining an inbox carries a green `A` badge — on its Playlists
+row, and beside the queue name in the queue chrome — titled with the inbox it
+drains. The controls sit two screens away from the queues they govern, so
+without it the switch has no visible effect at all: a queue with auto-import
+off is indistinguishable from one that has simply run dry, and turning it off
+is silent.
+
+The badge tracks configuration, not backlog: the repo's switch is on and the
+queue is not opted out. It deliberately does *not* consult what the repo is
+publishing right now, because a drained inbox is an empty directory and git
+carries no empty directories in a tree — keying the badge on availability
+would blink it out at exactly the moment auto-import had caught up. See
+`configured_host_queue` vs `resolve_host_queue`.
 
 **Cadences.**
 `cadences.auto_import_seconds` (default 60) is how often a bound queue checks

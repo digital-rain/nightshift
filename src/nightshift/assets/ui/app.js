@@ -875,6 +875,10 @@ async function loadPlaylists() {
   // or the failure policy quarantining a run — shows its pause icon here.
   if (state.view === "playlists") await refreshQueues();
   renderPlaylists();
+  // The queue chrome's auto-import badge reads the row this call just
+  // refreshed, so repaint it too -- otherwise toggling the switch on Repos
+  // leaves the header stale until something else happens to re-render it.
+  if (state.view === "queue") renderQueue();
 }
 
 // --------------------------------------------------------------------------
@@ -1468,6 +1472,37 @@ function ciBadge(ci) {
     ? `CI red: ${ci.detail} — dispatch held for this repo`
     : "CI red — dispatch held for this repo";
   return span;
+}
+
+// The auto-import badge: this queue is draining its repo's `.tasks/` inbox.
+// Returns null when it isn't, so both call sites can append unconditionally.
+//
+// Worth a badge of its own because auto-import is the one dispatch input with
+// no other trace on these screens -- a queue whose switch is off looks exactly
+// like one that has simply run dry, and the switch itself lives on Repos. It
+// carries a letter rather than a dot for the same reason `ciDot` carries a
+// title: green is the accent here, never the whole message, so the `title` and
+// `aria-label` name the inbox being drained.
+// The `/api/playlists` row for the queue in focus, or null for the main queue
+// (which the playlists list doesn't carry -- it is the "library" row, and has
+// no repo binding to auto-import from).
+function activePlaylistRow() {
+  if (!state.activePlaylist) return null;
+  return (state.playlists || []).find((p) => p.name === state.activePlaylist) || null;
+}
+
+function autoImportBadge(pl) {
+  if (!pl || !pl.auto_import) return null;
+  const badge = document.createElement("span");
+  badge.className = "badge auto-import";
+  badge.textContent = "A";
+  const source = pl.repo && pl.host_queue
+    ? `${pl.repo}/.tasks/${pl.host_queue}`
+    : "this queue’s repository inbox";
+  const label = `Auto-import on — draining ${source}`;
+  badge.title = label + ". Briefs arrive one at a time as runs complete.";
+  badge.setAttribute("aria-label", label);
+  return badge;
 }
 
 function renderRepos() {
@@ -2181,7 +2216,14 @@ function renderQueueNow() {
   ul.innerHTML = "";
   // Chrome: the active queue's name (playlist or main) above the list.
   const plLabel = $("queue-playlist");
-  if (plLabel) plLabel.textContent = state.activePlaylist || "Main queue";
+  // `textContent` clears the element, so the badge is re-appended every render
+  // rather than created once. The playlist row it reads from can be a poll
+  // behind on first paint; `loadPlaylists` re-renders this screen to catch up.
+  if (plLabel) {
+    plLabel.textContent = state.activePlaylist || "Main queue";
+    const badge = autoImportBadge(activePlaylistRow());
+    if (badge) plLabel.append(badge);
+  }
   // Count the same "up next" set the Now screen shows (pending = not the live
   // track, not disabled) so the two queue counts always agree.
   const pending = upNextItems().length;
@@ -4034,6 +4076,8 @@ function playlistRow(pl) {
   const count = `${pl.task_count} ${pl.task_count === 1 ? "task" : "tasks"}`;
   meta.textContent = active ? `${count} \u00b7 active queue` : count;
   main.append(name, meta);
+  const autoImport = autoImportBadge(pl);
+  if (autoImport) main.append(autoImport);
   if (state.players[pl.name] && PAUSE_REASON_COPY[state.players[pl.name].pause_reason]) {
     const badge = document.createElement("span");
     badge.className = "badge paused-failures";

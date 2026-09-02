@@ -614,3 +614,99 @@ def test_partial_removal_failure_does_not_re_import(tmp_path, monkeypatch) -> No
 
 def _failed_removal(*args, **kwargs) -> dict:
     return {"removed": False, "warning": "removal failed"}
+
+
+# --------------------------------------------------------------------------- #
+# The playlists payload — the operator's only view of the switch
+# --------------------------------------------------------------------------- #
+#
+# Auto-import decides whether a queue keeps refilling itself, but until the
+# badge it left no mark on the Playlists screen: a queue with the switch off
+# looked exactly like one that had run dry, and the switch lives on Repos, two
+# screens away. `/api/playlists` therefore carries the same two-part answer
+# `/api/repos` computes — the repo's switch is on *and* this queue resolves a
+# host queue — so the two pages can never disagree about it.
+
+
+def _badge_workspace(tmp_path: Path, *, queue_config: dict | None = None) -> Path:
+    """A workspace with a *named* playlist ("side") bound to `longitude`, which
+    publishes a matching `.tasks/side` inbox. Named, not "main": the playlists
+    list excludes the default queue (it is the separate "library" row)."""
+    ws = build_workspace(
+        tmp_path,
+        queues={"side": {"tasks": {}, "config": {"repo": "longitude", "order": [],
+                                                 **(queue_config or {})}}},
+    )
+    _publish(ws / "longitude", {".tasks/side/alpha.md": "Do alpha.\n"})
+    return ws
+
+
+def _playlist_row(ws: Path, name: str = "side") -> dict:
+    with TestClient(create_app(ws, store=SqliteStore())) as client:
+        rows = {p["name"]: p for p in client.get("/api/playlists").json()}
+    return rows[name]
+
+
+def test_playlist_carries_its_auto_import_binding(tmp_path: Path) -> None:
+    ws = _badge_workspace(tmp_path)
+    set_auto_import(_tasks_root(ws), "longitude", True)
+    row = _playlist_row(ws)
+    assert row["auto_import"] is True
+    assert row["host_queue"] == "side"
+    assert row["repo"] == "longitude"
+
+
+def test_playlist_reports_no_auto_import_while_the_switch_is_off(tmp_path: Path) -> None:
+    """The switch alone decides it: the repo still publishes `.tasks/side`, and
+    the queue still resolves to it — the badge is off because the operator's
+    switch is, which is exactly the state that is otherwise invisible."""
+    ws = _badge_workspace(tmp_path)
+    row = _playlist_row(ws)
+    assert row["auto_import"] is False
+    assert row["host_queue"] is None
+
+
+def test_an_explicit_none_binding_keeps_the_badge_off(tmp_path: Path) -> None:
+    """`host_queue: ""` is the explicit "this queue does not drain", and it
+    holds even with the repo's switch on — so the badge tracks the resolved
+    binding rather than the repo-level switch."""
+    ws = _badge_workspace(tmp_path, queue_config={"host_queue": ""})
+    set_auto_import(_tasks_root(ws), "longitude", True)
+    row = _playlist_row(ws)
+    assert row["auto_import"] is False
+    assert row["host_queue"] is None
+
+
+def test_the_badge_survives_an_empty_inbox(tmp_path: Path) -> None:
+    """The badge reports the standing binding, not this instant's backlog.
+
+    An empty inbox is the normal steady state — auto-import pulls one brief at
+    a time and deletes each source, and a drained directory stops existing in
+    the repo tree at all. Reporting the switch as off there would blink the
+    badge out precisely when it had finished its work, and the operator would
+    read that as "it stopped".
+    """
+    ws = build_workspace(
+        tmp_path,
+        queues={"side": {"tasks": {}, "config": {"repo": "longitude", "order": []}}},
+    )
+    _publish(ws / "longitude", {".tasks/other/alpha.md": "Do alpha.\n"})
+    set_auto_import(_tasks_root(ws), "longitude", True)
+    row = _playlist_row(ws)
+    assert row["auto_import"] is True
+    assert row["host_queue"] == "side"
+
+
+def test_a_drained_inbox_keeps_the_badge_on(tmp_path: Path) -> None:
+    """The same rule, exercised through the importer rather than a fixture: the
+    startup pass pulls the queue's only brief and removes the source, emptying
+    `.tasks/side`. The badge must still be on afterwards."""
+    ws = _badge_workspace(tmp_path)
+    set_auto_import(_tasks_root(ws), "longitude", True)
+    with TestClient(create_app(ws, store=SqliteStore())) as client:
+        _reconcile(client)
+        tree = git(ws / "longitude", "ls-tree", "-r", "--name-only", "main").splitlines()
+        assert ".tasks/side/alpha.md" not in tree, "the brief should have been pulled"
+        row = {p["name"]: p for p in client.get("/api/playlists").json()}["side"]
+    assert row["auto_import"] is True
+    assert row["host_queue"] == "side"

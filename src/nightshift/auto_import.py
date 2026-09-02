@@ -122,6 +122,33 @@ def set_auto_import(tasks_root: Path, repo: str, enabled: bool) -> list[str]:
     return out
 
 
+def configured_host_queue(queue_config: dict, queue_label: str) -> str | None:
+    """The host queue this queue is *configured* to drain, independent of what
+    its repo happens to be publishing right now.
+
+    The same precedence :func:`resolve_host_queue` applies, minus that
+    function's availability filter: an explicit name, ``None`` for the explicit
+    ``""`` opt-out, else the default binding (the subdir named after the
+    queue).
+
+    The two answers differ only for the default binding, and only when the
+    inbox is empty — but that difference matters to anything *describing* the
+    configuration rather than acting on it. A drained inbox is an empty
+    directory, and git carries no empty directories in a tree, so the subdir
+    stops existing the moment auto-import catches up. The importer wants the
+    strict answer (there is nothing to read this pass); an operator display
+    wants the standing one, or it reports the switch as off exactly when the
+    feature has finished doing its job.
+    """
+    raw = queue_config.get(HOST_QUEUE_KEY)
+    if raw is None:
+        return queue_label
+    name = str(raw).strip()
+    if not name or not is_valid_name(name):
+        return None
+    return name
+
+
 def resolve_host_queue(
     queue_config: dict, queue_label: str, *, available: list[str]
 ) -> str | None:
@@ -138,13 +165,15 @@ def resolve_host_queue(
       the repo publishes one. This is the spec's default binding (queue
       ``longitude`` drains ``.tasks/longitude``) and the reason the common
       case needs no configuration at all.
+
+    See :func:`configured_host_queue` for the same binding without the
+    availability filter the third case applies.
     """
-    raw = queue_config.get(HOST_QUEUE_KEY)
-    if raw is None:
-        return queue_label if queue_label in available else None
-    name = str(raw).strip()
-    if not name or not is_valid_name(name):
+    name = configured_host_queue(queue_config, queue_label)
+    if name is None:
         return None
+    if queue_config.get(HOST_QUEUE_KEY) is None:
+        return name if name in available else None
     return name
 
 

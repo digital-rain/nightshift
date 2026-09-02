@@ -23,6 +23,7 @@ from nightshift import repos
 from nightshift.auto_import import (
     HOST_QUEUE_KEY,
     auto_import_repos,
+    configured_host_queue,
     resolve_host_queue,
     set_auto_import,
 )
@@ -127,11 +128,25 @@ def register_playlist_api(
         keeping this playlist's tasks out of dispatch. Without it a held
         playlist is indistinguishable from an idle one -- these holds never
         reach ``/api/blocked``, which filters on ``state = 'blocked'``.
+
+        And ``auto_import`` / ``host_queue`` / ``repo``: whether this queue is
+        draining a repo inbox, and which one. ``auto_import`` is true exactly
+        when ``host_queue`` resolved, so the badge is never on while naming
+        nothing.
         """
         store = _store()
         entries = playlists_mod.list_playlists(tasks_root)
         monitored = _monitored_repo_names()
         ci_rows = await store.repo_ci() if monitored else {}
+        # Auto-import is the one dispatch input with no trace on this page: a
+        # queue whose inbox is being drained looks exactly like one whose
+        # switch is off, and the switch lives two screens away on Repos. Two
+        # parts, both configuration -- the repo's switch is on, and this queue
+        # is not opted out of a binding -- so the answer is a config read, no
+        # `ls-tree`: this endpoint is polled every 20s per browser, and the
+        # standing binding is what an operator display wants anyway (see
+        # `configured_host_queue`).
+        enabled = set(auto_import_repos(tasks_root))
         # A repo-level hold stops a playlist dispatching without changing
         # anything the row already shows, so the playlist just goes quiet.
         # Count the held tasks per queue and carry the reason, so the page can
@@ -152,6 +167,14 @@ def register_playlist_api(
             if hold and hold["kind"] == TaskHoldKind.CI_RED and row:
                 hold = {**hold, "detail": row.get("detail"), "url": row.get("url")}
             entry["hold"] = hold
+            host_queue = (
+                configured_host_queue(cfg, entry["name"])
+                if repo and repo in enabled
+                else None
+            )
+            entry["auto_import"] = host_queue is not None
+            entry["host_queue"] = host_queue
+            entry["repo"] = repo
         return JSONResponse(entries)
 
     @app.post("/api/playlists")

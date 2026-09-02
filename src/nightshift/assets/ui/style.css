@@ -1518,6 +1518,22 @@ body[data-view="detail"] #screen-detail { display: flex; flex: 1; }
    never reach the Blocked page, so the row badge is their only surface. */
 .badge.hold-ci { color: var(--err); border-color: var(--err); }
 .badge.hold-repo { color: var(--text-dim); border-color: var(--border); }
+/* Auto-import: this queue is draining its repo's `.tasks/` inbox. Green like
+   the other "healthy and working" signals, and tabular so the single letter
+   sits centred in the pill rather than riding the baseline off-centre. */
+.badge.auto-import {
+  color: var(--ok);
+  border-color: var(--ok);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+/* In the queue chrome the badge rides beside the h2, which sets its own large
+   type -- reset to the badge's own scale and lift it off the heading baseline. */
+.queue-playlist .badge.auto-import {
+  margin-left: 8px;
+  font-size: 11px;
+  vertical-align: middle;
+}
 /* Read-only workspace path (operator config — never edited from the UI). */
 .repos-workspace-row {
   display: flex;

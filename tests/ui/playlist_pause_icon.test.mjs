@@ -33,6 +33,9 @@ const pausedSrc = slice("function isQueuePaused(name) {", "function currentTaskR
 // playlistSpinner through playlistPauseButton — the row's two paused affordances.
 const glyphSrc = slice("function playlistSpinner(running, paused) {", "function renderPlaylists()");
 const ciDotSrc = slice("function ciDot(ciState) {", "const CHART_PALETTE");
+// The row also carries the auto-import badge; sliced in real rather than
+// stubbed so this test keeps seeing the same children the page renders.
+const badgeSrc = slice("function activePlaylistRow() {", "function renderRepos() {");
 const rowSrc = slice("function playlistRow(pl) {", "// Fill the add-queue repo dropdown");
 
 // The icon must be the shipped transport pause glyph, not a test stand-in.
@@ -97,6 +100,7 @@ function buildRow(players, pl = { name: "nightly", task_count: 3 }) {
      ${pausedSrc}
      ${glyphSrc}
      ${ciDotSrc}
+     ${badgeSrc}
      ${rowSrc}
      return { playlistRow, isQueuePaused };`,
   );
