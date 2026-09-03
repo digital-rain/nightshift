@@ -184,6 +184,10 @@ function expando(caption, { open = true, subtitle = "", accessory = null } = {})
 const STATE_LABELS = {
   pending: "Queued",
   blocked: "Blocked",
+  // An operator-disabled task is held out of scheduling indefinitely — it reads
+  // as "Disabled" on the muted pill rather than the blue "Queued", so the row
+  // needs no second badge to say the same thing.
+  disabled: "Disabled",
   quarantined: "Quarantined",
   failed: "Failed",
   running: "Running",
@@ -2264,6 +2268,11 @@ function queueRowAside(item, isNow) {
   else if (item.completed) status = "completed";
   else if (item.quarantined) status = "quarantined";
   else if (item.failed) status = "failed";
+  // Disabled is the operator's own hold — mutually exclusive with the flags
+  // above (the status segmented control enforces that), and it outranks any
+  // prior run record because the row's one status display is now the only
+  // place the row says the task won't run.
+  else if (item.disabled) status = "disabled";
   // A blocked overlay is the task's current, actionable state — it must win
   // over a stale prior run record (an earlier attempt that got the task
   // blocked would otherwise mask the "Blocked" badge behind its "Error").
@@ -2384,12 +2393,8 @@ function queueItemRow(item) {
     badge.title = `Workflow: ${item.workflow}`;
     li.append(badge);
   }
-  if (item.disabled) {
-    const badge = document.createElement("span");
-    badge.className = "badge";
-    badge.textContent = "disabled";
-    li.append(badge);
-  }
+  // No "disabled" badge here: the status display carries that state (see
+  // `queueRowAside`), and one row shouldn't say it twice.
   if (item.quarantined) {
     const badge = document.createElement("span");
     badge.className = "badge quarantined";

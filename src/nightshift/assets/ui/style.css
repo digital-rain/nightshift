@@ -860,7 +860,9 @@ body {
 .status.running, .status.pending { background: var(--accent-soft); color: var(--running); }
 .status.completed { background: rgba(91, 209, 139, 0.16); color: var(--ok); }
 .status.error { background: rgba(240, 120, 111, 0.16); color: var(--err); }
-.status.skipped, .status.stopped { background: var(--bg-sunken); color: var(--text-dim); }
+/* `disabled` shares the inert gray of the other "this isn't going to run"
+   states, so a disabled row reads as held rather than queued. */
+.status.skipped, .status.stopped, .status.disabled { background: var(--bg-sunken); color: var(--text-dim); }
 .status.paused { background: rgba(230, 192, 104, 0.16); color: var(--warn); }
 .status.aborted { background: rgba(230, 192, 104, 0.16); color: var(--warn); }
 .status.quarantined { background: rgba(230, 172, 64, 0.16); color: #e6ac40; }

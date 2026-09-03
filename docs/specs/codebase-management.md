@@ -281,6 +281,7 @@ All codebase management surfaces talk to the manager HTTP API only.
 | `blocked` | DB overlay | Blocked | blocked styling |
 | `failed` | Frontmatter (`failed: true`) | Failed | `.status.error` |
 | `quarantined` | Frontmatter (`quarantined: true`) | Quarantined | quarantined styling |
+| `disabled` | Frontmatter (`disabled: true`) | Disabled | `.status.disabled` |
 | (normal) | — | Queued / Running / … | per existing status map |
 
 **Frontmatter is the single source of truth** for `quarantined` and `failed` states. The manager writes these flags directly to the task's `.md` file. The DB overlay is used only for `blocked` and `repo_unavailable` states. See `docs/topics/task-state-handling.md` for details.

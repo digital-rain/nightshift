@@ -190,9 +190,13 @@ Display status priority in the queue rows and detail pane:
 1. `completed` → Completed
 2. `quarantined` → Quarantined
 3. `failed` → Failed (`.status.error` treatment)
-4. Latest run record → run status
+4. `disabled` → Disabled (`.status.disabled`, the inert gray treatment)
 5. `blockedTasks[task]` (from `/api/blocked`) → Blocked / Paused
-6. default → Pending
+6. Latest run record → run status
+7. default → Pending
+
+A disabled queue row carries no separate "disabled" badge — the status display
+is the single place the row reports that state.
 
 The status segmented control offers Ready / Disabled / Quarantine / Failed / Completed as mutually exclusive options. Paused queues show an amber banner with reason-specific copy (`PAUSE_REASON_COPY`) and an amber "paused" badge in the playlists view:
 
