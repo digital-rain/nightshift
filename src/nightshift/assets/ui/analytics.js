@@ -695,6 +695,216 @@
     container.append(panel);
   }
 
+  // ---- CI failures & resolutions (reliability) ---------------------------- //
+
+  const DAY_MS = 86400000;
+
+  // Cap on the per-day chart's x-axis. Every window but "All" is bounded at
+  // 30 days, so this only bites the unbounded one — where a year of mostly
+  // empty columns would compress the interesting bars to nothing.
+  const CI_TREND_DAYS = 60;
+
+  function mean(values) {
+    if (!values.length) return null;
+    return values.reduce((s, v) => s + v, 0) / values.length;
+  }
+
+  function isoDay(ms) {
+    return new Date(ms).toISOString().slice(0, 10);
+  }
+
+  // Continuous day keys covering [firstMs, lastMs]. The trend panel above
+  // plots only the days that carry runs, which is honest for an average but
+  // wrong for a *rate*: a week with one bad Tuesday would read as a week of
+  // daily failures. The quiet days have to be drawn as zeroes.
+  function dayRange(firstMs, lastMs) {
+    const t1 = Math.floor(lastMs / DAY_MS) * DAY_MS;
+    let t0 = Math.floor(firstMs / DAY_MS) * DAY_MS;
+    if (t1 < t0) return { keys: [], truncated: false };
+    const truncated = Math.round((t1 - t0) / DAY_MS) + 1 > CI_TREND_DAYS;
+    if (truncated) t0 = t1 - (CI_TREND_DAYS - 1) * DAY_MS;
+    const keys = [];
+    for (let t = t0; t <= t1; t += DAY_MS) keys.push(isoDay(t));
+    return { keys, truncated };
+  }
+
+  // A CI failure is one auto-spawned resolution BRIEF, not one attempt. The
+  // gate dedupes to a single open fix per red sha, and a fix that fails is
+  // retried under that same brief — so counting attempts would report one
+  // stubborn failure as several. Fold the CI slice's attempts back into one
+  // episode per task:
+  //
+  //   start — the first attempt's start. The closest stand-in for the failure
+  //           itself: the gate spawns the brief on the tick that finds main
+  //           red, and no detection timestamp is recorded anywhere on the
+  //           attempt, so everything downstream of here is a lower bound.
+  //   end   — the finish of the earliest attempt that landed; null while the
+  //           failure is still open.
+  function ciEpisodes(runs) {
+    const byTask = new Map();
+    for (const r of runs.filter(isTerminal).filter(isCiResolution)) {
+      if (isNaN(Date.parse(r.started_at))) continue;
+      const key = r.task || "—";
+      if (!byTask.has(key)) byTask.set(key, []);
+      byTask.get(key).push(r);
+    }
+    const episodes = [];
+    for (const [task, list] of byTask) {
+      let start = null;
+      let end = null;
+      for (const r of list) {
+        const t0 = Date.parse(r.started_at);
+        if (!isNaN(t0) && (start === null || t0 < start)) start = t0;
+        if (!r.landed) continue;
+        const t1 = Date.parse(r.finished_at);
+        if (!isNaN(t1) && (end === null || t1 < end)) end = t1;
+      }
+      if (start === null) continue;
+      episodes.push({
+        task,
+        start,
+        end,
+        attempts: list.length,
+        resolved: end !== null,
+        ttr: end !== null && end >= start ? (end - start) / 1000 : null,
+      });
+    }
+    return episodes.sort((a, b) => a.start - b.start);
+  }
+
+  // Intervals between consecutive failures, in seconds — the TTF series. n
+  // episodes yield n-1 gaps, so a window holding a single failure has no
+  // measurable interval rather than an interval of zero.
+  function ciGaps(episodes) {
+    const gaps = [];
+    for (let i = 1; i < episodes.length; i++) {
+      gaps.push((episodes[i].start - episodes[i - 1].start) / 1000);
+    }
+    return gaps;
+  }
+
+  // Denominator for the per-day rates: the selected window's own length, so
+  // "failures / day" answers the question the window asked. "All" has no
+  // length, so it falls back to the span the failures themselves cover. Never
+  // below a day — a 24h window with three failures reads "3 / day", not "72".
+  function ciWindowDays(episodes, hours) {
+    if (hours) return hours / 24;
+    if (episodes.length < 2) return 1;
+    return Math.max(1, (episodes[episodes.length - 1].start - episodes[0].start) / DAY_MS);
+  }
+
+  function ciReliability(episodes, hours) {
+    const resolved = episodes.filter((e) => e.resolved);
+    const days = ciWindowDays(episodes, hours);
+    const gaps = ciGaps(episodes);
+    const ttrs = resolved.map((e) => e.ttr).filter(hasNum);
+    return {
+      failures: episodes.length,
+      resolutions: resolved.length,
+      open: episodes.length - resolved.length,
+      resolveRate: episodes.length ? resolved.length / episodes.length : null,
+      attempts: episodes.reduce((n, e) => n + e.attempts, 0),
+      days,
+      failuresPerDay: episodes.length / days,
+      resolutionsPerDay: resolved.length / days,
+      avgTtr: mean(ttrs),
+      ttrCount: ttrs.length,
+      avgTtf: mean(gaps),
+      ttfCount: gaps.length,
+    };
+  }
+
+  // How often main breaks and how long it stays broken — the reliability half
+  // of the CI story, next to renderCiResolution's cost half. One card strip
+  // over the whole window, one bar-chart strip breaking it down per day.
+  // Renders nothing until the window holds a tagged CI-resolution run.
+  function renderCiReliability(container, runs, hours) {
+    const episodes = ciEpisodes(runs);
+    if (!episodes.length) return;
+    const rel = ciReliability(episodes, hours);
+
+    const panel = el("div", "an-panel");
+    panel.append(el("h3", "an-panel-title", "CI failures & resolutions"));
+
+    const row = el("div", "an-kpi-row");
+    row.append(kpiCard(
+      "CI failures",
+      String(rel.failures),
+      rel.attempts + (rel.attempts === 1 ? " fix attempt" : " fix attempts")
+    ));
+    row.append(kpiCard(
+      "Resolved",
+      String(rel.resolutions),
+      rel.resolveRate !== null
+        ? fmtPct(rel.resolveRate) + " of failures · " + rel.open + " still open"
+        : "—"
+    ));
+    row.append(kpiCard(
+      "Failures / day",
+      fmtNum(rel.failuresPerDay, 2),
+      fmtNum(rel.resolutionsPerDay, 2) + " resolved / day over " + fmtNum(rel.days, 1) + "d"
+    ));
+    row.append(kpiCard(
+      "TTR",
+      fmtDur(rel.avgTtr),
+      rel.ttrCount
+        ? "mean over " + rel.ttrCount + " resolved"
+        : "nothing resolved in this window"
+    ));
+    row.append(kpiCard(
+      "TTF",
+      fmtDur(rel.avgTtf),
+      rel.ttfCount
+        ? "mean over " + rel.ttfCount + (rel.ttfCount === 1 ? " interval" : " intervals")
+        : "one failure — no interval yet"
+    ));
+    panel.append(row);
+
+    // The chart's x-axis runs from the first failure to the last thing that
+    // happened (a resolution can land after the final failure started), so a
+    // fix that closes out the window still gets a column to sit in.
+    const lastMs = episodes.reduce((m, e) => Math.max(m, e.end || e.start), episodes[0].start);
+    const { keys: days, truncated } = dayRange(episodes[0].start, lastMs);
+    if (days.length >= 2) {
+      const failByDay = new Map();
+      const resByDay = new Map();
+      const ttrByDay = new Map();
+      const ttfByDay = new Map();
+      const push = (m, k, v) => {
+        if (!m.has(k)) m.set(k, []);
+        m.get(k).push(v);
+      };
+      episodes.forEach((e, i) => {
+        push(failByDay, isoDay(e.start), e);
+        if (i > 0) push(ttfByDay, isoDay(e.start), (e.start - episodes[i - 1].start) / 1000);
+        if (!e.resolved) return;
+        // Resolutions bucket by the day they closed, not the day they broke:
+        // "how many did we clear today" is the question this row answers.
+        push(resByDay, isoDay(e.end), e);
+        if (hasNum(e.ttr)) push(ttrByDay, isoDay(e.end), e.ttr);
+      });
+      const count = (m, d) => (m.get(d) || []).length;
+      const avg = (m, d) => mean(m.get(d) || []) || 0;
+      const fmtCount = (v) => fmtNum(v, 0);
+
+      panel.append(el("div", "an-subhead", "Per day"));
+      const grid = el("div", "an-trend-grid");
+      grid.append(trendCell("CI failures", days.map((d) => count(failByDay, d)), days, fmtCount));
+      grid.append(trendCell("Resolutions", days.map((d) => count(resByDay, d)), days, fmtCount));
+      grid.append(trendCell("Time to resolution", days.map((d) => avg(ttrByDay, d)), days, fmtDur));
+      grid.append(trendCell("Time between failures", days.map((d) => avg(ttfByDay, d)), days, fmtDur));
+      panel.append(grid);
+    }
+
+    panel.append(el("div", "an-note",
+      "One failure is one auto-spawned resolution brief; retries of the same fix fold into it. "
+      + "TTR runs from the first fix attempt's start to the landing attempt's finish — the gate "
+      + "records no separate detection time, so it under-counts however long main sat red before "
+      + "the check reported. TTF is the interval between consecutive failures inside this window."
+      + (truncated ? " Charts show the last " + CI_TREND_DAYS + " days." : "")));
+    container.append(panel);
+  }
+
   // ---- waste panel ------------------------------------------------------- //
 
   function renderWaste(container, runs) {
@@ -1324,6 +1534,7 @@
       renderTimeBreakdown(body, "Time by queue", taskCurrent, (r) => r.queue);
       renderEnhancement(body, taskCurrent);
       renderCiResolution(body, current);
+      renderCiReliability(body, ciCurrent, hours);
       renderWaste(body, taskCurrent);
       renderRunShape(body, taskCurrent);
       renderTurnComposition(body, taskCurrent);
