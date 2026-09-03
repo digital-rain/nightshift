@@ -256,10 +256,12 @@ body {
 .queue-play.paused { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
 .queue-play.paused:hover { color: var(--accent); border-color: var(--accent); }
 .queue-upnext { margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
-/* Sort toggle in line with the UP NEXT title: a borderless icon button that
-   lights up (accent) when priority sort is active. */
-.queue-sort {
-  margin-left: auto;
+/* The UP NEXT header's toggles (hide-disabled, sort) ride together at the right
+   end of the title row. */
+.queue-upnext-actions { margin-left: auto; display: inline-flex; align-items: center; gap: 2px; }
+/* Toggles in line with the UP NEXT title: borderless icon buttons that light up
+   (accent) while their filter/sort is active. */
+.queue-icon-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -272,9 +274,9 @@ body {
   color: var(--text-dim);
   cursor: pointer;
 }
-.queue-sort svg { width: 18px; height: 18px; display: block; }
-.queue-sort:hover { color: var(--accent); border-color: var(--border); }
-.queue-sort.active { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.queue-icon-btn svg { width: 18px; height: 18px; display: block; }
+.queue-icon-btn:hover { color: var(--accent); border-color: var(--border); }
+.queue-icon-btn.active { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
 .add-menu-wrap { position: relative; }
 .add-menu {
   position: absolute;

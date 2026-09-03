@@ -198,6 +198,11 @@ Display status priority in the queue rows and detail pane:
 A disabled queue row carries no separate "disabled" badge — the status display
 is the single place the row reports that state.
 
+Disabled tasks stay in the UP NEXT list by default (they are edited from their row, so hiding them by fiat would strand them).
+The UP NEXT header's eye toggle (`#queue-hide-disabled`, beside the sort control) filters them out for the session; the crossed-out eye lights up while rows are being held back, and the empty line says so when the filter is what emptied the list.
+Everything that acts on rows — keyboard navigation, Delete, the row menu — reads the same filtered set (`visibleQueueItems()`), and toggling the filter drops any selection it hides, so a filtered-out task is never the silent target of a visible action.
+The `(n)` count beside UP NEXT is unaffected: it tracks what will run (`upNextItems()`), which already excludes disabled tasks.
+
 The status segmented control offers Ready / Disabled / Quarantine / Failed / Completed as mutually exclusive options. Paused queues show an amber banner with reason-specific copy (`PAUSE_REASON_COPY`) and an amber "paused" badge in the playlists view:
 
 | Reason | Banner |

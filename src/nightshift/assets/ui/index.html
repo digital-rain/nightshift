@@ -140,14 +140,29 @@
         </div>
         <div id="queue-pause-banner" class="pause-banner" hidden></div>
         <h2 class="queue-upnext">UP NEXT <span id="queue-count" class="count"></span>
-          <button id="queue-sort" type="button" class="queue-sort"
-                  title="Sort by priority" aria-pressed="false">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M4 6h11M4 12h7M4 18h3" />
-              <path d="M18 8l3-3 3 3M21 5v13" />
-            </svg>
-          </button>
+          <!-- Header controls, right-aligned as a pair: filter out the disabled
+               rows, and switch between manual and priority order. -->
+          <div class="queue-upnext-actions">
+            <!-- Ships with the open eye (rows showing); `syncHideDisabledButton`
+                 swaps in the crossed-out one once the filter is on. -->
+            <button id="queue-hide-disabled" type="button" class="queue-icon-btn"
+                    title="Hide disabled tasks" aria-label="Hide disabled tasks"
+                    aria-pressed="false">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                   stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z" />
+                <circle cx="12" cy="12" r="3" />
+              </svg>
+            </button>
+            <button id="queue-sort" type="button" class="queue-icon-btn"
+                    title="Sort by priority" aria-pressed="false">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                   stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M4 6h11M4 12h7M4 18h3" />
+                <path d="M18 8l3-3 3 3M21 5v13" />
+              </svg>
+            </button>
+          </div>
         </h2>
         <ul id="queue" class="queue"></ul>
         <p id="queue-empty" class="empty" hidden>No pending tasks.</p>

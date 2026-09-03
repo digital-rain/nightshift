@@ -63,6 +63,7 @@ const state = {
   view: "now",
   queue: [],
   sortMode: "manual",    // active queue's sort mode: "manual" (drag order) or "priority"
+  hideDisabled: false,   // UP NEXT list: drop disabled tasks from the rows when true
   playPriorities: [],    // play-priority filter (0-5 levels allowed to play); [] = all
   runs: [],
   playlists: [],         // [{name, task_count, disabled}]
@@ -1901,6 +1902,16 @@ function upNextItems() {
   );
 }
 
+// The queue rows the UP NEXT list is currently showing. Disabled tasks stay in
+// the list by default — they are still editable there, and hiding them by fiat
+// would strand them somewhere the operator can't see. The header's eye toggle
+// filters them out when a long queue's held rows are just noise; everything
+// that acts on rows (keyboard nav, Delete, the row menu) reads this same set,
+// so a filtered-out task is never the silent target of a visible action.
+function visibleQueueItems() {
+  return state.hideDisabled ? state.queue.filter((i) => !i.disabled) : state.queue;
+}
+
 function renderNow() {
   renderList("now-body", renderNowInner);
 }
@@ -2242,10 +2253,49 @@ function renderQueueNow() {
       ? "Sorted by priority — click for manual (drag) order"
       : "Manual order — click to sort by priority";
   }
+  syncHideDisabledButton();
   syncQueuePlayButton();
-  $("queue-empty").hidden = state.queue.length > 0;
-  for (const item of state.queue) ul.append(queueItemRow(item));
+  const items = visibleQueueItems();
+  // The empty line has to explain itself when the filter is what emptied the
+  // list — "No pending tasks." would otherwise read as an empty queue while
+  // disabled rows sit hidden behind the toggle.
+  const empty = $("queue-empty");
+  empty.hidden = items.length > 0;
+  empty.textContent = state.hideDisabled && state.queue.length
+    ? "All tasks are disabled — click the eye to show them."
+    : "No pending tasks.";
+  for (const item of items) ul.append(queueItemRow(item));
   renderPauseBanner("queue-pause-banner");
+}
+
+// The UP NEXT header's hide-disabled toggle: an open eye while disabled rows are
+// showing (click to hide them), a crossed-out eye, lit, while they are filtered
+// out — so the button states what the list is doing, not just what it offers.
+function syncHideDisabledButton() {
+  const btn = $("queue-hide-disabled");
+  if (!btn) return;
+  const hiding = state.hideDisabled;
+  btn.innerHTML = hiding ? EYE_OFF_ICON : EYE_ICON;
+  btn.classList.toggle("active", hiding);
+  btn.setAttribute("aria-pressed", hiding ? "true" : "false");
+  const title = hiding
+    ? "Disabled tasks hidden — click to show them"
+    : "Hide disabled tasks";
+  btn.title = title;
+  btn.setAttribute("aria-label", title);
+}
+
+// Flip the filter. The cursor may be sat on a row that just disappeared, so drop
+// any selection the filter no longer shows before re-rendering — otherwise a
+// following Delete or "…" action would fire at an invisible row.
+function toggleHideDisabled() {
+  state.hideDisabled = !state.hideDisabled;
+  const visible = new Set(visibleQueueItems().map((i) => i.task));
+  for (const task of [...state.selectedTasks]) {
+    if (!visible.has(task)) state.selectedTasks.delete(task);
+  }
+  if (state.selectedTask && !visible.has(state.selectedTask)) state.selectedTask = null;
+  renderQueue();
 }
 
 // The right-hand block of a queue row: a status display sat just left of the
@@ -2461,7 +2511,7 @@ function selectQueueTask(task, { extend = false } = {}) {
 // falling back to the single cursor row. Empty when nothing is selected.
 function deleteTargets() {
   if (state.selectedTasks.size) {
-    return state.queue.map((i) => i.task).filter((t) => state.selectedTasks.has(t));
+    return visibleQueueItems().map((i) => i.task).filter((t) => state.selectedTasks.has(t));
   }
   return state.selectedTask ? [state.selectedTask] : [];
 }
@@ -2472,7 +2522,7 @@ function deleteTargets() {
 function menuTargets(task) {
   if (state.selectedTasks.has(task) && state.selectedTasks.size > 1) {
     // Preserve queue order so reorders (play next/last) are deterministic.
-    return state.queue.map((i) => i.task).filter((t) => state.selectedTasks.has(t));
+    return visibleQueueItems().map((i) => i.task).filter((t) => state.selectedTasks.has(t));
   }
   return [task];
 }
@@ -2799,7 +2849,7 @@ function cssEscape(s) {
 // stepping through it covers all three. Unlike a click this never opens the
 // detail pane — it just moves the selection cursor and keeps it in view.
 function moveQueueSelection(delta) {
-  const tasks = state.queue.map((i) => i.task);
+  const tasks = visibleQueueItems().map((i) => i.task);
   if (!tasks.length) return;
   let idx = tasks.indexOf(state.selectedTask);
   if (idx === -1) idx = delta > 0 ? -1 : 0;
@@ -7448,6 +7498,9 @@ function wire() {
   // UP NEXT sort toggle: manual (drag) order <-> priority sort.
   const sortBtn = $("queue-sort");
   if (sortBtn) sortBtn.addEventListener("click", toggleSortMode);
+  // UP NEXT eye toggle: show <-> hide the disabled rows.
+  const hideDisabledBtn = $("queue-hide-disabled");
+  if (hideDisabledBtn) hideDisabledBtn.addEventListener("click", toggleHideDisabled);
   // Play-priority filter: [ALL|P0..P5] multi-select. ALL clears the filter;
   // each Pn toggles that level in/out of the set.
   const playFilter = $("play-filter");
