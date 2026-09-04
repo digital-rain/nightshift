@@ -498,13 +498,13 @@
     if (aggByDay.some((a) => a.valRuns > 0)) {
       grid.append(trendCell("Validation/task", aggByDay.map((a) => a.avgValidate || 0), days, fmtDur));
     }
-    // CI-resolution row: what the gate cost per day. Conditional like the
-    // phase splits above -- a workspace with CI monitoring off would otherwise
-    // carry three permanently flat charts.
+    // CI-resolution row: what the gate cost per day, and how often it fired.
+    // Conditional like the phase splits above -- a workspace with CI monitoring
+    // off would otherwise carry three permanently flat charts.
     const ciByDayAgg = days.map((d) => aggregate(dayRuns(ciByDay, d)));
     if (ciByDayAgg.some((a) => a.runs > 0)) {
       grid.append(trendCell("Spend on CI resolution", ciByDayAgg.map((a) => a.cost || 0), days, fmtMoney));
-      grid.append(trendCell("Avg tokens/CI resolution", ciByDayAgg.map((a) => a.avgTokens || 0), days, fmtTokens));
+      grid.append(trendCell("Avg Resolutions/day", ciByDayAgg.map((a) => a.runs || 0), days, (v) => String(Math.round(v))));
       grid.append(trendCell("Avg time/CI resolution", ciByDayAgg.map((a) => a.avgDuration || 0), days, fmtDur));
     }
     panel.append(grid);

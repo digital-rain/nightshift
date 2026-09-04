@@ -280,10 +280,12 @@ test("the CI card and the fleet cards do not blend the two workloads", () => {
   assert.doesNotMatch(ciText, /Cost to clear CI {2}\$1\.47/);
 });
 
-test("the CI trend row renders spend, tokens and time per day", () => {
+test("the CI trend row renders spend, resolution count and time per day", () => {
   assert.match(ciText, /Spend on CI resolution/);
-  assert.match(ciText, /Avg tokens\/CI resolution/);
+  assert.match(ciText, /Avg Resolutions\/day/);
   assert.match(ciText, /Avg time\/CI resolution/);
+  // One CI resolution yesterday, two today -- a count, not a token average.
+  assert.match(ciText, /Avg Resolutions\/day.*1.*2 \(latest day\)/s);
   // The CI row shares the task slice's x-axis: yesterday's lone CI run is
   // $0.20, today's two are $0.80, read against the same two days as the rows
   // above it.
