@@ -737,6 +737,30 @@ def test_create_and_edit_reject_malformed_repo_without_orphan(tmp_path: Path) ->
         assert "repo: longitude" in (main_dir / f"{slug}.md").read_text()
 
 
+def test_create_persists_the_priority_chosen_in_the_create_pane(tmp_path: Path) -> None:
+    # The priority picked on create is written to the new brief's frontmatter —
+    # the operator should not have to create the task and then edit it to move
+    # it off the default P5.
+    workspace = _seed(tmp_path, {})
+    main_dir = workspace / "nightshift-tasks" / "main"
+    with _client(workspace) as client:
+        r = client.post("/api/tasks", json={"title": "Urgent", "text": "x", "priority": 3})
+        assert r.status_code == 200
+        slug = r.json()["task"]
+        assert "priority: 3" in (main_dir / f"{slug}.md").read_text()
+        assert client.get(f"/api/tasks/{slug}").json()["frontmatter"]["priority"] == 3
+
+        # Omitting it writes no key at all (a hand-authored brief's default).
+        plain = client.post("/api/tasks", json={"title": "Whenever", "text": "x"})
+        assert "priority:" not in (main_dir / f"{plain.json()['task']}.md").read_text()
+
+        # An out-of-range priority is a 400 that never orphans a brief.
+        before = {p.name for p in main_dir.glob("*.md")}
+        bad = client.post("/api/tasks", json={"title": "Nope", "text": "x", "priority": 9})
+        assert bad.status_code == 400
+        assert {p.name for p in main_dir.glob("*.md")} == before
+
+
 def test_blocked_submit_records_reason_without_landing(tmp_path: Path) -> None:
     workspace = _seed(tmp_path, {"10.hello": "Do a thing."})
     tasks_root = workspace / "nightshift-tasks"

@@ -123,6 +123,10 @@ class TaskCreate(BaseModel):
     # Optional per-task repo override (defaults to the queue's repo). Written as
     # an editable frontmatter meta key on the new brief.
     repo: str | None = None
+    # Dispatch priority chosen in the create pane (0 = highest … 5 = lowest).
+    # Omitted ⇒ no ``priority`` key is written and the brief inherits
+    # ``spawn_daily.DEFAULT_PRIORITY`` like any hand-authored task.
+    priority: int | None = None
     loop: bool | None = None
     loop_max_iterations: int | None = None
     # Workflow selection (§3.2): the definition name (empty/None = no workflow)
@@ -450,11 +454,15 @@ def register_operator_api(
     async def post_task(body: TaskCreate, queue: str | None = None) -> JSONResponse:
         target = _resolve_queue(queue)
         target_rel = playlists_mod.tasks_rel(target)
-        # Validate the optional repo override *before* writing the brief so a
-        # malformed ref is a clean 400 that never orphans a file in the content
-        # store (matches the legacy server and the contract's edit-time guard).
+        # Validate the optional repo override and priority *before* writing the
+        # brief so a malformed value is a clean 400 that never orphans a file in
+        # the content store (matches the legacy server and the contract's
+        # edit-time guard).
         try:
             repo_override = normalize_repo(body.repo)
+            priority = (
+                None if body.priority is None else _validate_priority(body.priority)
+            )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         # Enhance-on-create: the rewrite happens BEFORE the file exists, so a
@@ -514,11 +522,13 @@ def register_operator_api(
                 **enhance_telemetry,
             )
         # Apply optional frontmatter fields from the create pane (repo
-        # override, loop mode, enhancement attribution) to the freshly
-        # created file.
+        # override, priority, loop mode, enhancement attribution) to the
+        # freshly created file.
         meta_changes: dict[str, object | None] = {}
         if repo_override is not None:
             meta_changes["repo"] = repo_override
+        if priority is not None:
+            meta_changes["priority"] = priority
         if body.loop is not None:
             meta_changes["loop"] = body.loop
         if body.loop_max_iterations is not None:
