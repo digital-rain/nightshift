@@ -19,8 +19,22 @@
  * A normalized run record (both adapters must produce this shape):
  *   { task, queue, model, backend, worker_id, status, landed (bool),
  *     turns, input_tokens, output_tokens, cache_read_input_tokens,
- *     cache_creation_input_tokens, cost_usd, usage, failure_kind,
+ *     cache_creation_input_tokens, cost_usd, billing, usage, failure_kind,
  *     started_at, finished_at, timings, kind }
+ *
+ * `billing` says which account paid for `cost_usd`: "api" (a vendor API key
+ * was billed), "subscription" (a subscription login -- the `claude` CLI still
+ * reports a `total_cost_usd`, but it is notional list price, not money spent),
+ * or null/absent when the backend cannot say. Rollup rule, applied identically
+ * here, in the SQL stats views and in the worker's local stats:
+ *
+ *   `subscription` -> notional; `api` -> actual; `None` (every pre-existing
+ *   record, and backends that cannot say) -> actual. Conservative: an
+ *   unattributed dollar is counted as real money, so the actual figure can
+ *   only overstate. September stays readable as the API spend it was.
+ *
+ * `cost` below stays the total of every `cost_usd` regardless of billing, so
+ * every KPI built on it keeps its pre-split meaning.
  *
  * `kind` is the brief's classification ("ci_resolution" for the gate's
  * auto-spawned fixes, null otherwise). Both adapters carry it: the manager
@@ -146,6 +160,11 @@
     const terminal = runs.filter(isTerminal);
     const landed = terminal.filter((r) => r.landed);
     let cost = 0;
+    // The billing split over the same terminal runs: actual money vs the
+    // notional list price of subscription runs. See the rollup rule up top.
+    let actualCost = 0;
+    let notionalCost = 0;
+    let unattributedRuns = 0;
     let inTok = 0;
     let outTok = 0;
     let cacheRead = 0;
@@ -168,6 +187,11 @@
       const c = num(r.cost_usd);
       cost += c;
       if (hasNum(r.cost_usd)) costRuns++;
+      if (r.billing === "subscription") notionalCost += c;
+      else {
+        actualCost += c;
+        if (!r.billing && hasNum(r.cost_usd)) unattributedRuns++;
+      }
       inTok += totalInput(r);
       outTok += num(r.output_tokens);
       cacheRead += num(r.cache_read_input_tokens);
@@ -202,6 +226,9 @@
       landedRuns: landed.length,
       landRate,
       cost,
+      actualCost,
+      notionalCost,
+      unattributedRuns,
       landedCost,
       costPerLanded: landed.length ? landedCost / landed.length : null,
       avgTokens: terminal.length ? (inTok + outTok) / terminal.length : null,
@@ -326,10 +353,21 @@
     const row = el("div", "an-kpi-row");
     row.append(
       kpiCard(
-        "Total spend",
-        cur.hasCost ? fmtMoney(cur.cost) : "—",
-        cur.hasCost ? fmtMoney(cur.landedCost) + " on landed" : cur.runs + " runs",
-        deltaBadge(cur.cost, prior.cost, { lowerIsBetter: true })
+        // Money actually spent. Subscription runs report a list price the
+        // operator never paid, so they are reported apart on the sub-line
+        // rather than summed into the headline figure.
+        "Actual spend",
+        cur.hasCost ? fmtMoney(cur.actualCost) : "—",
+        cur.hasCost
+          ? (cur.notionalCost > 0
+            ? "+ " + fmtMoney(cur.notionalCost) + " notional (subscription)"
+            : fmtMoney(cur.landedCost) + " on landed") +
+            // How much of "actual" is really unattributed (no billing stamp).
+            (cur.unattributedRuns > 0
+              ? " · " + cur.unattributedRuns + " unattributed"
+              : "")
+          : cur.runs + " runs",
+        deltaBadge(cur.actualCost, prior.actualCost, { lowerIsBetter: true })
       )
     );
     row.append(

@@ -13,6 +13,11 @@ from pathlib import Path
 from typing import Any
 
 from nightshift import backends as backends_mod
+from nightshift.billing import (
+    CLAUDE_BILLING_MODES,
+    DEFAULT_CLAUDE_BILLING,
+    billing_setting,
+)
 from nightshift.config.io import load_dotenv, load_json, save_json, worker_json_path
 from nightshift.config.meta import meta
 from nightshift.config.player import parse_si_int
@@ -142,6 +147,15 @@ class WorkerConfig:
         category="Models", label="Model timeout seconds",
         desc="Global wall-clock bound for any backend run. 0 = no timeout.",
         apply="restart", env="NIGHTSHIFT_MODEL_TIMEOUT_SECONDS"))
+    claude_billing: str = field(default=DEFAULT_CLAUDE_BILLING, metadata=meta(
+        category="Models", label="Claude billing",
+        desc=(
+            "How claude-code runs on this worker authenticate the claude CLI: "
+            "subscription (the CLI's claude.ai login; the Anthropic API key is "
+            "removed from the CLI's environment), api (ANTHROPIC_API_KEY is "
+            "passed through and billed), or auto (subscription when `claude "
+            "auth status` reports a claude.ai login, else api with a warning)."),
+        apply="restart", options=list(CLAUDE_BILLING_MODES)))
 
     quarantine: bool = field(default=False, metadata=meta(
         category="Execution policy", label="Quarantine mode",
@@ -347,6 +361,7 @@ def load_worker_config(workspace: Path) -> WorkerConfig:
             or local.get("model_timeout_seconds")
             or 0.0
         ),
+        claude_billing=billing_setting(local),
         quarantine=_parse_bool(
             os.environ.get("NIGHTSHIFT_WORKER_QUARANTINE"),
             local.get("quarantine", False),
@@ -406,6 +421,7 @@ def save_worker_config(workspace: Path, config: WorkerConfig) -> None:
         "auto_model": config.auto_model,
         "max_model": config.max_model,
         "model_timeout_seconds": config.model_timeout_seconds,
+        "claude_billing": config.claude_billing,
         "quarantine": config.quarantine,
         "worker_url": config.worker_url,
         "ui_host": config.ui_host,

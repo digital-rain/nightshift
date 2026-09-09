@@ -78,6 +78,9 @@ PREVIOUS_SUBMIT_PAYLOAD_KEYS = frozenset({
     # Additive telemetry: the per-phase wall-clock split the worker loop
     # measures (None on payloads from older workers — wire-compat).
     "timings",
+    # Additive telemetry: which account paid for the run ("api" /
+    # "subscription" / None). None on payloads from older workers.
+    "billing",
 })
 
 # The envelope the loop adds around the Outcome (lease/task identity + the
@@ -109,6 +112,9 @@ PREVIOUS_LOCAL_FINISH_KEYS = frozenset({
     # worker UI's Stats page reads it to keep reactive fix work out of ordinary
     # throughput, exactly as the manager's does.
     "kind",
+    # Additive telemetry: the billing attribution the backend stamped, so the
+    # worker's own Stats page can split actual spend from notional.
+    "billing",
 })
 
 
@@ -232,6 +238,9 @@ def test_local_finish_record_carries_analytics_fields(tmp_path: Path) -> None:
         # runs out of every ordinary panel and reports them on their own, so a
         # record without it silently files reactive fix work as throughput.
         "kind",
+        # The billing attribution: without it every subscription dollar would
+        # be summed into the actual-spend figure as if it were money spent.
+        "billing",
     }
     client = _CapturingClient()
     cfg = WorkerConfig(workspace=tmp_path, worker_id="w1", manager_url="http://x")
@@ -279,13 +288,52 @@ def test_telemetry_slice_matches_the_old_worker_submit_repack() -> None:
         "cache_read_input_tokens": 200, "cache_creation_input_tokens": 100,
         "usage": {"input_tokens": 1500},
         "cost_usd": 0.09, "validate_cmd": "just validate", "worktree": "/w/t",
-        "timings": None,
+        "timings": None, "billing": None,
     }
     assert set(Telemetry.model_fields) == {
         "turns", "input_tokens", "output_tokens",
         "cache_read_input_tokens", "cache_creation_input_tokens", "usage",
-        "cost_usd", "validate_cmd", "worktree", "timings",
+        "cost_usd", "validate_cmd", "worktree", "timings", "billing",
     }
+
+
+def test_billing_flows_from_telemetry_through_every_derived_shape(
+    tmp_path: Path,
+) -> None:
+    """``Telemetry.billing`` is inherited by ``Outcome``, so it must reach the
+    submit body, the store's updatable-column allowlist and the worker's local
+    record without any of them naming it — the four shapes that would silently
+    drop a subscription dollar into the actual-spend total if it didn't."""
+    from nightshift.manager.store import ATTEMPT_UPDATABLE_FIELDS
+    from nightshift.manager.wire import SubmitBody
+
+    assert "billing" in Outcome.model_fields
+    assert "billing" in SubmitBody.model_fields
+    assert "billing" in ATTEMPT_UPDATABLE_FIELDS
+    # Absent-in-JSON ⇒ None (records that predate the field).
+    assert Outcome.model_validate({"status": "completed"}).billing is None
+
+    client = _CapturingClient()
+    cfg = WorkerConfig(workspace=tmp_path, worker_id="w1", manager_url="http://x")
+    local = LocalStore(tmp_path)
+    loop = WorkerLoop(cfg, client, local)
+    order = {
+        "run_id": "r1", "lease_id": "l1", "task": "10.demo",
+        "queue": "main", "repo": "longitude", "title": "demo",
+    }
+    local.begin(
+        run_id="r1", task="10.demo", queue="main", title="demo",
+        model="claude-code/claude-opus-5", backend="claude-code",
+        repo="longitude",
+    )
+    loop._submit(order, Outcome(
+        status=RunStatus.COMPLETED, result_line="validated", landable=True,
+        model="claude-code/claude-opus-5", backend="claude-code",
+        cost_usd=1.25, billing="subscription",
+    ))
+    assert client.payload is not None
+    assert client.payload["billing"] == "subscription"
+    assert local.history()[0]["billing"] == "subscription"
 
 
 def test_enum_values_are_todays_wire_strings() -> None:

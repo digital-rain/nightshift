@@ -270,6 +270,11 @@ function historyRow(r) {
   return row;
 }
 
+function money(v) {
+  const n = Number(v || 0);
+  return "$" + (Number.isFinite(n) ? n : 0).toFixed(2);
+}
+
 async function refreshHistory() {
   try {
     const [rows, stats] = await Promise.all([
@@ -281,6 +286,10 @@ async function refreshHistory() {
     document.getElementById("st-done").textContent = stats.completed || 0;
     document.getElementById("st-err").textContent = stats.errored || 0;
     document.getElementById("st-loc").textContent = stats.total_loc || 0;
+    // Actual vs notional: the CLI reports a dollar figure under a subscription
+    // login too, but no money changed hands there — never sum the two.
+    document.getElementById("st-actual").textContent = money(stats.actual_cost_usd);
+    document.getElementById("st-notional").textContent = money(stats.notional_cost_usd);
     const list = document.getElementById("history-list");
     list.innerHTML = "";
     const empty = document.getElementById("history-empty");

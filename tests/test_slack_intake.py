@@ -271,3 +271,45 @@ def test_enqueue_writes_directive_frontmatter(tmp_path: Path) -> None:
     assert "automerge: true" in text
     assert "loc: 50" in text
     assert "after: foo" in text
+
+
+# --------------------------------------------------------------------------- #
+# The claude-code normaliser goes through the backend's billing seam
+# --------------------------------------------------------------------------- #
+
+
+def test_claude_normalise_routes_through_the_backend_seam(monkeypatch) -> None:
+    """No private `claude -p` spawn: the rewrite runs on ClaudeCodeBackend's
+    print-mode seam with the runner config, so the declared claude_billing
+    decides what the CLI sees."""
+    import nightshift.backends as backends_mod
+    from nightshift.slack.intake import ClaudeNormaliseBackend
+
+    captured: dict = {}
+
+    def fake_complete_text(self, system, user, *, model, env, timeout, config=None):
+        captured.update(system=system, user=user, model=model, config=config)
+        return '{"title": "Fix the thing", "body": "Do it properly."}', {}
+
+    monkeypatch.setattr(backends_mod.ClaudeCodeBackend, "complete_text", fake_complete_text)
+    backend = ClaudeNormaliseBackend(
+        config={"claude_billing": "subscription", "model": "claude-sonnet-4-6"},
+    )
+    assert backend.normalise("pls fix the thing") == ("Fix the thing", "Do it properly.")
+    assert captured["config"]["claude_billing"] == "subscription"
+    assert captured["model"] == "claude-sonnet-4-6"
+    assert captured["user"] == "pls fix the thing"
+    assert "STRICT JSON" in captured["system"]
+
+
+def test_claude_normalise_falls_back_on_transport_error(monkeypatch) -> None:
+    import nightshift.backends as backends_mod
+    from nightshift.agent.transport import TransportError
+    from nightshift.slack.intake import ClaudeNormaliseBackend
+
+    def boom(self, *a, **k):
+        raise TransportError("claude_billing=api but ANTHROPIC_API_KEY is not set")
+
+    monkeypatch.setattr(backends_mod.ClaudeCodeBackend, "complete_text", boom)
+    title, body = ClaudeNormaliseBackend(config={}).normalise("Fix the widget\n\nIt is broken.")
+    assert title and body  # the heuristic split, never a hard failure

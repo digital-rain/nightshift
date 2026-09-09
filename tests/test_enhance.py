@@ -158,7 +158,8 @@ def test_claude_code_model_runs_the_cli_tool_less(
         " Fix the ops screen ",
         "make it nicer\n",
         model="claude-code/claude-sonnet-4-6",
-        env={"PATH": "/usr/bin"},
+        env={"PATH": "/usr/bin", "ANTHROPIC_API_KEY": "sk-leak"},
+        config={"claude_billing": "subscription"},
     )
 
     argv = captured["argv"]
@@ -175,6 +176,9 @@ def test_claude_code_model_runs_the_cli_tool_less(
     # A scratch cwd, so no unrelated project CLAUDE.md joins the rewrite.
     assert captured["cwd"] != str(Path.cwd())
     assert captured["timeout"] == enhance_mod.ENHANCE_TIMEOUT_SECONDS
+    # Subscription billing: the key never reaches the CLI's environment.
+    assert "ANTHROPIC_API_KEY" not in captured["env"]
+    assert captured["env"]["PATH"] == "/usr/bin"
 
     assert result.text == "A rewritten, self-contained brief."
     assert result.model == "claude-code/claude-sonnet-4-6"
@@ -187,7 +191,10 @@ def test_claude_code_cli_error_payload_raises(monkeypatch: pytest.MonkeyPatch) -
         backends_mod.subprocess, "run", _fake_run({}, _Proc(stdout=payload))
     )
     with pytest.raises(EnhanceError, match="credit balance too low"):
-        enhance_brief("T", "body", model="claude-code/claude-sonnet-4-6", env={})
+        enhance_brief(
+            "T", "body", model="claude-code/claude-sonnet-4-6", env={},
+            config={"claude_billing": "subscription"},
+        )
 
 
 def test_claude_code_nonzero_exit_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -197,7 +204,10 @@ def test_claude_code_nonzero_exit_raises(monkeypatch: pytest.MonkeyPatch) -> Non
         _fake_run({}, _Proc(returncode=1, stderr="unknown option --tools")),
     )
     with pytest.raises(EnhanceError, match="unknown option"):
-        enhance_brief("T", "body", model="claude-code/claude-sonnet-4-6", env={})
+        enhance_brief(
+            "T", "body", model="claude-code/claude-sonnet-4-6", env={},
+            config={"claude_billing": "subscription"},
+        )
 
 
 def test_claude_code_unparseable_output_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -205,7 +215,10 @@ def test_claude_code_unparseable_output_raises(monkeypatch: pytest.MonkeyPatch) 
         backends_mod.subprocess, "run", _fake_run({}, _Proc(stdout="not json"))
     )
     with pytest.raises(EnhanceError, match="unparseable"):
-        enhance_brief("T", "body", model="claude-code/claude-sonnet-4-6", env={})
+        enhance_brief(
+            "T", "body", model="claude-code/claude-sonnet-4-6", env={},
+            config={"claude_billing": "subscription"},
+        )
 
 
 def test_claude_code_empty_result_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -214,7 +227,10 @@ def test_claude_code_empty_result_raises(monkeypatch: pytest.MonkeyPatch) -> Non
         backends_mod.subprocess, "run", _fake_run({}, _Proc(stdout=payload))
     )
     with pytest.raises(EnhanceError, match="empty rewrite"):
-        enhance_brief("T", "body", model="claude-code/claude-sonnet-4-6", env={})
+        enhance_brief(
+            "T", "body", model="claude-code/claude-sonnet-4-6", env={},
+            config={"claude_billing": "subscription"},
+        )
 
 
 def test_claude_code_timeout_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -223,7 +239,10 @@ def test_claude_code_timeout_raises(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(backends_mod.subprocess, "run", boom)
     with pytest.raises(EnhanceError, match="timed out"):
-        enhance_brief("T", "body", model="claude-code/claude-sonnet-4-6", env={})
+        enhance_brief(
+            "T", "body", model="claude-code/claude-sonnet-4-6", env={},
+            config={"claude_billing": "subscription"},
+        )
 
 
 def test_claude_code_missing_binary_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -232,7 +251,10 @@ def test_claude_code_missing_binary_raises(monkeypatch: pytest.MonkeyPatch) -> N
 
     monkeypatch.setattr(backends_mod.subprocess, "run", boom)
     with pytest.raises(EnhanceError, match="not found"):
-        enhance_brief("T", "body", model="claude-code/claude-sonnet-4-6", env={})
+        enhance_brief(
+            "T", "body", model="claude-code/claude-sonnet-4-6", env={},
+            config={"claude_billing": "subscription"},
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -265,3 +287,29 @@ def test_unsupported_provider_names_what_works(
     monkeypatch.setattr(backends_mod.subprocess, "run", _unreachable)
     with pytest.raises(EnhanceError, match="claude-code"):
         enhance_brief("T", "body", model=model, env={})
+
+
+def test_claude_code_api_mode_forwards_the_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        backends_mod.subprocess, "run", _fake_run(captured, _Proc(stdout=_CLI_OK))
+    )
+    enhance_brief(
+        "T", "body", model="claude-code/claude-sonnet-4-6",
+        env={"PATH": "/usr/bin", "ANTHROPIC_API_KEY": "sk-real"},
+        config={"claude_billing": "api"},
+    )
+    assert captured["env"]["ANTHROPIC_API_KEY"] == "sk-real"
+
+
+def test_claude_code_unsatisfiable_billing_is_an_enhance_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(backends_mod.subprocess, "run", _unreachable)
+    # A non-empty env with no key: an empty env would inherit the process
+    # environment, where `just` may have loaded a real key from .env.
+    with pytest.raises(EnhanceError, match="claude_billing=api"):
+        enhance_brief(
+            "T", "body", model="claude-code/claude-sonnet-4-6",
+            env={"PATH": "/usr/bin"}, config={"claude_billing": "api"},
+        )

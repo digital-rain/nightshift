@@ -14,8 +14,11 @@ from pathlib import Path
 
 import uvicorn
 
+from nightshift.billing import describe_claude_billing
 from nightshift.config.manager import load_manager_config
 from nightshift.manager.app import create_app
+from nightshift.model_id import provider_of
+from nightshift.prompts import resolve_claude_bin
 from nightshift.restart import re_exec
 
 
@@ -34,6 +37,11 @@ def main(argv: list[str] | None = None) -> int:
     # ``$HOME`` rather than being treated as a relative dir joined to the cwd.
     workspace = args.workspace.expanduser().resolve()
     cfg = load_manager_config(workspace)
+    if provider_of(cfg.enhance_brief_model) == "claude-code":
+        # The enhance-on-create pass spawns the claude CLI from this process:
+        # say up front which account it will bill (or why it cannot run).
+        line = describe_claude_billing(cfg.claude_billing, claude_bin=resolve_claude_bin())
+        print(f"[nightshift-manager] claude-code billing (enhance): {line}")
     app = create_app(workspace)
     # Build the Server explicitly (rather than uvicorn.run) so the SSE endpoint
     # can poll `server.should_exit` and end its stream on Ctrl-C; the graceful

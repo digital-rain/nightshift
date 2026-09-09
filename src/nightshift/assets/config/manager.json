@@ -14,6 +14,7 @@
     "git_refresh_seconds": 15.0
   },
   "default_model": "auto",
+  "claude_billing": "auto",
   "scheduled_models_allow": ["claude-code/claude-sonnet-4-6", "claude-code/claude-opus-4-8"],
   "max_per_day": 200,
   "max_concurrent_queues": 2,
@@ -33,7 +34,7 @@
   "document_budget_bytes": 4194304,
   "auto_resolve": true,
   "max_resolve_attempts": 2,
-  "resolve_model": null,
+  "resolve_model": "claude-code/claude-sonnet-4-6",
   "resolve_backend": null,
   "max_concurrent_resolves": 1
 }

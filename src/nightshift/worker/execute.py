@@ -203,7 +203,7 @@ def _execute_doc_step(
     one markdown document to ``$OUTPUT_FILE``; nothing is validated, published,
     or landed. Returns a completed Outcome carrying the document + any signal,
     or a typed failure."""
-    from nightshift.backends import LAUNCH_FAILED, WorkerSpec
+    from nightshift.backends import CONFIG_FAILED, LAUNCH_FAILED, WorkerSpec
 
     workspace = cfg.workspace
 
@@ -301,12 +301,20 @@ def _execute_doc_step(
             "cache_creation_input_tokens": result.cache_creation_input_tokens,
             "usage": result.usage,
             "cost_usd": result.cost_usd,
+            "billing": result.billing,
         }
 
         if result.returncode == LAUNCH_FAILED:
             return fail(
                 FailureKind.WORKER_LAUNCH, result.error,
                 line="worker executable not found",
+            )
+        if result.returncode == CONFIG_FAILED:
+            # This box's declared config refused the run before any spawn — an
+            # environment fault, retried elsewhere, never counted on the task.
+            return fail(
+                FailureKind.BACKEND_UNAVAILABLE, result.error,
+                line="backend configuration error",
             )
 
         captured_text = "".join(captured)
@@ -380,7 +388,12 @@ def execute_work_order(
     ``on_session`` (optional) receives the backend's session id when one is
     parseable — the worker-local resume hint (spec §7.5). It never rides the
     outcome (nothing crosses the wire)."""
-    from nightshift.backends import LAUNCH_FAILED, WorkerSpec, require_backend
+    from nightshift.backends import (
+        CONFIG_FAILED,
+        LAUNCH_FAILED,
+        WorkerSpec,
+        require_backend,
+    )
     from nightshift.git.worktrees import worktree_dir
 
     workspace = cfg.workspace
@@ -389,7 +402,10 @@ def execute_work_order(
     # The work order carries the queue *label* ("main"/<name>); the engine's
     # worktree/brief helpers take the internal queue arg (main -> None).
     queue = playlists.queue_from_tasks_rel(order.get("queue") or "main")
-    config_blob = order.get("config", {})
+    # This box owns its own claude CLI auth state, so the worker's declared
+    # claude_billing is stamped over whatever the order's config carries: the
+    # backend reads the mode from spec.config (see ClaudeCodeBackend).
+    config_blob = {**order.get("config", {}), "claude_billing": cfg.claude_billing}
     validate_argv, validate_display = validate_cmd_from_blob(config_blob)
     prompt_validate = validate_display or DEFAULT_VALIDATE_CMD
     preflight_argv, preflight_display = preflight_cmd_from_blob(config_blob)
@@ -581,6 +597,7 @@ def execute_work_order(
             "cache_creation_input_tokens": result.cache_creation_input_tokens,
             "usage": result.usage,
             "cost_usd": result.cost_usd,
+            "billing": result.billing,
         }
 
         if result.returncode == LAUNCH_FAILED:
@@ -588,6 +605,13 @@ def execute_work_order(
                 FailureKind.WORKER_LAUNCH,
                 result.error,
                 line="worker executable not found",
+            )
+        if result.returncode == CONFIG_FAILED:
+            # This box's declared config refused the run before any spawn — an
+            # environment fault, retried elsewhere, never counted on the task.
+            return fail(
+                FailureKind.BACKEND_UNAVAILABLE, result.error,
+                line="backend configuration error",
             )
 
         has_commits = worktree_has_commits(workspace, repo, task, queue=queue)

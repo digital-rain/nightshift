@@ -137,7 +137,10 @@
     return tr;
   }
 
-  const STAT_COLS = 9;
+  // Key + 10 metric columns (the last three: total cost, then the actual /
+  // notional split of it — a subscription run's cost is list price the
+  // operator never paid, so the two are never summed into one figure).
+  const STAT_COLS = 11;
 
   function renderStatTable(bodyId, rows, keyField) {
     const body = $(bodyId);
@@ -160,6 +163,8 @@
           `${num(r.total_turns)} (${avg1(r.avg_turns)})`,
           compact(r.total_tokens),
           cost(r.total_cost_usd),
+          cost(r.actual_cost_usd),
+          cost(r.notional_cost_usd),
         ]),
       );
     }

@@ -728,6 +728,34 @@ def test_cursor_argv_includes_resume() -> None:
     assert "--resume" not in build_cursor_argv("hi", "sonnet-4", {})
 
 
+def test_local_store_stats_split_actual_from_notional_spend(tmp_path: Path) -> None:
+    """The worker's own rollup applies the same rule as the manager's views: a
+    ``subscription`` run's cost is notional list price, everything else — an
+    ``api`` stamp or none at all — is actual money. ``unattributed_runs`` counts
+    the rows carrying a cost the backend could not attribute, so the operator
+    can see how much of "actual" is really just unknown."""
+    root = _seed(tmp_path, {})
+    local = LocalStore(root)
+    for run_id, cost, billing in (
+        ("r1", 2.00, "subscription"),
+        ("r2", 1.00, "api"),
+        ("r3", 4.00, None),          # predates the field / backend can't say
+        ("r4", None, None),          # no cost at all: not unattributed spend
+    ):
+        local.finish({
+            "run_id": run_id, "task": run_id, "status": "completed",
+            "loc": 1, "cost_usd": cost, "billing": billing,
+        })
+
+    stats = local.stats()
+    assert stats["total_runs"] == 4
+    assert stats["completed"] == 4
+    assert round(stats["actual_cost_usd"], 2) == 5.00
+    assert round(stats["notional_cost_usd"], 2) == 2.00
+    # Only r3: a dollar figure with nothing saying who paid it.
+    assert stats["unattributed_runs"] == 1
+
+
 def test_local_store_session_memory_roundtrip_and_drop(tmp_path: Path) -> None:
     root = _seed(tmp_path, {})
     local = LocalStore(root)

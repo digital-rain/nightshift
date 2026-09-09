@@ -10,12 +10,15 @@ dispatch → execute (fake backend) → validate → land → brief consumed.
 from __future__ import annotations
 
 import io
+import os
 import subprocess
 from pathlib import Path
 
 import nightshift.backends as backends_mod
+from _fake_claude import install_fake_claude
 from _workspace import build_workspace, git
 from nightshift.backends import WorkerResult
+from nightshift.billing import clear_auth_status_cache
 from nightshift.repos import DEFAULT_TASKS_REPO
 from nightshift.run_local import _Tee, main, open_run_log
 from nightshift.spawn_daily import split_frontmatter
@@ -107,11 +110,15 @@ class _FailingBackend:
 
 
 def _prep(workspace: Path, monkeypatch, backend) -> Path:
-    """Satisfy run_local's pre-flight (claude bin + API key + a passing
-    `just validate` in the target repo) and install the fake backend."""
+    """Satisfy run_local's pre-flight (a fake logged-in claude on PATH, no API
+    key — subscription billing needs none — and a passing `just validate` in
+    the target repo) and install the fake backend."""
     repo_root = workspace / REPO
-    monkeypatch.setattr("nightshift.preflight.shutil.which", lambda _n: "/bin/claude")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    tmp_bin = workspace.parent / "fake-bin"
+    install_fake_claude(tmp_bin)
+    monkeypatch.setenv("PATH", f"{tmp_bin}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    clear_auth_status_cache()
     (repo_root / "justfile").write_text("validate:\n\t@true\n")
     git(repo_root, "add", "-A")
     git(repo_root, "commit", "-m", "add justfile")
@@ -294,3 +301,22 @@ def test_run_local_respects_alternate_queue(tmp_path: Path, monkeypatch) -> None
     assert (repo_root / "GENERATED-10.side.txt").exists()
     assert (tasks_root / "main" / "10.main-task.md").exists()
     assert not (tasks_root / "sidework" / "10.side.md").exists()
+
+
+def test_harness_anthropic_discriminator_reads_the_model_ids(tmp_path: Path) -> None:
+    """The preflight asks for ANTHROPIC_API_KEY when any declared model routes
+    to the harness's anthropic vendor — by id, not only by the toggle."""
+    from nightshift.config.worker import NightshiftBackendConfig, WorkerConfig
+    from nightshift.run_local import _harness_uses_anthropic
+
+    base = dict(workspace=tmp_path, worker_id="w", manager_url="http://x")
+    assert _harness_uses_anthropic(WorkerConfig(**base, models=["claude-code/x"])) is False
+    assert _harness_uses_anthropic(
+        WorkerConfig(**base, models=["nightshift/anthropic/claude-sonnet-4-6"])
+    ) is True
+    assert _harness_uses_anthropic(
+        WorkerConfig(**base, models=["nightshift/ollama/llama"])
+    ) is False
+    assert _harness_uses_anthropic(WorkerConfig(
+        **base, nightshift=NightshiftBackendConfig(enabled=True, vendor="anthropic"),
+    )) is True

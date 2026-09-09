@@ -49,6 +49,9 @@ ENHANCE_TRACKING_MIGRATION = (
 TIMINGS_MIGRATION = (
     MIGRATIONS_DIR / "20260811000001_nightshift_attempt_timings.sql"
 )
+BILLING_MIGRATION = (
+    MIGRATIONS_DIR / "20260909000001_nightshift_attempt_billing.sql"
+)
 
 
 def _run(coro):
@@ -305,6 +308,52 @@ def test_turns_and_tokens_roll_up_per_model_backend_queue() -> None:
     # main queue key is "" (the playlist is "alpha").
     assert by_queue[""]["total_turns"] == 10
     assert by_queue["alpha"]["total_turns"] == 1
+
+
+def test_billing_round_trips_and_splits_actual_from_notional_spend() -> None:
+    """The ``billing`` stamp reads back off the attempt, and the stats views
+    sum it two ways: a subscription run's ``cost_usd`` is a notional list-price
+    figure, never money spent, so it lands in ``notional_cost_usd`` alone. An
+    absent stamp counts as actual (conservative — pre-existing rows were all
+    API-billed), so ``total_cost_usd`` stays the sum of both figures."""
+    store = SqliteStore()
+    _run(_attempt(store, "r1", backend="claude-code"))
+    _run(store.update_attempt(
+        "r1", state=AttemptState.LANDED, loc=10, cost_usd=2.00,
+        billing="subscription",
+    ))
+    _run(_attempt(store, "r2", task="t2", backend="anthropic"))
+    _run(store.update_attempt(
+        "r2", state=AttemptState.LANDED, loc=5, cost_usd=1.00, billing="api",
+    ))
+    # A pre-existing row: cost, no stamp.
+    _run(_attempt(store, "r3", task="t3", backend="anthropic"))
+    _run(store.update_attempt("r3", state=AttemptState.NO_CHANGE, cost_usd=4.00))
+
+    assert _run(store.get_attempt("r1"))["billing"] == "subscription"
+    assert _run(store.get_attempt("r2"))["billing"] == "api"
+    assert _run(store.get_attempt("r3"))["billing"] is None
+
+    overall = _run(store.stats_overall())
+    assert round(overall["total_cost_usd"], 2) == 7.00     # unchanged meaning
+    assert round(overall["actual_cost_usd"], 2) == 5.00    # api + unstamped
+    assert round(overall["notional_cost_usd"], 2) == 2.00  # subscription only
+
+    by_backend = {row["backend"]: row for row in _run(store.stats_by_backend())}
+    assert round(by_backend["claude-code"]["actual_cost_usd"], 2) == 0.00
+    assert round(by_backend["claude-code"]["notional_cost_usd"], 2) == 2.00
+    assert round(by_backend["anthropic"]["actual_cost_usd"], 2) == 5.00
+    assert round(by_backend["anthropic"]["notional_cost_usd"], 2) == 0.00
+
+    # Every stats view carries the split, in lockstep with the migration.
+    for row in (
+        overall,
+        *_run(store.stats_by_worker()),
+        *_run(store.stats_by_model()),
+        *_run(store.stats_by_queue()),
+        *_run(store.stats_by_enhanced()),
+    ):
+        assert "actual_cost_usd" in row and "notional_cost_usd" in row
 
 
 def test_stats_by_enhanced_splits_outcomes_and_ratings() -> None:
@@ -1097,6 +1146,38 @@ def test_attempt_timings_migration_shape() -> None:
     down = sql[sql.index("-- migrate:down"):]
     assert "ADD COLUMN IF NOT EXISTS timings jsonb" in up
     assert "DROP COLUMN IF EXISTS timings" in down
+
+
+def test_attempt_billing_migration_shape() -> None:
+    """The billing stamp + the actual/notional split: a nullable text column
+    (no backfill — an absent stamp is read as actual, so pre-existing API-billed
+    history keeps its meaning) and all six stats views recreated with the two
+    filtered sums, reversible back to the pre-migration definitions."""
+    sql = BILLING_MIGRATION.read_text()
+    assert "-- migrate:up" in sql and "-- migrate:down" in sql
+    up = sql[sql.index("-- migrate:up"):sql.index("-- migrate:down")]
+    down = sql[sql.index("-- migrate:down"):]
+    assert "ADD COLUMN IF NOT EXISTS billing text" in up
+    assert "DROP COLUMN IF EXISTS billing" in down
+    views = (
+        "stats_overall", "stats_by_worker", "stats_by_backend",
+        "stats_by_model", "stats_by_enhanced", "stats_by_queue",
+    )
+    for view in views:
+        assert f"CREATE VIEW nightshift.{view}" in up
+        assert f"CREATE VIEW nightshift.{view}" in down
+        assert f"DROP VIEW IF EXISTS nightshift.{view};" in up
+    # up: the two filtered sums, with the conservative rule (an absent stamp
+    # is actual, not notional) in a form both dialects accept verbatim.
+    assert "FILTER (WHERE coalesce(billing, '') <> 'subscription'), 0) AS actual_cost_usd" in up
+    assert "FILTER (WHERE billing = 'subscription'), 0) AS notional_cost_usd" in up
+    assert up.count("AS actual_cost_usd") == len(views)
+    assert up.count("AS notional_cost_usd") == len(views)
+    # down: the pre-migration definitions come back — no split anywhere, and
+    # stats_by_enhanced keeps its own (cache-free) shape while the other five
+    # keep the cache totals 20260731000005 gave them.
+    assert "actual_cost_usd" not in down and "notional_cost_usd" not in down
+    assert down.count("total_cache_read_tokens") == 5
 
 
 def test_capability_migration_adds_columns_and_queue_routing() -> None:

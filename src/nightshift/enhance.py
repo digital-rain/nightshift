@@ -63,12 +63,15 @@ def enhance_brief(
     model: str,
     env: dict[str, str],
     timeout: float = ENHANCE_TIMEOUT_SECONDS,
+    config: dict[str, Any] | None = None,
 ) -> EnhanceResult:
     """Rewrite ``text`` (the operator's raw brief) for worker execution.
 
     ``model`` is a provider-qualified id (e.g. ``claude-code/claude-sonnet-4-6``
     or ``anthropic/claude-sonnet-4-6``); ``env`` supplies the vendor API keys
-    and the child process environment. Raises :class:`EnhanceError` on any
+    and the child process environment; ``config`` carries backend knobs — for
+    ``claude-code`` the manager's declared ``claude_billing``, which decides
+    whether the CLI sees the API key. Raises :class:`EnhanceError` on any
     completion failure, a provider without one-shot text support, or an empty
     rewrite.
     """
@@ -95,7 +98,7 @@ def enhance_brief(
     user = f"Title: {title.strip()}\n\nOriginal brief:\n\n{text.strip()}"
     try:
         enhanced, usage = complete_text(
-            system, user, model=bare, env=env, timeout=timeout
+            system, user, model=bare, env=env, timeout=timeout, config=config
         )
     except TransportError as exc:
         raise EnhanceError(str(exc)) from exc

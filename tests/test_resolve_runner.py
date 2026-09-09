@@ -14,9 +14,9 @@ from pathlib import Path
 import nightshift.backends as backends_mod
 from _workspace import build_workspace, git, git_commit_all
 from nightshift.backends import WorkerResult
-from nightshift.events import TASK_STATUS
+from nightshift.events import TASK_RESULT, TASK_STATUS
 from nightshift.git.squash import squash_failure_kind, squash_to_main
-from nightshift.git.worktrees import setup_worktree
+from nightshift.git.worktrees import rebase_in_progress, setup_worktree
 from nightshift.repos import DEFAULT_TASKS_REPO
 from nightshift.resolve_runner import resolve_task, write_failure_log
 
@@ -119,7 +119,10 @@ def _seed_conflict_repo(
     workspace, tasks_root, repo_root = _full(
         tmp_path,
         tasks={"10.hello": "Do something."},
-        config={"max_resolve_attempts": max_attempts},
+        # S5 (declared fallbacks only): the agent-resolve path now requires a
+        # declared resolve_backend/worker_backend for an agnostic model id
+        # ("auto", the test default_model) — no more silent default backend.
+        config={"max_resolve_attempts": max_attempts, "resolve_backend": "cursor"},
     )
     (repo_root / "shared.txt").write_text("base\n")
     git_commit_all(repo_root, "add shared.txt")
@@ -225,6 +228,40 @@ def test_resolve_task_bounded_attempts_preserves_branch(tmp_path: Path) -> None:
     assert "task-local/main/10.hello" in git(repo_root, "branch")
 
 
+def test_resolve_task_unknown_provider_yields_typed_failure(tmp_path: Path) -> None:
+    """A brief/config that declares an unknown provider fails cleanly with a
+    typed TaskResult (S5: declared fallbacks only) — no traceback, no silent
+    routing to the default backend."""
+    workspace, tasks_root, repo_root = _full(
+        tmp_path,
+        tasks={"10.hello": "Do something."},
+        config={
+            "max_resolve_attempts": 1,
+            "resolve_model": "bogus-provider/some-model",
+        },
+    )
+    (repo_root / "shared.txt").write_text("base\n")
+    git_commit_all(repo_root, "add shared.txt")
+    worktree = setup_worktree(workspace, REPO, "10.hello")
+    (worktree / "shared.txt").write_text("branch\n")
+    git(worktree, "add", "shared.txt")
+    git(worktree, "commit", "-m", "branch edit")
+    (repo_root / "shared.txt").write_text("main\n")
+    git(repo_root, "add", "shared.txt")
+    git(repo_root, "commit", "-m", "main edit")
+
+    events: list = []
+    result = resolve_task(
+        workspace, REPO, tasks_root, "10.hello", "hello world", emit=events.append
+    )
+
+    assert not result.success
+    assert result.failure_kind == "backend_unavailable"
+    assert "bogus-provider" in (result.error or "")
+    task_results = [e.payload for e in events if e.type == TASK_RESULT]
+    assert task_results and task_results[-1]["failure_kind"] == "backend_unavailable"
+
+
 def test_resolve_deterministic_rebase_after_main_fixed(
     tmp_path: Path, monkeypatch,
 ) -> None:
@@ -279,3 +316,81 @@ def test_resolve_deterministic_rebase_after_main_fixed(
     assert "task-local/main/10.hello" not in git(repo_root, "branch")
     phases = [e.payload.get("phase") for e in events if e.type == TASK_STATUS]
     assert "validate" in phases
+
+
+class _RefusingBackend:
+    """A backend whose declared config refuses every spawn (CONFIG_FAILED)."""
+
+    name = "cursor"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def run(self, spec, emit_log, should_abort, on_worker_start=None) -> WorkerResult:
+        self.calls += 1
+        return WorkerResult(
+            returncode=backends_mod.CONFIG_FAILED,
+            error="claude_billing=api but ANTHROPIC_API_KEY is not set",
+        )
+
+
+def test_resolve_config_failed_is_typed_and_not_retried(tmp_path: Path, monkeypatch) -> None:
+    """A CONFIG_FAILED spawn refusal ends the resolve at once with the backend's
+    own message and BACKEND_UNAVAILABLE — never max_attempts retries reported
+    as 'conflicts remain'."""
+    workspace, tasks_root, _repo_root = _seed_conflict_repo(
+        tmp_path, branch_content="branch\n", main_content="main\n", max_attempts=3,
+    )
+    backend = _RefusingBackend()
+    monkeypatch.setattr(backends_mod, "require_backend", lambda _name: backend)
+    monkeypatch.setattr(backends_mod, "get_backend", lambda _name=None: backend)
+
+    events: list = []
+    result = resolve_task(
+        workspace, REPO, tasks_root, "10.hello", "hello world", emit=events.append
+    )
+    assert not result.success
+    assert backend.calls == 1
+    assert result.failure_kind == "backend_unavailable"
+    assert "claude_billing=api" in (result.error or "")
+    worktree = workspace / ".worktrees" / REPO / "10.hello"
+    assert not worktree.exists() or not rebase_in_progress(worktree)
+
+
+class _TelemetryResolvingBackend(_StubBackend):
+    def run(self, spec, emit_log, should_abort, on_worker_start=None) -> WorkerResult:
+        super().run(spec, emit_log, should_abort, on_worker_start)
+        return WorkerResult(
+            returncode=0, billing="subscription", cost_usd=0.25, turns=3,
+            input_tokens=100, output_tokens=20, usage={"input_tokens": 100},
+        )
+
+
+def test_resolve_result_carries_the_agent_telemetry(tmp_path: Path, monkeypatch) -> None:
+    """The resolver agent's spawn-time billing and cost ride the TaskResult so
+    the resolve attempt row is attributed like every other run."""
+    workspace, tasks_root, _repo_root = _seed_conflict_repo(
+        tmp_path, branch_content="branch\n", main_content="main\n",
+    )
+    def _resolver(cwd: Path) -> None:
+        (Path(cwd) / "shared.txt").write_text("resolved\n")
+        subprocess.run(
+            ["git", "add", "shared.txt"], cwd=cwd, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "rebase", "--continue"],
+            cwd=cwd, check=True, capture_output=True,
+            env={**os.environ, "GIT_EDITOR": "true"},
+        )
+
+    backend = _TelemetryResolvingBackend(_resolver)
+    monkeypatch.setattr(backends_mod, "require_backend", lambda _name: backend)
+    monkeypatch.setattr(backends_mod, "get_backend", lambda _name=None: backend)
+
+    result = resolve_task(
+        workspace, REPO, tasks_root, "10.hello", "hello world", emit=lambda _e: None
+    )
+    assert result.success, result.error
+    assert result.billing == "subscription"
+    assert result.cost_usd == 0.25
+    assert result.turns == 3

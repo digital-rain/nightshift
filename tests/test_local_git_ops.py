@@ -16,7 +16,9 @@ from pathlib import Path
 
 import pytest
 
+from _fake_claude import install_fake_claude
 from _workspace import build_workspace, git, git_commit_all
+from nightshift.billing import clear_auth_status_cache
 from nightshift.git.squash import compute_code_loc, squash_to_main
 from nightshift.git.store import commit_queue_state
 from nightshift.git.worktrees import (
@@ -27,6 +29,7 @@ from nightshift.git.worktrees import (
 )
 from nightshift.preflight import (
     acquire_lock,
+    check_backend_credentials,
     check_preconditions,
     enough_free_disk,
     landing_blockers,
@@ -372,13 +375,79 @@ def test_landing_blockers_reports_code_never_queue_state(tmp_path: Path) -> None
     assert all(not p.startswith("main/") for p in paths)
 
 
-def _prep_preconditions(repo_root: Path, monkeypatch) -> None:
+def _prep_preconditions(repo_root: Path, monkeypatch, *, auth: str = "logged_in") -> None:
     """Satisfy every non-dirty-tree check so check_preconditions reaches (and
-    passes) the dirty-tree gate: fake the claude binary + API key and a trivial
-    `just validate` in the target repo."""
-    monkeypatch.setattr("nightshift.preflight.shutil.which", lambda _name: "/bin/claude")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    passes) the dirty-tree gate: a fake logged-in claude on PATH, no API key
+    (the subscription path needs none), and a trivial `just validate` in the
+    target repo."""
+    bin_dir = repo_root.parent / "fake-bin"
+    install_fake_claude(bin_dir, auth=auth)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    clear_auth_status_cache()
     (repo_root / "justfile").write_text("validate:\n\t@true\n")
+
+
+_CLAUDE = {"claude-code"}
+
+
+def test_credentials_subscription_needs_no_key(tmp_path: Path, monkeypatch) -> None:
+    """A logged-in box under subscription billing passes with no API key at
+    all — the key is not the claude-code credential."""
+    _, _, repo_root = _full(tmp_path)
+    _prep_preconditions(repo_root, monkeypatch)
+    assert check_backend_credentials(claude_billing="subscription", providers=_CLAUDE) == []
+
+
+def test_credentials_subscription_logged_out_exits(tmp_path: Path, monkeypatch) -> None:
+    _, _, repo_root = _full(tmp_path)
+    _prep_preconditions(repo_root, monkeypatch, auth="logged_out")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")  # a key does not rescue it
+    with pytest.raises(SystemExit, match="claude login"):
+        check_backend_credentials(claude_billing="subscription", providers=_CLAUDE)
+
+
+def test_credentials_api_without_key_exits_naming_setting(tmp_path: Path, monkeypatch) -> None:
+    _, _, repo_root = _full(tmp_path)
+    _prep_preconditions(repo_root, monkeypatch)
+    with pytest.raises(SystemExit, match="claude_billing=api"):
+        check_backend_credentials(claude_billing="api", providers=_CLAUDE)
+
+
+def test_credentials_auto_logged_out_with_key_warns(tmp_path: Path, monkeypatch, capsys) -> None:
+    _, _, repo_root = _full(tmp_path)
+    _prep_preconditions(repo_root, monkeypatch, auth="logged_out")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    warnings = check_backend_credentials(claude_billing="auto", providers=_CLAUDE)
+    assert len(warnings) == 1 and "claude login" in warnings[0]
+    assert "warning: [claude-code] billing: API key" in capsys.readouterr().out
+
+
+def test_credentials_auto_logged_out_without_key_exits(tmp_path: Path, monkeypatch) -> None:
+    _, _, repo_root = _full(tmp_path)
+    _prep_preconditions(repo_root, monkeypatch, auth="logged_out")
+    with pytest.raises(SystemExit, match="claude_billing=auto"):
+        check_backend_credentials(claude_billing="auto", providers=_CLAUDE)
+
+
+def test_credentials_anthropic_provider_needs_key(tmp_path: Path, monkeypatch) -> None:
+    """The API backend still needs the key regardless of claude_billing, and
+    without claude-code among the providers the CLI is not even required."""
+    _, _, repo_root = _full(tmp_path)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+    monkeypatch.setattr("nightshift.prompts.EXTRA_BIN_DIRS", ())
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    with pytest.raises(SystemExit, match="anthropic provider"):
+        check_backend_credentials(claude_billing="subscription", providers={"anthropic"})
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    assert check_backend_credentials(claude_billing="subscription", providers={"anthropic"}) == []
+
+
+def test_credentials_missing_cli_exits(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+    monkeypatch.setattr("nightshift.prompts.EXTRA_BIN_DIRS", ())  # no ~/.local/bin rescue
+    with pytest.raises(SystemExit, match="not found on PATH"):
+        check_backend_credentials(claude_billing="auto", providers=_CLAUDE)
 
 
 def test_check_preconditions_ignores_dirty_queue_state(tmp_path: Path, monkeypatch) -> None:
@@ -389,7 +458,7 @@ def test_check_preconditions_ignores_dirty_queue_state(tmp_path: Path, monkeypat
 
     (tasks_root / "main" / "10.hello.md").write_text("Edited brief.")
     # Should not raise: content-store churn never blocks.
-    check_preconditions(workspace, REPO)
+    check_preconditions(workspace, REPO, claude_billing="subscription", providers=_CLAUDE)
 
 
 def test_check_preconditions_notice_on_code_wip(
@@ -406,7 +475,7 @@ def test_check_preconditions_notice_on_code_wip(
     git_commit_all(repo_root, "add app.py")
     code.write_text("x = 2\n")
 
-    check_preconditions(workspace, REPO)  # notice, never an exit
+    check_preconditions(workspace, REPO, providers=_CLAUDE)  # notice, never an exit
     assert "behind main" in capsys.readouterr().out
 
 

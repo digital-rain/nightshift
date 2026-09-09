@@ -98,7 +98,7 @@ The same settings can come from `NIGHTSHIFT_*` environment variables (env wins o
 A worker can serve several providers at once; each task's resolved `provider/model` id picks the backend.
 Install only the tooling for the providers you advertise:
 
-- `claude-code` — the `claude` CLI on `PATH` (agentic).
+- `claude-code` — the `claude` CLI on `PATH`, logged in via `claude login` (agentic; bills the subscription — `claude_billing` in the config reference).
 - `cursor` — the `cursor-agent` CLI on `PATH` (agentic).
 - `antigravity` — the `agy` CLI on `PATH`, with an authenticated Google account (agentic; successor to Gemini CLI).
 - `anthropic` — `ANTHROPIC_API_KEY` set (single-shot API, no CLI).

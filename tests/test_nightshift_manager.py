@@ -1160,8 +1160,13 @@ def test_post_task_enhance_rewrites_and_preserves_original(
     the request lands in the enhancements telemetry."""
     workspace = _seed(tmp_path, {})
 
-    def fake_enhance(title: str, text: str, *, model: str, env: dict) -> EnhanceResult:
+    def fake_enhance(
+        title: str, text: str, *, model: str, env: dict, config: dict
+    ) -> EnhanceResult:
         assert title == "Fix ops" and text == "make it nicer"
+        # The manager's declared claude_billing rides along so a claude-code
+        # enhance model never sees the API key under subscription billing.
+        assert config == {"claude_billing": "auto"}
         return EnhanceResult(
             text="A precise, self-contained spec.",
             model=model,
@@ -1200,7 +1205,9 @@ def test_post_task_enhance_failure_is_502_and_creates_nothing(
     still recorded in the telemetry."""
     workspace = _seed(tmp_path, {})
 
-    def fake_enhance(title: str, text: str, *, model: str, env: dict) -> EnhanceResult:
+    def fake_enhance(
+        title: str, text: str, *, model: str, env: dict, config: dict
+    ) -> EnhanceResult:
         raise EnhanceError("vendor down")
 
     monkeypatch.setattr(api_operator, "enhance_brief", fake_enhance)
@@ -2229,13 +2236,16 @@ def test_open_store_no_dsn_is_sqlite(monkeypatch) -> None:
 # insertion order and the previous rows were column-ordered), extended with
 # the token-usage-granularity fields (cache splits + raw usage payload) added
 # alongside input_tokens/output_tokens, and with the enhance-tracking fields
-# (enhanced flag + operator rating) — see manager/views.py RUN_VIEW_KEYS.
+# (enhanced flag + operator rating), and with the billing attribution that
+# says whether cost_usd is money spent or notional list price — see
+# manager/views.py RUN_VIEW_KEYS.
 RUN_WIRE_KEYS = [
     "id", "task", "queue", "worker_id", "backend", "model", "repo",
     "required_mcps", "status", "phase", "result_line", "commit_sha", "loc",
     "remote", "pushed", "turns", "input_tokens", "output_tokens",
     "cache_read_input_tokens", "cache_creation_input_tokens", "usage",
-    "cost_usd", "failure_kind", "failure_reason", "validate_cmd", "worktree",
+    "cost_usd", "billing", "failure_kind", "failure_reason", "validate_cmd",
+    "worktree",
     "title", "body", "started_at", "finished_at", "enhanced", "rating", "notes",
     "workflow", "timings", "kind",
 ]
@@ -2254,7 +2264,11 @@ def _seed_every_state(store: SqliteStore) -> dict[str, str]:
         ("running", None, {}),
         ("landing", AttemptState.LANDING, {"phase": "landing"}),
         ("resolving", None, {}),  # created with state="resolving" below
-        ("landed", AttemptState.LANDED, {"commit_sha": "abc123", "loc": 3}),
+        ("landed", AttemptState.LANDED, {
+            "commit_sha": "abc123", "loc": 3,
+            # The billing attribution rides the same projection as cost_usd.
+            "cost_usd": 1.5, "billing": "subscription",
+        }),
         ("no_change", AttemptState.NO_CHANGE, {"result_line": "no changes"}),
         ("blocked", AttemptState.BLOCKED, {"failure_kind": "blocked"}),
         ("failed", AttemptState.FAILED, {"failure_kind": "worker_error"}),
@@ -2309,6 +2323,10 @@ def test_api_runs_snapshot_keys_and_status_projection(tmp_path: Path) -> None:
             # may ever leak onto the wire.
             assert list(row) == RUN_WIRE_KEYS, name
             assert row["status"] == expected_status[name], name
+        # The billing attribution is projected, not dropped: without it the UI
+        # cannot tell a notional subscription dollar from money spent.
+        assert rows[ids["landed"]]["billing"] == "subscription"
+        assert rows[ids["failed"]]["billing"] is None
         # phase passes through (worker-reported or the manager's "landing").
         assert rows[ids["landing"]]["phase"] == "landing"
         # Terminal scenarios carry finished_at; live ones don't.
@@ -2338,6 +2356,10 @@ def test_api_analytics_runs_landed_flag_and_shape(tmp_path: Path) -> None:
         assert set(ids.values()) <= set(rows)
         for rid, row in rows.items():
             assert list(row) == list(ANALYTICS_RUN_KEYS), rid
+        # The billing attribution reaches the analytics record too — the
+        # actual/notional split is computed client-side from it.
+        assert rows[ids["landed"]]["billing"] == "subscription"
+        assert rows[ids["no_change"]]["billing"] is None
         # Only the LANDED attempt is a landed change.
         assert rows[ids["landed"]]["landed"] is True
         assert rows[ids["no_change"]]["landed"] is False

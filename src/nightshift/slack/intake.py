@@ -413,30 +413,23 @@ class ClaudeNormaliseBackend:
         self._model = model or str(self._config.get("model") or "claude-sonnet-4-6")
 
     def normalise(self, text: str) -> tuple[str, str]:
-        import subprocess
+        # Through the claude-code backend's print-mode seam, never a private
+        # spawn: that is where the declared ``claude_billing`` decides whether
+        # the API key reaches the CLI (``config`` carries manager.json's value).
+        import os
 
-        from nightshift.prompts import resolve_claude_bin
+        from nightshift.agent.transport import TransportError
+        from nightshift.backends import ClaudeCodeBackend
 
-        prompt = _NORMALISE_PROMPT.format(text=text)
-        argv = [
-            resolve_claude_bin(self._config),
-            "-p",
-            prompt,
-            "--model",
-            self._model,
-        ]
+        system, _, _ = _NORMALISE_PROMPT.partition("Request:\n")
         try:
-            proc = subprocess.run(
-                argv,
-                capture_output=True,
-                text=True,
-                timeout=120,
+            reply, _usage = ClaudeCodeBackend().complete_text(
+                system.strip(), text, model=self._model, env=dict(os.environ),
+                timeout=120, config=dict(self._config),
             )
-        except (OSError, subprocess.SubprocessError):
+        except TransportError:
             return _heuristic_split(text)
-        if proc.returncode != 0:
-            return _heuristic_split(text)
-        return _parse_normalise_reply(proc.stdout) or _heuristic_split(text)
+        return _parse_normalise_reply(reply) or _heuristic_split(text)
 
 
 def _parse_normalise_reply(reply: str) -> tuple[str, str] | None:

@@ -481,6 +481,7 @@ def register_operator_api(
                     body.text,
                     model=cfg.enhance_brief_model,
                     env=dict(os.environ),
+                    config={"claude_billing": cfg.claude_billing},
                 )
             except EnhanceError as exc:
                 await _store().record_enhancement(

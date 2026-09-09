@@ -25,7 +25,7 @@ flowchart LR
 
 - The repo is cloned and its Python environment is installed: `just install` (== `uv sync`, creates `.venv`). To provision a fresh Ubuntu VM from scratch, see [`provision.sh`](../../provision.sh).
 - At least one backend's tooling is available on the worker machine (you only need the ones whose models you advertise):
-  - `claude-code` — the `claude` CLI on `PATH`.
+  - `claude-code` — the `claude` CLI on `PATH`, logged in with `claude login` (subscription billing). An `ANTHROPIC_API_KEY` is **not** its credential; see [Claude billing](configuration-reference.md#claude-billing).
   - `cursor` — the `cursor-agent` CLI on `PATH`.
   - `antigravity` — the `agy` CLI on `PATH`, with an authenticated Google account (`agy` login).
   - `anthropic` — `ANTHROPIC_API_KEY` set (single-shot API backend, no CLI).
@@ -81,8 +81,10 @@ NIGHTSHIFT_MANAGER_URL=http://localhost:8800
 # Omit to use the in-memory fallback.
 NIGHTSHIFT_PG_DSN=postgresql://nightshift:nightshift@127.0.0.1:5432/nightshift
 
-# A backend credential — whichever backends this worker will use.
-ANTHROPIC_API_KEY=sk-ant-...
+# Backend credentials — only for API-billed paths (anthropic/ models, the
+# harness's anthropic vendor, claude_billing: api). claude-code uses the
+# CLI's own login; leave this unset on a subscription box.
+#ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 If you expose the manager beyond localhost, also set a shared secret on both sides (see step 6 and the reference): `NIGHTSHIFT_SHARED_SECRET=...`.

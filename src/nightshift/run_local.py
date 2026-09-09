@@ -39,11 +39,12 @@ from nightshift.config.manager import load_manager_config
 from nightshift.lifecycle import Outcome, RunStatus
 from nightshift.manager.app import create_app
 from nightshift.manager.store_sqlite import SqliteStore
+from nightshift.model_id import split_model
 from nightshift.preflight import acquire_lock, check_preconditions
 from nightshift.spawn_daily import load_queue_config
 from nightshift.task_files import build_task_list, live_ordered_queue
 from nightshift.worker.client import ManagerClient
-from nightshift.worker.config import load_worker_config
+from nightshift.worker.config import WorkerConfig, load_worker_config
 from nightshift.worker.local_store import LocalStore
 from nightshift.worker.loop import WorkerLoop
 
@@ -278,6 +279,19 @@ def print_summary(runs: list[dict[str, Any]]) -> None:
     print()
 
 
+def _harness_uses_anthropic(wcfg: WorkerConfig) -> bool:
+    """True when any run on this worker can reach the harness's anthropic
+    vendor — an explicit ``nightshift/anthropic/…`` id among the declared
+    models, or the harness toggle routing agentic runs to that vendor."""
+    if wcfg.nightshift.enabled and wcfg.nightshift.vendor == "anthropic":
+        return True
+    for model in [*wcfg.models, wcfg.auto_model, wcfg.max_model]:
+        provider, bare = split_model(model)
+        if provider == "nightshift" and bare.startswith("anthropic/"):
+            return True
+    return False
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Drain a nightshift queue once through an ephemeral "
@@ -324,8 +338,18 @@ def main(argv: list[str] | None = None) -> int:
             )
         except repos.RepoConfigError:
             queue_repo = None
+        # Credentials are checked for what this box's worker config declares:
+        # its providers (plus the harness's anthropic vendor when routed) and
+        # its claude_billing mode — the one-shot loop below runs on that config.
+        wcfg = load_worker_config(workspace)
+        providers = wcfg.providers()
+        if _harness_uses_anthropic(wcfg):
+            providers.add("anthropic")
         if queue_repo and repos.repo_available(workspace, queue_repo):
-            check_preconditions(workspace, queue_repo)
+            check_preconditions(
+                workspace, queue_repo,
+                claude_billing=wcfg.claude_billing, providers=providers,
+            )
 
         lock_fd = acquire_lock(workspace)
 
@@ -350,7 +374,6 @@ def main(argv: list[str] | None = None) -> int:
                     store, tasks_root, tasks_rel, queue_internal, set(tasks)
                 )
 
-            wcfg = load_worker_config(workspace)
             wcfg.manager_url = manager_url
             wcfg.worker_id = f"local-{os.getpid()}"
             wcfg.queues = [args.queue]

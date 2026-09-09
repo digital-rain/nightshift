@@ -113,6 +113,13 @@ def main(argv: list[str] | None = None) -> int:
         "loc": result.loc if landed else None,
         "remote": None,
         "pushed": None,
+        # The resolver agent's telemetry (a failed resolve burned tokens too).
+        "billing": result.billing,
+        "cost_usd": result.cost_usd,
+        "turns": result.turns,
+        "input_tokens": result.input_tokens,
+        "output_tokens": result.output_tokens,
+        "usage": result.usage,
     }
     client.resolve_result(run_id, payload)
     emit(Event(RUN_FINISHED, {"task": task}))

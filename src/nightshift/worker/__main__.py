@@ -14,6 +14,8 @@ from pathlib import Path
 
 import uvicorn
 
+from nightshift.billing import describe_claude_billing
+from nightshift.prompts import resolve_claude_bin
 from nightshift.restart import re_exec
 from nightshift.worker.client import ManagerClient
 from nightshift.worker.config import load_worker_config
@@ -57,6 +59,9 @@ def main(argv: list[str] | None = None) -> int:
         f"manager={cfg.manager_url} queues={cfg.queues} priorities={cfg.priorities}"
         f"{url_tag}"
     )
+    if "claude-code" in cfg.providers():
+        line = describe_claude_billing(cfg.claude_billing, claude_bin=resolve_claude_bin())
+        print(f"[nightshift-worker] claude-code billing: {line}")
 
     loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
     loop_thread.start()

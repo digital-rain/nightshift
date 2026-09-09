@@ -276,7 +276,7 @@ test("the CI card reports total spend and the per-run rate to clear a red main",
 // every other panel (renderBody), and untagged feature work is held out of the
 // CI card: runA ($0.05) + runB ($0.40) total $0.45 and no more.
 test("the CI card and the fleet cards do not blend the two workloads", () => {
-  assert.match(ciText, /Total spend {2}\$0\.47/);   // 0.05 + 0.40 + 0.02
+  assert.match(ciText, /Actual spend {2}\$0\.47/);  // 0.05 + 0.40 + 0.02, none billed to a subscription
   assert.doesNotMatch(ciText, /Cost to clear CI {2}\$1\.47/);
 });
 

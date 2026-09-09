@@ -1159,6 +1159,7 @@ def register_worker_api(
             "cache_creation_input_tokens": body.cache_creation_input_tokens,
             "usage": body.usage,
             "cost_usd": body.cost_usd,
+            "billing": body.billing,
         }
         landed = bool(body.landed and body.status == RunStatus.COMPLETED)
         sha, remote_kind, pushed = body.sha, body.remote, body.pushed

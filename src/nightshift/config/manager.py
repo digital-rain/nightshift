@@ -13,6 +13,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from nightshift.billing import (
+    CLAUDE_BILLING_MODES,
+    DEFAULT_CLAUDE_BILLING,
+    billing_setting,
+)
 from nightshift.config.io import load_dotenv, load_json, manager_json_path, save_json
 from nightshift.config.meta import meta
 from nightshift.git.transport import WIP_REF_PREFIX, normalize_wip_prefix
@@ -100,6 +105,17 @@ class OperatorConfig:
                 "anthropic / ollama-cloud / ollama APIs."),
             env="NIGHTSHIFT_ENHANCE_MODEL",
             validate="model_id"))
+    claude_billing: str = field(
+        default=DEFAULT_CLAUDE_BILLING, metadata=meta(
+            category="Models", label="Claude billing",
+            desc=(
+                "How this manager's claude-code calls (the enhance-on-create "
+                "pass) authenticate the claude CLI: subscription (the CLI's claude.ai login; the Anthropic "
+                "API key is removed from the CLI's environment), api "
+                "(ANTHROPIC_API_KEY is passed through and billed), or auto "
+                "(subscription when `claude auth status` reports a claude.ai "
+                "login, else api with a warning)."),
+            apply="restart", options=list(CLAUDE_BILLING_MODES)))
     planner_model: str = field(default="", metadata=meta(
         category="Models", label="Planner model",
         desc=(
@@ -373,6 +389,7 @@ def load_manager_settings(workspace: Path) -> ManagerSettings:
             os.environ.get("NIGHTSHIFT_ENHANCE_MODEL")
             or data.get("enhance_brief_model")
             or "anthropic/claude-sonnet-4-6"),
+        claude_billing=billing_setting(data),
         planner_model=(
             os.environ.get("NIGHTSHIFT_PLANNER_MODEL")
             or data.get("planner_model")
@@ -450,6 +467,7 @@ class ManagerConfig:
     landing_mode: LandingMode = _DEFAULT_OPERATOR.landing_mode
     default_model: str = _DEFAULT_OPERATOR.default_model
     enhance_brief_model: str = _DEFAULT_OPERATOR.enhance_brief_model
+    claude_billing: str = _DEFAULT_OPERATOR.claude_billing
     planner_model: str = _DEFAULT_OPERATOR.planner_model
     shared_secret: str | None = _DEFAULT_SETTINGS.shared_secret
     dsn: str | None = _DEFAULT_SETTINGS.dsn
@@ -475,6 +493,7 @@ def load_manager_config(workspace: Path) -> ManagerConfig:
         landing_mode=settings.operator.landing_mode,
         default_model=settings.operator.default_model,
         enhance_brief_model=settings.operator.enhance_brief_model,
+        claude_billing=settings.operator.claude_billing,
         planner_model=settings.operator.planner_model,
         shared_secret=settings.shared_secret,
         dsn=settings.dsn,
@@ -516,6 +535,7 @@ def save_manager_settings(workspace: Path, settings: ManagerSettings) -> None:
         },
         "default_model": settings.operator.default_model,
         "enhance_brief_model": settings.operator.enhance_brief_model,
+        "claude_billing": settings.operator.claude_billing,
         "planner_model": settings.operator.planner_model,
         "scheduled_models_allow": list(settings.operator.scheduled_models_allow),
         "max_per_day": settings.operator.max_per_day,

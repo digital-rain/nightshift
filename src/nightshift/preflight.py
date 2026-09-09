@@ -24,6 +24,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from nightshift import prompts
+from nightshift.billing import (
+    BILLING_SUBSCRIPTION,
+    BillingConfigError,
+    billing_setting,
+    claude_auth_status,
+    decide_claude_billing,
+    has_api_key,
+    is_claude_login,
+    scrub_cli_auth,
+)
 from nightshift.git import GitRunner
 
 
@@ -311,12 +322,83 @@ def enough_free_disk(workspace: Path, min_free_pct: float = MIN_FREE_PCT) -> boo
     return (usage.free / usage.total) * 100.0 >= min_free_pct
 
 
-def check_preconditions(workspace: Path, repo: str) -> None:
+def check_backend_credentials(
+    *,
+    claude_billing: str | None = None,
+    providers: set[str] | None = None,
+    env: dict[str, str] | None = None,
+    config: dict | None = None,
+) -> list[str]:
+    """The credential preflight: warnings printed, or a ``sys.exit`` on a hard miss.
+
+    Requires only what the *declared* configuration needs, never a blanket
+    ``ANTHROPIC_API_KEY``, and makes the same decision the backend will
+    (:func:`nightshift.billing.decide_claude_billing`, same binary resolution,
+    same cache) so the two cannot disagree:
+
+    - ``claude-code`` among ``providers`` → the ``claude`` CLI resolvable
+      (``config['claude_bin']``, ``PATH``, the common install dirs). Under
+      ``subscription`` it must also be logged in (probed against a scrubbed
+      env, the way a run sees it); ``auto``/``api`` are whatever the billing
+      decision says, an unsatisfiable one exiting with its message.
+    - the ``anthropic`` provider (callers add it for the harness's anthropic
+      vendor too) → ``ANTHROPIC_API_KEY``.
+
+    ``providers`` is the declared provider set; ``None``/empty means there is
+    no backend to check (only the disk / tree / validate gates apply).
+    """
+    mode = billing_setting({"claude_billing": claude_billing})
+    providers = set(providers or ())
+    env = dict(os.environ if env is None else env)
+    warnings: list[str] = []
+
+    def _warn(line: str) -> None:
+        line = f"warning: {line}"
+        print(line)
+        warnings.append(line)
+
+    if "claude-code" in providers:
+        claude_bin = prompts.resolve_claude_bin(config)
+        if not (shutil.which(claude_bin, path=env.get("PATH")) or Path(claude_bin).is_file()):
+            sys.exit(
+                "error: 'claude' CLI not found on PATH.\n"
+                "Install: https://docs.anthropic.com/en/docs/claude-code"
+            )
+        if mode == BILLING_SUBSCRIPTION and not is_claude_login(
+            claude_auth_status(claude_bin, scrub_cli_auth(env))
+        ):
+            sys.exit(
+                "error: claude_billing=subscription but the claude CLI is "
+                "not logged in.\nRun `claude login` (or set claude_billing "
+                "to api with ANTHROPIC_API_KEY)."
+            )
+        try:
+            decide_claude_billing(mode, env=env, claude_bin=claude_bin, log=_warn)
+        except BillingConfigError as exc:
+            sys.exit(f"error: {exc}")
+
+    if "anthropic" in providers and not has_api_key(env):
+        sys.exit(
+            "error: ANTHROPIC_API_KEY is not set but the anthropic provider "
+            "needs it.\nAdd it to .env or export it in your shell."
+        )
+    return warnings
+
+
+def check_preconditions(
+    workspace: Path,
+    repo: str,
+    *,
+    claude_billing: str | None = None,
+    providers: set[str] | None = None,
+) -> None:
     """Fail fast if prerequisites are missing.
 
     Disk headroom is checked on the ``workspace`` (which parents every worktree);
     tracked-code WIP and the pre-flight ``just validate`` are checked in the
-    target ``repo_root = workspace / repo``.
+    target ``repo_root = workspace / repo``. Backend credentials are checked
+    against the declared ``claude_billing`` mode and ``providers`` (see
+    :func:`check_backend_credentials`) — never a blanket API-key demand.
     """
     repo_root = workspace / repo
     if not enough_free_disk(workspace):
@@ -326,16 +408,7 @@ def check_preconditions(workspace: Path, repo: str) -> None:
             f"error: only {free_pct:.1f}% disk free (need >= {MIN_FREE_PCT}%).\n"
             "Free space before running — e.g. 'just clean' to expunge the Bazel cache."
         )
-    if not shutil.which("claude"):
-        sys.exit(
-            "error: 'claude' CLI not found on PATH.\n"
-            "Install: https://docs.anthropic.com/en/docs/claude-code"
-        )
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        sys.exit(
-            "error: ANTHROPIC_API_KEY is not set.\n"
-            "Add it to .env or export it in your shell."
-        )
+    check_backend_credentials(claude_billing=claude_billing, providers=providers)
     # Untracked files never block a run, and since Phase 6 neither does tracked
     # code WIP: landing is a ref operation that leaves the working tree alone.
     # The only consequence is that a land overlapping this WIP will refuse to

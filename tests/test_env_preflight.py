@@ -336,3 +336,71 @@ def test_execute_preflight_disabled_runs_backend(tmp_path: Path, monkeypatch) ->
     assert spy.ran is True
     assert outcome.failure_kind != "preflight_failed"
     assert not (repo_root / ".venv" / ".nightshift-lock-hash").exists()
+
+
+# --------------------------------------------------------------------------- #
+# billing: the worker stamps its declared mode onto the spec, and the run's
+# spawn-time billing decision rides the outcome unchanged
+# --------------------------------------------------------------------------- #
+
+
+class _BillingSpyBackend(_SpyBackend):
+    def __init__(self, billing: str | None) -> None:
+        super().__init__()
+        self.billing = billing
+        self.spec_config: dict[str, Any] | None = None
+
+    def run(self, spec, emit_log, should_abort, on_worker_start=None) -> WorkerResult:
+        self.spec_config = dict(spec.config)
+        self.ran = True
+        return WorkerResult(returncode=0, turns=1, cost_usd=0.5, billing=self.billing)
+
+
+def test_execute_stamps_claude_billing_and_carries_billing(tmp_path: Path, monkeypatch) -> None:
+    workspace = build_workspace(tmp_path, tasks={"00.demo": "Do a thing."})
+    spy = _BillingSpyBackend("subscription")
+    monkeypatch.setattr(backends_mod, "require_backend", lambda _p: spy)
+    cfg = WorkerConfig(
+        workspace=workspace, worker_id="w", manager_url="http://x",
+        models=["ollama-cloud/gpt-oss:120b"], claude_billing="subscription",
+    )
+    order = _order("")
+    # An order's config can't override the box's own declaration.
+    order["config"]["claude_billing"] = "api"
+
+    outcome = execute_work_order(cfg, order, on_phase=lambda _p: None, on_log=lambda _l: None)
+
+    assert spy.spec_config is not None
+    assert spy.spec_config["claude_billing"] == "subscription"
+    assert outcome.billing == "subscription"
+    assert outcome.cost_usd == 0.5
+    # The wire/local record shapes carry it too (Telemetry.billing).
+    assert outcome.model_dump()["billing"] == "subscription"
+
+
+def test_execute_config_failed_is_an_environment_failure(tmp_path: Path, monkeypatch) -> None:
+    """A backend that refuses the run because this box's declared config cannot
+    satisfy it (CONFIG_FAILED) is an environment fault — BACKEND_UNAVAILABLE,
+    retried elsewhere — never a worker error counted against the task."""
+    from nightshift.backends import CONFIG_FAILED
+
+    workspace = build_workspace(tmp_path, tasks={"00.demo": "Do a thing."})
+
+    class _RefusingBackend(_SpyBackend):
+        def run(self, spec, emit_log, should_abort, on_worker_start=None) -> WorkerResult:
+            self.ran = True
+            return WorkerResult(
+                returncode=CONFIG_FAILED,
+                error="claude_billing=api but ANTHROPIC_API_KEY is not set",
+            )
+
+    monkeypatch.setattr(backends_mod, "require_backend", lambda _p: _RefusingBackend())
+    cfg = WorkerConfig(
+        workspace=workspace, worker_id="w", manager_url="http://x",
+        models=["ollama-cloud/gpt-oss:120b"],
+    )
+    outcome = execute_work_order(cfg, _order(""), on_phase=lambda _p: None, on_log=lambda _l: None)
+    assert outcome.status == "error"
+    assert outcome.failure_kind == "backend_unavailable"
+    assert "claude_billing=api" in (outcome.failure_reason or "")
+    assert outcome.result_line == "backend configuration error"

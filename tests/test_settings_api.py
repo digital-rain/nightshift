@@ -108,6 +108,19 @@ class TestRegistryProjection:
         assert by_key[("worker", "nightshift.max_tokens")].type == "si_int"
         assert by_key[("worker", "model_aliases")].type == "str_map"
 
+    def test_claude_billing_is_an_enum_on_both_surfaces(self):
+        """The billing switch renders as a three-option picker, manager + worker."""
+        from nightshift.billing import CLAUDE_BILLING_MODES
+        from nightshift.config.registry import build_registry
+
+        by_key = {(s.surface, s.key): s for s in build_registry()}
+        for surface in ("manager", "worker"):
+            spec = by_key[(surface, "claude_billing")]
+            assert spec.type == "enum"
+            assert spec.options == list(CLAUDE_BILLING_MODES) == ["auto", "subscription", "api"]
+            assert spec.category == "Models"
+            assert spec.default == "auto"
+
     def test_dotted_keys_for_cadences(self):
         from nightshift.config.registry import build_registry
 

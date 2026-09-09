@@ -147,11 +147,38 @@ class LocalStore:
         return rows[:limit]
 
     def stats(self) -> dict[str, Any]:
+        """The worker's own headline rollup over every local record.
+
+        Spend is split by the record's ``billing`` stamp on the same rule the
+        manager's stats views use: ``"subscription"`` is notional list price
+        (the CLI reports a dollar figure either way, but a subscription run
+        spends no money), everything else — an ``"api"`` stamp or none at all —
+        is actual. Absent-is-actual is the conservative reading: an
+        unattributed dollar can only overstate the actual figure.
+        ``unattributed_runs`` counts the records carrying a cost with no stamp,
+        so how much of "actual" is really just unknown stays visible.
+        """
         rows = self.history(limit=100000)
         completed = [r for r in rows if r.get("status") == "completed"]
+        actual = notional = 0.0
+        unattributed = 0
+        for r in rows:
+            cost = r.get("cost_usd")
+            if cost is None:
+                continue
+            cost = float(cost)
+            if r.get("billing") == "subscription":
+                notional += cost
+            else:
+                actual += cost
+                if not r.get("billing"):
+                    unattributed += 1
         return {
             "total_runs": len(rows),
             "completed": len(completed),
             "errored": sum(1 for r in rows if r.get("status") == "error"),
             "total_loc": sum(int(r.get("loc") or 0) for r in completed),
+            "actual_cost_usd": actual,
+            "notional_cost_usd": notional,
+            "unattributed_runs": unattributed,
         }

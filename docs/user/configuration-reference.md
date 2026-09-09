@@ -70,7 +70,7 @@ Only `NIGHTSHIFT_WORKSPACE` is strictly required for a local setup (and only whe
 | `NIGHTSHIFT_MANAGER_URL` | Worker | `http://localhost:8800` | Where workers reach the manager. |
 | `NIGHTSHIFT_PG_DSN` | Recommended | (in-memory) | Postgres DSN for durable state. Omit for the ephemeral in-memory store. |
 | `NIGHTSHIFT_SHARED_SECRET` | If remote | — | Shared secret protecting the manager's worker API. Must match on both sides. |
-| `ANTHROPIC_API_KEY` | `anthropic` backend, harness, or enhance-on-create | — | Anthropic API key. |
+| `ANTHROPIC_API_KEY` | `anthropic` backend, the harness's anthropic vendor, or `claude_billing: api` | — | Anthropic API key. **Not** the `claude-code` credential: the `claude` CLI uses its own claude.ai login, and under subscription billing the key is removed from the CLI's environment (see [Claude billing](#claude-billing)). |
 | `OLLAMA_API_KEY` | `ollama-cloud` backend | — | Ollama Cloud API key (create at `https://ollama.com/settings/keys`). Sent as a Bearer token to `https://ollama.com`. |
 | `OLLAMA_HOST` | No | `http://localhost:11434` | Local Ollama daemon address (harness `ollama` vendor). |
 
@@ -82,8 +82,9 @@ Backend CLIs (`claude`, `cursor-agent`, `agy`, `ollama`) are resolved from `PATH
 NIGHTSHIFT_WORKSPACE=$HOME/workspaces
 NIGHTSHIFT_MANAGER_URL=http://localhost:8800
 NIGHTSHIFT_PG_DSN=postgresql://nightshift:nightshift@127.0.0.1:5432/nightshift
-ANTHROPIC_API_KEY=sk-ant-api03-...
 ```
+
+No `ANTHROPIC_API_KEY` is needed for `claude-code`: log the CLI in once with `claude login` and leave the key out of `.env` unless an API-billed path (`anthropic/`, the harness's anthropic vendor, or `claude_billing: api`) is actually configured.
 
 ### Using `.env` values in tasks
 
@@ -243,6 +244,7 @@ There is no `backend` key: providers are derived automatically from the qualifie
 | `model_aliases` | — | `{}` | `{requested: actual}` remap applied at execution. |
 | `auto_model` | — | `claude-code/claude-sonnet-4-6` | Single qualified id that `auto` resolves to. |
 | `max_model` | — | `claude-code/claude-opus-4-8` | Single qualified id that `max` resolves to. |
+| `claude_billing` | — | `auto` | How this worker's `claude-code` runs authenticate the `claude` CLI: `subscription`, `api`, or `auto`. See [Claude billing](#claude-billing). |
 | `model_timeout_seconds` | `NIGHTSHIFT_MODEL_TIMEOUT_SECONDS` | `0` (disabled) | Global wall-clock timeout applied to every backend run. `0` means no limit. |
 | `quarantine` | `NIGHTSHIFT_WORKER_QUARANTINE` | `false` | When enabled, any task that fails on this worker is immediately quarantined (held in the queue, skipped by every worker) instead of retried. |
 | `worker_url` | `NIGHTSHIFT_WORKER_URL` | `null` | Externally reachable URL for this worker's UI, sent at checkin so the operator UI can link through. |
@@ -281,16 +283,55 @@ A worker can serve multiple providers concurrently. The provider is chosen per t
 
 | Backend | Type | Requires | Telemetry |
 |---|---|---|---|
-| `claude-code` | Agentic CLI | `claude` on `PATH` | turns + tokens + cost from `stream-json` |
+| `claude-code` | Agentic CLI | `claude` on `PATH`, logged in (`claude login`) — or `ANTHROPIC_API_KEY` with `claude_billing: api` | turns + tokens + cost from `stream-json`; `billing` = `subscription` or `api` |
 | `cursor` | Agentic CLI | `cursor-agent` on `PATH` | turns + tokens from `stream-json` |
 | `antigravity` | Agentic CLI | `agy` on `PATH` + authenticated Google account | live text stream (no turn/token/cost telemetry) |
-| `anthropic` | Single-shot API | `ANTHROPIC_API_KEY` | token counts with `turns=1` |
+| `anthropic` | Single-shot API | `ANTHROPIC_API_KEY` | token counts with `turns=1`; `billing` = `api` |
 | `ollama` | Single-shot API | `ollama` on `PATH` / a local daemon | token counts with `turns=1`, no dollar cost |
 | `ollama-cloud` | Single-shot API | `OLLAMA_API_KEY` (cloud-hosted on `ollama.com`) | token counts with `turns=1`, no dollar cost |
 | `nightshift` | Agentic harness (in-house) | The chosen vendor's API credential; enabled via `worker.json`'s `nightshift.enabled` | turns + per-turn tokens + cost from the owned price table |
 
 The single-shot API backends stream a model response but do not edit files, so their runs finish as "no changes"; they exist to measure raw model latency/throughput against the agent CLIs.
 The `nightshift` harness is the in-house agentic loop over the Anthropic or Ollama APIs — see [`docs/topics/agentic-harness.md`](../topics/agentic-harness.md).
+
+## Claude billing
+
+The `claude` CLI can authenticate two ways, and they bill differently: a claude.ai login (a Pro/Max subscription) or an `ANTHROPIC_API_KEY` in its environment (pay-per-token on the Anthropic console).
+When both are present the CLI's choice is not something Nightshift relies on, so the `claude_billing` setting decides explicitly what the CLI subprocess sees.
+It is declared in both `.nightshift/worker.json` (that worker's task runs and workflow doc steps) and `.nightshift/manager.json` (the manager's enhance-on-create pass, the Slack intake normaliser, and conflict resolves, which run as a manager-spawned process on the merged manager/queue config), because each process spawns the CLI with its own auth context.
+Both render on the Settings page under **Models**.
+
+| Value | What the CLI subprocess gets | When to use it |
+|---|---|---|
+| `subscription` | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK`, and `CLAUDE_CODE_USE_VERTEX` are removed from its environment; the CLI uses its claude.ai login. | The box is logged in (`claude auth status` shows `loggedIn: true`, `authMethod: claude.ai`) and every `claude-code/` run should bill the subscription. |
+| `api` | The environment is passed through unchanged; `ANTHROPIC_API_KEY` must be set or the run fails naming this setting. | Headless boxes with only a key. Every `claude-code/` run bills the API. |
+| `auto` (default) | Probes `claude auth status` once per process (with the scrubbed environment) and behaves like `subscription` when a claude.ai login is present, else like `api` with a warning line in the run log. | The safe default; prefer an explicit value once you know which you want. |
+
+`--bare` is never passed to the CLI (it reads only `ANTHROPIC_API_KEY`).
+
+**Recommended end state for a subscription box:** set `claude_billing: subscription` on the worker and the manager and remove `ANTHROPIC_API_KEY` from `.env` entirely unless an `anthropic/` model, the harness's anthropic vendor, or `claude_billing: api` is in use.
+With no key in the process at all, a regression cannot bill the API.
+
+**What changes for the agent.** Under `subscription` the `claude` process and every command it runs no longer sees Nightshift's `ANTHROPIC_API_KEY`.
+Target repos' own `.env` files are still symlinked into task worktrees, so repo tooling that reads them is unaffected; if a target repo's `.env` carries its own `ANTHROPIC_API_KEY`, the agent's shell children can still read that one.
+
+**Switching on an existing deployment.**
+
+1. Land the change and run `just migrate` from the primary checkout **before** restarting the manager: the run record gains a `billing` column, and a manager on the new code with the old schema fails every submit.
+2. Set `claude_billing` on both config files (or leave `auto`), remove the key from `.env` if nothing API-billed remains, and restart the manager and the worker.
+3. Confirm the worker's startup line reports `claude-code billing: subscription (...)` and that a `claude-code` run's log opens with `[claude-code] billing: subscription`.
+4. Ground truth is the Anthropic console: after a run, its usage must not move.
+   Nightshift can only report what it decided at spawn time; it cannot see the bill.
+   `tools/billing_smoke.py` prints the decision for the current config and runs one tiny print-mode completion under it so the console check has a known event to look for.
+
+**Reading the numbers.** Every run record now carries `billing`: `api` (the run demonstrably held a vendor key), `subscription` (the CLI's `total_cost_usd` is a notional list-price figure, not money spent), or absent (records from before this field, and backends that cannot say).
+Spend rollups sum the two separately: **actual** = `api` plus absent (an unattributed dollar is treated as real money, so the actual figure can only overstate; records before 2026-09-09 were API-billed), **notional** = `subscription`.
+The Stats page's "Actual spend" card shows the actual total with the notional total on its sub-line; the Workers tab tables and the worker UI's local stats carry `actual_cost_usd` / `notional_cost_usd` columns; `cost_usd` on each record is unchanged (list price in both modes: the CLI's figure first, the owned price sheet as fallback).
+Every other money figure on the Stats page (cost per landed change, non-landed spend, validation burn, the per-model tables, the daily series) is list price, the sum of `cost_usd` regardless of billing, so efficiency stays comparable across modes; only the headline card is real money.
+Historical records are never rewritten.
+
+**Conflict resolves need a declared model.** Routing no longer falls back to a built-in default: a resolve whose model is `auto` with no `resolve_model` declared fails with `backend_unavailable` naming the setting, instead of launching the CLI with a model id it rejects.
+Set `resolve_model` in `manager.json` to a qualified id (the shipped template uses `claude-code/claude-sonnet-4-6`).
 
 ## Task frontmatter
 

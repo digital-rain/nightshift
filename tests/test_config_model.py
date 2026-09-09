@@ -82,6 +82,11 @@ class TestDefaultsDriftGuard:
         from nightshift.config.manager import OperatorConfig
         assert OperatorConfig().planner_model == ""
 
+    def test_operator_claude_billing_defaults_auto(self):
+        from nightshift.billing import DEFAULT_CLAUDE_BILLING
+        from nightshift.config.manager import OperatorConfig
+        assert OperatorConfig().claude_billing == DEFAULT_CLAUDE_BILLING == "auto"
+
     def test_manager_host(self):
         from nightshift.config.manager import ManagerSettings
         assert ManagerSettings().host == "0.0.0.0"
@@ -121,6 +126,12 @@ class TestDefaultsDriftGuard:
     def test_worker_ui_port(self):
         from nightshift.config.worker import WorkerConfig
         assert WorkerConfig(workspace=Path(".")).ui_port == 8810
+
+    def test_worker_claude_billing_defaults_auto(self):
+        """One declaration: both surfaces default to the same billing.py constant."""
+        from nightshift.billing import DEFAULT_CLAUDE_BILLING
+        from nightshift.config.worker import WorkerConfig
+        assert WorkerConfig(workspace=Path(".")).claude_billing == DEFAULT_CLAUDE_BILLING
 
     def test_player_theme(self):
         from nightshift.config.player import PlayerConfig
@@ -213,6 +224,7 @@ class TestRoundTrip:
         assert loaded.operator.max_per_day == original.operator.max_per_day
         assert loaded.operator.automerge == original.operator.automerge
         assert loaded.operator.planner_model == original.operator.planner_model
+        assert loaded.operator.claude_billing == original.operator.claude_billing
 
     def test_worker_round_trip(self, workspace: Path, monkeypatch):
         monkeypatch.delenv("NIGHTSHIFT_WORKER_BACKEND", raising=False)
@@ -239,6 +251,7 @@ class TestRoundTrip:
             models=["antigravity/gemini-3.1-pro-high"],
             auto_model="antigravity/gemini-3.5-flash-low",
             max_model="antigravity/gemini-3.1-pro-high",
+            claude_billing="subscription",
         )
         save_worker_config(workspace, original)
         loaded = load_worker_config(workspace)
@@ -247,6 +260,7 @@ class TestRoundTrip:
         assert loaded.models == ["antigravity/gemini-3.1-pro-high"]
         assert loaded.auto_model == "antigravity/gemini-3.5-flash-low"
         assert loaded.ui_port == 8810
+        assert loaded.claude_billing == "subscription"
 
     def test_player_round_trip(self, workspace: Path):
         from nightshift.config.player import (
@@ -396,6 +410,81 @@ class TestSecretsIsolation:
         save_json(workspace / ".nightshift" / "manager.json", {})
         loaded = load_manager_settings(workspace)
         assert loaded.shared_secret == "from-env"
+
+
+# ─── claude_billing on both surfaces ─────────────────────────────────────────
+
+
+class TestClaudeBillingSetting:
+    """The declared billing mode loads from both config files, or fails loudly."""
+
+    def test_worker_absent_key_is_auto(self, workspace: Path):
+        from nightshift.config.io import save_json
+        from nightshift.config.worker import load_worker_config
+
+        save_json(workspace / ".nightshift" / "worker.json", {"worker_id": "w1"})
+        assert load_worker_config(workspace).claude_billing == "auto"
+
+    def test_worker_invalid_value_names_the_setting(self, workspace: Path):
+        from nightshift.billing import BillingConfigError
+        from nightshift.config.io import save_json
+        from nightshift.config.worker import load_worker_config
+
+        save_json(
+            workspace / ".nightshift" / "worker.json", {"claude_billing": "free"}
+        )
+        with pytest.raises(BillingConfigError, match="claude_billing"):
+            load_worker_config(workspace)
+
+    def test_worker_value_is_normalised(self, workspace: Path):
+        from nightshift.config.io import save_json
+        from nightshift.config.worker import load_worker_config
+
+        save_json(
+            workspace / ".nightshift" / "worker.json", {"claude_billing": " API "}
+        )
+        assert load_worker_config(workspace).claude_billing == "api"
+
+    def test_manager_absent_key_is_auto(self, workspace: Path, monkeypatch):
+        _clear_manager_env(monkeypatch)
+        from nightshift.config.io import save_json
+        from nightshift.config.manager import load_manager_settings
+
+        save_json(workspace / ".nightshift" / "manager.json", {})
+        assert load_manager_settings(workspace).operator.claude_billing == "auto"
+
+    def test_manager_invalid_value_names_the_setting(self, workspace: Path, monkeypatch):
+        _clear_manager_env(monkeypatch)
+        from nightshift.billing import BillingConfigError
+        from nightshift.config.io import save_json
+        from nightshift.config.manager import load_manager_settings
+
+        save_json(
+            workspace / ".nightshift" / "manager.json", {"claude_billing": "free"}
+        )
+        with pytest.raises(BillingConfigError, match="claude_billing"):
+            load_manager_settings(workspace)
+
+    def test_manager_flat_config_carries_it(self, workspace: Path, monkeypatch):
+        _clear_manager_env(monkeypatch)
+        from nightshift.config.io import save_json
+        from nightshift.config.manager import load_manager_config
+
+        save_json(
+            workspace / ".nightshift" / "manager.json",
+            {"claude_billing": "subscription"},
+        )
+        assert load_manager_config(workspace).claude_billing == "subscription"
+
+
+def _clear_manager_env(monkeypatch) -> None:
+    for name in (
+        "NIGHTSHIFT_PG_DSN", "NIGHTSHIFT_SHARED_SECRET", "NIGHTSHIFT_MANAGER_HOST",
+        "NIGHTSHIFT_MANAGER_PORT", "NIGHTSHIFT_LANDING_MODE",
+        "NIGHTSHIFT_DEFAULT_MODEL", "NIGHTSHIFT_TASKS_REPO",
+        "NIGHTSHIFT_WIP_REF_PREFIX", "NIGHTSHIFT_RENDEZVOUS_REMOTE",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 # ─── §8.5 Apply classification ───────────────────────────────────────────────

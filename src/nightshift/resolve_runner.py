@@ -39,6 +39,7 @@ from nightshift.git.worktrees import (
     teardown_worktree,
     worktree_branch,
 )
+from nightshift.lifecycle import FailureKind
 from nightshift.model_id import split_model
 from nightshift.preflight import run_interruptible
 from nightshift.prompts import build_resolve_prompt, worker_env
@@ -60,13 +61,34 @@ def _noop(_event: Event) -> None:
     return None
 
 
+def _worker_tele(worker: backends.WorkerResult) -> dict[str, Any]:
+    """The resolver agent's telemetry, in TaskResult's field names."""
+    return {
+        "billing": worker.billing,
+        "cost_usd": worker.cost_usd,
+        "turns": worker.turns,
+        "input_tokens": worker.input_tokens,
+        "output_tokens": worker.output_tokens,
+        "usage": worker.usage,
+    }
+
+
+class BackendSelectionError(ValueError):
+    """A model id (or its declared fallback) can't be resolved to a known
+    backend — routing follows declared settings only, never a silent
+    substitution."""
+
+
 def select_run_backend(model: str, fallback_backend: str | None) -> tuple[Any, str]:
     """Pick the backend for a (possibly qualified) model id.
 
     A ``provider/model`` id dispatches to that provider's backend and the bare
-    model is what reaches the CLI. Agnostic keywords (``auto``/``max``) and bare
-    or unrecognized ids fall back to ``fallback_backend`` (the default backend
-    when ``None``) with the id passed through unchanged.
+    model is what reaches the CLI; an unrecognized provider raises rather than
+    silently substituting a default. Agnostic keywords (``auto``/``max``) and
+    bare ids dispatch to ``fallback_backend`` (the *declared* ``resolve_backend``
+    / ``worker_backend``) with the id passed through unchanged; a missing or
+    unknown fallback raises naming those settings — there is no built-in
+    default here.
 
     References :mod:`nightshift.backends` through the module object so test
     monkeypatching of ``backends.require_backend``/``get_backend`` holds.
@@ -76,7 +98,25 @@ def select_run_backend(model: str, fallback_backend: str | None) -> tuple[Any, s
         try:
             return backends.require_backend(provider), bare
         except KeyError:
-            pass
+            raise BackendSelectionError(
+                f"unknown provider {provider!r} in model {model!r}; declare a "
+                "known provider in resolve_model (manager.json) or the "
+                f"brief's model: (known: {sorted(backends.known_providers())})"
+            ) from None
+    if not fallback_backend:
+        raise BackendSelectionError(
+            f"model {model!r} names no provider and no backend is declared; "
+            "set resolve_model (manager.json) to a qualified provider/model "
+            "id, or give the brief a qualified model: "
+            f"(known providers: {sorted(backends.known_providers())})"
+        )
+    if fallback_backend not in backends.known_providers():
+        raise BackendSelectionError(
+            f"model {model!r} falls back to backend {fallback_backend!r} "
+            "(resolve_backend), but that name is unknown; set resolve_model "
+            "to a qualified provider/model id instead "
+            f"(known providers: {sorted(backends.known_providers())})"
+        )
     return backends.get_backend(fallback_backend), model
 
 
@@ -91,6 +131,14 @@ class TaskResult:
     error: str | None = None
     status: str = ""
     result_line: str = ""
+    # Telemetry of the resolver agent's last run (billing decided at spawn,
+    # CLI-reported cost/turns/tokens) — ``None`` when no agent ran.
+    billing: str | None = None
+    cost_usd: float | None = None
+    turns: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    usage: dict[str, Any] | None = None
     # Classified failure category when ``success`` is False (see events.py).
     failure_kind: str | None = None
 
@@ -219,8 +267,10 @@ def _land_resolved(
     tasks_rel: str,
     emit: Listener,
     queue: str | None,
+    tele: dict[str, Any] | None = None,
 ) -> TaskResult:
-    """Record a successful resolve land and tear down the preserved worktree."""
+    """Record a successful resolve land and tear down the preserved worktree.
+    ``tele`` is the resolver agent's telemetry when an agent ran."""
     repo_root = workspace / repo
     loc = compute_code_loc(repo_root, sha)
     teardown_worktree(workspace, repo, task, queue=queue)
@@ -233,7 +283,7 @@ def _land_resolved(
     }))
     return TaskResult(
         task=task, title=title, success=True, commit_sha=sha, loc=loc,
-        result_line=result_line,
+        result_line=result_line, **(tele or {}),
     )
 
 
@@ -367,6 +417,7 @@ def _agent_resolve(
     abort_reason: object = None,
     queue: str | None = None,
 ) -> TaskResult:
+    tele: dict[str, Any] = {}
     """Rebase the task branch onto the target repo's ``main`` and drive an agent
     to resolve the conflicts / validation failures, then squash. Bounded by
     config ``max_resolve_attempts``."""
@@ -391,7 +442,7 @@ def _agent_resolve(
         }))
         return TaskResult(
             task=task, title=title, success=False, error=error,
-            failure_kind="merge_conflict",
+            failure_kind="merge_conflict", **tele,
         )
 
     max_attempts = int(config.get("max_resolve_attempts", DEFAULT_MAX_RESOLVE_ATTEMPTS))
@@ -427,10 +478,22 @@ def _agent_resolve(
         except DocumentUnavailable as exc:
             _emit_log(f"  reference docs unavailable for resolve: {exc}\n")
     resolved = resolve_frontmatter(meta, config)
-    backend, model = select_run_backend(
-        config.get("resolve_model") or resolved["model"],
-        config.get("resolve_backend") or backend_name or config.get("worker_backend"),
-    )
+    try:
+        backend, model = select_run_backend(
+            config.get("resolve_model") or resolved["model"],
+            config.get("resolve_backend") or backend_name or config.get("worker_backend"),
+        )
+    except BackendSelectionError as exc:
+        error = str(exc)
+        emit(Event(TASK_RESULT, {
+            "task": task, "status": "error", "error": error, "repo": repo,
+            "result_line": "backend unavailable",
+            "failure_kind": FailureKind.BACKEND_UNAVAILABLE,
+        }))
+        return TaskResult(
+            task=task, title=title, success=False, error=error,
+            failure_kind=FailureKind.BACKEND_UNAVAILABLE, **tele,
+        )
 
     last_error = conflict_detail or "merge conflict"
     for attempt in range(1, max_attempts + 1):
@@ -461,6 +524,7 @@ def _agent_resolve(
             worker = backend.run(
                 spec, _emit_log, _should_abort, on_worker_start=_on_worker_start
             )
+            tele = _worker_tele(worker)
             if worker.aborted is not None:
                 if rebase_in_progress(worktree_dir):
                     abort_rebase(worktree_dir)
@@ -468,7 +532,7 @@ def _agent_resolve(
                     "task": task, "status": worker.aborted, "repo": repo,
                 }))
                 return TaskResult(
-                    task=task, title=title, success=False, status=worker.aborted,
+                    task=task, title=title, success=False, status=worker.aborted, **tele,
                 )
             if worker.returncode == backends.LAUNCH_FAILED:
                 error = (
@@ -484,7 +548,23 @@ def _agent_resolve(
                 }))
                 return TaskResult(
                     task=task, title=title, success=False, error=error,
-                    failure_kind="worker_launch",
+                    failure_kind="worker_launch", **tele,
+                )
+            if worker.returncode == backends.CONFIG_FAILED:
+                # The box's declared config refused the spawn (e.g. an
+                # unsatisfiable claude_billing): say so, once, no retry.
+                error = worker.error or "backend configuration error"
+                _emit_log(f"  {error}\n")
+                if rebase_in_progress(worktree_dir):
+                    abort_rebase(worktree_dir)
+                emit(Event(TASK_RESULT, {
+                    "task": task, "status": "error", "error": error, "repo": repo,
+                    "result_line": "backend configuration error",
+                    "failure_kind": FailureKind.BACKEND_UNAVAILABLE,
+                }))
+                return TaskResult(
+                    task=task, title=title, success=False, error=error,
+                    failure_kind=FailureKind.BACKEND_UNAVAILABLE, **tele,
                 )
             if rebase_in_progress(worktree_dir):
                 abort_rebase(worktree_dir)
@@ -527,7 +607,7 @@ def _agent_resolve(
             return _land_resolved(
                 workspace, repo, tasks_root, task, title,
                 sha=sha, meta=meta, config=config, tasks_rel=tasks_rel,
-                emit=emit, queue=queue,
+                emit=emit, queue=queue, tele=tele,
             )
         last_error = squash_detail or "squash-merge still failed after resolution"
 
@@ -540,7 +620,7 @@ def _agent_resolve(
     }))
     return TaskResult(
         task=task, title=title, success=False, error=error,
-        failure_kind="merge_conflict",
+        failure_kind="merge_conflict", **tele,
     )
 
 

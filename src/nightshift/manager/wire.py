@@ -106,6 +106,7 @@ class ResolveResultBody(BaseModel):
     cache_creation_input_tokens: int | None = None
     usage: dict[str, Any] | None = None
     cost_usd: float | None = None
+    billing: str | None = None
 
 
 class EmitFn(Protocol):

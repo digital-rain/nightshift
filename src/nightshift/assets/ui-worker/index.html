@@ -61,6 +61,12 @@
             <div class="stat"><span class="stat-num" id="st-done">0</span><span class="stat-label">completed</span></div>
             <div class="stat"><span class="stat-num" id="st-err">0</span><span class="stat-label">errored</span></div>
             <div class="stat"><span class="stat-num" id="st-loc">0</span><span class="stat-label">LOC</span></div>
+            <!-- Spend split by billing attribution: actual is money this box
+                 really spent (API-billed runs, plus any run the backend could
+                 not attribute); notional is the list price the CLI reports for
+                 subscription runs, which cost no money. -->
+            <div class="stat"><span class="stat-num" id="st-actual">$0.00</span><span class="stat-label">actual</span></div>
+            <div class="stat"><span class="stat-num" id="st-notional">$0.00</span><span class="stat-label">notional</span></div>
           </div>
           <button id="btn-stats" type="button" class="ghost-btn" title="Run statistics">Stats</button>
         </div>

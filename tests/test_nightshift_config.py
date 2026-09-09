@@ -11,12 +11,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from nightshift.billing import DEFAULT_CLAUDE_BILLING
 from nightshift.config.manager import ManagerSettings
 from nightshift.queue_config import ci_monitoring_enabled, set_ci_monitoring
 
 
 ROOT = Path(__file__).resolve().parents[1]
 MANAGER_TEMPLATE = ROOT / "src" / "nightshift" / "assets" / "config" / "manager.json"
+WORKER_TEMPLATE = ROOT / "src" / "nightshift" / "assets" / "config" / "worker.json"
 
 
 def test_template_forbidden_paths_exclude_templates_dir() -> None:
@@ -48,6 +50,14 @@ def test_template_scheduled_models_allow_filter() -> None:
     assert isinstance(config["scheduled_models_allow"], list)
     assert config["scheduled_models_allow"]
     assert "diff_cap_lines" in config
+
+
+def test_templates_declare_claude_billing() -> None:
+    # A scaffolded workspace states which credential claude-code runs spend,
+    # rather than inheriting whatever leaked into the process environment.
+    for template in (MANAGER_TEMPLATE, WORKER_TEMPLATE):
+        config = json.loads(template.read_text())
+        assert config["claude_billing"] == DEFAULT_CLAUDE_BILLING == "auto"
 
 
 def test_ci_monitoring_defaults_off() -> None:

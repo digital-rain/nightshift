@@ -248,6 +248,12 @@ class Telemetry(BaseModel):
     actually entered, plus ``total`` for the whole execute). ``None`` when the
     run failed before entering any phase (environment failures) or predates
     the instrumentation.
+
+    ``billing`` says which account paid: ``"api"`` when the run demonstrably
+    billed a vendor API key, ``"subscription"`` when it ran under a
+    subscription login (its ``cost_usd`` is then a notional list-price figure,
+    not money spent), ``None`` when the backend cannot say (and on every record
+    that predates the field). The spend rollups never sum the two together.
     """
 
     turns: int | None = None
@@ -257,6 +263,7 @@ class Telemetry(BaseModel):
     cache_creation_input_tokens: int | None = None
     usage: dict[str, Any] | None = None
     cost_usd: float | None = None
+    billing: str | None = None
     validate_cmd: str | None = None
     worktree: str | None = None
     timings: dict[str, float] | None = None

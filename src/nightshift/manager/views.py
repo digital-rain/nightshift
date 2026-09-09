@@ -26,7 +26,13 @@ RUN_VIEW_KEYS = (
     "required_mcps", "status", "phase", "result_line", "commit_sha", "loc",
     "remote", "pushed", "turns", "input_tokens", "output_tokens",
     "cache_read_input_tokens", "cache_creation_input_tokens", "usage",
-    "cost_usd", "failure_kind", "failure_reason", "validate_cmd", "worktree",
+    "cost_usd",
+    # Which account paid for that cost_usd: "api" (a vendor API key was
+    # billed), "subscription" (a subscription login — cost_usd is then a
+    # notional list-price figure), or NULL when the backend cannot say and on
+    # every pre-existing row. Drives the actual/notional split in Stats.
+    "billing",
+    "failure_kind", "failure_reason", "validate_cmd", "worktree",
     "title", "body", "started_at", "finished_at",
     # Additive (post-Phase-8): enhance-on-create attribution, the operator's
     # thumbs verdict on the run, and free-form notes.
@@ -76,7 +82,12 @@ ANALYTICS_RUN_KEYS = (
     "status", "landed", "loc", "turns",
     "input_tokens", "output_tokens",
     "cache_read_input_tokens", "cache_creation_input_tokens",
-    "cost_usd", "usage", "failure_kind", "started_at", "finished_at",
+    "cost_usd",
+    # See RUN_VIEW_KEYS above: the billing attribution, without which the
+    # analytics module would sum notional subscription dollars into actual
+    # spend.
+    "billing",
+    "usage", "failure_kind", "started_at", "finished_at",
     "enhanced", "rating", "timings",
     # See RUN_VIEW_KEYS above: the brief's `kind:` frontmatter, carried onto
     # the attempt, split out by the Stats CI-resolution card.

@@ -40,6 +40,7 @@ module lazily, from inside ``run_task``.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -53,8 +54,10 @@ from typing import Any
 
 import httpx
 
-from nightshift import preflight, price, prompts
+from nightshift import billing, preflight, price, prompts
 
+
+_log = logging.getLogger("nightshift.backends")
 
 EmitLog = Callable[[str], None]
 ShouldAbort = Callable[[], "str | None"]
@@ -65,6 +68,12 @@ OnWorkerStart = Callable[[int], None]
 # Conventional returncode used by :func:`_stream_subprocess` when the worker
 # binary itself could not be launched (distinct from a non-zero worker exit).
 LAUNCH_FAILED = 127
+# Conventional returncode for a run refused *before* anything was spawned
+# because this box's declared configuration cannot satisfy it (a missing
+# credential, an unsatisfiable ``claude_billing``). An environment fault, not a
+# task fault: the engine maps it to ``BACKEND_UNAVAILABLE`` so the task is
+# retried elsewhere instead of counting toward its quarantine ladder.
+CONFIG_FAILED = 2
 
 
 def httpx_timeout(seconds: float | None) -> Any:
@@ -124,6 +133,10 @@ class WorkerResult:
     cache_creation_input_tokens: int | None = None
     usage: dict[str, Any] | None = None
     cost_usd: float | None = None
+    # Which account the run billed — ``"api"`` (a vendor key), ``"subscription"``
+    # (a login; ``cost_usd`` is then a notional list price), or ``None`` when
+    # the backend can't say. Decided at spawn time, never inferred afterwards.
+    billing: str | None = None
 
 
 def _usage_tokens(usage: dict[str, Any] | None) -> tuple[int | None, int | None]:
@@ -453,6 +466,26 @@ class ClaudeCodeBackend:
     def available(self, config: dict[str, Any] | None = None) -> bool:
         return bool(shutil.which("claude") or (config or {}).get("claude_bin"))
 
+    @staticmethod
+    def _decide_billing(
+        config: dict[str, Any] | None,
+        env: dict[str, str],
+        log: Callable[[str], None] | None = None,
+    ) -> billing.BillingDecision:
+        """Resolve the declared ``claude_billing`` mode into the env the CLI
+        is spawned with (see :mod:`nightshift.billing`). This is the single
+        seam every ``claude`` spawn passes through — the worker run, workflow
+        doc steps, the conflict resolver, the manager's enhance pass, and the
+        Slack intake normaliser — so the key can only reach the CLI when the
+        declaration says so. Raises
+        ``BillingConfigError`` for an unsatisfiable declaration."""
+        return billing.decide_claude_billing(
+            billing.billing_setting(config),
+            env=env,
+            claude_bin=prompts.resolve_claude_bin(config),
+            log=log,
+        )
+
     def complete_text(
         self,
         system: str,
@@ -472,12 +505,19 @@ class ClaudeCodeBackend:
         """
         from nightshift.agent.transport import TransportError
 
+        try:
+            decision = self._decide_billing(
+                config, dict(env or os.environ), log=_log.warning,
+            )
+        except billing.BillingConfigError as exc:
+            raise TransportError(str(exc)) from exc
+        _log.info("[claude-code] billing: %s (%s)", decision.mode, decision.reason)
         argv = prompts.build_claude_text_argv(system, user, model)
         argv[0] = prompts.resolve_claude_bin(config)
         try:
             with tempfile.TemporaryDirectory(prefix="nightshift-oneshot-") as cwd:
                 proc = subprocess.run(
-                    argv, cwd=cwd, env=env or None, capture_output=True,
+                    argv, cwd=cwd, env=decision.env, capture_output=True,
                     text=True, timeout=timeout,
                 )
         except FileNotFoundError as exc:
@@ -515,18 +555,27 @@ class ClaudeCodeBackend:
         should_abort: ShouldAbort,
         on_worker_start: OnWorkerStart | None = None,
     ) -> WorkerResult:
+        try:
+            decision = self._decide_billing(
+                spec.config, spec.env, log=lambda line: emit_log(f"  {line}\n"),
+            )
+        except billing.BillingConfigError as exc:
+            return WorkerResult(returncode=CONFIG_FAILED, error=str(exc))
+        emit_log(f"  [claude-code] billing: {decision.mode} ({decision.reason})\n")
         argv = prompts.build_claude_argv(
             spec.prompt, spec.model, spec.max_turns,
             resume=spec.config.get("resume_session_id"),
         )
         argv[0] = prompts.resolve_claude_bin(spec.config)
-        return _stream_subprocess(
-            argv, cwd=spec.cwd, env=spec.env, emit_log=emit_log,
+        result = _stream_subprocess(
+            argv, cwd=spec.cwd, env=decision.env, emit_log=emit_log,
             should_abort=should_abort, on_start=on_worker_start,
             parser=AgentStreamParser(),
             timeout=spec.timeout,
             model=spec.model,
         )
+        result.billing = decision.mode
+        return result
 
 
 class CursorAgentBackend:
@@ -628,7 +677,7 @@ class AnthropicBackend(_TransportTextCompletion):
     ) -> WorkerResult:
         key = spec.env.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
         if not key:
-            return WorkerResult(returncode=2, error="ANTHROPIC_API_KEY is not set")
+            return WorkerResult(returncode=CONFIG_FAILED, error="ANTHROPIC_API_KEY is not set")
         model = spec.config.get("anthropic_model") or spec.model
         max_tokens = int(spec.config.get("anthropic_max_tokens", 4096))
         emit_log(f"  [anthropic] {model}: single-shot completion (non-agentic; no file edits)\n")
@@ -697,6 +746,7 @@ class AnthropicBackend(_TransportTextCompletion):
             cache_creation_input_tokens=cache_creation,
             usage=usage or None,
             cost_usd=price.cost_of(model, usage),
+            billing=billing.BILLING_API,
         )
 
 
@@ -840,7 +890,7 @@ class OllamaCloudBackend(_TransportTextCompletion):
             or os.environ.get("OLLAMA_API_KEY")
         )
         if not key:
-            return WorkerResult(returncode=2, error="OLLAMA_API_KEY is not set")
+            return WorkerResult(returncode=CONFIG_FAILED, error="OLLAMA_API_KEY is not set")
         host = str(spec.config.get("ollama_cloud_host", "https://ollama.com")).rstrip("/")
         model = spec.config.get("ollama_cloud_model") or spec.model or "gpt-oss:120b"
         emit_log(f"  [ollama-cloud] {model} @ {host}: single-shot completion (non-agentic)\n")
@@ -965,6 +1015,9 @@ class NightshiftAgentBackend:
             # Vendor half of the model id (e.g. anthropic/claude-…) prices the
             # run; unknown / local-Ollama vendors return None (honest).
             cost_usd=price.cost_of(upstream, loop.usage),
+            # The harness holds the vendor's key itself: anthropic runs are
+            # API-billed; the Ollama vendors carry no dollar bill to attribute.
+            billing=billing.BILLING_API if vendor == "anthropic" else None,
         )
         if loop.error is not None:
             # An errored loop (max_turns, transport failure) still burned real
@@ -996,9 +1049,18 @@ def backend_names() -> list[str]:
 
 
 def get_backend(name: str | None) -> Any:
-    """Return the backend by ``name``, falling back to the default."""
+    """Return the backend by ``name``.
+
+    ``None``/empty still means the declared default (``DEFAULT_BACKEND``); an
+    unknown non-empty name is never silently substituted — it raises
+    ``KeyError(name)`` (mirrors :func:`require_backend`).
+    """
     registry = _by_name()
-    return registry.get(name or DEFAULT_BACKEND) or registry[DEFAULT_BACKEND]
+    if not name:
+        return registry[DEFAULT_BACKEND]
+    if name not in registry:
+        raise KeyError(name)
+    return registry[name]
 
 
 def known_providers() -> set[str]:
