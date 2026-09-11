@@ -423,46 +423,9 @@ def set_engine_meta(
     if dest.parent != tasks_dir or not dest.is_file():
         raise FileNotFoundError(task)
 
-    lines = dest.read_text(errors="replace").splitlines()
-    close: int | None = None
-    if lines and lines[0].strip() == "---":
-        for i in range(1, len(lines)):
-            if lines[i].strip() == "---":
-                close = i
-                break
-
-    if close is not None:
-        fence_lines = lines[1:close]
-        body_lines = lines[close + 1 :]
-    else:
-        fence_lines = []
-        body_lines = lines
-
-    remaining = dict(changes)
-    new_fence: list[str] = []
-    for line in fence_lines:
-        stripped = line.strip()
-        key = (
-            line.split(":", 1)[0].strip()
-            if stripped and not stripped.startswith("#") and ":" in line
-            else None
-        )
-        if key is not None and key in remaining:
-            value = remaining.pop(key)
-            if value is not None:
-                new_fence.append(f"{key}: {_render_meta_value(value)}")
-        else:
-            new_fence.append(line)
-    for key, value in remaining.items():
-        if value is not None:
-            new_fence.append(f"{key}: {_render_meta_value(value)}")
-
-    body = _strip_leading_blanks(body_lines)
-    if new_fence:
-        out = ["---", *new_fence, "---", "", *body]
-    else:
-        out = body
-    dest.write_text("\n".join(out).rstrip("\n") + "\n")
+    dest.write_text(
+        set_frontmatter_text(dest.read_text(errors="replace"), changes)
+    )
     return read_task(tasks_root, task, tasks_rel)
 
 
@@ -859,6 +822,69 @@ def _strip_leading_blanks(lines: list[str]) -> list[str]:
     return lines[idx:]
 
 
+def _split_fence(text: str) -> tuple[list[str], list[str]]:
+    """Split brief text into ``(frontmatter lines, body lines)`` — an unfenced
+    brief is all body."""
+    lines = text.splitlines()
+    close: int | None = None
+    if lines and lines[0].strip() == "---":
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                close = i
+                break
+    if close is None:
+        return [], lines
+    return lines[1:close], lines[close + 1 :]
+
+
+def _apply_fence_changes(
+    fence_lines: list[str], changes: dict[str, object | None]
+) -> list[str]:
+    """Rewrite frontmatter lines from ``changes``: a key already in the fence is
+    updated *where it sits* (so field order, unrelated keys, and comments
+    survive), a key that isn't is appended, and a ``None`` value drops it."""
+    remaining = dict(changes)
+    out: list[str] = []
+    for line in fence_lines:
+        stripped = line.strip()
+        key = (
+            line.split(":", 1)[0].strip()
+            if stripped and not stripped.startswith("#") and ":" in line
+            else None
+        )
+        if key is not None and key in remaining:
+            value = remaining.pop(key)
+            if value is not None:
+                out.append(f"{key}: {_render_meta_value(value)}")
+        else:
+            out.append(line)
+    for key, value in remaining.items():
+        if value is not None:
+            out.append(f"{key}: {_render_meta_value(value)}")
+    return out
+
+
+def _join_fence(fence_lines: list[str], body_lines: list[str]) -> str:
+    body = _strip_leading_blanks(body_lines)
+    out = ["---", *fence_lines, "---", "", *body] if fence_lines else body
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+def set_frontmatter_text(text: str, changes: dict[str, object | None]) -> str:
+    """Apply frontmatter ``changes`` to a brief's *text* and return the rewrite.
+
+    The pure core of :func:`set_engine_meta` and :func:`set_task_meta`'s fence
+    half (:func:`_apply_fence_changes` for the rules), lifted out because one
+    caller edits a brief that does **not** live in the content store: a repo
+    import refused because the queued task of that name has already begun
+    disables its source in the target repo
+    (:func:`nightshift.repo_tasks.disable_inbox_sources`), which is a text
+    rewrite committed through the landing pipeline rather than a file write.
+    """
+    fence_lines, body_lines = _split_fence(text)
+    return _join_fence(_apply_fence_changes(fence_lines, changes), body_lines)
+
+
 def set_task_meta(
     tasks_root: Path,
     task: str,
@@ -901,45 +927,14 @@ def set_task_meta(
         raise ValueError("title is required")
     meta_changes = {k: v for k, v in changes.items() if k in _EDITABLE_META_KEYS}
 
-    lines = dest.read_text(errors="replace").splitlines()
-    close: int | None = None
-    if lines and lines[0].strip() == "---":
-        for i in range(1, len(lines)):
-            if lines[i].strip() == "---":
-                close = i
-                break
-
-    if close is not None:
-        fence_lines = lines[1:close]
-        body_lines = lines[close + 1 :]
-    else:
-        fence_lines = []
-        body_lines = lines
+    fence_lines, body_lines = _split_fence(dest.read_text(errors="replace"))
 
     # ``title`` rides through the same fence-rewrite machinery as the scalars so
     # an existing ``title:`` line is updated in place rather than duplicated.
     fence_changes: dict[str, object | None] = dict(meta_changes)
     if "title" in changes:
         fence_changes["title"] = str(new_title).strip()
-
-    remaining = dict(fence_changes)
-    new_fence: list[str] = []
-    for line in fence_lines:
-        stripped = line.strip()
-        key = (
-            line.split(":", 1)[0].strip()
-            if stripped and not stripped.startswith("#") and ":" in line
-            else None
-        )
-        if key is not None and key in remaining:
-            value = remaining.pop(key)
-            if value is not None:
-                new_fence.append(f"{key}: {_render_meta_value(value)}")
-        else:
-            new_fence.append(line)
-    for key, value in remaining.items():
-        if value is not None:
-            new_fence.append(f"{key}: {_render_meta_value(value)}")
+    new_fence = _apply_fence_changes(fence_lines, fence_changes)
 
     # Content edits operate on the three body sections independently: the spec
     # prose, the notes section, and the original-brief tail each replace their
@@ -952,14 +947,9 @@ def set_task_meta(
         notes = str(changes.get("notes") or "").strip()
     if "original_brief" in changes:
         original = str(changes.get("original_brief") or "").strip()
-    body = _strip_leading_blanks(
-        join_original(join_notes(brief, notes), original).splitlines()
-    )
-    if new_fence:
-        out = ["---", *new_fence, "---", "", *body]
-    else:
-        out = body
-    dest.write_text("\n".join(out).rstrip("\n") + "\n")
+    dest.write_text(_join_fence(
+        new_fence, join_original(join_notes(brief, notes), original).splitlines()
+    ))
 
     return read_task(tasks_root, task, tasks_rel)
 

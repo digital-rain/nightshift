@@ -68,6 +68,7 @@ from nightshift import repos
 from nightshift.auto_import import (
     auto_import_repos,
     imported_brief_text,
+    is_replay,
     pending_imports,
     resolve_host_queue,
 )
@@ -812,7 +813,10 @@ class Reconciler:
         A published quarantine is refused outright: the brief stays in the
         host queue, re-skipped every pass, until the publisher clears or
         removes it. The pending map filters the scan, so a source whose
-        removal failed after its copy landed is not imported twice.
+        removal failed after its copy landed is not imported twice — but a
+        source re-published with *different* text is an update the publisher
+        means this queue to take, so it passes the guard and overwrites the
+        task it named (:func:`nightshift.auto_import.is_replay`).
         """
         enabled = set(auto_import_repos(self._tasks_root))
         if not enabled:
@@ -842,6 +846,7 @@ class Reconciler:
                 scan_repo_inbox,
                 self._workspace, repo, host_inbox(host),
                 self._tasks_root, tasks_rel,
+                await self._store().started_tasks(queue),
             )
             if not entries:
                 # The steady state: a drained inbox. Don't pay the destination
@@ -850,11 +855,15 @@ class Reconciler:
             # Replay guard: a source already imported into this queue is still
             # published only because its removal failed, so skip past it rather
             # than running the same brief twice. A published quarantine is the
-            # publisher's hold — skipped and left published.
+            # publisher's hold — skipped and left published. So is a refusal
+            # already marked as one: the source is held where it was published,
+            # and there is nothing left for this pass to do to it.
             pending = pending_imports(self._tasks_root, tasks_rel)
             fresh = [
                 e for e in entries
-                if not e.quarantined and f"{repo}/{e.source}" not in pending
+                if not e.quarantined
+                and not (e.started and e.disabled)
+                and not is_replay(pending, f"{repo}/{e.source}", e.text)
             ]
             if fresh:
                 await self._auto_import_batch(queue, repo, host, fresh)
@@ -872,6 +881,10 @@ class Reconciler:
         again — the operator drained it by hand at some point — but its source
         is still removed, so the inbox converges instead of re-offering it
         every tick.
+
+        A brief naming a task that has already begun is *refused*: not copied,
+        and its source held where it was published (``disabled: true``) rather
+        than drained, so the publisher can see their update was not taken.
         """
         label = queue_label(queue)
         tasks_rel = playlists_mod.tasks_rel(queue)
@@ -893,7 +906,7 @@ class Reconciler:
         )
         stems: dict[str, str | None] = dict.fromkeys(e.source for e in entries)
         stems.update(zip(
-            (e.source for e in rewritten if not e.duplicate),
+            (e.source for e in rewritten if not (e.duplicate or e.started)),
             (t["task"] for t in imported),
             strict=True,
         ))
@@ -902,12 +915,15 @@ class Reconciler:
                 "nightshift: auto-import "
                 f"{', '.join(t['task'] for t in imported)} from {repo}/{host}"
             )
+        drained = [e.source for e in entries if not e.started]
+        refused = [e.source for e in entries if e.started]
         removal = await asyncio.wrap_future(self._executors.submit(repo, partial(
             remove_repo_tasks_locked,
             self._workspace,
             repo,
-            [entry.source for entry in entries],
-            f"nightshift: auto-import {len(entries)} brief(s) into queue {label}",
+            drained,
+            f"nightshift: auto-import {len(drained)} brief(s) into queue {label}",
+            disable=refused,
         )))
         if removal["warning"]:
             _log.warning("reconciler: auto-import: %s", removal["warning"])
@@ -923,6 +939,11 @@ class Reconciler:
                     "source": entry.source,
                     "removed": removal["removed"],
                     "warning": removal["warning"],
+                    # An update to a task that had already begun: refused and
+                    # held at the source, so the event says so rather than
+                    # reading as one more import that produced no task.
+                    "refused": entry.started,
+                    "replaced": entry.replaces,
                 },
             )
 

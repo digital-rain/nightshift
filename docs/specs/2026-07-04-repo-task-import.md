@@ -67,8 +67,38 @@ each root (`.tasks`, then `docs/tasks` — an absent root contributes nothing):
   without creating a second copy. This is also crash recovery: if a previous
   import copied the brief but the removal failed, the next import converges
   instead of duplicating.
-- Name collisions with *different* content get a `-2` suffix (the existing
-  cross-queue copy policy).
+- **Re-publishing a name** (`replaces`): a brief whose stem is already a task
+  in the destination queue, with *different* content, is an **update** to that
+  task — not a second task beside it.
+  It overwrites the brief in place, keeping its position in the execution
+  order, and the source is drained like any other import.
+  This is how an operator or another agent corrects work Nightshift has not
+  started yet: publish the brief again under the same name.
+- **A task that has begun** (`started`) is the exception (see *Refusal*).
+- Two briefs sharing a stem *inside one batch* — the same name published under
+  both inbox roots — are distinct briefs, so the second still gets a `-2`
+  suffix rather than overwriting the first.
+
+### Refusal: a task that has already begun
+
+A brief cannot be rewritten under a task a worker has already been handed: the
+attempt is running (or has run) against the text it was dispatched with, and
+replacing it would put a task in History whose brief nobody ran.
+"Has begun" is *any* attempt row for that queue+task, read from the store
+(`started_tasks`) at scan time.
+
+Such a publish is **refused**, and refusal is neither a silent drop nor a
+delete:
+
+- it is not imported — the queued task keeps its brief;
+- its source is **left in the repo with `disabled: true`** set in the
+  published frontmatter (`disable_inbox_sources`), written as part of the same
+  removal commit that drains the rest of the batch.
+
+So the publisher sees their update was not taken and still has the text, and
+can rename it, wait for the task to finish, or clear the flag themselves.
+The edit is idempotent — an already-disabled source produces no edit, so a
+re-scan that refuses the same brief again makes no commit at all.
 
 ## Import flow (order of operations = never lose a task)
 
@@ -80,12 +110,15 @@ a time (imports are rare, operator-initiated actions):
    the whole scanned set when the request carries no selection. Everything
    below operates on the picked subset only: unpicked briefs are neither
    copied nor removed, so the next preview offers them again.
-2. **Copy into the content store:** write each non-duplicate brief to
-   `nightshift-tasks/X/`, append to `order`, commit the content store
-   (`nightshift: import N task(s) from R/.tasks`). *After this commit the
-   tasks are durable* — everything later is cleanup.
+2. **Copy into the content store:** write each brief that is neither a
+   duplicate nor a refusal to `nightshift-tasks/X/` — overwriting in place
+   when it updates a queued task, otherwise appending to `order` — and commit
+   the content store (`nightshift: import N task(s) from R/.tasks`). *After
+   this commit the tasks are durable* — everything later is cleanup.
 3. **Remove from the repo** as one commit on R's `main`, run as a job on R's
-   git executor (so it can never interleave with a land or sync):
+   git executor (so it can never interleave with a land or sync). The same
+   commit carries the refused briefs' holds; a batch with nothing to drain and
+   nothing to hold makes no commit:
    - sync `origin/main` first (best-effort) so the commit lands on the fresh
      tip;
    - `delete_produce(paths, rewrite=…)` — a third producer next to `squash_produce` / `cherry_produce`: builds the base tree minus the source files in a temporary index (never touches the working tree), `commit-tree`s it, and rides `integrate_and_push_locked` with local-CAS semantics (`LandingMode.NONE`), checkout advanced best-effort exactly like a land;
@@ -95,7 +128,8 @@ a time (imports are rare, operator-initiated actions):
      commit and surfaces a warning in the response — never unwound; dedupe
      covers any replay.
 4. Emit `queue_changed`; respond
-   `{imported, deduped, removed, warning, missing}`.
+   `{imported, deduped, refused, removed, warning, missing}`, where each
+   `imported` entry is `{task, title, replaced}`.
 
 A removal where none of the paths exist on `main` *and* no config needs
 pruning collapses to the base commit (no empty commit) — the idempotent replay
@@ -119,7 +153,7 @@ preserved, and a config that needs no change is not rewritten.
 
 - `GET /api/queue/repo-tasks?queue=X` — preview:
   `{queue, repo, available, count, tasks: [{task, title, source, priority,
-  disabled, duplicate}]}`. Inert (`available: false`, empty `tasks`) when the
+  disabled, quarantined, duplicate, replaces, started}]}`. Inert (`available: false`, empty `tasks`) when the
   queue has no bound repo, the repo is unavailable, or it has no inbox at all.
 - `POST /api/queue/repo-tasks/import?queue=X` — drains the briefs the operator
   selected. Optional body `{sources: [".tasks/….md", "docs/tasks/….md", …]}`:
@@ -139,7 +173,9 @@ pattern — `api_operator.py` is near the 1k-line budget).
 
 The queue page's **"+ Add" menu** gains **"Import from repository…"**. It
 opens a modal in the established `addfrom` pattern: fetches the preview and
-lists each brief (title, source path, an "in queue" tag on duplicates).
+lists each brief (title, source path, and a tag where the brief is not a plain
+new arrival: "in queue" for a duplicate, "updates" for one that will replace a
+queued task, "already running" for one that will be refused and held).
 
 Each row carries a tick box and the whole row is its toggle, with a
 **Select all** box above the list (tri-state) — the operator controls exactly
@@ -149,8 +185,10 @@ de-selecting the exceptions is the shorter path. The **Import** button counts
 the selection (`Import 3 tasks`) and goes inert at zero. It reports progress
 ("Importing…") while the move runs — the removal syncs and pushes the repo's
 main, which takes a few seconds. Empty state: "No importable tasks in `R`
-(`.tasks/` or `docs/tasks/`)." Success refreshes the queue, reports the count (plus any `missing`
-and the push warning), and **re-scans the inbox** so the briefs left unticked
+(`.tasks/` or `docs/tasks/`)." Success refreshes the queue, reports the count
+— how many of those were updates in place, and how many were refused as
+already running — plus any `missing` and the push warning, and **re-scans the
+inbox** so the briefs left unticked
 are still on offer for a second pass — the modal empties out only once the
 inbox is actually drained.
 
@@ -174,6 +212,13 @@ Against `tests/_workspace.py` fixtures (`tests/test_repo_tasks.py`):
   removed from repo `main` (commit present, clean checkout advanced), order
   appended — for `docs/tasks` sources too, leaving neighbouring docs untouched;
 - order pruning: drained stems leave the root and queue-dir `config.json` orders (other keys and unpicked entries intact), stems with no brief left are healed with them, `docs/tasks` imports rewrite no config, a malformed config is left byte-identical, and a replayed removal still lands the prune;
+- re-publishing a name: the scan splits a collision into `replaces` /
+  `started` against the attempt store; a copy overwrites the queued brief in
+  place and keeps its order position, while two briefs sharing a stem in one
+  batch still suffix; end to end, an update lands over the queued task and an
+  update to a *started* task is refused — not imported, source left in the
+  repo with `disabled: true` — and refusing it again makes no further commit
+  (a batch that drains nothing deletes nothing);
 - never-lose: removal push failure → import still succeeds with a warning;
   second import after re-publish dedupes instead of duplicating;
 - inert paths: queue without a repo, absent repo, no inbox at all.

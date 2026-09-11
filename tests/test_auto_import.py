@@ -8,6 +8,7 @@ repo's ``main``), and the Repos-page API surface the operator drives it from.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -18,12 +19,15 @@ from _workspace import build_workspace, git, git_commit_all
 from nightshift.auto_import import (
     HOST_QUEUE_KEY,
     PROVENANCE_KEY,
+    SOURCE_DIGEST_KEY,
     auto_import_repos,
     imported_brief_text,
+    is_replay,
     normalize_frontmatter,
     pending_imports,
     resolve_host_queue,
     set_auto_import,
+    source_digest,
 )
 from nightshift.manager.app import create_app
 from nightshift.manager.store_sqlite import SqliteStore
@@ -226,11 +230,27 @@ def test_pending_imports_reports_only_stamped_briefs(tmp_path: Path) -> None:
     (queue_dir / "native.md").write_text("---\ntitle: Native\n---\n\nwork\n")
     (queue_dir / "plain.md").write_text("no frontmatter\n")
     (queue_dir / "pulled.md").write_text(
-        f"---\n{PROVENANCE_KEY}: longitude/.tasks/nightly/pulled.md\n---\n\nwork\n"
+        f"---\n{PROVENANCE_KEY}: longitude/.tasks/nightly/pulled.md\n"
+        f"{SOURCE_DIGEST_KEY}: {source_digest('work\n')}\n---\n\nwork\n"
     )
     assert pending_imports(_tasks_root(ws), "main") == {
-        "longitude/.tasks/nightly/pulled.md": "pulled",
+        "longitude/.tasks/nightly/pulled.md": source_digest("work\n"),
     }
+
+
+def test_the_replay_guard_passes_a_re_published_update_through() -> None:
+    """The guard exists to catch a source whose removal failed — the same
+    brief, still published. Different text at that path is the publisher
+    correcting themselves, and must not be mistaken for a replay."""
+    provenance = "longitude/.tasks/main/alpha.md"
+    pending = {provenance: source_digest("Do alpha.\n")}
+    assert is_replay(pending, provenance, "Do alpha.\n") is True
+    assert is_replay(pending, provenance, "Do alpha, but better.\n") is False
+    # Nothing pending under that path at all: an ordinary fresh brief.
+    assert is_replay(pending, "longitude/.tasks/main/beta.md", "Do beta.\n") is False
+    # Stamped before digests were recorded: no text to compare, so the
+    # conservative reading stands and the source is treated as a replay.
+    assert is_replay({provenance: ""}, provenance, "anything\n") is True
 
 
 # --------------------------------------------------------------------------- #
@@ -368,6 +388,57 @@ def test_a_source_whose_removal_failed_is_not_imported_twice(imported) -> None:
     _reconcile(client)
     # No second copy of alpha under a `-2` suffix.
     assert _stems(ws) == ["alpha", "beta", "native"]
+
+
+def test_a_re_published_brief_updates_the_task_it_already_pulled(imported) -> None:
+    """The publisher corrects work that has not started: same path, new text.
+    It replaces the queued brief rather than queueing a second copy — and it
+    is not mistaken for the failed-removal replay above, because the text it
+    was imported with is stamped beside its provenance."""
+    ws, client = imported
+    _reconcile(client)
+    _publish(ws / "longitude", {".tasks/main/alpha.md": "Do alpha, but better.\n"},
+             message="corrected")
+    _open_throttle(client)
+    _reconcile(client)
+    assert _stems(ws) == ["alpha", "beta", "native"]
+    brief = (_tasks_root(ws) / "main" / "alpha.md").read_text()
+    assert "Do alpha, but better." in brief
+    # Same task, same place in the line — an update, not an arrival.
+    assert load_order(_tasks_root(ws), "main") == ["native", "alpha", "beta"]
+    assert ".tasks/main/alpha.md" not in git(
+        ws / "longitude", "ls-tree", "-r", "--name-only", "main"
+    )
+
+
+def test_an_update_to_a_started_task_is_refused_and_held_at_the_source(
+    tmp_path,
+) -> None:
+    """A task a worker has already been handed cannot be rewritten under it.
+    The brief is left where it was published, disabled, so the publisher can
+    see the update was not taken — and the next pass leaves it alone."""
+    ws = build_workspace(tmp_path, tasks={"alpha": "The brief that is running.\n"})
+    _publish(ws / "longitude", {".tasks/main/alpha.md": "Too late.\n"})
+    set_auto_import(_tasks_root(ws), "longitude", True)
+    store = SqliteStore()
+    asyncio.run(store.create_attempt(
+        "run-alpha", task="alpha", queue=None, worker_id="w1",
+        backend="claude-code", model="auto", base_ref=None, ttl_seconds=600,
+        title="alpha", repo="longitude",
+    ))
+    with TestClient(create_app(ws, store=store)) as client:
+        _reconcile(client)
+        assert (_tasks_root(ws) / "main" / "alpha.md").read_text() \
+            == "The brief that is running.\n"
+        assert _stems(ws) == ["alpha"]
+        held = git(ws / "longitude", "cat-file", "blob", "main:.tasks/main/alpha.md")
+        assert split_frontmatter(held)[0] == {"disabled": True}
+        head = git(ws / "longitude", "rev-parse", "main")
+        # Every pass would otherwise re-refuse it; a brief already held has
+        # nothing left to do, so the repo stops moving.
+        _open_throttle(client)
+        _reconcile(client)
+        assert git(ws / "longitude", "rev-parse", "main") == head
 
 
 def test_duty_never_drains_a_host_queue_this_queue_did_not_bind(imported) -> None:

@@ -6518,7 +6518,8 @@ function renderRepoImport(data) {
   desc.textContent =
     `${data.count} task${data.count === 1 ? "" : "s"} published in ` +
     `${data.repo} (${REPO_INBOXES}). Ticked tasks move into this queue and are ` +
-    "removed from the repository; unticked ones stay published there.";
+    "removed from the repository; unticked ones stay published there. A brief " +
+    "named after a task already here updates it, unless that task has begun.";
   for (const t of data.tasks) ul.append(repoImportRow(t));
   $("repoimport-all").hidden = false;
   go.hidden = false;
@@ -6550,6 +6551,22 @@ function repoImportRow(t) {
     tag.className = "addfrom-tag";
     tag.textContent = "in queue";
     tag.title = "Identical brief already in this queue — the repo copy will just be removed.";
+    li.append(tag);
+  } else if (t.started) {
+    const tag = document.createElement("span");
+    tag.className = "addfrom-tag";
+    tag.textContent = "already running";
+    tag.title =
+      "A task of this name has already begun, so its brief can't be rewritten. " +
+      "Importing leaves this one in the repository, disabled.";
+    li.append(tag);
+  } else if (t.replaces) {
+    const tag = document.createElement("span");
+    tag.className = "addfrom-tag";
+    tag.textContent = "updates";
+    tag.title =
+      "A task of this name is queued and hasn't started — importing replaces " +
+      "its brief, keeping its place in the queue.";
     li.append(tag);
   } else if (t.quarantined) {
     const tag = document.createElement("span");
@@ -6625,12 +6642,23 @@ async function runRepoImport() {
     return;
   }
   await loadQueue();
-  const n = (data.imported || []).length;
+  const imported = data.imported || [];
+  const n = imported.length;
+  const u = imported.filter((t) => t.replaced).length;
   const d = (data.deduped || []).length;
+  const r = (data.refused || []).length;
   const m = (data.missing || []).length;
   let msg = `Imported ${n} task${n === 1 ? "" : "s"}` +
+    (u ? ` (${u} updated in place)` : "") +
     (d ? ` (${d} already in queue)` : "") +
     (data.removed ? " and removed them from the repository." : ".");
+  // A refusal is not a failure, but it is not an import either: the task was
+  // already running, so the brief stays in the repo held instead.
+  if (r) {
+    msg += ` ${r} task${r === 1 ? " was" : "s were"} already running — ` +
+      `${r === 1 ? "that brief was" : "those briefs were"} left in the ` +
+      "repository, disabled.";
+  }
   // Honest reporting: a selection made against a stale preview imports what is
   // still published and says so rather than claiming the rest moved.
   if (m) msg += ` ${m} selected task${m === 1 ? " was" : "s were"} no longer published.`;

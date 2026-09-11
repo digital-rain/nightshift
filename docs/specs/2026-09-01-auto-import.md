@@ -60,6 +60,7 @@ It is the latency of *noticing* new published work: each open check drains every
 | Repo switch | `<tasks_root>/config.json` (the store-level layer) | `auto_import_repos: ["longitude", …]` |
 | Host binding | `<tasks_root>/<queue>/config.json` | `host_queue: "longitude"` (`""` = explicit none) |
 | Provenance | the imported brief's own frontmatter | `imported_from: <repo>/<source-path>` |
+| Source digest | the imported brief's own frontmatter | `imported_digest: <sha256 prefix of the source text>` |
 
 Both settings live in the content store, so they commit and travel with the
 rest of the queue configuration.
@@ -77,10 +78,11 @@ Per bound queue, per pass:
 2. Discover the repo's host queues, resolve this queue's binding, and scan
    exactly that one inbox tree of the repo's `main`.
 3. Take every fresh brief — skipping published quarantines (below) and any
-   source this queue has already imported: normalise each one's frontmatter,
-   stamp its provenance, write it into the queue appended to the end of the
-   execution order, then commit the content store once for the batch.
-4. Remove the batch's sources from the repo's `main` as one repo-executor job — the shared removal, so the same commit prunes the drained stems from the host queue's `config.json` order.
+   source this queue has already imported unchanged: normalise each one's
+   frontmatter, stamp its provenance, write it into the queue appended to the
+   end of the execution order (or over the task it names, see *Re-publishing*),
+   then commit the content store once for the batch.
+4. Remove the batch's sources from the repo's `main` as one repo-executor job — the shared removal, so the same commit prunes the drained stems from the host queue's `config.json` order, and holds any brief the queue refused.
 
 Ordering matters and matches the manual import: the briefs are durable in the
 content store *before* the removal runs.
@@ -89,6 +91,31 @@ not pulled a second time: step 3 skips any source already stamped into this
 queue (`imported_from`), which is the check that has to do the work, because an
 import is rewritten on the way in and so never matches its source text
 verbatim.
+
+### Re-publishing (updating a brief already pulled)
+
+A host queue is also how a publisher *corrects* itself: publish the brief
+again, at the same path, with new text.
+The import replaces the queued task in place — same file, same position in the
+execution order — rather than queueing an `alpha-2` beside it (see the
+re-publish rule in `docs/specs/2026-07-04-repo-task-import.md`).
+
+The replay guard is what makes that reachable.
+Keyed on the source path alone it would swallow every update as "a removal
+that failed", so each import also stamps `imported_digest` — a digest of the
+source text it was imported *from*.
+A still-published source whose text still matches that stamp is a replay and
+is skipped; one whose text has changed is an update and is taken.
+(A brief stamped before digests were recorded has nothing to compare against,
+so it stays a replay — the conservative reading; renaming the source forces it
+through.)
+
+A task that has already **begun** is refused instead: the brief is not
+imported and its source is left in the repo with `disabled: true` set, so the
+publisher sees the update was not taken.
+A source already held that way is skipped on later passes — nothing left to
+import, nothing left to write — so the refusal costs one commit, not one per
+cadence window.
 
 ### FIFO drain
 

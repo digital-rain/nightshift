@@ -10,6 +10,7 @@ of duplicating. See ``docs/spec/2026-07-04-repo-task-import.md``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -24,12 +25,14 @@ from _workspace import (
 )
 from nightshift.manager.app import create_app
 from nightshift.manager.store_sqlite import SqliteStore
+from nightshift.queue_config import save_order
 from nightshift.repo_tasks import (
     RepoTask,
     copy_repo_tasks,
     scan_repo_tasks,
     select_repo_tasks,
 )
+from nightshift.spawn_daily import split_frontmatter
 
 
 def _publish(repo_root: Path, files: dict[str, str], *, message: str = "publish tasks") -> None:
@@ -133,6 +136,32 @@ def test_scan_flags_duplicates(tmp_path: Path) -> None:
     })
     entries = scan_repo_tasks(ws, "longitude", "main", ws / "nightshift-tasks", "main")
     assert {e.name: e.duplicate for e in entries} == {"alpha": True, "fresh": False}
+    # An identical re-publish is the brief that is already here, not an update
+    # to it — nothing to rewrite, and nothing to refuse.
+    assert {e.name: e.replaces for e in entries} == {"alpha": False, "fresh": False}
+
+
+def test_scan_splits_a_name_collision_by_whether_the_task_has_begun(
+    tmp_path: Path,
+) -> None:
+    """Same name, different text: an update to a task that has not started,
+    and a refusal for one that has."""
+    ws = build_workspace(
+        tmp_path, tasks={"waiting": "Old brief.\n", "running": "Old brief.\n"}
+    )
+    _publish(ws / "longitude", {
+        ".tasks/waiting.md": "Corrected brief.\n",
+        ".tasks/running.md": "Corrected too late.\n",
+        ".tasks/fresh.md": "Something new.\n",
+    })
+    entries = scan_repo_tasks(
+        ws, "longitude", "main", ws / "nightshift-tasks", "main", {"running"}
+    )
+    assert {e.name: (e.replaces, e.started) for e in entries} == {
+        "waiting": (True, False),
+        "running": (False, True),
+        "fresh": (False, False),
+    }
 
 
 def test_scan_without_inbox_is_empty(tmp_path: Path) -> None:
@@ -140,27 +169,81 @@ def test_scan_without_inbox_is_empty(tmp_path: Path) -> None:
     assert scan_repo_tasks(ws, "longitude", "main", ws / "nightshift-tasks", "main") == []
 
 
-def test_copy_suffixes_collisions_and_appends_order(tmp_path: Path) -> None:
-    ws = build_workspace(tmp_path, tasks={"alpha": "Existing different brief.\n"})
-    tasks_root = ws / "nightshift-tasks"
+def _copy_entry(
+    name: str,
+    text: str,
+    *,
+    source: str | None = None,
+    duplicate: bool = False,
+    replaces: bool = False,
+    started: bool = False,
+) -> RepoTask:
+    return RepoTask(
+        name=name, title=name, source=source or f".tasks/{name}.md", priority=5,
+        disabled=False, quarantined=False, duplicate=duplicate, text=text,
+        replaces=replaces, started=started,
+    )
 
-    def entry(name: str, text: str, *, duplicate: bool = False) -> RepoTask:
-        return RepoTask(
-            name=name, title=name, source=f".tasks/{name}.md", priority=5,
-            disabled=False, quarantined=False, duplicate=duplicate, text=text,
-        )
+
+def test_copy_updates_a_named_task_in_place_and_appends_the_rest(
+    tmp_path: Path,
+) -> None:
+    """Re-publishing a name is an update, not a second task: the brief is
+    rewritten where it sits, keeping its place in the running order."""
+    ws = build_workspace(
+        tmp_path, tasks={"alpha": "Stale brief.\n", "later": "Runs after.\n"}
+    )
+    tasks_root = ws / "nightshift-tasks"
+    save_order(tasks_root, ["alpha", "later"], "main")
 
     imported = copy_repo_tasks(tasks_root, "main", [
-        entry("alpha", "Published alpha.\n"),      # collides with different content
-        entry("fresh", "New.\n"),
-        entry("dup", "whatever\n", duplicate=True),  # duplicates are not copied
+        _copy_entry("alpha", "Corrected alpha.\n", replaces=True),
+        _copy_entry("fresh", "New.\n"),
+        _copy_entry("dup", "whatever\n", duplicate=True),   # already here
+        _copy_entry("busy", "Too late.\n", started=True),   # refused, see below
     ])
-    assert [t["task"] for t in imported] == ["alpha-2", "fresh"]
-    assert (tasks_root / "main" / "alpha-2.md").read_text() == "Published alpha.\n"
-    assert (tasks_root / "main" / "alpha.md").read_text() == "Existing different brief.\n"
+    assert imported == [
+        {"task": "alpha", "title": "alpha", "replaced": True},
+        {"task": "fresh", "title": "fresh", "replaced": False},
+    ]
+    assert (tasks_root / "main" / "alpha.md").read_text() == "Corrected alpha.\n"
+    assert not (tasks_root / "main" / "alpha-2.md").exists()
     assert not (tasks_root / "main" / "dup.md").exists()
+    assert not (tasks_root / "main" / "busy.md").exists()
+    # The update keeps its position; only the genuinely new brief is appended.
     order = json.loads((tasks_root / "main" / "config.json").read_text())["order"]
-    assert order[-2:] == ["alpha-2", "fresh"]
+    assert order == ["alpha", "later", "fresh"]
+
+
+def test_copy_still_suffixes_two_briefs_sharing_a_name_in_one_batch(
+    tmp_path: Path,
+) -> None:
+    """The same stem published under two inbox roots is two distinct briefs —
+    the second must not overwrite the first just because it arrived later."""
+    ws = build_workspace(tmp_path, tasks={"alpha": "Stale brief.\n"})
+    tasks_root = ws / "nightshift-tasks"
+    imported = copy_repo_tasks(tasks_root, "main", [
+        _copy_entry("alpha", "From the legacy inbox.\n", replaces=True),
+        _copy_entry("alpha", "From docs/tasks.\n", source="docs/tasks/alpha.md"),
+    ])
+    assert [t["task"] for t in imported] == ["alpha", "alpha-2"]
+    assert (tasks_root / "main" / "alpha.md").read_text() == "From the legacy inbox.\n"
+    assert (tasks_root / "main" / "alpha-2.md").read_text() == "From docs/tasks.\n"
+    order = json.loads((tasks_root / "main" / "config.json").read_text())["order"]
+    assert order[-1:] == ["alpha-2"]
+
+
+def test_copy_appends_an_update_whose_task_left_the_queue(tmp_path: Path) -> None:
+    """The scan said "update", but the task landed and dropped out between
+    scan and copy. It is a fresh task now, and needs its order entry."""
+    ws = build_workspace(tmp_path, tasks={})
+    tasks_root = ws / "nightshift-tasks"
+    copy_repo_tasks(tasks_root, "main", [
+        _copy_entry("alpha", "Do alpha.\n", replaces=True),
+    ])
+    assert (tasks_root / "main" / "alpha.md").read_text() == "Do alpha.\n"
+    order = json.loads((tasks_root / "main" / "config.json").read_text())["order"]
+    assert order == ["alpha"]
 
 
 # --------------------------------------------------------------------------- #
@@ -337,7 +420,7 @@ def test_import_of_nothing_selected_is_a_no_op(tmp_path: Path) -> None:
             "/api/queue/repo-tasks/import", json={"sources": []}
         ).json()
         assert data == {
-            "imported": [], "deduped": [], "removed": False,
+            "imported": [], "deduped": [], "refused": [], "removed": False,
             "warning": None, "missing": [],
         }
         assert client.get("/api/queue/repo-tasks").json()["count"] == 1
@@ -359,6 +442,106 @@ def test_import_of_a_stale_selection_imports_the_rest(tmp_path: Path) -> None:
         assert [t["task"] for t in data["imported"]] == ["alpha"]
         assert data["missing"] == [".tasks/vanished.md"]
         assert data["removed"] is True
+
+
+def _seed_attempt(store: SqliteStore, task: str) -> None:
+    """Give ``task`` an attempt row — the record that it has *begun*, which is
+    what makes a re-published brief of that name unimportable."""
+    asyncio.run(store.create_attempt(
+        f"run-{task}", task=task, queue=None, worker_id="w1",
+        backend="claude-code", model="auto", base_ref=None, ttl_seconds=600,
+        title=task, repo="longitude",
+    ))
+
+
+def test_republishing_a_name_updates_the_queued_task_in_place(
+    tmp_path: Path,
+) -> None:
+    """The point of the rule: an operator or agent corrects a brief Nightshift
+    has not started yet by publishing it again under the same name."""
+    ws = build_workspace(
+        tmp_path, tasks={"alpha": "Stale brief.\n", "later": "Runs after.\n"}
+    )
+    tasks_root = ws / "nightshift-tasks"
+    save_order(tasks_root, ["alpha", "later"], "main")
+    _publish(ws / "longitude", {".tasks/alpha.md": "Corrected brief.\n"})
+    with _client(ws) as client:
+        preview = client.get("/api/queue/repo-tasks").json()["tasks"]
+        assert preview[0]["replaces"] is True
+        assert preview[0]["started"] is False
+        data = client.post("/api/queue/repo-tasks/import").json()
+        assert data["imported"] == [
+            {"task": "alpha", "title": "alpha", "replaced": True}
+        ]
+        assert data["refused"] == []
+        assert data["removed"] is True
+    # Updated where it sat, still ahead of the task queued behind it, and no
+    # second copy under a suffix.
+    assert (tasks_root / "main" / "alpha.md").read_text() == "Corrected brief.\n"
+    assert not (tasks_root / "main" / "alpha-2.md").exists()
+    assert json.loads(
+        (tasks_root / "main" / "config.json").read_text()
+    )["order"] == ["alpha", "later"]
+    assert ".tasks/alpha.md" not in git(
+        ws / "longitude", "ls-tree", "-r", "--name-only", "main"
+    )
+
+
+def test_a_task_that_has_begun_refuses_the_update_and_holds_the_source(
+    tmp_path: Path,
+) -> None:
+    """A running task's brief is not rewritten under it. The publish is
+    refused — and rather than vanishing, the source stays in the repo disabled
+    so whoever published it can see it was not taken."""
+    ws = build_workspace(tmp_path, tasks={"alpha": "The brief that is running.\n"})
+    repo_root = ws / "longitude"
+    tasks_root = ws / "nightshift-tasks"
+    _publish(repo_root, {
+        ".tasks/alpha.md": "---\npriority: 1\n---\n\nToo late.\n",
+        ".tasks/beta.md": "Do beta.\n",
+    })
+    store = SqliteStore()
+    _seed_attempt(store, "alpha")
+    with TestClient(create_app(ws, store=store)) as client:
+        assert client.get("/api/queue/repo-tasks").json()["tasks"][0]["started"] is True
+        data = client.post("/api/queue/repo-tasks/import").json()
+        assert [t["task"] for t in data["imported"]] == ["beta"]
+        assert data["refused"] == ["alpha"]
+    # The queue task is untouched...
+    assert (tasks_root / "main" / "alpha.md").read_text() \
+        == "The brief that is running.\n"
+    # ...and the source is still published, held, with its own frontmatter
+    # otherwise intact. The drained brief beside it still left.
+    tree = git(repo_root, "ls-tree", "-r", "--name-only", "main").splitlines()
+    assert ".tasks/alpha.md" in tree
+    assert ".tasks/beta.md" not in tree
+    held = git(repo_root, "cat-file", "blob", "main:.tasks/alpha.md")
+    assert split_frontmatter(held)[0] == {"priority": 1, "disabled": True}
+    assert "Too late." in held
+
+
+def test_refusing_the_same_brief_again_makes_no_further_commit(
+    tmp_path: Path,
+) -> None:
+    """The hold is idempotent: a second import of an already-refused brief has
+    nothing to write, so it does not churn the repo."""
+    ws = build_workspace(tmp_path, tasks={"alpha": "Running.\n"})
+    repo_root = ws / "longitude"
+    _publish(repo_root, {".tasks/alpha.md": "Too late.\n"})
+    store = SqliteStore()
+    _seed_attempt(store, "alpha")
+    with TestClient(create_app(ws, store=store)) as client:
+        client.post("/api/queue/repo-tasks/import")
+        # An import that drains *nothing* deletes nothing: the repo is intact
+        # apart from the hold just written into the refused brief.
+        assert git(repo_root, "ls-tree", "-r", "--name-only", "main").split() == [
+            ".tasks/alpha.md", "README.md",
+        ]
+        head = git(repo_root, "rev-parse", "main")
+        data = client.post("/api/queue/repo-tasks/import").json()
+        assert data["refused"] == ["alpha"]
+        assert data["imported"] == []
+    assert git(repo_root, "rev-parse", "main") == head
 
 
 def test_import_without_a_body_drains_everything(tmp_path: Path) -> None:

@@ -24,6 +24,7 @@ from nightshift import playlists as playlists_mod
 from nightshift import repos
 from nightshift.git.executor import ExecutorPool
 from nightshift.manager.scheduler import queue_label
+from nightshift.manager.store import NightshiftStore
 from nightshift.manager.wire import EmitFn
 from nightshift.repo_tasks import (
     RepoTask,
@@ -54,6 +55,7 @@ def register_repo_tasks_api(
     _commit: Callable[[str], Awaitable[None]],
     _emit: EmitFn,
     _executors: ExecutorPool,
+    _store: Callable[[], NightshiftStore],
 ) -> None:
     """Register the repo-task import endpoints (see module docstring)."""
     # One import at a time: the copy step reads-then-writes the destination
@@ -61,13 +63,18 @@ def register_repo_tasks_api(
     # interleave (imports are rare, operator-initiated actions).
     import_lock = asyncio.Lock()
 
-    def _scan(target: str | None, repo: str) -> list[RepoTask]:
-        return scan_repo_tasks(
+    async def _scan(target: str | None, repo: str) -> list[RepoTask]:
+        # The started set turns a name collision into an update-or-refuse
+        # decision, so it is read fresh with every scan rather than cached.
+        started = await _store().started_tasks(target)
+        return await asyncio.to_thread(
+            scan_repo_tasks,
             workspace,
             repo,
             queue_label(target),
             tasks_root,
             playlists_mod.tasks_rel(target),
+            started,
         )
 
     def _entry(e: RepoTask) -> dict:
@@ -81,16 +88,18 @@ def register_repo_tasks_api(
             "disabled": e.disabled,
             "quarantined": e.quarantined,
             "duplicate": e.duplicate,
+            "replaces": e.replaces,
+            "started": e.started,
         }
 
     @app.get("/api/queue/repo-tasks")
-    def get_repo_tasks(queue: str | None = None) -> JSONResponse:
+    async def get_repo_tasks(queue: str | None = None) -> JSONResponse:
         target = _resolve_queue(queue)
         if not _queue_exists(target):
             return JSONResponse({"error": "queue not found"}, status_code=404)
         repo = _queue_repo(target)
         available = bool(repo) and repos.repo_available(workspace, repo)
-        entries = _scan(target, repo) if available and repo else []
+        entries = await _scan(target, repo) if available and repo else []
         return JSONResponse({
             "queue": queue_label(target),
             "repo": repo,
@@ -106,7 +115,12 @@ def register_repo_tasks_api(
         """Drain the selected briefs (``sources``; absent = the whole scanned
         set) into the queue and remove them from the repo's ``main``. Briefs the
         operator left out stay published in the inbox and are offered again by
-        the next preview."""
+        the next preview.
+
+        A brief whose name is already a task here updates that task in place
+        instead of arriving beside it — unless the task has begun, in which
+        case the brief is refused: not imported, and held (``disabled: true``)
+        where it was published instead of drained."""
         target = _resolve_queue(queue)
         if not _queue_exists(target):
             return JSONResponse({"error": "queue not found"}, status_code=404)
@@ -119,12 +133,13 @@ def register_repo_tasks_api(
         label = queue_label(target)
         async with import_lock:
             entries, missing = select_repo_tasks(
-                _scan(target, repo), req.sources if req else None
+                await _scan(target, repo), req.sources if req else None
             )
             if not entries:
                 return JSONResponse({
                     "imported": [],
                     "deduped": [],
+                    "refused": [],
                     "removed": False,
                     "warning": None,
                     "missing": missing,
@@ -140,12 +155,16 @@ def register_repo_tasks_api(
                 )
             # 2. Remove the drained sources from the repo's main as a
             #    repo-executor job (serialized with lands/syncs on that repo).
+            #    A refused brief is held at the source instead of removed.
+            drained = [e.source for e in entries if not e.started]
+            refused = [e for e in entries if e.started]
             removal = await asyncio.wrap_future(_executors.submit(repo, partial(
                 remove_repo_tasks_locked,
                 workspace,
                 repo,
-                [e.source for e in entries],
-                f"nightshift: import {len(entries)} task(s) into queue {label}",
+                drained,
+                f"nightshift: import {len(drained)} task(s) into queue {label}",
+                disable=[e.source for e in refused],
             )))
         await _emit(
             "queue_changed",
@@ -155,6 +174,7 @@ def register_repo_tasks_api(
         return JSONResponse({
             "imported": imported,
             "deduped": [e.name for e in entries if e.duplicate],
+            "refused": [e.name for e in refused],
             "removed": removal["removed"],
             "warning": removal["warning"],
             "missing": missing,

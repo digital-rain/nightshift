@@ -318,10 +318,19 @@ def delete_produce(
                 kind=LandKind.CONFLICT, detail=f"inbox removal failed:\n{detail}",
             ))
 
-        present = git.run("ls-tree", "-r", "--name-only", base, "--", *paths)
-        if not present.ok:
+        # No paths means delete nothing — never a bare ``ls-tree`` of the whole
+        # tree, which would list (and then remove) every file in the repo. An
+        # import whose every brief was refused is exactly this case: nothing
+        # drained, only ``rewrite``'s holds to carry.
+        present = (
+            git.run("ls-tree", "-r", "--name-only", base, "--", *paths)
+            if paths else None
+        )
+        if present is not None and not present.ok:
             return failure(present.detail)
-        existing = [p for p in present.stdout.splitlines() if p.strip()]
+        existing = (
+            [p for p in present.stdout.splitlines() if p.strip()] if present else []
+        )
         edits = rewrite(base, existing) if rewrite is not None else {}
         if not existing and not edits:
             return ProduceResult(

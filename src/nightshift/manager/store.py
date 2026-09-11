@@ -252,6 +252,7 @@ class NightshiftStore(Protocol):
         since: str | None = None,
     ) -> list[dict[str, Any]]: ...
     async def heartbeat_attempt(self, attempt_id: str, ttl_seconds: float) -> None: ...
+    async def started_tasks(self, queue: str | None) -> set[str]: ...
 
     # transitions (the one write path for lifecycle state changes)
     async def apply_transition(
@@ -626,6 +627,23 @@ class SqlStoreBase:
                 """,
                 attempt_id, str(int(ttl_seconds)),
             )
+
+    async def started_tasks(self, queue: str | None) -> set[str]:
+        """The queue's task names that have ever been attempted — running,
+        finished, or failed.
+
+        "Has begun" in the repo-import sense (``nightshift.repo_tasks``): a
+        re-published brief may overwrite a queued task, but not one a worker
+        has already been handed. Any attempt row at all counts, because the
+        worker had the brief text from the moment it was dispatched — a later
+        rewrite would put a task in History whose brief nobody ran.
+        """
+        async with self._connection() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT task FROM nightshift.attempts WHERE queue = $1",
+                _qkey(queue),
+            )
+        return {r["task"] for r in rows}
 
     # ---- transitions ------------------------------------------------------ #
 

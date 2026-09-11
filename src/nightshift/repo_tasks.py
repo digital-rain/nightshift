@@ -21,6 +21,14 @@ An import drains the briefs the operator picked (the whole scanned set when
 they pick nothing in particular); anything left out stays published in the
 inbox and is offered again next time.
 
+**Re-publishing a name.** A brief whose stem is already a task in the
+destination queue is an *update*, not a second task: it overwrites that task
+in place, keeping its position in the execution order, so a publisher can
+correct work Nightshift has not started yet. The one exception is a task that
+has already begun — its brief is not rewritten under a running attempt, so the
+publish is refused: the source stays in the repo with ``disabled: true`` set
+(:func:`disable_inbox_sources`) rather than being drained.
+
 This module is shared-core: read-only scan/select/copy plus the lock-held
 removal orchestration; the HTTP surface lives in
 :mod:`nightshift.manager.api_repo_tasks`.
@@ -29,7 +37,7 @@ removal orchestration; the HTTP surface lives in
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -51,7 +59,7 @@ from nightshift.spawn_daily import (
     split_frontmatter,
     task_priority,
 )
-from nightshift.task_files import resolve_title
+from nightshift.task_files import resolve_title, set_frontmatter_text
 
 
 # The inbox directories external tooling publishes briefs into, relative to a
@@ -92,6 +100,15 @@ class RepoTask:
     # recovery path).
     duplicate: bool
     text: str
+    # A queue task of this name exists and has *not* begun: the import
+    # overwrites it in place, keeping its execution-order position, so a
+    # publisher can correct a brief it already sent by re-publishing it.
+    replaces: bool = False
+    # A queue task of this name has already begun — the brief behind a running
+    # or finished attempt is not rewritten under it. The publish is refused:
+    # not imported, and left in the repo disabled rather than deleted, so the
+    # publisher sees their update was not taken.
+    started: bool = False
 
 
 def _inboxes(queue_name: str) -> list[_Inbox]:
@@ -210,10 +227,15 @@ def _scan_inboxes(
     inboxes: list[_Inbox],
     tasks_root: Path,
     dest_rel: str,
+    started: Collection[str],
 ) -> list[RepoTask]:
     """Scan the given inbox trees of a repo's canonical ``main`` into
     importable briefs — the shared core of :func:`scan_repo_tasks` (every
     inbox a queue drains) and :func:`scan_repo_inbox` (one named host queue).
+
+    ``started`` names the destination tasks that have already begun (the
+    caller reads them from the attempt store), which is what splits a name
+    collision into :attr:`RepoTask.replaces` and :attr:`RepoTask.started`.
     """
     repo_root = workspace / repo
     git = GitRunner(repo_root)
@@ -222,11 +244,10 @@ def _scan_inboxes(
         return []
 
     dest_dir = tasks_root / dest_rel
-    existing = (
-        {p.read_text(errors="replace") for p in dest_dir.glob("*.md")}
-        if dest_dir.is_dir()
-        else set()
-    )
+    briefs = list(dest_dir.glob("*.md")) if dest_dir.is_dir() else []
+    existing = {p.read_text(errors="replace") for p in briefs}
+    queued = {p.stem for p in briefs}
+    begun = set(started)
 
     out: list[RepoTask] = []
     for inbox in inboxes:
@@ -237,6 +258,10 @@ def _scan_inboxes(
                 continue
             meta, text = parsed
             stem = name[: -len(".md")]
+            # Exact-text dedupe first: that brief *is* the queued task, so it
+            # is neither an update to make nor one to refuse.
+            duplicate = text in existing
+            collides = not duplicate and stem in queued
             out.append(RepoTask(
                 name=stem,
                 title=resolve_title(stem, meta),
@@ -244,8 +269,10 @@ def _scan_inboxes(
                 priority=task_priority(meta),
                 disabled=is_disabled(meta),
                 quarantined=is_quarantined(meta),
-                duplicate=text in existing,
+                duplicate=duplicate,
                 text=text,
+                replaces=collides and stem not in begun,
+                started=collides and stem in begun,
             ))
     return out
 
@@ -256,6 +283,7 @@ def scan_repo_tasks(
     queue_name: str,
     tasks_root: Path,
     dest_rel: str,
+    started: Collection[str] = (),
 ) -> list[RepoTask]:
     """Scan the repo's canonical ``main`` for inbox briefs importable into a
     queue.
@@ -270,7 +298,7 @@ def scan_repo_tasks(
     :func:`remove_repo_tasks_locked`.
     """
     return _scan_inboxes(
-        workspace, repo, _inboxes(queue_name), tasks_root, dest_rel
+        workspace, repo, _inboxes(queue_name), tasks_root, dest_rel, started
     )
 
 
@@ -280,6 +308,7 @@ def scan_repo_inbox(
     inbox: str,
     tasks_root: Path,
     dest_rel: str,
+    started: Collection[str] = (),
 ) -> list[RepoTask]:
     """Scan exactly one inbox tree, in its published order.
 
@@ -289,7 +318,7 @@ def scan_repo_inbox(
     a queue that did not bind them.
     """
     return _scan_inboxes(
-        workspace, repo, [_Inbox(inbox, ordered=True)], tasks_root, dest_rel
+        workspace, repo, [_Inbox(inbox, ordered=True)], tasks_root, dest_rel, started
     )
 
 
@@ -319,32 +348,55 @@ def select_repo_tasks(
 def copy_repo_tasks(
     tasks_root: Path, dest_rel: str, entries: list[RepoTask]
 ) -> list[dict]:
-    """Copy the non-duplicate scanned briefs into the destination queue dir,
-    appending them to its execution order. A name collision with *different*
-    content gets a ``-2`` suffix (the existing cross-queue copy policy).
+    """Copy the importable scanned briefs into the destination queue dir.
 
-    Returns ``{task, title}`` per brief written. This is the durable half of
-    an import — the caller commits the content store, and only then removes
-    the sources from the repo.
+    Three outcomes per entry, decided by the scan:
+
+    * ``duplicate`` or ``started`` — not written at all. A duplicate is
+      already here; a started collision is a task this import may not rewrite
+      (:func:`remove_repo_tasks_locked` disables its source instead).
+    * ``replaces`` — **overwritten in place**: same file, same position in the
+      execution order, new content. Re-publishing a brief is how a publisher
+      corrects work Nightshift has not started yet.
+    * otherwise — a new file appended to the end of the execution order.
+
+    A name taken by a *different brief in this same batch* (the same stem
+    published under two inbox roots) still gets the ``-2`` suffix: those are
+    distinct briefs, so neither may overwrite the other.
+
+    Returns ``{task, title, replaced}`` per brief written. This is the durable
+    half of an import — the caller commits the content store, and only then
+    removes the sources from the repo.
     """
     dest_dir = tasks_root / dest_rel
     dest_dir.mkdir(parents=True, exist_ok=True)
     imported: list[dict] = []
+    written: set[str] = set()
+    appended: list[str] = []
     for entry in entries:
-        if entry.duplicate:
+        if entry.duplicate or entry.started:
             continue
         name = entry.name
-        n = 2
-        while (dest_dir / f"{name}.md").exists():
-            name = f"{entry.name}-{n}"
-            n += 1
+        # Re-check the file rather than trusting the scan: between scan and
+        # copy the brief may have landed and left the queue, in which case
+        # this is a fresh task that still needs its order entry.
+        replaced = (
+            entry.replaces
+            and name not in written
+            and (dest_dir / f"{name}.md").exists()
+        )
+        if not replaced:
+            n = 2
+            while name in written or (dest_dir / f"{name}.md").exists():
+                name = f"{entry.name}-{n}"
+                n += 1
+            appended.append(name)
         (dest_dir / f"{name}.md").write_text(entry.text)
-        imported.append({"task": name, "title": entry.title})
-    if imported:
+        written.add(name)
+        imported.append({"task": name, "title": entry.title, "replaced": replaced})
+    if appended:
         save_order(
-            tasks_root,
-            [*load_order(tasks_root, dest_rel), *(t["task"] for t in imported)],
-            dest_rel,
+            tasks_root, [*load_order(tasks_root, dest_rel), *appended], dest_rel
         )
     return imported
 
@@ -416,12 +468,62 @@ def prune_inbox_orders(
     return rewrite
 
 
+def disable_inbox_sources(
+    repo_root: Path, sources: Sequence[str]
+) -> Callable[[str, Sequence[str]], dict[str, str]]:
+    """The refusal edit (:func:`delete_produce`'s ``rewrite``): every source
+    whose queued task has already begun, with ``disabled: true`` set in its
+    published frontmatter.
+
+    A brief cannot be rewritten under a task that is already running, so the
+    import refuses it — but dropping it on the floor would be silent, and
+    deleting it would destroy the publisher's work. Instead it stays exactly
+    where it was published, held: the publisher (an operator or another agent)
+    sees their update was not taken and can rename it, wait for the task to
+    finish, or clear the flag themselves.
+
+    Idempotent by construction: a source already disabled produces no edit, so
+    a re-scan that refuses the same brief again collapses to the base commit
+    rather than churning the repo every pass.
+    """
+
+    def rewrite(base: str, deleted: Sequence[str]) -> dict[str, str]:
+        git = GitRunner(repo_root)
+        edits: dict[str, str] = {}
+        for path in sorted(set(sources) - set(deleted)):
+            raw = git.run("cat-file", "blob", f"{base}:{path}")
+            if not raw.ok:
+                continue
+            held = set_frontmatter_text(raw.stdout, {"disabled": True})
+            if held != raw.stdout:
+                edits[path] = held
+        return edits
+
+    return rewrite
+
+
+def _compose_rewrites(
+    *rewrites: Callable[[str, Sequence[str]], dict[str, str]],
+) -> Callable[[str, Sequence[str]], dict[str, str]]:
+    """One ``rewrite`` hook out of several — the removal commit carries both
+    the drained inboxes' pruned orders and the refused briefs' holds."""
+
+    def rewrite(base: str, deleted: Sequence[str]) -> dict[str, str]:
+        edits: dict[str, str] = {}
+        for one in rewrites:
+            edits.update(one(base, deleted))
+        return edits
+
+    return rewrite
+
+
 def remove_repo_tasks_locked(
     workspace: Path,
     repo: str,
     sources: list[str],
     message: str,
     *,
+    disable: Sequence[str] = (),
     remote: str = "origin",
 ) -> dict:
     """Remove drained inbox files from the repo's canonical ``main`` — one
@@ -439,7 +541,9 @@ def remove_repo_tasks_locked(
     The commit deletes the brief files *and* prunes the stems they left behind
     in the inbox's ``config.json`` order (:func:`prune_inbox_orders`), so a
     drained inbox is left consistent rather than listing briefs that no longer
-    exist.
+    exist. ``disable`` names the sources the import *refused* — held in place
+    instead of drained (:func:`disable_inbox_sources`), in the same commit.
+    A pass with nothing to delete and nothing to hold makes no commit at all.
     """
     repo_root = workspace / repo
     has_remote = GitRunner(repo_root).run("remote", "get-url", remote).ok
@@ -449,7 +553,10 @@ def remove_repo_tasks_locked(
         RepoContext(workspace=workspace, repo=repo),
         delete_produce(
             repo_root, sources, message,
-            rewrite=prune_inbox_orders(repo_root, sources),
+            rewrite=_compose_rewrites(
+                prune_inbox_orders(repo_root, sources),
+                disable_inbox_sources(repo_root, disable),
+            ),
         ),
         mode=LandingMode.NONE,
     )

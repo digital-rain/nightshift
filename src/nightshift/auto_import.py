@@ -28,6 +28,15 @@ the end of the destination queue's execution order in their published order.
 The queue's own tasks keep their places — manually added work still runs, and
 an operator who wants a pulled brief sooner re-prioritises it by hand.
 
+**Re-publishing.** A host queue is also how a publisher *corrects* itself: a
+brief re-published under a name this queue already holds overwrites that task
+in place (keeping its order position) instead of arriving beside it as
+``<name>-2``. The replay guard is what makes that reachable — it skips a
+still-published source only while the source still says what it said when it
+was imported (:func:`is_replay`), so a rewritten brief is an update rather
+than a failed removal. A task that has already begun is refused instead: its
+source stays in the repo, disabled. See :mod:`nightshift.repo_tasks`.
+
 **Holds.** A brief published ``quarantined: true`` is not imported at all: the
 publisher said "do not run this", and Nightshift honours it by leaving the
 brief in the host queue — re-skipped every pass, never removed — until the
@@ -49,6 +58,7 @@ reasoning behind both rules.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from nightshift.model_id import is_qualified
@@ -76,6 +86,12 @@ HOST_QUEUE_KEY = "host_queue"
 # record, and the key the replay guard matches on (a brief carrying it came
 # from a host queue and has not run yet — see :func:`pending_imports`).
 PROVENANCE_KEY = "imported_from"
+
+# Stamped beside it: a digest of the source text this brief was imported from.
+# The replay guard skips a still-published source only while it still says what
+# it said when it was imported; re-publishing *different* text at the same path
+# is an update, not a replay, and imports over the queued task.
+SOURCE_DIGEST_KEY = "imported_digest"
 
 # Model keywords that pin nothing concrete (the scheduler's ``AGNOSTIC_MODELS``
 # vocabulary): a published ``model: auto`` is usable, not unrecognised.
@@ -218,17 +234,25 @@ def normalize_frontmatter(
     return out
 
 
+def source_digest(text: str) -> str:
+    """The :data:`SOURCE_DIGEST_KEY` stamp for a published brief's text —
+    short, since it only has to tell one publish of a path from the next."""
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
 def imported_brief_text(
     text: str, *, stem: str, repo: str, source: str, default_model: str
 ) -> str:
     """Rewrite a published brief for the destination queue: normalised
-    frontmatter plus the :data:`PROVENANCE_KEY` stamp naming where it came
-    from. A brief with no frontmatter at all gains a complete one."""
+    frontmatter plus the :data:`PROVENANCE_KEY` / :data:`SOURCE_DIGEST_KEY`
+    stamps naming where it came from and what it said. A brief with no
+    frontmatter at all gains a complete one."""
     meta, body = split_frontmatter(text) if text.startswith("---") else ({}, text)
     normalized = normalize_frontmatter(
         meta, stem=stem, repo=repo, default_model=default_model
     )
     normalized[PROVENANCE_KEY] = f"{repo}/{source}"
+    normalized[SOURCE_DIGEST_KEY] = source_digest(text)
     return join_frontmatter(normalized, body)
 
 
@@ -238,7 +262,8 @@ def imported_brief_text(
 
 
 def pending_imports(tasks_root: Path, tasks_rel: str) -> dict[str, str]:
-    """Auto-imported briefs still sitting in a queue, ``provenance -> stem``.
+    """Auto-imported briefs still sitting in a queue, ``provenance -> digest``
+    (``""`` for a brief stamped before digests were recorded).
 
     A landed task's brief is dropped from the store, so an entry here means
     that source's import has not landed yet. This is the **replay guard**: a
@@ -246,7 +271,10 @@ def pending_imports(tasks_root: Path, tasks_rel: str) -> dict[str, str]:
     and re-importing it would run the same work twice. The importer keys that
     check on the provenance string rather than on brief text, because an
     auto-imported brief is rewritten on the way in (normalised frontmatter
-    plus the provenance stamp) and so never matches its source verbatim.
+    plus the stamps) and so never matches its source verbatim.
+
+    The digest is what keeps the guard from swallowing *updates*: see
+    :func:`is_replay`.
     """
     queue_dir = tasks_root / tasks_rel
     if not queue_dir.is_dir():
@@ -256,9 +284,27 @@ def pending_imports(tasks_root: Path, tasks_rel: str) -> dict[str, str]:
         text = path.read_text(errors="replace")
         if not text.startswith("---"):
             continue
-        provenance = split_frontmatter(text)[0].get(PROVENANCE_KEY)
+        meta = split_frontmatter(text)[0]
+        provenance = meta.get(PROVENANCE_KEY)
         if provenance:
-            out[str(provenance)] = path.stem
+            out[str(provenance)] = str(meta.get(SOURCE_DIGEST_KEY) or "")
     return out
+
+
+def is_replay(pending: dict[str, str], provenance: str, text: str) -> bool:
+    """True when this still-published source is the *same* brief this queue
+    already imported — the removal simply failed, and importing it again would
+    run the same work twice.
+
+    Text that has changed since is a re-publish: the publisher corrected the
+    brief, and the import takes it (overwriting the queued task, unless that
+    task has begun). A brief stamped before digests were recorded has no text
+    to compare against, so it stays a replay — the conservative reading, and
+    the publisher can force the update through by renaming the source.
+    """
+    if provenance not in pending:
+        return False
+    digest = pending[provenance]
+    return not digest or digest == source_digest(text)
 
 

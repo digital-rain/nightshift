@@ -989,6 +989,7 @@ def register_operator_api(
         _commit=_commit,
         _emit=_emit,
         _executors=_executors,
+        _store=_store,
     )
 
     register_documents_api(
